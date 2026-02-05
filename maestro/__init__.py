@@ -13,6 +13,15 @@ from maestro.database import (
     TaskNotFoundError,
     create_database,
 )
+from maestro.notifications import (
+    DesktopNotifier,
+    Notification,
+    NotificationChannel,
+    NotificationEvent,
+    NotificationManager,
+    Platform,
+    create_notification_manager,
+)
 from maestro.recovery import RecoveryStatistics, StateRecovery
 from maestro.scheduler import (
     BaseSpawner,
@@ -50,6 +59,12 @@ __all__ = [
     "Database",
     "DatabaseError",
     "DependencyNotFoundError",
+    "DesktopNotifier",
+    "Notification",
+    "NotificationChannel",
+    "NotificationEvent",
+    "NotificationManager",
+    "Platform",
     "RecoveryStatistics",
     "RunningTask",
     "Scheduler",
@@ -68,6 +83,7 @@ __all__ = [
     "Validator",
     "create_database",
     "create_default_registry",
+    "create_notification_manager",
     "create_scheduler_from_config",
     "load_config",
     "load_config_from_string",

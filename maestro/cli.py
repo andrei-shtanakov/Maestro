@@ -28,6 +28,7 @@ from maestro import (
     StateRecovery,
     TaskNotFoundError,
     create_database,
+    create_notification_manager,
     create_scheduler_from_config,
     load_config,
 )
@@ -228,6 +229,9 @@ async def _run_scheduler(
         if log_dir is None:
             log_dir = workdir / "logs"
 
+        # Setup notifications
+        notifications = create_notification_manager(config.notifications)
+
         # Create scheduler
         scheduler = await create_scheduler_from_config(
             db=db,
@@ -236,6 +240,7 @@ async def _run_scheduler(
             max_concurrent=config.max_concurrent,
             workdir=workdir,
             log_dir=log_dir,
+            notification_manager=notifications,
         )
 
         # Display initial state

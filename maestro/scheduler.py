@@ -22,6 +22,8 @@ from typing import Protocol
 from maestro.dag import DAG
 from maestro.database import Database
 from maestro.models import Task, TaskConfig, TaskStatus
+from maestro.notifications.base import Notification, NotificationEvent
+from maestro.notifications.manager import NotificationManager
 from maestro.validator import ValidationResult, Validator
 
 
@@ -160,6 +162,7 @@ class Scheduler:
         dag: DAG,
         spawners: dict[str, SpawnerProtocol],
         config: SchedulerConfig | None = None,
+        notification_manager: NotificationManager | None = None,
     ) -> None:
         """Initialize scheduler.
 
@@ -168,11 +171,13 @@ class Scheduler:
             dag: DAG for dependency resolution.
             spawners: Map of agent_type to spawner instances.
             config: Scheduler configuration.
+            notification_manager: Optional notification manager.
         """
         self._db = db
         self._dag = dag
         self._spawners = spawners
         self._config = config or SchedulerConfig()
+        self._notifications = notification_manager
 
         self._running_tasks: dict[str, RunningTask] = {}
         self._shutdown_requested = False
@@ -194,6 +199,24 @@ class Scheduler:
     def max_concurrent(self) -> int:
         """Get maximum concurrent tasks."""
         return self._config.max_concurrent
+
+    async def _notify(
+        self,
+        task: Task,
+        event: NotificationEvent,
+        message: str | None = None,
+    ) -> None:
+        """Send a notification for a task event.
+
+        Args:
+            task: The task the event is about.
+            event: The notification event type.
+            message: Optional additional message.
+        """
+        if self._notifications is None:
+            return
+        notification = Notification.from_task(task, event, message)
+        await self._notifications.notify(notification)
 
     async def run(self) -> None:
         """Run the scheduler main loop.
@@ -361,6 +384,8 @@ class Scheduler:
             log_file=log_file,
         )
 
+        await self._notify(task, NotificationEvent.TASK_STARTED)
+
     async def _build_dependency_context(self, task: Task) -> str:
         """Build context string from completed dependency tasks.
 
@@ -463,6 +488,7 @@ class Scheduler:
                         expected_status=TaskStatus.VALIDATING,
                         result_summary="Task completed successfully",
                     )
+                    await self._notify(task, NotificationEvent.TASK_COMPLETED)
                 else:
                     # Include validation output in error for retry context
                     error_msg = self._format_validation_error(validation_result)
@@ -477,6 +503,7 @@ class Scheduler:
                     expected_status=TaskStatus.RUNNING,
                     result_summary="Task completed successfully",
                 )
+                await self._notify(task, NotificationEvent.TASK_COMPLETED)
         else:
             # Process failed
             error_msg = f"Process exited with code {return_code}"
@@ -553,6 +580,11 @@ class Scheduler:
                 TaskStatus.NEEDS_REVIEW,
                 expected_status=TaskStatus.FAILED,
             )
+            await self._notify(
+                current_task,
+                NotificationEvent.TASK_NEEDS_REVIEW,
+                full_error,
+            )
 
     async def _handle_task_failure(
         self, task_id: str, _task: Task, error_message: str
@@ -594,6 +626,11 @@ class Scheduler:
                 TaskStatus.NEEDS_REVIEW,
                 expected_status=TaskStatus.FAILED,
             )
+            await self._notify(
+                current_task,
+                NotificationEvent.TASK_NEEDS_REVIEW,
+                error_message,
+            )
 
     async def _handle_task_timeout(
         self, task_id: str, running_task: RunningTask
@@ -616,8 +653,15 @@ class Scheduler:
         except OSError:
             pass  # Process may have already exited
 
-        # Handle as failure
+        # Notify timeout
         error_msg = f"Task timed out after {running_task.task.timeout_minutes} minutes"
+        await self._notify(
+            running_task.task,
+            NotificationEvent.TASK_TIMEOUT,
+            error_msg,
+        )
+
+        # Handle as failure
         await self._handle_task_failure(task_id, running_task.task, error_msg)
 
     async def _run_validation(self, task: Task) -> ValidationResult:
@@ -732,6 +776,7 @@ async def create_scheduler_from_config(
     max_concurrent: int = 3,
     workdir: Path | None = None,
     log_dir: Path | None = None,
+    notification_manager: NotificationManager | None = None,
 ) -> Scheduler:
     """Create a scheduler from task configurations.
 
@@ -747,6 +792,7 @@ async def create_scheduler_from_config(
         max_concurrent: Maximum concurrent tasks.
         workdir: Base working directory.
         log_dir: Directory for log files.
+        notification_manager: Optional notification manager.
 
     Returns:
         Configured Scheduler instance.
@@ -770,4 +816,4 @@ async def create_scheduler_from_config(
             task = Task.from_config(task_config, str(config.workdir))
             await db.create_task(task)
 
-    return Scheduler(db, dag, spawners, config)
+    return Scheduler(db, dag, spawners, config, notification_manager)

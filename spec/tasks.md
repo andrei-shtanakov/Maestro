@@ -381,22 +381,22 @@ FastAPI REST API с теми же эндпоинтами.
 ---
 
 ### TASK-030: Post-Task Validation
-🟠 P1 | 🔄 IN_PROGRESS | Est: 1d
+🟠 P1 | ✅ DONE | Est: 1d
 
 **Description:**
 Валидация результатов через validation_cmd.
 
 **Checklist:**
-- [ ] Validator class
-- [ ] validation_cmd execution
-- [ ] Timeout handling
-- [ ] Exit code → success/failure
-- [ ] Output capture для retry context
-- [ ] VALIDATING status integration
+- [x] Validator class
+- [x] validation_cmd execution
+- [x] Timeout handling
+- [x] Exit code → success/failure
+- [x] Output capture для retry context
+- [x] VALIDATING status integration
 
 **Tests:**
-- [ ] Unit: validation execution
-- [ ] Integration: success/failure flows
+- [x] Unit: validation execution
+- [x] Integration: success/failure flows
 
 **Traces to:** [REQ-030], [DESIGN-030]
 **Depends on:** [TASK-012]

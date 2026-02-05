@@ -182,17 +182,23 @@
       "completed_at": "2026-02-05T17:47:58.418342"
     },
     "TASK-030": {
-      "status": "running",
+      "status": "success",
       "attempts": [
         {
           "timestamp": "2026-02-05T17:48:02.521016",
           "success": false,
           "duration_seconds": 4.002543,
           "error": "API error: you've hit your limit"
+        },
+        {
+          "timestamp": "2026-02-05T21:55:13.138174",
+          "success": true,
+          "duration_seconds": 450.633912,
+          "error": null
         }
       ],
       "started_at": "2026-02-05T21:47:27.396225",
-      "completed_at": null
+      "completed_at": "2026-02-05T21:55:13.138222"
     },
     "TASK-032": {
       "status": "success",
@@ -223,12 +229,12 @@
     "TASK-040": {
       "status": "running",
       "attempts": [],
-      "started_at": "2026-02-05T21:45:02.501727",
+      "started_at": "2026-02-05T21:55:13.251434",
       "completed_at": null
     }
   },
   "consecutive_failures": 0,
-  "total_completed": 15,
+  "total_completed": 16,
   "total_failed": 0,
-  "last_updated": "2026-02-05T21:47:27.396358"
+  "last_updated": "2026-02-05T21:55:13.251540"
 }
