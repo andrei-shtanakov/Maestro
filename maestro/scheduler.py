@@ -32,9 +32,14 @@ class SpawnerProtocol(Protocol):
         """Unique identifier for this agent type."""
         ...
 
+    def is_available(self) -> bool:
+        """Check if this agent is available."""
+        ...
+
     def spawn(
         self,
         task: Task,
+        context: str,
         workdir: Path,
         log_file: Path,
     ) -> Popen[bytes]:
@@ -43,7 +48,12 @@ class SpawnerProtocol(Protocol):
 
 
 class BaseSpawner(ABC):
-    """Abstract base class for agent spawners."""
+    """Abstract base class for agent spawners.
+
+    .. deprecated::
+        Use :class:`maestro.spawners.AgentSpawner` instead.
+        This class is kept for backward compatibility.
+    """
 
     @property
     @abstractmethod
@@ -51,10 +61,21 @@ class BaseSpawner(ABC):
         """Unique identifier for this agent type."""
         ...
 
+    def is_available(self) -> bool:
+        """Check if this agent is available.
+
+        Default implementation returns True for backward compatibility.
+
+        Returns:
+            True if agent is available.
+        """
+        return True
+
     @abstractmethod
     def spawn(
         self,
         task: Task,
+        context: str,
         workdir: Path,
         log_file: Path,
     ) -> Popen[bytes]:
@@ -62,6 +83,7 @@ class BaseSpawner(ABC):
 
         Args:
             task: Task to execute.
+            context: Context from completed dependencies.
             workdir: Working directory for the process.
             log_file: Path to write process output.
 
@@ -297,8 +319,27 @@ class Scheduler:
             msg = f"No spawner available for agent type '{task.agent_type}'"
             raise SchedulerError(msg)
 
+        # Check if spawner is available
+        if not spawner.is_available():
+            msg = f"Agent '{task.agent_type}' is not available on this system"
+            raise SchedulerError(msg)
+
         # Prepare log file
         log_file = self._config.log_dir / f"{task_id}.log"
+
+        # Validate workdir exists (use sync path checks as they're fast I/O operations)
+        workdir = Path(task.workdir)
+        workdir_exists = workdir.exists()  # noqa: ASYNC240
+        workdir_is_dir = workdir.is_dir()  # noqa: ASYNC240
+        if not workdir_exists:
+            msg = f"Working directory does not exist: {workdir}"
+            raise SchedulerError(msg)
+        if not workdir_is_dir:
+            msg = f"Working directory is not a directory: {workdir}"
+            raise SchedulerError(msg)
+
+        # Build context from completed dependencies
+        context = await self._build_dependency_context(task)
 
         # Transition to RUNNING
         task = await self._db.update_task_status(
@@ -308,8 +349,7 @@ class Scheduler:
         )
 
         # Spawn the process
-        workdir = Path(task.workdir)
-        process = spawner.spawn(task, workdir, log_file)
+        process = spawner.spawn(task, context, workdir, log_file)
 
         # Track running task
         self._running_tasks[task_id] = RunningTask(
@@ -318,6 +358,38 @@ class Scheduler:
             started_at=datetime.now(UTC),
             log_file=log_file,
         )
+
+    async def _build_dependency_context(self, task: Task) -> str:
+        """Build context string from completed dependency tasks.
+
+        Collects result summaries from all completed dependencies
+        to provide context for the current task.
+
+        Args:
+            task: The task needing context.
+
+        Returns:
+            Formatted context string from dependencies.
+        """
+        if not task.depends_on:
+            return ""
+
+        context_parts: list[str] = []
+        for dep_id in task.depends_on:
+            try:
+                dep_task = await self._db.get_task(dep_id)
+                if dep_task.result_summary:
+                    context_parts.append(f"[{dep_id}]: {dep_task.result_summary}")
+            except Exception as e:
+                # Log the error but continue - missing context shouldn't block execution
+                logging.warning(
+                    "Failed to get context from dependency %s for task %s: %s",
+                    dep_id,
+                    task.id,
+                    e,
+                )
+
+        return "\n".join(context_parts)
 
     async def _handle_spawn_error(self, task_id: str, error: Exception) -> None:
         """Handle error during task spawn.
@@ -461,6 +533,8 @@ class Scheduler:
             await asyncio.sleep(0.5)
             if running_task.process.poll() is None:
                 running_task.process.kill()
+            # Reap the child process to avoid zombies
+            running_task.process.wait()
         except OSError:
             pass  # Process may have already exited
 
@@ -484,8 +558,13 @@ class Scheduler:
         validation_timeout = 300
 
         try:
-            proc = await asyncio.create_subprocess_shell(
-                task.validation_cmd,
+            # Use subprocess_exec with shell=False via shlex to avoid command injection
+            # The validation_cmd is split into args for safer execution
+            import shlex
+
+            args = shlex.split(task.validation_cmd)
+            proc = await asyncio.create_subprocess_exec(
+                *args,
                 cwd=task.workdir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
@@ -494,6 +573,7 @@ class Scheduler:
                 await asyncio.wait_for(proc.communicate(), timeout=validation_timeout)
             except TimeoutError:
                 proc.kill()
+                await proc.wait()  # Reap the child process
                 logging.warning(
                     "Validation command for task %s timed out after %d seconds",
                     task.id,
@@ -501,7 +581,12 @@ class Scheduler:
                 )
                 return False
             return proc.returncode == 0
-        except Exception:
+        except Exception as e:
+            logging.warning(
+                "Validation command for task %s failed: %s",
+                task.id,
+                e,
+            )
             return False
 
     async def _get_completed_task_ids(self) -> set[str]:
@@ -560,6 +645,8 @@ class Scheduler:
                 await asyncio.sleep(0.5)
                 if running_task.process.poll() is None:
                     running_task.process.kill()
+                # Reap the child process to avoid zombies
+                running_task.process.wait()
             except OSError:
                 pass
 

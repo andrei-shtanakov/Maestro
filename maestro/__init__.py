@@ -22,11 +22,14 @@ from maestro.scheduler import (
     TaskTimeoutError,
     create_scheduler_from_config,
 )
+from maestro.spawners import AgentSpawner, ClaudeCodeSpawner
 
 
 __all__ = [
     "DAG",
+    "AgentSpawner",
     "BaseSpawner",
+    "ClaudeCodeSpawner",
     "ConcurrentModificationError",
     "ConfigError",
     "CycleError",

@@ -36,12 +36,15 @@ class MockSpawner(BaseSpawner):
         agent_type_name: str = "claude_code",
         return_code: int = 0,
         delay_seconds: float = 0.0,
+        available: bool = True,
     ) -> None:
         self._agent_type = agent_type_name
         self._return_code = return_code
         self._delay_seconds = delay_seconds
+        self._available = available
         self._spawn_count = 0
         self._spawned_tasks: list[Task] = []
+        self._spawned_contexts: list[str] = []
         self._mock_processes: list[MagicMock] = []
 
     @property
@@ -56,14 +59,23 @@ class MockSpawner(BaseSpawner):
     def spawned_tasks(self) -> list[Task]:
         return self._spawned_tasks
 
+    @property
+    def spawned_contexts(self) -> list[str]:
+        return self._spawned_contexts
+
+    def is_available(self) -> bool:
+        return self._available
+
     def spawn(
         self,
         task: Task,
+        context: str,
         workdir: Path,
         log_file: Path,
     ) -> subprocess.Popen[bytes]:
         self._spawn_count += 1
         self._spawned_tasks.append(task)
+        self._spawned_contexts.append(context)
 
         # Create mock process
         mock_process = MagicMock(spec=subprocess.Popen)
@@ -99,9 +111,13 @@ class FailingSpawner(BaseSpawner):
     def agent_type(self) -> str:
         return "claude_code"
 
+    def is_available(self) -> bool:
+        return True
+
     def spawn(
         self,
         task: Task,
+        context: str,
         workdir: Path,
         log_file: Path,
     ) -> subprocess.Popen[bytes]:
@@ -1185,3 +1201,154 @@ class TestSchedulerErrors:
         assert error.timeout_minutes == 30
         assert "task-123" in str(error)
         assert "30 minutes" in str(error)
+
+
+# =============================================================================
+# Tests: Spawner Error Handling
+# =============================================================================
+
+
+class TestSpawnerErrorHandling:
+    """Tests for spawner error handling."""
+
+    @pytest.mark.anyio
+    async def test_missing_spawner_raises_error(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """Test that missing spawner raises SchedulerError."""
+        configs = [
+            TaskConfig(
+                id="unknown-agent-task",
+                title="Task with unknown agent",
+                prompt="Test prompt",
+                agent_type=AgentType.CLAUDE_CODE,
+            )
+        ]
+
+        db = await create_database(temp_db_path)
+        try:
+            for config in configs:
+                task = Task.from_config(config, str(temp_dir))
+                await db.create_task(task)
+
+            # Create scheduler with NO spawners registered
+            dag = DAG(configs)
+            scheduler_config = SchedulerConfig(
+                max_concurrent=1,
+                poll_interval=0.05,
+                log_dir=temp_dir / "logs",
+            )
+
+            scheduler = Scheduler(
+                db=db,
+                dag=dag,
+                spawners={},  # No spawners!
+                config=scheduler_config,
+            )
+
+            ready = scheduler._resolve_ready_tasks(set())
+            await scheduler._spawn_ready_tasks(ready)
+
+            # Task should be marked as FAILED due to missing spawner
+            task = await db.get_task("unknown-agent-task")
+            assert task.status == TaskStatus.FAILED
+            assert "No spawner available" in (task.error_message or "")
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_unavailable_spawner_raises_error(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """Test that unavailable spawner raises SchedulerError."""
+        configs = [
+            TaskConfig(
+                id="unavailable-agent-task",
+                title="Task with unavailable agent",
+                prompt="Test prompt",
+                agent_type=AgentType.CLAUDE_CODE,
+            )
+        ]
+
+        db = await create_database(temp_db_path)
+        try:
+            for config in configs:
+                task = Task.from_config(config, str(temp_dir))
+                await db.create_task(task)
+
+            # Create spawner that reports unavailable
+            mock_spawner = MockSpawner(available=False)
+            dag = DAG(configs)
+            scheduler_config = SchedulerConfig(
+                max_concurrent=1,
+                poll_interval=0.05,
+                log_dir=temp_dir / "logs",
+            )
+
+            scheduler = Scheduler(
+                db=db,
+                dag=dag,
+                spawners={"claude_code": mock_spawner},
+                config=scheduler_config,
+            )
+
+            ready = scheduler._resolve_ready_tasks(set())
+            await scheduler._spawn_ready_tasks(ready)
+
+            # Task should be marked as FAILED due to unavailable spawner
+            task = await db.get_task("unavailable-agent-task")
+            assert task.status == TaskStatus.FAILED
+            assert "not available" in (task.error_message or "")
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_invalid_workdir_raises_error(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """Test that invalid workdir raises SchedulerError."""
+        nonexistent_dir = temp_dir / "nonexistent_workdir"
+        configs = [
+            TaskConfig(
+                id="invalid-workdir-task",
+                title="Task with invalid workdir",
+                prompt="Test prompt",
+            )
+        ]
+
+        db = await create_database(temp_db_path)
+        try:
+            # Create task with nonexistent workdir
+            task = Task.from_config(configs[0], str(nonexistent_dir))
+            await db.create_task(task)
+
+            mock_spawner = MockSpawner()
+            dag = DAG(configs)
+            scheduler_config = SchedulerConfig(
+                max_concurrent=1,
+                poll_interval=0.05,
+                log_dir=temp_dir / "logs",
+            )
+
+            scheduler = Scheduler(
+                db=db,
+                dag=dag,
+                spawners={"claude_code": mock_spawner},
+                config=scheduler_config,
+            )
+
+            ready = scheduler._resolve_ready_tasks(set())
+            await scheduler._spawn_ready_tasks(ready)
+
+            # Task should be marked as FAILED due to invalid workdir
+            task = await db.get_task("invalid-workdir-task")
+            assert task.status == TaskStatus.FAILED
+            assert "Working directory" in (task.error_message or "")
+        finally:
+            await db.close()

@@ -181,26 +181,26 @@ Database layer для хранения состояния задач.
 ---
 
 ### TASK-005: Scheduler Core
-🔴 P0 | 🔄 IN_PROGRESS | Est: 2d
+🔴 P0 | ✅ DONE | Est: 2d
 
 **Description:**
 Основной scheduler loop: resolve ready tasks → spawn → monitor.
 
 **Checklist:**
-- [ ] asyncio event loop
-- [ ] Ready task resolution через DAG
-- [ ] Concurrency limit (max_concurrent)
-- [ ] Task timeout handling
-- [ ] Process monitoring (Popen)
-- [ ] Status transitions на completion
-- [ ] Graceful shutdown (SIGTERM)
+- [x] asyncio event loop
+- [x] Ready task resolution через DAG
+- [x] Concurrency limit (max_concurrent)
+- [x] Task timeout handling
+- [x] Process monitoring (Popen)
+- [x] Status transitions на completion
+- [x] Graceful shutdown (SIGTERM)
 
 **Tests:**
-- [ ] Unit: ready task resolution
-- [ ] Unit: concurrency limiting
-- [ ] Integration: full execution with mock spawner
-- [ ] Integration: timeout handling
-- [ ] Integration: graceful shutdown
+- [x] Unit: ready task resolution
+- [x] Unit: concurrency limiting
+- [x] Integration: full execution with mock spawner
+- [x] Integration: timeout handling
+- [x] Integration: graceful shutdown
 
 **Traces to:** [REQ-002], [REQ-003]
 **Depends on:** [TASK-003], [TASK-004]
@@ -209,7 +209,7 @@ Database layer для хранения состояния задач.
 ---
 
 ### TASK-010: Claude Code Spawner
-🔴 P0 | ⬜ TODO | Est: 1d
+🔴 P0 | 🔄 IN_PROGRESS | Est: 1d
 
 **Description:**
 Spawner для Claude Code в headless-режиме.
