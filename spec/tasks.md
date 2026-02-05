@@ -234,20 +234,20 @@ Spawner для Claude Code в headless-режиме.
 ---
 
 ### TASK-011: Spawner Registry
-🟠 P1 | 🔄 IN_PROGRESS | Est: 0.5d
+🟠 P1 | ✅ DONE | Est: 0.5d
 
 **Description:**
 Auto-discovery и registry для spawner plugins.
 
 **Checklist:**
-- [ ] SpawnerRegistry class
-- [ ] Auto-discovery через entry points или directory scan
-- [ ] get_spawner(agent_type) lookup
-- [ ] Fallback handling
+- [x] SpawnerRegistry class
+- [x] Auto-discovery через entry points или directory scan
+- [x] get_spawner(agent_type) lookup
+- [x] Fallback handling
 
 **Tests:**
-- [ ] Unit: registry operations
-- [ ] Unit: spawner discovery
+- [x] Unit: registry operations
+- [x] Unit: spawner discovery
 
 **Traces to:** [REQ-011], [DESIGN-011]
 **Depends on:** [TASK-010]
@@ -334,7 +334,7 @@ FastMCP сервер для координации агентов.
 ---
 
 ### TASK-021: REST API
-🟠 P1 | ⬜ TODO | Est: 1d
+🟠 P1 | 🔄 IN_PROGRESS | Est: 1d
 
 **Description:**
 FastAPI REST API с теми же эндпоинтами.
