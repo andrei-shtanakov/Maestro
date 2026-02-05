@@ -358,21 +358,21 @@ FastAPI REST API с теми же эндпоинтами.
 ---
 
 ### TASK-022: Inter-Agent Messages
-🟡 P2 | 🔄 IN_PROGRESS | Est: 0.5d
+🟡 P2 | ✅ DONE | Est: 0.5d
 
 **Description:**
 Система сообщений между агентами.
 
 **Checklist:**
-- [ ] messages table in DB
-- [ ] post_message MCP tool
-- [ ] read_messages MCP tool
-- [ ] REST endpoints for messages
-- [ ] Broadcast support (to_agent=null)
+- [x] messages table in DB
+- [x] post_message MCP tool
+- [x] read_messages MCP tool
+- [x] REST endpoints for messages
+- [x] Broadcast support (to_agent=null)
 
 **Tests:**
-- [ ] Unit: message CRUD
-- [ ] Integration: broadcast
+- [x] Unit: message CRUD
+- [x] Integration: broadcast
 
 **Traces to:** [REQ-020], [DESIGN-020]
 **Depends on:** [TASK-020]
@@ -453,7 +453,7 @@ Retry с exponential backoff и контекстом ошибки.
 ## Milestone 3: Production Ready
 
 ### TASK-040: Desktop Notifications
-🟡 P2 | ⬜ TODO | Est: 0.5d
+🟡 P2 | 🔄 IN_PROGRESS | Est: 0.5d
 
 **Description:**
 Desktop notifications через notify-send или macOS.

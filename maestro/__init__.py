@@ -30,6 +30,12 @@ from maestro.spawners import (
     SpawnerRegistry,
     create_default_registry,
 )
+from maestro.validator import (
+    ValidationError,
+    ValidationResult,
+    ValidationTimeoutError,
+    Validator,
+)
 
 
 __all__ = [
@@ -56,6 +62,10 @@ __all__ = [
     "TaskAlreadyExistsError",
     "TaskNotFoundError",
     "TaskTimeoutError",
+    "ValidationError",
+    "ValidationResult",
+    "ValidationTimeoutError",
+    "Validator",
     "create_database",
     "create_default_registry",
     "create_scheduler_from_config",

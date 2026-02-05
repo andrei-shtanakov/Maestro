@@ -22,6 +22,7 @@ from typing import Protocol
 from maestro.dag import DAG
 from maestro.database import Database
 from maestro.models import Task, TaskConfig, TaskStatus
+from maestro.validator import ValidationResult, Validator
 
 
 class SpawnerProtocol(Protocol):
@@ -177,6 +178,7 @@ class Scheduler:
         self._shutdown_requested = False
         self._shutdown_event = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._validator = Validator()
 
     @property
     def is_running(self) -> bool:
@@ -452,9 +454,9 @@ class Scheduler:
                     TaskStatus.VALIDATING,
                     expected_status=TaskStatus.RUNNING,
                 )
-                # Run validation (simplified - actual validation would be async)
-                validation_success = await self._run_validation(task)
-                if validation_success:
+                # Run validation with the Validator class
+                validation_result = await self._run_validation(task)
+                if validation_result.success:
                     await self._db.update_task_status(
                         task_id,
                         TaskStatus.DONE,
@@ -462,7 +464,11 @@ class Scheduler:
                         result_summary="Task completed successfully",
                     )
                 else:
-                    await self._handle_task_failure(task_id, task, "Validation failed")
+                    # Include validation output in error for retry context
+                    error_msg = self._format_validation_error(validation_result)
+                    await self._handle_validation_failure(
+                        task_id, task, error_msg, validation_result
+                    )
             else:
                 # No validation - mark as done
                 await self._db.update_task_status(
@@ -475,6 +481,78 @@ class Scheduler:
             # Process failed
             error_msg = f"Process exited with code {return_code}"
             await self._handle_task_failure(task_id, task, error_msg)
+
+    def _format_validation_error(self, result: ValidationResult) -> str:
+        """Format validation result as an error message.
+
+        Args:
+            result: The validation result.
+
+        Returns:
+            Formatted error message.
+        """
+        if result.timed_out:
+            return "Validation timed out"
+        if result.error_message:
+            return f"Validation failed: {result.error_message}"
+        return f"Validation failed with exit code {result.exit_code}"
+
+    async def _handle_validation_failure(
+        self,
+        task_id: str,
+        _task: Task,
+        error_message: str,
+        validation_result: ValidationResult,
+    ) -> None:
+        """Handle validation failure with retry context.
+
+        Args:
+            task_id: ID of the failed task.
+            _task: The task that failed validation (unused, fetched fresh from DB).
+            error_message: Error message describing the failure.
+            validation_result: The validation result with captured output.
+        """
+        # Get current task state from DB (fresh to avoid stale retry_count)
+        current_task = await self._db.get_task(task_id)
+
+        # Build error message with validation output for retry context
+        full_error = error_message
+        if validation_result.output:
+            # Truncate output if too long
+            output = validation_result.output[:2000]
+            if len(validation_result.output) > 2000:
+                output += "\n... (truncated)"
+            full_error = f"{error_message}\n\nValidation output:\n{output}"
+
+        if current_task.can_retry():
+            # Increment retry count and set back to READY
+            new_retry_count = current_task.retry_count + 1
+            await self._db.update_task_status(
+                task_id,
+                TaskStatus.FAILED,
+                expected_status=TaskStatus.VALIDATING,
+                error_message=full_error,
+                retry_count=new_retry_count,
+            )
+            # Transition back to READY for retry
+            await self._db.update_task_status(
+                task_id,
+                TaskStatus.READY,
+                expected_status=TaskStatus.FAILED,
+            )
+        else:
+            # No more retries - needs review
+            await self._db.update_task_status(
+                task_id,
+                TaskStatus.FAILED,
+                expected_status=TaskStatus.VALIDATING,
+                error_message=full_error,
+            )
+            await self._db.update_task_status(
+                task_id,
+                TaskStatus.NEEDS_REVIEW,
+                expected_status=TaskStatus.FAILED,
+            )
 
     async def _handle_task_failure(
         self, task_id: str, _task: Task, error_message: str
@@ -542,52 +620,19 @@ class Scheduler:
         error_msg = f"Task timed out after {running_task.task.timeout_minutes} minutes"
         await self._handle_task_failure(task_id, running_task.task, error_msg)
 
-    async def _run_validation(self, task: Task) -> bool:
+    async def _run_validation(self, task: Task) -> ValidationResult:
         """Run validation command for a task.
 
         Args:
             task: The task to validate.
 
         Returns:
-            True if validation passed, False otherwise.
+            ValidationResult with execution details.
         """
-        if not task.validation_cmd:
-            return True
-
-        # Validation timeout: 5 minutes by default
-        validation_timeout = 300
-
-        try:
-            # Use subprocess_exec with shell=False via shlex to avoid command injection
-            # The validation_cmd is split into args for safer execution
-            import shlex
-
-            args = shlex.split(task.validation_cmd)
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                cwd=task.workdir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            try:
-                await asyncio.wait_for(proc.communicate(), timeout=validation_timeout)
-            except TimeoutError:
-                proc.kill()
-                await proc.wait()  # Reap the child process
-                logging.warning(
-                    "Validation command for task %s timed out after %d seconds",
-                    task.id,
-                    validation_timeout,
-                )
-                return False
-            return proc.returncode == 0
-        except Exception as e:
-            logging.warning(
-                "Validation command for task %s failed: %s",
-                task.id,
-                e,
-            )
-            return False
+        return await self._validator.validate_task(
+            task.validation_cmd,
+            task.workdir,
+        )
 
     async def _get_completed_task_ids(self) -> set[str]:
         """Get IDs of all completed tasks.
