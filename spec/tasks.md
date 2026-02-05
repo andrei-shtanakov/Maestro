@@ -36,21 +36,21 @@
 ## Project Setup
 
 ### TASK-000: Project Scaffolding
-🔴 P0 | 🔄 IN_PROGRESS | Est: 0.5d
+🔴 P0 | ✅ DONE | Est: 0.5d
 
 **Description:**
 Создать структуру проекта и настроить зависимости.
 
 **Checklist:**
-- [ ] Создать директории: `maestro/`, `maestro/spawners/`, `maestro/coordination/`, `maestro/notifications/`, `tests/`, `examples/`
-- [ ] `__init__.py` файлы во всех пакетах
-- [ ] `pyproject.toml` с зависимостями: pydantic, fastapi, uvicorn, fastmcp, pyyaml, click/typer, aiosqlite
-- [ ] Dev dependencies: pytest, pytest-asyncio, pytest-cov, ruff
-- [ ] `uv sync` для создания виртуального окружения
-- [ ] `.gitignore` для Python проекта
+- [x] Создать директории: `maestro/`, `maestro/spawners/`, `maestro/coordination/`, `maestro/notifications/`, `tests/`, `examples/`
+- [x] `__init__.py` файлы во всех пакетах
+- [x] `pyproject.toml` с зависимостями: pydantic, fastapi, uvicorn, fastmcp, pyyaml, click/typer, aiosqlite
+- [x] Dev dependencies: pytest, pytest-asyncio, pytest-cov, ruff
+- [x] `uv sync` для создания виртуального окружения
+- [x] `.gitignore` для Python проекта
 
 **Tests:**
-- [ ] `uv run python -c "import maestro"` работает
+- [x] `uv run python -c "import maestro"` работает
 
 **Traces to:** [NFR-000]
 **Depends on:** —
@@ -61,7 +61,7 @@
 ## Testing Tasks (обязательные)
 
 ### TASK-100: Test Infrastructure Setup
-🔴 P0 | ⬜ TODO | Est: 1d
+🔴 P0 | 🔄 IN_PROGRESS | Est: 1d
 
 **Description:**
 Настроить тестовую инфраструктуру проекта.

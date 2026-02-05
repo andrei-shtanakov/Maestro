@@ -18,13 +18,13 @@ ATP Task Manager — CLI для управления задачами из tasks
     python task.py export-gh               # Экспорт в GitHub Issues
 """
 
+import argparse
 import re
 import sys
-import argparse
-from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional
 from datetime import datetime
+from pathlib import Path
+
 
 # Конфигурация
 TASKS_FILE = Path("spec/tasks.md")
@@ -259,7 +259,7 @@ def log_change(task_id: str, change: str):
         f.write(f"{timestamp} | {task_id} | {change}\n")
 
 
-def get_task_by_id(tasks: list[Task], task_id: str) -> Optional[Task]:
+def get_task_by_id(tasks: list[Task], task_id: str) -> Task | None:
     """Находит задачу по ID"""
     for task in tasks:
         if task.id == task_id:

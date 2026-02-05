@@ -12,25 +12,25 @@ ATP Task Executor — автоматическое выполнение зада
     python executor.py logs TASK-001          # Логи задачи
 """
 
-import re
-import json
-import subprocess
 import argparse
-from pathlib import Path
-from datetime import datetime
-from dataclasses import dataclass, field
-from typing import Optional
+import json
+import re
 import shutil
+import subprocess
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 
 # Импортируем парсер задач
 from task import (
-    parse_tasks,
-    get_task_by_id,
-    get_next_tasks,
-    update_task_status,
-    Task,
     TASKS_FILE,
+    Task,
+    get_next_tasks,
+    get_task_by_id,
+    parse_tasks,
+    update_task_status,
 )
+
 
 # === Configuration ===
 
@@ -54,7 +54,7 @@ class ExecutorConfig:
     auto_commit: bool = False  # Автокоммит при успехе
 
     # Paths
-    project_root: Path = Path(".")
+    project_root: Path = Path()
     logs_dir: Path = Path("spec/.executor-logs")
     state_file: Path = Path("spec/.executor-state.json")
 
@@ -73,8 +73,8 @@ class TaskAttempt:
     timestamp: str
     success: bool
     duration_seconds: float
-    error: Optional[str] = None
-    claude_output: Optional[str] = None
+    error: str | None = None
+    claude_output: str | None = None
 
 
 @dataclass
@@ -83,16 +83,16 @@ class TaskState:
 
     task_id: str
     status: str  # pending, running, success, failed, skipped
-    attempts: list = field(default_factory=list)
-    started_at: Optional[str] = None
-    completed_at: Optional[str] = None
+    attempts: list[TaskAttempt] = field(default_factory=list)
+    started_at: str | None = None
+    completed_at: str | None = None
 
     @property
     def attempt_count(self) -> int:
         return len(self.attempts)
 
     @property
-    def last_error(self) -> Optional[str]:
+    def last_error(self) -> str | None:
         if self.attempts:
             return self.attempts[-1].error
         return None
@@ -164,8 +164,8 @@ class ExecutorState:
         task_id: str,
         success: bool,
         duration: float,
-        error: Optional[str] = None,
-        output: Optional[str] = None,
+        error: str | None = None,
+        output: str | None = None,
     ):
         """Записать попытку выполнения"""
         state = self.get_task_state(task_id)
