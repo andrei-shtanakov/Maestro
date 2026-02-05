@@ -476,3 +476,25 @@ class ProjectConfig(BaseModel):
     def get_task_ids(self) -> list[str]:
         """Get all task IDs in order."""
         return [task.id for task in self.tasks]
+
+
+class Message(BaseModel):
+    """Inter-agent message model.
+
+    Messages can be sent between agents for coordination. A message with
+    to_agent=None is a broadcast message visible to all agents.
+    """
+
+    id: int | None = Field(default=None, description="Message ID (auto-generated)")
+    from_agent: str = Field(..., min_length=1, description="Sender agent identifier")
+    to_agent: str | None = Field(
+        default=None, description="Recipient agent identifier (None for broadcast)"
+    )
+    message: str = Field(
+        ..., min_length=1, max_length=65536, description="Message content"
+    )
+    read: bool = Field(default=False, description="Whether the message has been read")
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        description="Message creation timestamp",
+    )

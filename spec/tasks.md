@@ -358,7 +358,7 @@ FastAPI REST API с теми же эндпоинтами.
 ---
 
 ### TASK-022: Inter-Agent Messages
-🟡 P2 | ⬜ TODO | Est: 0.5d
+🟡 P2 | 🔄 IN_PROGRESS | Est: 0.5d
 
 **Description:**
 Система сообщений между агентами.
@@ -429,20 +429,20 @@ Retry с exponential backoff и контекстом ошибки.
 ---
 
 ### TASK-032: State Recovery
-🟠 P1 | 🔄 IN_PROGRESS | Est: 0.5d
+🟠 P1 | ✅ DONE | Est: 0.5d
 
 **Description:**
 Восстановление состояния после crash.
 
 **Checklist:**
-- [ ] StateRecovery class
-- [ ] RUNNING → READY transition
-- [ ] VALIDATING → READY transition
-- [ ] --resume CLI flag integration
-- [ ] Recovery statistics
+- [x] StateRecovery class
+- [x] RUNNING → READY transition
+- [x] VALIDATING → READY transition
+- [x] --resume CLI flag integration
+- [x] Recovery statistics
 
 **Tests:**
-- [ ] Integration: crash recovery simulation
+- [x] Integration: crash recovery simulation
 
 **Traces to:** [REQ-032], [DESIGN-032]
 **Depends on:** [TASK-003]

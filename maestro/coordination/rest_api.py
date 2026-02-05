@@ -14,6 +14,10 @@ from pydantic import BaseModel, Field
 
 from maestro.coordination.mcp_server import (
     ClaimResult,
+    MarkReadResult,
+    MessageResponse,
+    PostMessageResult,
+    ReadMessagesResult,
     StatusUpdateResult,
     TaskResponse,
     TaskResultResponse,
@@ -21,10 +25,11 @@ from maestro.coordination.mcp_server import (
 from maestro.database import (
     ConcurrentModificationError,
     Database,
+    MessageNotFoundError,
     TaskNotFoundError,
     create_database,
 )
-from maestro.models import TaskStatus
+from maestro.models import Message, TaskStatus
 
 
 # =============================================================================
@@ -82,6 +87,25 @@ class AvailableTasksResponse(BaseModel):
 
     tasks: list[AvailableTaskItem]
     count: int
+
+
+class PostMessageRequest(BaseModel):
+    """Request body for posting a message."""
+
+    from_agent: str = Field(..., min_length=1, description="Sender agent identifier")
+    to_agent: str | None = Field(
+        default=None, description="Recipient agent identifier (None for broadcast)"
+    )
+    message: str = Field(..., min_length=1, description="Message content")
+
+
+class MarkMessagesReadRequest(BaseModel):
+    """Request body for marking messages as read."""
+
+    agent_id: str = Field(
+        ..., min_length=1, description="Agent identifier marking messages"
+    )
+    message_ids: list[int] = Field(..., description="List of message IDs to mark read")
 
 
 # =============================================================================
@@ -338,6 +362,139 @@ class RESTServer:
                     status_code=404, detail=f"Task '{task_id}' not found"
                 ) from err
 
+        # =====================================================================
+        # Message Endpoints
+        # =====================================================================
+
+        @app.post("/messages", response_model=PostMessageResult, tags=["Messages"])
+        async def post_message(request: PostMessageRequest) -> PostMessageResult:
+            """Post a message to another agent or broadcast.
+
+            Args:
+                request: Message request with from_agent, to_agent, and message.
+
+            Returns:
+                PostMessageResult with success status and message details.
+            """
+            try:
+                msg = Message(
+                    from_agent=request.from_agent,
+                    to_agent=request.to_agent,
+                    message=request.message,
+                )
+                saved_msg = await self.db.save_message(msg)
+                return PostMessageResult(
+                    success=True,
+                    message=MessageResponse.from_message(saved_msg),
+                )
+            except Exception as e:
+                return PostMessageResult(success=False, error=str(e))
+
+        @app.get("/messages", response_model=ReadMessagesResult, tags=["Messages"])
+        async def get_messages(
+            agent_id: str = Query(
+                ..., description="Identifier of the requesting agent"
+            ),
+            unread_only: bool = Query(
+                default=True, description="Only return unread messages"
+            ),
+        ) -> ReadMessagesResult:
+            """Get messages for an agent.
+
+            Returns messages addressed to the agent and broadcast messages.
+
+            Args:
+                agent_id: Identifier of the agent reading messages.
+                unread_only: If True, only return unread messages.
+
+            Returns:
+                ReadMessagesResult with success status and messages list.
+            """
+            try:
+                messages = await self.db.get_messages_for_agent(
+                    agent_id, unread_only=unread_only
+                )
+                responses = [MessageResponse.from_message(m) for m in messages]
+                return ReadMessagesResult(
+                    success=True,
+                    messages=responses,
+                    count=len(responses),
+                )
+            except Exception as e:
+                return ReadMessagesResult(success=False, error=str(e))
+
+        @app.get(
+            "/messages/{message_id}", response_model=MessageResponse, tags=["Messages"]
+        )
+        async def get_message(message_id: int) -> MessageResponse:
+            """Get a specific message by ID.
+
+            Args:
+                message_id: Message identifier.
+
+            Returns:
+                MessageResponse with message details.
+
+            Raises:
+                HTTPException: 404 if message not found.
+            """
+            try:
+                msg = await self.db.get_message(message_id)
+                return MessageResponse.from_message(msg)
+            except MessageNotFoundError as err:
+                raise HTTPException(
+                    status_code=404, detail=f"Message '{message_id}' not found"
+                ) from err
+
+        @app.put(
+            "/messages/{message_id}/read",
+            response_model=MessageResponse,
+            tags=["Messages"],
+        )
+        async def mark_message_read(message_id: int) -> MessageResponse:
+            """Mark a single message as read.
+
+            Args:
+                message_id: Message identifier.
+
+            Returns:
+                Updated MessageResponse.
+
+            Raises:
+                HTTPException: 404 if message not found.
+            """
+            try:
+                msg = await self.db.mark_message_read(message_id)
+                return MessageResponse.from_message(msg)
+            except MessageNotFoundError as err:
+                raise HTTPException(
+                    status_code=404, detail=f"Message '{message_id}' not found"
+                ) from err
+
+        @app.put("/messages/read", response_model=MarkReadResult, tags=["Messages"])
+        async def mark_messages_read(
+            request: MarkMessagesReadRequest,
+        ) -> MarkReadResult:
+            """Mark multiple messages as read.
+
+            Only messages addressed to the requesting agent (or broadcast
+            messages) will be marked as read. Messages addressed to other
+            agents will not be affected.
+
+            Args:
+                request: Request with agent_id and list of message IDs.
+
+            Returns:
+                MarkReadResult with count of updated messages.
+            """
+            try:
+                count = await self.db.mark_messages_read(
+                    request.message_ids, agent_id=request.agent_id
+                )
+                return MarkReadResult(success=True, count=count)
+            except Exception as e:
+                return MarkReadResult(success=False, error=str(e))
+
 
 # =============================================================================
 # Global Server Instance Management
@@ -558,5 +715,98 @@ def create_app_with_lifespan(db_path: str | Path | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=404, detail=f"Task '{task_id}' not found"
             ) from err
+
+    # =========================================================================
+    # Message Endpoints (lifespan version)
+    # =========================================================================
+
+    @app.post("/messages", response_model=PostMessageResult, tags=["Messages"])
+    async def post_message(request: PostMessageRequest) -> PostMessageResult:
+        """Post a message to another agent or broadcast."""
+        if _db is None:
+            raise HTTPException(status_code=503, detail="Database not available")
+        try:
+            msg = Message(
+                from_agent=request.from_agent,
+                to_agent=request.to_agent,
+                message=request.message,
+            )
+            saved_msg = await _db.save_message(msg)
+            return PostMessageResult(
+                success=True,
+                message=MessageResponse.from_message(saved_msg),
+            )
+        except Exception as e:
+            return PostMessageResult(success=False, error=str(e))
+
+    @app.get("/messages", response_model=ReadMessagesResult, tags=["Messages"])
+    async def get_messages(
+        agent_id: str = Query(..., description="Identifier of the requesting agent"),
+        unread_only: bool = Query(default=True, description="Only return unread msgs"),
+    ) -> ReadMessagesResult:
+        """Get messages for an agent."""
+        if _db is None:
+            raise HTTPException(status_code=503, detail="Database not available")
+        try:
+            messages = await _db.get_messages_for_agent(
+                agent_id, unread_only=unread_only
+            )
+            responses = [MessageResponse.from_message(m) for m in messages]
+            return ReadMessagesResult(
+                success=True,
+                messages=responses,
+                count=len(responses),
+            )
+        except Exception as e:
+            return ReadMessagesResult(success=False, error=str(e))
+
+    @app.get(
+        "/messages/{message_id}", response_model=MessageResponse, tags=["Messages"]
+    )
+    async def get_message(message_id: int) -> MessageResponse:
+        """Get a specific message by ID."""
+        if _db is None:
+            raise HTTPException(status_code=503, detail="Database not available")
+        try:
+            msg = await _db.get_message(message_id)
+            return MessageResponse.from_message(msg)
+        except MessageNotFoundError as err:
+            raise HTTPException(
+                status_code=404, detail=f"Message '{message_id}' not found"
+            ) from err
+
+    @app.put(
+        "/messages/{message_id}/read",
+        response_model=MessageResponse,
+        tags=["Messages"],
+    )
+    async def mark_message_read(message_id: int) -> MessageResponse:
+        """Mark a single message as read."""
+        if _db is None:
+            raise HTTPException(status_code=503, detail="Database not available")
+        try:
+            msg = await _db.mark_message_read(message_id)
+            return MessageResponse.from_message(msg)
+        except MessageNotFoundError as err:
+            raise HTTPException(
+                status_code=404, detail=f"Message '{message_id}' not found"
+            ) from err
+
+    @app.put("/messages/read", response_model=MarkReadResult, tags=["Messages"])
+    async def mark_messages_read(request: MarkMessagesReadRequest) -> MarkReadResult:
+        """Mark multiple messages as read.
+
+        Only messages addressed to the requesting agent (or broadcast
+        messages) will be marked as read.
+        """
+        if _db is None:
+            raise HTTPException(status_code=503, detail="Database not available")
+        try:
+            count = await _db.mark_messages_read(
+                request.message_ids, agent_id=request.agent_id
+            )
+            return MarkReadResult(success=True, count=count)
+        except Exception as e:
+            return MarkReadResult(success=False, error=str(e))
 
     return app

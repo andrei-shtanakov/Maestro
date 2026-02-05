@@ -144,6 +144,10 @@ class StateRecovery:
 
         Follows the state machine: RUNNING/VALIDATING → FAILED → READY
 
+        Note: If the second transition fails after FAILED is set, the task
+        remains in FAILED state. This is acceptable because FAILED → READY
+        is a valid transition that will be retried on the next recovery cycle.
+
         Args:
             task: The task to recover.
             reason: Description of why the task is being recovered.

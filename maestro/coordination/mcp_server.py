@@ -18,7 +18,7 @@ from maestro.database import (
     TaskNotFoundError,
     create_database,
 )
-from maestro.models import Task, TaskStatus
+from maestro.models import Message, Task, TaskStatus
 
 
 class TaskResponse(BaseModel):
@@ -88,6 +88,54 @@ class TaskResultResponse(BaseModel):
     result_summary: str | None = None
     error_message: str | None = None
     completed_at: str | None = None
+
+
+class MessageResponse(BaseModel):
+    """Response model for message information."""
+
+    id: int
+    from_agent: str
+    to_agent: str | None
+    message: str
+    read: bool
+    created_at: str
+
+    @classmethod
+    def from_message(cls, message: Message) -> "MessageResponse":
+        """Create a MessageResponse from a Message model."""
+        return cls(
+            id=message.id or 0,
+            from_agent=message.from_agent,
+            to_agent=message.to_agent,
+            message=message.message,
+            read=message.read,
+            created_at=message.created_at.isoformat(),
+        )
+
+
+class PostMessageResult(BaseModel):
+    """Result of posting a message."""
+
+    success: bool
+    message: MessageResponse | None = None
+    error: str | None = None
+
+
+class ReadMessagesResult(BaseModel):
+    """Result of reading messages."""
+
+    success: bool
+    messages: list[MessageResponse] = []
+    count: int = 0
+    error: str | None = None
+
+
+class MarkReadResult(BaseModel):
+    """Result of marking messages as read."""
+
+    success: bool
+    count: int = 0
+    error: str | None = None
 
 
 class MCPServer:
@@ -292,6 +340,101 @@ class MCPServer:
                     "error": f"Task '{task_id}' not found",
                 }
 
+        @self.mcp.tool()
+        async def post_message(
+            agent_id: str,
+            message: str,
+            to_agent: str | None = None,
+        ) -> dict[str, Any]:
+            """Post a message to another agent or broadcast to all.
+
+            Args:
+                agent_id: Identifier of the sending agent.
+                message: Content of the message.
+                to_agent: Recipient agent ID, or None for broadcast.
+
+            Returns:
+                Dictionary with success status and message details or error.
+            """
+            try:
+                msg = Message(
+                    from_agent=agent_id,
+                    to_agent=to_agent,
+                    message=message,
+                )
+                saved_msg = await self.db.save_message(msg)
+                return PostMessageResult(
+                    success=True,
+                    message=MessageResponse.from_message(saved_msg),
+                ).model_dump()
+            except Exception as e:
+                return PostMessageResult(
+                    success=False,
+                    error=str(e),
+                ).model_dump()
+
+        @self.mcp.tool()
+        async def read_messages(
+            agent_id: str,
+            unread_only: bool = True,
+        ) -> dict[str, Any]:
+            """Read messages for an agent.
+
+            Returns messages addressed to the agent and broadcast messages.
+
+            Args:
+                agent_id: Identifier of the agent reading messages.
+                unread_only: If True, only return unread messages.
+
+            Returns:
+                Dictionary with success status, messages list, and count.
+            """
+            try:
+                messages = await self.db.get_messages_for_agent(
+                    agent_id, unread_only=unread_only
+                )
+                responses = [MessageResponse.from_message(m) for m in messages]
+                return ReadMessagesResult(
+                    success=True,
+                    messages=responses,
+                    count=len(responses),
+                ).model_dump()
+            except Exception as e:
+                return ReadMessagesResult(
+                    success=False,
+                    error=str(e),
+                ).model_dump()
+
+        @self.mcp.tool()
+        async def mark_messages_read(
+            agent_id: str,
+            message_ids: list[int],
+        ) -> dict[str, Any]:
+            """Mark messages as read.
+
+            Only messages addressed to the requesting agent (or broadcast
+            messages) will be marked as read. Messages addressed to other
+            agents will not be affected.
+
+            Args:
+                agent_id: Identifier of the agent marking messages.
+                message_ids: List of message IDs to mark as read.
+
+            Returns:
+                Dictionary with success status and count of updated messages.
+            """
+            try:
+                count = await self.db.mark_messages_read(message_ids, agent_id=agent_id)
+                return MarkReadResult(
+                    success=True,
+                    count=count,
+                ).model_dump()
+            except Exception as e:
+                return MarkReadResult(
+                    success=False,
+                    error=str(e),
+                ).model_dump()
+
     async def get_available_tasks(
         self,
         agent_id: str,  # noqa: ARG002 - kept for API consistency
@@ -444,6 +587,91 @@ class MCPServer:
             error_message=task.error_message,
             completed_at=(task.completed_at.isoformat() if task.completed_at else None),
         )
+
+    async def post_message(
+        self,
+        agent_id: str,
+        message: str,
+        to_agent: str | None = None,
+    ) -> PostMessageResult:
+        """Post a message to another agent or broadcast.
+
+        This is a direct method for programmatic access.
+
+        Args:
+            agent_id: Identifier of the sending agent.
+            message: Content of the message.
+            to_agent: Recipient agent ID, or None for broadcast.
+
+        Returns:
+            PostMessageResult with success status and message details.
+        """
+        try:
+            msg = Message(
+                from_agent=agent_id,
+                to_agent=to_agent,
+                message=message,
+            )
+            saved_msg = await self.db.save_message(msg)
+            return PostMessageResult(
+                success=True,
+                message=MessageResponse.from_message(saved_msg),
+            )
+        except Exception as e:
+            return PostMessageResult(success=False, error=str(e))
+
+    async def read_messages(
+        self,
+        agent_id: str,
+        unread_only: bool = True,
+    ) -> ReadMessagesResult:
+        """Read messages for an agent.
+
+        This is a direct method for programmatic access.
+
+        Args:
+            agent_id: Identifier of the agent reading messages.
+            unread_only: If True, only return unread messages.
+
+        Returns:
+            ReadMessagesResult with success status and messages list.
+        """
+        try:
+            messages = await self.db.get_messages_for_agent(
+                agent_id, unread_only=unread_only
+            )
+            responses = [MessageResponse.from_message(m) for m in messages]
+            return ReadMessagesResult(
+                success=True,
+                messages=responses,
+                count=len(responses),
+            )
+        except Exception as e:
+            return ReadMessagesResult(success=False, error=str(e))
+
+    async def mark_messages_read(
+        self,
+        agent_id: str,
+        message_ids: list[int],
+    ) -> MarkReadResult:
+        """Mark messages as read.
+
+        This is a direct method for programmatic access. Only messages
+        addressed to the requesting agent (or broadcast messages) will be
+        marked as read.
+
+        Args:
+            agent_id: Identifier of the agent marking messages.
+            message_ids: List of message IDs to mark as read.
+
+        Returns:
+            MarkReadResult with success status and count of updated messages.
+        """
+        try:
+            count = await self.db.mark_messages_read(message_ids, agent_id=agent_id)
+            return MarkReadResult(success=True, count=count)
+        except Exception as e:
+            return MarkReadResult(success=False, error=str(e))
 
 
 # Global server instance and database

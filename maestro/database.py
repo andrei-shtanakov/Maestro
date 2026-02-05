@@ -15,7 +15,7 @@ from typing import Any
 
 import aiosqlite
 
-from maestro.models import AgentType, Task, TaskStatus
+from maestro.models import AgentType, Message, Task, TaskStatus
 
 
 class DatabaseError(Exception):
@@ -36,6 +36,10 @@ class ConcurrentModificationError(DatabaseError):
 
 class DependencyNotFoundError(DatabaseError):
     """Raised when a dependency task does not exist."""
+
+
+class MessageNotFoundError(DatabaseError):
+    """Raised when a message is not found in the database."""
 
 
 # SQL Schema
@@ -130,6 +134,18 @@ def _format_datetime(value: datetime | None) -> str | None:
     if value is None:
         return None
     return value.isoformat()
+
+
+def _row_to_message(row: aiosqlite.Row) -> Message:
+    """Convert a database row to a Message model."""
+    return Message(
+        id=row["id"],
+        from_agent=row["from_agent"],
+        to_agent=row["to_agent"],
+        message=row["message"],
+        read=bool(row["read"]),
+        created_at=_parse_datetime(row["created_at"]) or datetime.now(UTC),
+    )
 
 
 def _row_to_task(row: aiosqlite.Row) -> Task:
@@ -786,6 +802,232 @@ class Database:
         rows = await cursor.fetchall()
 
         return [(row["task_id"], row["depends_on"]) for row in rows]
+
+    # =========================================================================
+    # Message Operations
+    # =========================================================================
+
+    async def save_message(self, message: Message) -> Message:
+        """Save a new message to the database.
+
+        Args:
+            message: Message model to persist.
+
+        Returns:
+            The saved message with generated ID.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            """
+            INSERT INTO messages (from_agent, to_agent, message, read, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                message.from_agent,
+                message.to_agent,
+                message.message,
+                message.read,
+                _format_datetime(message.created_at),
+            ),
+        )
+        await self._connection.commit()
+
+        # Return message with generated ID
+        return message.model_copy(update={"id": cursor.lastrowid})
+
+    async def get_message(self, message_id: int) -> Message:
+        """Get a message by ID.
+
+        Args:
+            message_id: Message identifier.
+
+        Returns:
+            Message model.
+
+        Raises:
+            MessageNotFoundError: If message not found.
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            "SELECT * FROM messages WHERE id = ?", (message_id,)
+        )
+        row = await cursor.fetchone()
+
+        if row is None:
+            msg = f"Message with ID '{message_id}' not found"
+            raise MessageNotFoundError(msg)
+
+        return _row_to_message(row)
+
+    async def get_messages_for_agent(
+        self,
+        agent_id: str,
+        unread_only: bool = False,
+    ) -> list[Message]:
+        """Get messages for a specific agent (including broadcasts).
+
+        Args:
+            agent_id: Agent identifier to get messages for.
+            unread_only: If True, only return unread messages.
+
+        Returns:
+            List of messages for the agent, ordered by creation time DESC.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        # Get messages where to_agent matches OR to_agent is NULL (broadcast)
+        if unread_only:
+            cursor = await self._connection.execute(
+                """
+                SELECT * FROM messages
+                WHERE (to_agent = ? OR to_agent IS NULL)
+                AND read = FALSE
+                ORDER BY created_at DESC
+                """,
+                (agent_id,),
+            )
+        else:
+            cursor = await self._connection.execute(
+                """
+                SELECT * FROM messages
+                WHERE to_agent = ? OR to_agent IS NULL
+                ORDER BY created_at DESC
+                """,
+                (agent_id,),
+            )
+
+        rows = await cursor.fetchall()
+        return [_row_to_message(row) for row in rows]
+
+    async def get_all_messages(self) -> list[Message]:
+        """Get all messages from the database.
+
+        Returns:
+            List of all messages ordered by creation time DESC.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            "SELECT * FROM messages ORDER BY created_at DESC"
+        )
+        rows = await cursor.fetchall()
+
+        return [_row_to_message(row) for row in rows]
+
+    async def mark_message_read(self, message_id: int) -> Message:
+        """Mark a message as read.
+
+        Args:
+            message_id: Message identifier.
+
+        Returns:
+            Updated message.
+
+        Raises:
+            MessageNotFoundError: If message not found.
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            "UPDATE messages SET read = TRUE WHERE id = ?",
+            (message_id,),
+        )
+        await self._connection.commit()
+
+        if cursor.rowcount == 0:
+            msg = f"Message with ID '{message_id}' not found"
+            raise MessageNotFoundError(msg)
+
+        return await self.get_message(message_id)
+
+    async def mark_messages_read(
+        self, message_ids: list[int], agent_id: str | None = None
+    ) -> int:
+        """Mark multiple messages as read.
+
+        Args:
+            message_ids: List of message identifiers.
+            agent_id: If provided, only marks messages that are addressed to
+                this agent or are broadcasts (to_agent IS NULL). Messages
+                addressed to other agents will not be marked.
+
+        Returns:
+            Number of messages updated.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        if not message_ids:
+            return 0
+
+        placeholders = ", ".join("?" * len(message_ids))
+
+        if agent_id is not None:
+            # Only mark messages addressed to this agent or broadcasts
+            cursor = await self._connection.execute(
+                f"""UPDATE messages SET read = TRUE
+                WHERE id IN ({placeholders})
+                AND (to_agent = ? OR to_agent IS NULL)""",
+                [*message_ids, agent_id],
+            )
+        else:
+            cursor = await self._connection.execute(
+                f"UPDATE messages SET read = TRUE WHERE id IN ({placeholders})",
+                message_ids,
+            )
+        await self._connection.commit()
+
+        return cursor.rowcount
+
+    async def delete_message(self, message_id: int) -> bool:
+        """Delete a message by ID.
+
+        Args:
+            message_id: Message identifier.
+
+        Returns:
+            True if message was deleted, False if not found.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            "DELETE FROM messages WHERE id = ?", (message_id,)
+        )
+        await self._connection.commit()
+
+        return cursor.rowcount > 0
 
 
 # Convenience function for creating and initializing a database
