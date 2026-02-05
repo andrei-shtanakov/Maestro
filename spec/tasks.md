@@ -209,23 +209,23 @@ Database layer для хранения состояния задач.
 ---
 
 ### TASK-010: Claude Code Spawner
-🔴 P0 | 🔄 IN_PROGRESS | Est: 1d
+🔴 P0 | ✅ DONE | Est: 1d
 
 **Description:**
 Spawner для Claude Code в headless-режиме.
 
 **Checklist:**
-- [ ] AgentSpawner ABC
-- [ ] ClaudeCodeSpawner implementation
-- [ ] is_available() проверка
-- [ ] spawn() с --print --output-format json
-- [ ] Prompt building с context
-- [ ] Log file capture
+- [x] AgentSpawner ABC
+- [x] ClaudeCodeSpawner implementation
+- [x] is_available() проверка
+- [x] spawn() с --print --output-format json
+- [x] Prompt building с context
+- [x] Log file capture
 
 **Tests:**
-- [ ] Unit: prompt building
-- [ ] Unit: is_available check
-- [ ] Integration: spawn with mock (echo)
+- [x] Unit: prompt building
+- [x] Unit: is_available check
+- [x] Integration: spawn with mock (echo)
 
 **Traces to:** [REQ-010], [REQ-011], [DESIGN-010], [DESIGN-011]
 **Depends on:** [TASK-005]
@@ -256,7 +256,7 @@ Auto-discovery и registry для spawner plugins.
 ---
 
 ### TASK-012: Git Manager
-🔴 P0 | ⬜ TODO | Est: 1d
+🔴 P0 | 🔄 IN_PROGRESS | Est: 1d
 
 **Description:**
 Git операции: создание веток, push, rebase.

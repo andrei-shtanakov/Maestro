@@ -99,6 +99,7 @@ class MockSpawner(BaseSpawner):
 
         mock_process.terminate = MagicMock()
         mock_process.kill = MagicMock()
+        mock_process.wait = MagicMock(return_value=self._return_code)
 
         self._mock_processes.append(mock_process)
         return mock_process
