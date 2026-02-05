@@ -478,6 +478,28 @@ class ProjectConfig(BaseModel):
         return [task.id for task in self.tasks]
 
 
+class TaskCost(BaseModel):
+    """Cost tracking record for a task execution attempt.
+
+    Stores token usage and estimated cost for each task attempt,
+    parsed from agent log output.
+    """
+
+    id: int | None = Field(default=None, description="Record ID (auto-generated)")
+    task_id: str = Field(..., min_length=1, description="Associated task identifier")
+    agent_type: AgentType = Field(..., description="Agent type that executed the task")
+    input_tokens: int = Field(default=0, ge=0, description="Input tokens consumed")
+    output_tokens: int = Field(default=0, ge=0, description="Output tokens generated")
+    estimated_cost_usd: float = Field(
+        default=0.0, ge=0.0, description="Estimated cost in USD"
+    )
+    attempt: int = Field(default=1, ge=1, description="Retry attempt number")
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        description="Record creation timestamp",
+    )
+
+
 class Message(BaseModel):
     """Inter-agent message model.
 

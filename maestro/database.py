@@ -15,7 +15,7 @@ from typing import Any
 
 import aiosqlite
 
-from maestro.models import AgentType, Message, Task, TaskStatus
+from maestro.models import AgentType, Message, Task, TaskCost, TaskStatus
 
 
 class DatabaseError(Exception):
@@ -94,9 +94,22 @@ CREATE TABLE IF NOT EXISTS agent_logs (
     FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS task_costs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    agent_type TEXT NOT NULL,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    estimated_cost_usd REAL DEFAULT 0.0,
+    attempt INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_messages_to_agent ON messages(to_agent, read);
 CREATE INDEX IF NOT EXISTS idx_agent_logs_task_id ON agent_logs(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_costs_task_id ON task_costs(task_id);
 """
 
 
@@ -176,6 +189,20 @@ def _row_to_task(row: aiosqlite.Row) -> Task:
         started_at=_parse_datetime(row["started_at"]),
         completed_at=_parse_datetime(row["completed_at"]),
         depends_on=[],  # Will be populated separately if needed
+    )
+
+
+def _row_to_task_cost(row: aiosqlite.Row) -> TaskCost:
+    """Convert a database row to a TaskCost model."""
+    return TaskCost(
+        id=row["id"],
+        task_id=row["task_id"],
+        agent_type=AgentType(row["agent_type"]),
+        input_tokens=row["input_tokens"],
+        output_tokens=row["output_tokens"],
+        estimated_cost_usd=row["estimated_cost_usd"],
+        attempt=row["attempt"],
+        created_at=_parse_datetime(row["created_at"]) or datetime.now(UTC),
     )
 
 
@@ -1028,6 +1055,132 @@ class Database:
         await self._connection.commit()
 
         return cursor.rowcount > 0
+
+    # =========================================================================
+    # Task Cost Operations
+    # =========================================================================
+
+    async def save_task_cost(self, cost: TaskCost) -> TaskCost:
+        """Save a task cost record to the database.
+
+        Args:
+            cost: TaskCost model to persist.
+
+        Returns:
+            The saved task cost with generated ID.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            """
+            INSERT INTO task_costs (
+                task_id, agent_type, input_tokens, output_tokens,
+                estimated_cost_usd, attempt, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cost.task_id,
+                cost.agent_type.value,
+                cost.input_tokens,
+                cost.output_tokens,
+                cost.estimated_cost_usd,
+                cost.attempt,
+                _format_datetime(cost.created_at),
+            ),
+        )
+        await self._connection.commit()
+
+        return cost.model_copy(update={"id": cursor.lastrowid})
+
+    async def get_task_costs(self, task_id: str) -> list[TaskCost]:
+        """Get all cost records for a task.
+
+        Args:
+            task_id: Task identifier.
+
+        Returns:
+            List of TaskCost records ordered by attempt.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            "SELECT * FROM task_costs WHERE task_id = ? ORDER BY attempt",
+            (task_id,),
+        )
+        rows = await cursor.fetchall()
+
+        return [_row_to_task_cost(row) for row in rows]
+
+    async def get_all_costs(self) -> list[TaskCost]:
+        """Get all cost records.
+
+        Returns:
+            List of all TaskCost records.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            "SELECT * FROM task_costs ORDER BY created_at"
+        )
+        rows = await cursor.fetchall()
+
+        return [_row_to_task_cost(row) for row in rows]
+
+    async def get_cost_summary(self) -> dict[str, float | int]:
+        """Get aggregated cost summary across all tasks.
+
+        Returns:
+            Dictionary with total_input_tokens, total_output_tokens,
+            total_cost_usd, and task_count.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            """
+            SELECT
+                COALESCE(SUM(input_tokens), 0) as total_input_tokens,
+                COALESCE(SUM(output_tokens), 0) as total_output_tokens,
+                COALESCE(SUM(estimated_cost_usd), 0.0) as total_cost_usd,
+                COUNT(DISTINCT task_id) as task_count
+            FROM task_costs
+            """
+        )
+        row = await cursor.fetchone()
+
+        if row is None:
+            return {
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "total_cost_usd": 0.0,
+                "task_count": 0,
+            }
+
+        return {
+            "total_input_tokens": int(row["total_input_tokens"]),
+            "total_output_tokens": int(row["total_output_tokens"]),
+            "total_cost_usd": float(row["total_cost_usd"]),
+            "task_count": int(row["task_count"]),
+        }
 
 
 # Convenience function for creating and initializing a database

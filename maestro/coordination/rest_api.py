@@ -22,6 +22,7 @@ from maestro.coordination.mcp_server import (
     TaskResponse,
     TaskResultResponse,
 )
+from maestro.cost_tracker import build_summary, format_summary
 from maestro.database import (
     ConcurrentModificationError,
     Database,
@@ -29,7 +30,7 @@ from maestro.database import (
     TaskNotFoundError,
     create_database,
 )
-from maestro.models import Message, TaskStatus
+from maestro.models import Message, TaskCost, TaskStatus
 
 
 # =============================================================================
@@ -106,6 +107,56 @@ class MarkMessagesReadRequest(BaseModel):
         ..., min_length=1, description="Agent identifier marking messages"
     )
     message_ids: list[int] = Field(..., description="List of message IDs to mark read")
+
+
+# =============================================================================
+# Cost Response Models
+# =============================================================================
+
+
+class TaskCostResponse(BaseModel):
+    """Response model for a task cost record."""
+
+    id: int
+    task_id: str
+    agent_type: str
+    input_tokens: int
+    output_tokens: int
+    estimated_cost_usd: float
+    attempt: int
+    created_at: str
+
+    @classmethod
+    def from_task_cost(cls, cost: TaskCost) -> "TaskCostResponse":
+        """Create from a TaskCost model."""
+        return cls(
+            id=cost.id or 0,
+            task_id=cost.task_id,
+            agent_type=cost.agent_type.value,
+            input_tokens=cost.input_tokens,
+            output_tokens=cost.output_tokens,
+            estimated_cost_usd=cost.estimated_cost_usd,
+            attempt=cost.attempt,
+            created_at=cost.created_at.isoformat(),
+        )
+
+
+class TaskCostsListResponse(BaseModel):
+    """Response model for task costs list."""
+
+    costs: list[TaskCostResponse]
+    count: int
+
+
+class CostSummaryResponse(BaseModel):
+    """Response model for aggregated cost summary."""
+
+    total_input_tokens: int
+    total_output_tokens: int
+    total_cost_usd: float
+    task_count: int
+    costs_by_task: dict[str, float]
+    report: str
 
 
 # =============================================================================
@@ -495,6 +546,51 @@ class RESTServer:
             except Exception as e:
                 return MarkReadResult(success=False, error=str(e))
 
+        # =====================================================================
+        # Cost Endpoints
+        # =====================================================================
+
+        @app.get(
+            "/tasks/{task_id}/costs",
+            response_model=TaskCostsListResponse,
+            tags=["Costs"],
+        )
+        async def get_task_costs(task_id: str) -> TaskCostsListResponse:
+            """Get cost records for a specific task.
+
+            Args:
+                task_id: Task identifier.
+
+            Returns:
+                List of cost records for the task.
+            """
+            costs = await self.db.get_task_costs(task_id)
+            responses = [TaskCostResponse.from_task_cost(c) for c in costs]
+            return TaskCostsListResponse(costs=responses, count=len(responses))
+
+        @app.get(
+            "/costs/summary",
+            response_model=CostSummaryResponse,
+            tags=["Costs"],
+        )
+        async def get_cost_summary() -> CostSummaryResponse:
+            """Get aggregated cost summary across all tasks.
+
+            Returns:
+                Summary with totals and per-task breakdown.
+            """
+            all_costs = await self.db.get_all_costs()
+            summary = build_summary(all_costs)
+            report = format_summary(summary)
+            return CostSummaryResponse(
+                total_input_tokens=summary.total_input_tokens,
+                total_output_tokens=summary.total_output_tokens,
+                total_cost_usd=summary.total_cost_usd,
+                task_count=summary.task_count,
+                costs_by_task=summary.costs_by_task,
+                report=report,
+            )
+
 
 # =============================================================================
 # Global Server Instance Management
@@ -808,5 +904,43 @@ def create_app_with_lifespan(db_path: str | Path | None = None) -> FastAPI:
             return MarkReadResult(success=True, count=count)
         except Exception as e:
             return MarkReadResult(success=False, error=str(e))
+
+    # =========================================================================
+    # Cost Endpoints (lifespan version)
+    # =========================================================================
+
+    @app.get(
+        "/tasks/{task_id}/costs",
+        response_model=TaskCostsListResponse,
+        tags=["Costs"],
+    )
+    async def get_task_costs(task_id: str) -> TaskCostsListResponse:
+        """Get cost records for a specific task."""
+        if _db is None:
+            raise HTTPException(status_code=503, detail="Database not available")
+        costs = await _db.get_task_costs(task_id)
+        responses = [TaskCostResponse.from_task_cost(c) for c in costs]
+        return TaskCostsListResponse(costs=responses, count=len(responses))
+
+    @app.get(
+        "/costs/summary",
+        response_model=CostSummaryResponse,
+        tags=["Costs"],
+    )
+    async def get_cost_summary() -> CostSummaryResponse:
+        """Get aggregated cost summary across all tasks."""
+        if _db is None:
+            raise HTTPException(status_code=503, detail="Database not available")
+        all_costs = await _db.get_all_costs()
+        summary = build_summary(all_costs)
+        report = format_summary(summary)
+        return CostSummaryResponse(
+            total_input_tokens=summary.total_input_tokens,
+            total_output_tokens=summary.total_output_tokens,
+            total_cost_usd=summary.total_cost_usd,
+            task_count=summary.task_count,
+            costs_by_task=summary.costs_by_task,
+            report=report,
+        )
 
     return app

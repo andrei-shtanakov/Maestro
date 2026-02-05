@@ -497,22 +497,22 @@ Spawners для Codex CLI и Aider.
 ---
 
 ### TASK-050: Web Dashboard
-🟡 P2 | 🔄 IN_PROGRESS | Est: 2d
+🟡 P2 | ✅ DONE | Est: 2d
 
 **Description:**
 Веб-интерфейс для мониторинга.
 
 **Checklist:**
-- [ ] FastAPI static serving
-- [ ] DAG visualization (Mermaid.js)
-- [ ] Real-time updates (SSE)
-- [ ] Task status colors
-- [ ] Retry button
-- [ ] Log viewer
+- [x] FastAPI static serving
+- [x] DAG visualization (Mermaid.js)
+- [x] Real-time updates (SSE)
+- [x] Task status colors
+- [x] Retry button
+- [x] Log viewer
 
 **Tests:**
-- [ ] Integration: SSE events
-- [ ] Manual: visual verification
+- [x] Integration: SSE events
+- [x] Manual: visual verification
 
 **Traces to:** [REQ-050]
 **Depends on:** [TASK-021]
@@ -521,7 +521,7 @@ Spawners для Codex CLI и Aider.
 ---
 
 ### TASK-060: Cost Tracking
-🟢 P3 | ⬜ TODO | Est: 1d
+🟢 P3 | 🔄 IN_PROGRESS | Est: 1d
 
 **Description:**
 Трекинг token usage и стоимости.
