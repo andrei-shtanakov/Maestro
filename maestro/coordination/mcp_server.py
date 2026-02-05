@@ -5,6 +5,7 @@ task execution. Agents can discover available tasks, claim them atomically,
 update their status, and retrieve results.
 """
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -448,10 +449,22 @@ class MCPServer:
 # Global server instance and database
 _server: MCPServer | None = None
 _db: Database | None = None
+_server_lock: asyncio.Lock | None = None
+
+
+def _get_lock() -> asyncio.Lock:
+    """Get or create the server initialization lock."""
+    global _server_lock
+    if _server_lock is None:
+        _server_lock = asyncio.Lock()
+    return _server_lock
 
 
 async def get_server(db_path: str | Path | None = None) -> MCPServer:
     """Get or create the MCP server instance.
+
+    This function is thread-safe and uses asyncio locking to prevent
+    race conditions during initialization.
 
     Args:
         db_path: Path to the SQLite database. If None, uses default location.
@@ -461,27 +474,46 @@ async def get_server(db_path: str | Path | None = None) -> MCPServer:
     """
     global _server, _db
 
-    if _server is None:
+    # Fast path: if server already exists, return it
+    if _server is not None:
+        return _server
+
+    async with _get_lock():
+        # Double-check after acquiring lock
+        if _server is not None:
+            return _server
+
         if db_path is None:
             # Use default location
             db_path = Path.home() / ".maestro" / "maestro.db"
             db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        _db = await create_database(db_path)
-        _server = MCPServer(_db)
+        # Create database and server atomically
+        # If server creation fails, we don't leave _db in an inconsistent state
+        db = await create_database(db_path)
+        try:
+            server = MCPServer(db)
+            _db = db
+            _server = server
+        except Exception:
+            # Clean up database if server creation fails
+            await db.close()
+            raise
 
     return _server
 
 
 async def shutdown_server() -> None:
     """Shutdown the server and close database connection."""
-    global _server, _db
+    global _server, _db, _server_lock
 
-    if _db is not None:
-        await _db.close()
-        _db = None
+    async with _get_lock():
+        if _db is not None:
+            await _db.close()
+            _db = None
 
-    _server = None
+        _server = None
+        _server_lock = None
 
 
 def create_mcp_server(db: Database) -> MCPServer:

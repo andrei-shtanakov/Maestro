@@ -22,7 +22,13 @@ from maestro.scheduler import (
     TaskTimeoutError,
     create_scheduler_from_config,
 )
-from maestro.spawners import AgentSpawner, ClaudeCodeSpawner
+from maestro.spawners import (
+    AgentSpawner,
+    ClaudeCodeSpawner,
+    SpawnerNotFoundError,
+    SpawnerRegistry,
+    create_default_registry,
+)
 
 
 __all__ = [
@@ -42,10 +48,13 @@ __all__ = [
     "SchedulerConfig",
     "SchedulerError",
     "ScopeWarning",
+    "SpawnerNotFoundError",
+    "SpawnerRegistry",
     "TaskAlreadyExistsError",
     "TaskNotFoundError",
     "TaskTimeoutError",
     "create_database",
+    "create_default_registry",
     "create_scheduler_from_config",
     "load_config",
     "load_config_from_string",

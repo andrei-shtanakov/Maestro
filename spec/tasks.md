@@ -234,7 +234,7 @@ Spawner для Claude Code в headless-режиме.
 ---
 
 ### TASK-011: Spawner Registry
-🟠 P1 | ⬜ TODO | Est: 0.5d
+🟠 P1 | 🔄 IN_PROGRESS | Est: 0.5d
 
 **Description:**
 Auto-discovery и registry для spawner plugins.
@@ -309,23 +309,23 @@ CLI с командами run, status, retry, stop.
 ## Milestone 2: Coordination
 
 ### TASK-020: MCP Server
-🔴 P0 | 🔄 IN_PROGRESS | Est: 1d
+🔴 P0 | ✅ DONE | Est: 1d
 
 **Description:**
 FastMCP сервер для координации агентов.
 
 **Checklist:**
-- [ ] FastMCP setup
-- [ ] get_available_tasks tool
-- [ ] claim_task tool (atomic)
-- [ ] update_status tool
-- [ ] get_task_result tool
-- [ ] Интеграция с database layer
+- [x] FastMCP setup
+- [x] get_available_tasks tool
+- [x] claim_task tool (atomic)
+- [x] update_status tool
+- [x] get_task_result tool
+- [x] Интеграция с database layer
 
 **Tests:**
-- [ ] Unit: tool handlers
-- [ ] Integration: claim conflict
-- [ ] Integration: status updates
+- [x] Unit: tool handlers
+- [x] Integration: claim conflict
+- [x] Integration: status updates
 
 **Traces to:** [REQ-020], [DESIGN-020]
 **Depends on:** [TASK-003], [TASK-005]
