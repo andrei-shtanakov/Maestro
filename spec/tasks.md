@@ -61,17 +61,17 @@
 ## Testing Tasks (обязательные)
 
 ### TASK-100: Test Infrastructure Setup
-🔴 P0 | 🔄 IN_PROGRESS | Est: 1d
+🔴 P0 | ✅ DONE | Est: 1d
 
 **Description:**
 Настроить тестовую инфраструктуру проекта.
 
 **Checklist:**
-- [ ] pytest + pytest-asyncio setup
-- [ ] Coverage reporting (pytest-cov)
-- [ ] conftest.py with fixtures
-- [ ] pyrefly init for type checking
-- [ ] ruff configuration in pyproject.toml
+- [x] pytest + pytest-asyncio setup
+- [x] Coverage reporting (pytest-cov)
+- [x] conftest.py with fixtures
+- [x] pyrefly init for type checking
+- [x] ruff configuration in pyproject.toml
 
 **Traces to:** [NFR-000]
 **Depends on:** [TASK-000]
@@ -82,7 +82,7 @@
 ## Milestone 1: MVP
 
 ### TASK-001: Pydantic Models
-🔴 P0 | ⬜ TODO | Est: 1d
+🔴 P0 | 🔄 IN_PROGRESS | Est: 1d
 
 **Description:**
 Создать Pydantic модели для Task, TaskConfig, ProjectConfig и связанных типов.
