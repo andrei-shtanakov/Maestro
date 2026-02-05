@@ -475,20 +475,20 @@ Desktop notifications через notify-send или macOS.
 ---
 
 ### TASK-041: Additional Spawners
-🟡 P2 | 🔄 IN_PROGRESS | Est: 1d
+🟡 P2 | ✅ DONE | Est: 1d
 
 **Description:**
 Spawners для Codex CLI и Aider.
 
 **Checklist:**
-- [ ] CodexSpawner implementation
-- [ ] AiderSpawner implementation
-- [ ] AnnounceSpawner (notification-only)
-- [ ] Registry integration
+- [x] CodexSpawner implementation
+- [x] AiderSpawner implementation
+- [x] AnnounceSpawner (notification-only)
+- [x] Registry integration
 
 **Tests:**
-- [ ] Unit: is_available checks
-- [ ] Integration: spawn with mock
+- [x] Unit: is_available checks
+- [x] Integration: spawn with mock
 
 **Traces to:** [REQ-011]
 **Depends on:** [TASK-011]
@@ -497,7 +497,7 @@ Spawners для Codex CLI и Aider.
 ---
 
 ### TASK-050: Web Dashboard
-🟡 P2 | ⬜ TODO | Est: 2d
+🟡 P2 | 🔄 IN_PROGRESS | Est: 2d
 
 **Description:**
 Веб-интерфейс для мониторинга.
