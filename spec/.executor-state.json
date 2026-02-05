@@ -169,14 +169,40 @@
       "completed_at": "2026-02-05T17:41:11.875877"
     },
     "TASK-021": {
+      "status": "success",
+      "attempts": [
+        {
+          "timestamp": "2026-02-05T17:47:58.418318",
+          "success": true,
+          "duration_seconds": 380.997445,
+          "error": null
+        }
+      ],
+      "started_at": "2026-02-05T17:41:12.002798",
+      "completed_at": "2026-02-05T17:47:58.418342"
+    },
+    "TASK-030": {
+      "status": "running",
+      "attempts": [
+        {
+          "timestamp": "2026-02-05T17:48:02.521016",
+          "success": false,
+          "duration_seconds": 4.002543,
+          "error": "API error: you've hit your limit"
+        }
+      ],
+      "started_at": "2026-02-05T17:47:58.516244",
+      "completed_at": null
+    },
+    "TASK-032": {
       "status": "running",
       "attempts": [],
-      "started_at": "2026-02-05T17:41:12.002798",
+      "started_at": "2026-02-05T21:22:51.382387",
       "completed_at": null
     }
   },
-  "consecutive_failures": 0,
-  "total_completed": 12,
+  "consecutive_failures": 1,
+  "total_completed": 13,
   "total_failed": 0,
-  "last_updated": "2026-02-05T17:41:12.002909"
+  "last_updated": "2026-02-05T21:22:51.382504"
 }

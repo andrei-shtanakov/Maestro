@@ -25,6 +25,7 @@ from maestro import (
     ConfigError,
     CycleError,
     Database,
+    StateRecovery,
     TaskNotFoundError,
     create_database,
     create_scheduler_from_config,
@@ -193,6 +194,24 @@ async def _run_scheduler(
                 console.print(
                     f"[cyan]Resuming with {len(existing_tasks)} existing tasks[/cyan]"
                 )
+
+                # Perform state recovery for orphaned tasks
+                recovery = StateRecovery(db)
+                if await recovery.needs_recovery():
+                    console.print(
+                        "[yellow]Detected orphaned tasks, performing recovery...[/yellow]"
+                    )
+                    stats = await recovery.recover()
+                    console.print(
+                        Panel(
+                            f"[green]Recovery complete[/green]\n"
+                            f"RUNNING → READY: {stats.running_recovered}\n"
+                            f"VALIDATING → READY: {stats.validating_recovered}\n"
+                            f"Total recovered: {stats.total_recovered}\n"
+                            f"Already done: {stats.tasks_done}",
+                            title="State Recovery",
+                        )
+                    )
             else:
                 console.print(
                     "[yellow]No existing tasks found, starting fresh[/yellow]"

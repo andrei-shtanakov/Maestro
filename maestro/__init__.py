@@ -13,6 +13,7 @@ from maestro.database import (
     TaskNotFoundError,
     create_database,
 )
+from maestro.recovery import RecoveryStatistics, StateRecovery
 from maestro.scheduler import (
     BaseSpawner,
     RunningTask,
@@ -43,6 +44,7 @@ __all__ = [
     "Database",
     "DatabaseError",
     "DependencyNotFoundError",
+    "RecoveryStatistics",
     "RunningTask",
     "Scheduler",
     "SchedulerConfig",
@@ -50,6 +52,7 @@ __all__ = [
     "ScopeWarning",
     "SpawnerNotFoundError",
     "SpawnerRegistry",
+    "StateRecovery",
     "TaskAlreadyExistsError",
     "TaskNotFoundError",
     "TaskTimeoutError",

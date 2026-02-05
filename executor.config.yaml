@@ -1,0 +1,64 @@
+# ATP Executor Configuration
+# Settings for automatic task execution via Claude CLI
+
+executor:
+  # Retry policy
+  max_retries: 3                    # Max attempts per task
+  retry_delay_seconds: 5            # Pause between attempts
+  max_consecutive_failures: 2       # Stop after N consecutive failures
+  on_task_failure: "skip"           # What to do after max_retries: skip | stop | ask
+
+  # Timeout
+  task_timeout_minutes: 30          # Timeout for one task
+  review_timeout_minutes: 15        # Timeout for code review
+
+  # Claude CLI (for task execution)
+  claude_command: "claude"          # Command (claude, claude-code, etc.)
+  claude_model: ""                  # Model (empty = default)
+  skip_permissions: true            # Skip permission prompts (--dangerously-skip-permissions)
+
+  # Code Review CLI (optional, uses claude_command if empty)
+  # Supports: claude, codex, ollama, or any CLI with "-p prompt" syntax
+  review_command: "codex"           # Examples: "codex", "ollama", "claude"
+  review_model: "gpt-5-codex"       # Examples: "gpt-4o", "llama3", "claude-3-haiku-20240307"
+
+  # Hooks
+  hooks:
+    pre_start:
+      create_git_branch: true       # Create branch task/TASK-XXX
+
+    post_done:
+      run_tests: true               # Run tests
+      run_lint: true                # Run lint
+      lint_blocking: true           # Lint errors block task completion
+      auto_commit: true             # Auto-commit changes
+      run_review: true              # Run code review after task (3 agents)
+
+  # Commands (using uv)
+  commands:
+    test: "uv run pytest tests/ -v -m 'not slow'"  # Test command
+    lint: "uv run ruff check ."                     # Lint command
+    lint_fix: "uv run ruff check . --fix"           # Lint auto-fix command
+
+  # Paths
+  paths:
+    logs: "spec/.executor-logs"     # Logs directory
+    state: "spec/.executor-state.json"  # State file
+
+# Task execution order (optional override)
+# By default uses priority from tasks.md + dependencies
+execution_order:
+  # Can specify explicit order:
+  # - TASK-100
+  # - TASK-001
+  # - TASK-004
+
+# Skip tasks (won't be executed automatically)
+skip_tasks:
+  # - TASK-021  # Web Dashboard - manual
+  # - TASK-024  # Documentation - manual
+
+# Environment variables for Claude
+environment:
+  # ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+  # PROJECT_ROOT: "."

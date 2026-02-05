@@ -334,22 +334,22 @@ FastMCP сервер для координации агентов.
 ---
 
 ### TASK-021: REST API
-🟠 P1 | 🔄 IN_PROGRESS | Est: 1d
+🟠 P1 | ✅ DONE | Est: 1d
 
 **Description:**
 FastAPI REST API с теми же эндпоинтами.
 
 **Checklist:**
-- [ ] FastAPI app setup
-- [ ] /tasks endpoints
-- [ ] /tasks/{id}/claim endpoint
-- [ ] /tasks/{id}/status endpoint
-- [ ] /health endpoint
-- [ ] OpenAPI documentation
+- [x] FastAPI app setup
+- [x] /tasks endpoints
+- [x] /tasks/{id}/claim endpoint
+- [x] /tasks/{id}/status endpoint
+- [x] /health endpoint
+- [x] OpenAPI documentation
 
 **Tests:**
-- [ ] Integration: API endpoints
-- [ ] Integration: concurrent claims
+- [x] Integration: API endpoints
+- [x] Integration: concurrent claims
 
 **Traces to:** [REQ-021], [DESIGN-021]
 **Depends on:** [TASK-003], [TASK-005]
@@ -381,7 +381,7 @@ FastAPI REST API с теми же эндпоинтами.
 ---
 
 ### TASK-030: Post-Task Validation
-🟠 P1 | ⬜ TODO | Est: 1d
+🟠 P1 | 🔄 IN_PROGRESS | Est: 1d
 
 **Description:**
 Валидация результатов через validation_cmd.
@@ -429,7 +429,7 @@ Retry с exponential backoff и контекстом ошибки.
 ---
 
 ### TASK-032: State Recovery
-🟠 P1 | ⬜ TODO | Est: 0.5d
+🟠 P1 | 🔄 IN_PROGRESS | Est: 0.5d
 
 **Description:**
 Восстановление состояния после crash.
