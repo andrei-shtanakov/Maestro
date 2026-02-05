@@ -255,7 +255,8 @@ class Task(BaseModel):
             updates["started_at"] = datetime.now(UTC)
 
         # Set completed_at when transitioning to terminal states
-        if target in (TaskStatus.DONE, TaskStatus.ABANDONED):
+        # Only set if started_at exists (to satisfy timestamp validation)
+        if target in (TaskStatus.DONE, TaskStatus.ABANDONED) and self.started_at:
             updates["completed_at"] = datetime.now(UTC)
 
         return self.model_copy(update=updates)

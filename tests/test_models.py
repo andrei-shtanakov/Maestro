@@ -357,6 +357,39 @@ class TestTask:
         assert new_task.completed_at is not None
         assert task.completed_at is None
 
+    def test_transition_to_abandoned_without_started_at(self) -> None:
+        """Test transitioning to ABANDONED from AWAITING_APPROVAL (no started_at)."""
+        task = Task(
+            id="t1",
+            title="T",
+            prompt="P",
+            workdir="/tmp",
+            status=TaskStatus.AWAITING_APPROVAL,
+        )
+        # This should succeed - ABANDONED from AWAITING_APPROVAL doesn't require started_at
+        new_task = task.transition_to(TaskStatus.ABANDONED)
+
+        assert new_task.status == TaskStatus.ABANDONED
+        # completed_at should NOT be set because started_at is None
+        assert new_task.completed_at is None
+
+    def test_transition_to_running_preserves_started_at(self) -> None:
+        """Test that re-entering RUNNING doesn't overwrite started_at."""
+        now = datetime.now(UTC)
+        task = Task(
+            id="t1",
+            title="T",
+            prompt="P",
+            workdir="/tmp",
+            status=TaskStatus.READY,
+            created_at=now,
+            started_at=now,  # Already has started_at from previous run
+        )
+        new_task = task.transition_to(TaskStatus.RUNNING)
+
+        # started_at should be preserved, not overwritten
+        assert new_task.started_at == now
+
     def test_can_retry(self) -> None:
         """Test can_retry method."""
         task = Task(

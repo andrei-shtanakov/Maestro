@@ -15,6 +15,7 @@ from maestro.database import (
     ConcurrentModificationError,
     Database,
     DatabaseError,
+    DependencyNotFoundError,
     TaskAlreadyExistsError,
     TaskNotFoundError,
     create_database,
@@ -239,6 +240,23 @@ class TestTaskCRUD:
             await db.create_task(sample_task_no_deps)
 
     @pytest.mark.anyio
+    async def test_create_task_missing_dependency(self, db) -> None:
+        """Test that creating a task with missing dependency raises error."""
+        task = Task(
+            id="task-with-missing-dep",
+            title="Test Task",
+            prompt="This task depends on a non-existent task",
+            workdir="/tmp/test",
+            depends_on=["nonexistent-task"],
+        )
+
+        with pytest.raises(
+            DependencyNotFoundError,
+            match="Dependency task 'nonexistent-task' not found",
+        ):
+            await db.create_task(task)
+
+    @pytest.mark.anyio
     async def test_create_task_with_all_fields(self, db) -> None:
         """Test creating a task with all optional fields."""
         task = Task(
@@ -383,6 +401,20 @@ class TestTaskCRUD:
         assert fetched.depends_on == ["t2"]
 
     @pytest.mark.anyio
+    async def test_update_task_missing_dependency(self, db) -> None:
+        """Test that updating a task with missing dependency raises error."""
+        task1 = Task(id="t1", title="T1", prompt="P1", workdir="/tmp")
+        await db.create_task(task1)
+
+        # Try to update with a non-existent dependency
+        updated = task1.model_copy(update={"depends_on": ["nonexistent"]})
+
+        with pytest.raises(
+            DependencyNotFoundError, match="Dependency task 'nonexistent' not found"
+        ):
+            await db.update_task(updated)
+
+    @pytest.mark.anyio
     async def test_delete_task(self, db, sample_task_no_deps) -> None:
         """Test deleting a task."""
         await db.create_task(sample_task_no_deps)
@@ -494,6 +526,51 @@ class TestAtomicStatusUpdates:
         updated = await db.update_task_status(sample_task_no_deps.id, TaskStatus.DONE)
 
         assert updated.completed_at is not None
+
+    @pytest.mark.anyio
+    async def test_update_status_abandoned_sets_completed_at(
+        self, db, sample_task_no_deps
+    ) -> None:
+        """Test that transitioning to ABANDONED sets completed_at."""
+        await db.create_task(sample_task_no_deps)
+
+        # Walk through state machine to NEEDS_REVIEW
+        await db.update_task_status(sample_task_no_deps.id, TaskStatus.READY)
+        await db.update_task_status(sample_task_no_deps.id, TaskStatus.RUNNING)
+        await db.update_task_status(sample_task_no_deps.id, TaskStatus.FAILED)
+        await db.update_task_status(sample_task_no_deps.id, TaskStatus.NEEDS_REVIEW)
+
+        updated = await db.update_task_status(
+            sample_task_no_deps.id, TaskStatus.ABANDONED
+        )
+
+        assert updated.completed_at is not None
+
+    @pytest.mark.anyio
+    async def test_update_status_running_preserves_started_at(
+        self, db, sample_task_no_deps
+    ) -> None:
+        """Test that re-entering RUNNING preserves original started_at."""
+        await db.create_task(sample_task_no_deps)
+
+        # First transition to RUNNING
+        await db.update_task_status(sample_task_no_deps.id, TaskStatus.READY)
+        first_run = await db.update_task_status(
+            sample_task_no_deps.id, TaskStatus.RUNNING
+        )
+        original_started_at = first_run.started_at
+
+        assert original_started_at is not None
+
+        # Fail and retry
+        await db.update_task_status(sample_task_no_deps.id, TaskStatus.FAILED)
+        await db.update_task_status(sample_task_no_deps.id, TaskStatus.READY)
+        second_run = await db.update_task_status(
+            sample_task_no_deps.id, TaskStatus.RUNNING
+        )
+
+        # started_at should be preserved from first run
+        assert second_run.started_at == original_started_at
 
     @pytest.mark.anyio
     async def test_update_status_with_extra_fields(
@@ -1086,3 +1163,25 @@ class TestFullLifecycle:
         assert fetched.started_at is not None
         assert fetched.completed_at is not None
         assert fetched.created_at <= fetched.started_at <= fetched.completed_at
+
+    @pytest.mark.anyio
+    async def test_invalid_datetime_format_raises_error(self, db) -> None:
+        """Test that invalid datetime format in database raises DatabaseError."""
+        task = Task(
+            id="invalid-datetime-task",
+            title="Invalid DateTime Test",
+            prompt="Test invalid datetime.",
+            workdir="/tmp",
+        )
+        await db.create_task(task)
+
+        # Manually corrupt the datetime in the database
+        async with db.transaction() as conn:
+            await conn.execute(
+                "UPDATE tasks SET created_at = ? WHERE id = ?",
+                ("invalid-datetime-format", task.id),
+            )
+
+        # Attempting to fetch should raise DatabaseError
+        with pytest.raises(DatabaseError, match="Invalid datetime format"):
+            await db.get_task(task.id)

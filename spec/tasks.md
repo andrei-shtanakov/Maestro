@@ -130,23 +130,23 @@
 ---
 
 ### TASK-003: SQLite Database Layer
-🔴 P0 | 🔄 IN_PROGRESS | Est: 1d
+🔴 P0 | ✅ DONE | Est: 1d
 
 **Description:**
 Database layer для хранения состояния задач.
 
 **Checklist:**
-- [ ] SQLite connection с WAL mode
-- [ ] Schema creation/migration
-- [ ] CRUD операции для tasks
-- [ ] CRUD для task_dependencies
-- [ ] Atomic status updates с WHERE clause
-- [ ] Query by status
+- [x] SQLite connection с WAL mode
+- [x] Schema creation/migration
+- [x] CRUD операции для tasks
+- [x] CRUD для task_dependencies
+- [x] Atomic status updates с WHERE clause
+- [x] Query by status
 
 **Tests:**
-- [ ] Unit: CRUD operations
-- [ ] Unit: atomic updates (concurrent access)
-- [ ] Integration: full lifecycle
+- [x] Unit: CRUD operations
+- [x] Unit: atomic updates (concurrent access)
+- [x] Integration: full lifecycle
 
 **Traces to:** [REQ-003], [DESIGN-003]
 **Depends on:** [TASK-001]
@@ -155,7 +155,7 @@ Database layer для хранения состояния задач.
 ---
 
 ### TASK-004: DAG Builder
-🔴 P0 | ⬜ TODO | Est: 1d
+🔴 P0 | 🔄 IN_PROGRESS | Est: 1d
 
 **Description:**
 Построение DAG из конфигурации, валидация, topological sort.

@@ -6,6 +6,7 @@ CRUD operations for tasks and dependencies.
 """
 
 import json
+import sqlite3
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -31,6 +32,10 @@ class TaskAlreadyExistsError(DatabaseError):
 
 class ConcurrentModificationError(DatabaseError):
     """Raised when an atomic update fails due to concurrent modification."""
+
+
+class DependencyNotFoundError(DatabaseError):
+    """Raised when a dependency task does not exist."""
 
 
 # SQL Schema
@@ -92,7 +97,17 @@ CREATE INDEX IF NOT EXISTS idx_agent_logs_task_id ON agent_logs(task_id);
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
-    """Parse datetime from SQLite string format."""
+    """Parse datetime from SQLite string format.
+
+    Args:
+        value: Datetime string in ISO format or SQLite default format.
+
+    Returns:
+        Parsed datetime with UTC timezone, or None if value is None.
+
+    Raises:
+        DatabaseError: If the datetime format is invalid.
+    """
     if value is None:
         return None
     # Handle both ISO format and SQLite default format
@@ -100,8 +115,14 @@ def _parse_datetime(value: str | None) -> datetime | None:
         # Try ISO format first (what we store)
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
+        pass
+
+    try:
         # Fall back to SQLite default format
         return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+    except ValueError as e:
+        msg = f"Invalid datetime format in database: '{value}'"
+        raise DatabaseError(msg) from e
 
 
 def _format_datetime(value: datetime | None) -> str | None:
@@ -223,53 +244,62 @@ class Database:
 
         Raises:
             TaskAlreadyExistsError: If task with same ID exists.
+            DependencyNotFoundError: If a dependency task does not exist.
             DatabaseError: If database not connected.
         """
         if self._connection is None:
             msg = "Database not connected"
             raise DatabaseError(msg)
 
-        # Check if task already exists
-        cursor = await self._connection.execute(
-            "SELECT id FROM tasks WHERE id = ?", (task.id,)
-        )
-        if await cursor.fetchone():
-            msg = f"Task with ID '{task.id}' already exists"
-            raise TaskAlreadyExistsError(msg)
+        # Validate dependencies exist before inserting
+        if task.depends_on:
+            for dep_id in task.depends_on:
+                cursor = await self._connection.execute(
+                    "SELECT id FROM tasks WHERE id = ?", (dep_id,)
+                )
+                if not await cursor.fetchone():
+                    msg = f"Dependency task '{dep_id}' not found"
+                    raise DependencyNotFoundError(msg)
 
-        # Insert task
-        await self._connection.execute(
-            """
-            INSERT INTO tasks (
-                id, title, prompt, branch, workdir, agent_type, status,
-                assigned_to, scope, priority, max_retries, retry_count,
-                timeout_minutes, requires_approval, validation_cmd,
-                result_summary, error_message, created_at, started_at, completed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task.id,
-                task.title,
-                task.prompt,
-                task.branch,
-                task.workdir,
-                task.agent_type.value,
-                task.status.value,
-                task.assigned_to,
-                json.dumps(task.scope),
-                task.priority,
-                task.max_retries,
-                task.retry_count,
-                task.timeout_minutes,
-                task.requires_approval,
-                task.validation_cmd,
-                task.result_summary,
-                task.error_message,
-                _format_datetime(task.created_at),
-                _format_datetime(task.started_at),
-                _format_datetime(task.completed_at),
-            ),
-        )
+        try:
+            # Insert task (use INSERT to let DB enforce uniqueness)
+            await self._connection.execute(
+                """
+                INSERT INTO tasks (
+                    id, title, prompt, branch, workdir, agent_type, status,
+                    assigned_to, scope, priority, max_retries, retry_count,
+                    timeout_minutes, requires_approval, validation_cmd,
+                    result_summary, error_message, created_at, started_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task.id,
+                    task.title,
+                    task.prompt,
+                    task.branch,
+                    task.workdir,
+                    task.agent_type.value,
+                    task.status.value,
+                    task.assigned_to,
+                    json.dumps(task.scope),
+                    task.priority,
+                    task.max_retries,
+                    task.retry_count,
+                    task.timeout_minutes,
+                    task.requires_approval,
+                    task.validation_cmd,
+                    task.result_summary,
+                    task.error_message,
+                    _format_datetime(task.created_at),
+                    _format_datetime(task.started_at),
+                    _format_datetime(task.completed_at),
+                ),
+            )
+        except sqlite3.IntegrityError as e:
+            if "UNIQUE constraint failed" in str(e) or "PRIMARY KEY" in str(e):
+                msg = f"Task with ID '{task.id}' already exists"
+                raise TaskAlreadyExistsError(msg) from e
+            raise
 
         # Insert dependencies
         for dep_id in task.depends_on:
@@ -362,6 +392,7 @@ class Database:
 
         Raises:
             TaskNotFoundError: If task not found.
+            DependencyNotFoundError: If a dependency task does not exist.
             DatabaseError: If database not connected.
         """
         if self._connection is None:
@@ -375,6 +406,16 @@ class Database:
         if not await cursor.fetchone():
             msg = f"Task with ID '{task.id}' not found"
             raise TaskNotFoundError(msg)
+
+        # Validate dependencies exist before updating
+        if task.depends_on:
+            for dep_id in task.depends_on:
+                dep_cursor = await self._connection.execute(
+                    "SELECT id FROM tasks WHERE id = ?", (dep_id,)
+                )
+                if not await dep_cursor.fetchone():
+                    msg = f"Dependency task '{dep_id}' not found"
+                    raise DependencyNotFoundError(msg)
 
         # Update task
         await self._connection.execute(
