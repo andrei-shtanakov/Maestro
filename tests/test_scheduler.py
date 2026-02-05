@@ -1004,9 +1004,10 @@ class TestGracefulShutdown:
                 await asyncio.sleep(0.3)
                 await scheduler.shutdown()
 
-            start_time = asyncio.get_event_loop().time()
+            loop = asyncio.get_running_loop()
+            start_time = loop.time()
             await asyncio.gather(scheduler.run(), shutdown_after_delay())
-            elapsed = asyncio.get_event_loop().time() - start_time
+            elapsed = loop.time() - start_time
 
             # Should have stopped within reasonable time
             assert elapsed < 2.0

@@ -10,9 +10,24 @@ dependencies = [
     "fastmcp>=2.14.5",
     "pydantic>=2.12.5",
     "pyyaml>=6.0.3",
+    "rich>=14.3.2",
     "typer>=0.21.1",
     "uvicorn>=0.40.0",
 ]
+
+[project.scripts]
+maestro = "maestro.cli:main"
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["maestro*"]
 
 [tool.pyrefly]
 project-includes = [
@@ -54,6 +69,10 @@ filterwarnings = [
     "error",
     "ignore::DeprecationWarning",
     "ignore::PendingDeprecationWarning",
+    # Ignore resource warnings from aiosqlite's internal socket handling during cleanup
+    "ignore:Exception ignored in.*socket.socket:pytest.PytestUnraisableExceptionWarning",
+    # Ignore unclosed event loop warnings that occur during pytest cleanup
+    "ignore:Exception ignored in.*BaseEventLoop:pytest.PytestUnraisableExceptionWarning",
 ]
 
 # Coverage configuration

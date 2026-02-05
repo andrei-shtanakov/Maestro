@@ -1,9 +1,7 @@
 """Tests for the maestro package."""
 
-from io import StringIO
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 
@@ -55,18 +53,19 @@ class TestSubpackages:
 class TestMain:
     """Tests for main entry point."""
 
-    def test_main_prints_greeting(self) -> None:
-        """Test that main() prints the expected greeting."""
-        with patch("sys.stdout", new_callable=StringIO) as mock_stdout:
-            main()
-            output = mock_stdout.getvalue()
-        assert "Hello from maestro!" in output
+    def test_main_is_callable(self) -> None:
+        """Test that main() is callable."""
+        assert callable(main)
 
-    def test_main_returns_none(self) -> None:
-        """Test that main() returns None."""
-        with patch("sys.stdout", new_callable=StringIO):
-            result = main()
-        assert result is None
+    def test_main_with_help_returns_zero(self) -> None:
+        """Test that main() with --help returns exit code 0."""
+        import sys
+        from unittest.mock import patch as mock_patch
+
+        with mock_patch.object(sys, "argv", ["maestro", "--help"]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 0
 
 
 class TestFixtures:

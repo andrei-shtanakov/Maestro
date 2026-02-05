@@ -256,24 +256,24 @@ Auto-discovery и registry для spawner plugins.
 ---
 
 ### TASK-012: Git Manager
-🔴 P0 | 🔄 IN_PROGRESS | Est: 1d
+🔴 P0 | ✅ DONE | Est: 1d
 
 **Description:**
 Git операции: создание веток, push, rebase.
 
 **Checklist:**
-- [ ] GitManager class
-- [ ] create_task_branch(task_id)
-- [ ] checkout existing branch
-- [ ] rebase_on_base()
-- [ ] push()
-- [ ] get_current_branch()
-- [ ] Error handling для git failures
+- [x] GitManager class
+- [x] create_task_branch(task_id)
+- [x] checkout existing branch
+- [x] rebase_on_base()
+- [x] push()
+- [x] get_current_branch()
+- [x] Error handling для git failures
 
 **Tests:**
-- [ ] Integration: branch creation (temp repo)
-- [ ] Integration: push (mock remote)
-- [ ] Unit: command building
+- [x] Integration: branch creation (temp repo)
+- [x] Integration: push (mock remote)
+- [x] Unit: command building
 
 **Traces to:** [REQ-012], [DESIGN-012]
 **Depends on:** [TASK-010]
@@ -282,7 +282,7 @@ Git операции: создание веток, push, rebase.
 ---
 
 ### TASK-006: CLI Interface
-🔴 P0 | ⬜ TODO | Est: 1d
+🔴 P0 | 🔄 IN_PROGRESS | Est: 1d
 
 **Description:**
 CLI с командами run, status, retry, stop.

@@ -98,13 +98,13 @@ class GitManager:
             True if path is a git repository, False otherwise.
         """
         try:
-            result = subprocess.run(
+            subprocess.run(
                 ["git", "rev-parse", "--git-dir"],
                 cwd=self._repo_path,
                 check=True,
                 capture_output=True,
             )
-            return result.returncode == 0
+            return True
         except (subprocess.CalledProcessError, FileNotFoundError):
             return False
 
@@ -157,7 +157,7 @@ class GitManager:
             GitError: If git command fails.
         """
         result = self._run_git(["branch", "--show-current"])
-        return result.stdout.decode("utf-8").strip()
+        return result.stdout.decode("utf-8", errors="replace").strip()
 
     def branch_exists(self, branch: str) -> bool:
         """Check if a branch exists locally.
@@ -269,7 +269,7 @@ class GitManager:
 
         # Check if remote exists
         result = self._run_git(["remote"], check=False)
-        remotes = result.stdout.decode("utf-8").strip().split("\n")
+        remotes = result.stdout.decode("utf-8", errors="replace").strip().split("\n")
         if not remotes or remotes == [""]:
             msg = "No remote configured"
             raise RemoteError(msg)
@@ -294,7 +294,7 @@ class GitManager:
             True if there are uncommitted changes, False otherwise.
         """
         result = self._run_git(["status", "--porcelain"])
-        return bool(result.stdout.decode("utf-8").strip())
+        return bool(result.stdout.decode("utf-8", errors="replace").strip())
 
     def get_branch_list(self) -> list[str]:
         """Get list of all local branches.
@@ -303,5 +303,5 @@ class GitManager:
             List of branch names.
         """
         result = self._run_git(["branch", "--format=%(refname:short)"])
-        branches = result.stdout.decode("utf-8").strip().split("\n")
+        branches = result.stdout.decode("utf-8", errors="replace").strip().split("\n")
         return [b for b in branches if b]
