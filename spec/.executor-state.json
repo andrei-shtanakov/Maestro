@@ -227,14 +227,27 @@
       "completed_at": "2026-02-05T21:45:02.400711"
     },
     "TASK-040": {
+      "status": "success",
+      "attempts": [
+        {
+          "timestamp": "2026-02-05T22:02:52.155253",
+          "success": true,
+          "duration_seconds": 444.230886,
+          "error": null
+        }
+      ],
+      "started_at": "2026-02-05T21:55:13.251434",
+      "completed_at": "2026-02-05T22:02:52.155298"
+    },
+    "TASK-031": {
       "status": "running",
       "attempts": [],
-      "started_at": "2026-02-05T21:55:13.251434",
+      "started_at": "2026-02-05T22:02:52.263207",
       "completed_at": null
     }
   },
   "consecutive_failures": 0,
-  "total_completed": 16,
+  "total_completed": 17,
   "total_failed": 0,
-  "last_updated": "2026-02-05T21:55:13.251540"
+  "last_updated": "2026-02-05T22:02:52.263321"
 }

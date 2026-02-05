@@ -48,6 +48,7 @@ class AgentSpawner(ABC):
         context: str,
         workdir: Path,
         log_file: Path,
+        retry_context: str = "",
     ) -> Popen[bytes]:
         """Spawn agent process.
 
@@ -56,14 +57,20 @@ class AgentSpawner(ABC):
             context: Context from completed dependencies.
             workdir: Working directory for the process.
             log_file: Path to write process output.
+            retry_context: Error context from previous failed attempt.
 
         Returns:
             Subprocess handle for monitoring.
         """
         ...
 
-    def build_prompt(self, task: Task, context: str) -> str:
-        """Build prompt with task details and dependency context.
+    def build_prompt(
+        self,
+        task: Task,
+        context: str,
+        retry_context: str = "",
+    ) -> str:
+        """Build prompt with task details, dependency context, and retry info.
 
         This method can be overridden by subclasses to customize
         prompt formatting for specific agents.
@@ -71,13 +78,14 @@ class AgentSpawner(ABC):
         Args:
             task: Task to build prompt for.
             context: Context from completed dependencies.
+            retry_context: Error context from previous failed attempt.
 
         Returns:
             Formatted prompt string.
         """
         scope_str = ", ".join(task.scope) if task.scope else "any"
 
-        return f"""Task: {task.title}
+        prompt = f"""Task: {task.title}
 
 {task.prompt}
 
@@ -87,3 +95,7 @@ Context from completed dependencies:
 Scope (files you can modify):
 {scope_str}
 """
+        if retry_context:
+            prompt += f"\n{retry_context}"
+
+        return prompt

@@ -24,6 +24,7 @@ from maestro.database import Database
 from maestro.models import Task, TaskConfig, TaskStatus
 from maestro.notifications.base import Notification, NotificationEvent
 from maestro.notifications.manager import NotificationManager
+from maestro.retry import RetryManager
 from maestro.validator import ValidationResult, Validator
 
 
@@ -45,6 +46,7 @@ class SpawnerProtocol(Protocol):
         context: str,
         workdir: Path,
         log_file: Path,
+        retry_context: str = "",
     ) -> Popen[bytes]:
         """Spawn agent process."""
         ...
@@ -81,6 +83,7 @@ class BaseSpawner(ABC):
         context: str,
         workdir: Path,
         log_file: Path,
+        retry_context: str = "",
     ) -> Popen[bytes]:
         """Spawn agent process.
 
@@ -89,6 +92,7 @@ class BaseSpawner(ABC):
             context: Context from completed dependencies.
             workdir: Working directory for the process.
             log_file: Path to write process output.
+            retry_context: Error context from previous failed attempt.
 
         Returns:
             Subprocess handle for monitoring.
@@ -163,6 +167,7 @@ class Scheduler:
         spawners: dict[str, SpawnerProtocol],
         config: SchedulerConfig | None = None,
         notification_manager: NotificationManager | None = None,
+        retry_manager: RetryManager | None = None,
     ) -> None:
         """Initialize scheduler.
 
@@ -172,12 +177,14 @@ class Scheduler:
             spawners: Map of agent_type to spawner instances.
             config: Scheduler configuration.
             notification_manager: Optional notification manager.
+            retry_manager: Optional retry manager for backoff/context.
         """
         self._db = db
         self._dag = dag
         self._spawners = spawners
         self._config = config or SchedulerConfig()
         self._notifications = notification_manager
+        self._retry_manager = retry_manager or RetryManager()
 
         self._running_tasks: dict[str, RunningTask] = {}
         self._shutdown_requested = False
@@ -366,6 +373,24 @@ class Scheduler:
         # Build context from completed dependencies
         context = await self._build_dependency_context(task)
 
+        # Apply retry delay if this is a retry attempt
+        retry_context = ""
+        if task.retry_count > 0:
+            delay = self._retry_manager.get_delay(task.retry_count - 1)
+            logging.info(
+                "Applying retry delay of %.1f seconds for task %s (attempt %d)",
+                delay,
+                task_id,
+                task.retry_count + 1,
+            )
+            await asyncio.sleep(delay)
+
+            # Build retry context from previous error
+            if task.error_message:
+                retry_context = self._retry_manager.build_retry_context(
+                    task, task.error_message
+                )
+
         # Transition to RUNNING
         task = await self._db.update_task_status(
             task_id,
@@ -373,8 +398,8 @@ class Scheduler:
             expected_status=TaskStatus.READY,
         )
 
-        # Spawn the process
-        process = spawner.spawn(task, context, workdir, log_file)
+        # Spawn the process with retry context
+        process = spawner.spawn(task, context, workdir, log_file, retry_context)
 
         # Track running task
         self._running_tasks[task_id] = RunningTask(
@@ -551,9 +576,15 @@ class Scheduler:
                 output += "\n... (truncated)"
             full_error = f"{error_message}\n\nValidation output:\n{output}"
 
-        if current_task.can_retry():
+        if self._retry_manager.should_retry(current_task):
             # Increment retry count and set back to READY
             new_retry_count = current_task.retry_count + 1
+            logging.info(
+                "Scheduling retry %d/%d for task %s",
+                new_retry_count,
+                current_task.max_retries,
+                task_id,
+            )
             await self._db.update_task_status(
                 task_id,
                 TaskStatus.FAILED,
@@ -569,6 +600,11 @@ class Scheduler:
             )
         else:
             # No more retries - needs review
+            logging.warning(
+                "Task %s exhausted all %d retries, moving to NEEDS_REVIEW",
+                task_id,
+                current_task.max_retries,
+            )
             await self._db.update_task_status(
                 task_id,
                 TaskStatus.FAILED,
@@ -599,9 +635,15 @@ class Scheduler:
         # Get current task state from DB (fresh to avoid stale retry_count)
         current_task = await self._db.get_task(task_id)
 
-        if current_task.can_retry():
+        if self._retry_manager.should_retry(current_task):
             # Increment retry count and set back to READY
             new_retry_count = current_task.retry_count + 1
+            logging.info(
+                "Scheduling retry %d/%d for task %s",
+                new_retry_count,
+                current_task.max_retries,
+                task_id,
+            )
             await self._db.update_task_status(
                 task_id,
                 TaskStatus.FAILED,
@@ -616,6 +658,11 @@ class Scheduler:
             )
         else:
             # No more retries - needs review
+            logging.warning(
+                "Task %s exhausted all %d retries, moving to NEEDS_REVIEW",
+                task_id,
+                current_task.max_retries,
+            )
             await self._db.update_task_status(
                 task_id,
                 TaskStatus.FAILED,

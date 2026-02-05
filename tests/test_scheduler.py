@@ -12,6 +12,7 @@ import pytest
 from maestro.dag import DAG
 from maestro.database import Database, create_database
 from maestro.models import AgentType, Task, TaskConfig, TaskStatus
+from maestro.retry import RetryManager
 from maestro.scheduler import (
     BaseSpawner,
     RunningTask,
@@ -45,6 +46,7 @@ class MockSpawner(BaseSpawner):
         self._spawn_count = 0
         self._spawned_tasks: list[Task] = []
         self._spawned_contexts: list[str] = []
+        self._spawned_retry_contexts: list[str] = []
         self._mock_processes: list[MagicMock] = []
 
     @property
@@ -72,10 +74,12 @@ class MockSpawner(BaseSpawner):
         context: str,
         workdir: Path,
         log_file: Path,
+        retry_context: str = "",
     ) -> subprocess.Popen[bytes]:
         self._spawn_count += 1
         self._spawned_tasks.append(task)
         self._spawned_contexts.append(context)
+        self._spawned_retry_contexts.append(retry_context)
 
         # Create mock process
         mock_process = MagicMock(spec=subprocess.Popen)
@@ -121,6 +125,7 @@ class FailingSpawner(BaseSpawner):
         context: str,
         workdir: Path,
         log_file: Path,
+        retry_context: str = "",
     ) -> subprocess.Popen[bytes]:
         msg = "Spawn failed intentionally"
         raise RuntimeError(msg)
@@ -714,6 +719,7 @@ class TestFullExecution:
                 dag=dag,
                 spawners={"claude_code": mock_spawner},
                 config=scheduler_config,
+                retry_manager=RetryManager(base_delay=0.0),
             )
 
             async def run_with_timeout() -> None:

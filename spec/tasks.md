@@ -405,7 +405,7 @@ FastAPI REST API с теми же эндпоинтами.
 ---
 
 ### TASK-031: Retry Logic
-🟠 P1 | ⬜ TODO | Est: 0.5d
+🟠 P1 | 🔄 IN_PROGRESS | Est: 0.5d
 
 **Description:**
 Retry с exponential backoff и контекстом ошибки.
@@ -453,20 +453,20 @@ Retry с exponential backoff и контекстом ошибки.
 ## Milestone 3: Production Ready
 
 ### TASK-040: Desktop Notifications
-🟡 P2 | 🔄 IN_PROGRESS | Est: 0.5d
+🟡 P2 | ✅ DONE | Est: 0.5d
 
 **Description:**
 Desktop notifications через notify-send или macOS.
 
 **Checklist:**
-- [ ] NotificationChannel ABC
-- [ ] DesktopNotifier implementation
-- [ ] Platform detection (Linux/macOS)
-- [ ] Configuration in YAML
+- [x] NotificationChannel ABC
+- [x] DesktopNotifier implementation
+- [x] Platform detection (Linux/macOS)
+- [x] Configuration in YAML
 
 **Tests:**
-- [ ] Unit: notification formatting
-- [ ] Manual: visual verification
+- [x] Unit: notification formatting
+- [x] Manual: visual verification
 
 **Traces to:** [REQ-040]
 **Depends on:** [TASK-005]

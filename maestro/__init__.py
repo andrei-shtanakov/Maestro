@@ -23,6 +23,7 @@ from maestro.notifications import (
     create_notification_manager,
 )
 from maestro.recovery import RecoveryStatistics, StateRecovery
+from maestro.retry import RetryManager
 from maestro.scheduler import (
     BaseSpawner,
     RunningTask,
@@ -66,6 +67,7 @@ __all__ = [
     "NotificationManager",
     "Platform",
     "RecoveryStatistics",
+    "RetryManager",
     "RunningTask",
     "Scheduler",
     "SchedulerConfig",

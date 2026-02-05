@@ -39,6 +39,7 @@ class ClaudeCodeSpawner(AgentSpawner):
         context: str,
         workdir: Path,
         log_file: Path,
+        retry_context: str = "",
     ) -> subprocess.Popen[bytes]:
         """Spawn Claude Code process.
 
@@ -54,11 +55,12 @@ class ClaudeCodeSpawner(AgentSpawner):
             context: Context from completed dependencies.
             workdir: Working directory for the process.
             log_file: Path to write process output.
+            retry_context: Error context from previous failed attempt.
 
         Returns:
             Subprocess handle for monitoring.
         """
-        prompt = self.build_prompt(task, context)
+        prompt = self.build_prompt(task, context, retry_context)
 
         # Open log file and duplicate the fd for subprocess
         # This allows us to close the Python file object without affecting

@@ -73,6 +73,7 @@ class TestAgentSpawnerABC:
                 context: str,
                 workdir: Path,
                 log_file: Path,
+                retry_context: str = "",
             ) -> subprocess.Popen[bytes]:
                 return MagicMock()
 
@@ -93,6 +94,7 @@ class TestAgentSpawnerABC:
                 context: str,
                 workdir: Path,
                 log_file: Path,
+                retry_context: str = "",
             ) -> subprocess.Popen[bytes]:
                 return MagicMock()
 
@@ -368,8 +370,9 @@ class TestSpawnIntegration:
                 context: str,
                 workdir: Path,
                 log_file: Path,
+                retry_context: str = "",
             ) -> subprocess.Popen[bytes]:
-                prompt = self.build_prompt(task, context)
+                prompt = self.build_prompt(task, context, retry_context)
                 return _spawn_with_log_fd(["echo", prompt], workdir, log_file)
 
         spawner = EchoSpawner()
@@ -421,6 +424,7 @@ class TestSpawnIntegration:
                 context: str,
                 workdir: Path,
                 log_file: Path,
+                retry_context: str = "",
             ) -> subprocess.Popen[bytes]:
                 return _spawn_with_log_fd(
                     ["sh", "-c", "echo 'error message' >&2"],
@@ -464,6 +468,7 @@ class TestSpawnIntegration:
                 context: str,
                 workdir: Path,
                 log_file: Path,
+                retry_context: str = "",
             ) -> subprocess.Popen[bytes]:
                 return _spawn_with_log_fd(
                     ["sh", "-c", "exit 42"],
@@ -512,6 +517,7 @@ class TestSpawnerInheritance:
                 context: str,
                 workdir: Path,
                 log_file: Path,
+                retry_context: str = "",
             ) -> subprocess.Popen[bytes]:
                 return MagicMock()
 
@@ -545,10 +551,16 @@ class TestSpawnerInheritance:
                 context: str,
                 workdir: Path,
                 log_file: Path,
+                retry_context: str = "",
             ) -> subprocess.Popen[bytes]:
                 return MagicMock()
 
-            def build_prompt(self, task: Task, context: str) -> str:
+            def build_prompt(
+                self,
+                task: Task,
+                context: str,
+                retry_context: str = "",
+            ) -> str:
                 return f"CUSTOM: {task.title}"
 
         spawner = CustomSpawner()

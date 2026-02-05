@@ -41,6 +41,7 @@ class MockSpawner(AgentSpawner):
         context: str,
         workdir: Path,
         log_file: Path,
+        retry_context: str = "",
     ) -> subprocess.Popen[bytes]:
         return MagicMock()
 
@@ -61,6 +62,7 @@ class AnotherMockSpawner(AgentSpawner):
         context: str,
         workdir: Path,
         log_file: Path,
+        retry_context: str = "",
     ) -> subprocess.Popen[bytes]:
         return MagicMock()
 
@@ -473,6 +475,7 @@ class CustomTestSpawner(AgentSpawner):
         context: str,
         workdir: Path,
         log_file: Path,
+        retry_context: str = "",
     ) -> subprocess.Popen[bytes]:
         return MagicMock()
 '''
