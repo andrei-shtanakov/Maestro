@@ -282,23 +282,23 @@ Git операции: создание веток, push, rebase.
 ---
 
 ### TASK-006: CLI Interface
-🔴 P0 | 🔄 IN_PROGRESS | Est: 1d
+🔴 P0 | ✅ DONE | Est: 1d
 
 **Description:**
 CLI с командами run, status, retry, stop.
 
 **Checklist:**
-- [ ] Click/Typer setup
-- [ ] `maestro run tasks.yaml` command
-- [ ] `maestro status` command
-- [ ] `maestro retry <task-id>` command
-- [ ] `maestro stop` command
-- [ ] `--resume` flag для recovery
-- [ ] Pretty output (rich/click styling)
+- [x] Click/Typer setup
+- [x] `maestro run tasks.yaml` command
+- [x] `maestro status` command
+- [x] `maestro retry <task-id>` command
+- [x] `maestro stop` command
+- [x] `--resume` flag для recovery
+- [x] Pretty output (rich/click styling)
 
 **Tests:**
-- [ ] Unit: command parsing
-- [ ] Integration: full flow
+- [x] Unit: command parsing
+- [x] Integration: full flow
 
 **Traces to:** [REQ-001], [REQ-003]
 **Depends on:** [TASK-005]
@@ -309,7 +309,7 @@ CLI с командами run, status, retry, stop.
 ## Milestone 2: Coordination
 
 ### TASK-020: MCP Server
-🔴 P0 | ⬜ TODO | Est: 1d
+🔴 P0 | 🔄 IN_PROGRESS | Est: 1d
 
 **Description:**
 FastMCP сервер для координации агентов.
