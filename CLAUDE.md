@@ -9,11 +9,20 @@ Maestro is an AI Agent Orchestrator - a daemon/scheduler that coordinates multip
 ## Development Commands
 
 ```bash
-# Run the application
-uv run python main.py
+# Run the orchestrator
+uv run maestro run <config.yaml>
+uv run maestro run config.yaml --resume  # Resume after crash
+
+# Check status
+uv run maestro status --db maestro.db
+
+# Retry failed task
+uv run maestro retry <task-id> --db maestro.db
 
 # Run tests
 uv run pytest
+uv run pytest tests/test_models.py -v  # Single file
+uv run pytest -k "test_dag" -v         # By pattern
 
 # Type checking
 pyrefly check
@@ -30,13 +39,25 @@ uv add --dev <package>
 
 ## Architecture
 
-The planned structure (see `agent-orchestrator-spec.md` for full details):
+Core modules in `maestro/`:
 
-- **Task Engine**: Parses YAML task definitions, builds/validates DAG, manages task state machine
-- **Scheduler**: Main loop (resolve → spawn → monitor), handles parallelism limits
-- **Agent Spawners**: Plugin architecture for different agents (Claude Code, Codex, Aider, announce-only)
-- **Coordination API**: MCP server + FastAPI REST endpoints backed by SQLite
-- **Notifications**: Desktop, Telegram, webhooks
+- **models.py**: Pydantic models (Task, TaskStatus, TaskConfig, ProjectConfig)
+- **config.py**: YAML parsing with defaults merging and env var substitution
+- **database.py**: SQLite layer with async CRUD, WAL mode
+- **dag.py**: DAG building, cycle detection, topological sort, scope overlap warnings
+- **scheduler.py**: Main asyncio loop (resolve → spawn → monitor)
+- **cli.py**: Typer CLI (run, status, retry, stop commands)
+- **git.py**: Git operations (branch creation, rebase, push)
+- **validator.py**: Post-task validation (run validation_cmd)
+- **retry.py**: Exponential backoff retry logic
+- **recovery.py**: State recovery after crash
+- **cost_tracker.py**: Token usage parsing and cost calculation
+
+Subpackages:
+- **spawners/**: AgentSpawner ABC + implementations (claude_code, codex, aider, announce) + registry
+- **coordination/**: MCP server (FastMCP) + REST API (FastAPI)
+- **notifications/**: Desktop notifications (macOS/Linux)
+- **dashboard/**: Web UI with DAG visualization (Mermaid.js) + SSE updates
 
 ### Task State Machine
 
@@ -58,9 +79,9 @@ PENDING → READY → RUNNING → VALIDATING → DONE
 ## Tech Stack
 
 - Python 3.12+, uv for package management
-- FastAPI + uvicorn for REST API
+- FastAPI + uvicorn for REST API and dashboard
 - FastMCP for MCP server
-- SQLite for state persistence
-- PyYAML + jsonschema for configuration
+- SQLite (aiosqlite) for state persistence
+- PyYAML for configuration
 - Pydantic for data models
-- AutoGen for agent orchestration patterns
+- Typer + Rich for CLI

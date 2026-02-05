@@ -521,20 +521,20 @@ Spawners для Codex CLI и Aider.
 ---
 
 ### TASK-060: Cost Tracking
-🟢 P3 | 🔄 IN_PROGRESS | Est: 1d
+🟢 P3 | ✅ DONE | Est: 1d
 
 **Description:**
 Трекинг token usage и стоимости.
 
 **Checklist:**
-- [ ] task_costs table
-- [ ] Log parsing для token counts
-- [ ] Cost calculation
-- [ ] Summary report
+- [x] task_costs table
+- [x] Log parsing для token counts
+- [x] Cost calculation
+- [x] Summary report
 
 **Tests:**
-- [ ] Unit: log parsing
-- [ ] Unit: cost calculation
+- [x] Unit: log parsing
+- [x] Unit: cost calculation
 
 **Traces to:** —
 **Depends on:** [TASK-010]

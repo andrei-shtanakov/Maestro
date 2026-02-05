@@ -525,6 +525,161 @@ class StateRecovery:
 
 ---
 
+### DESIGN-013: Spawner Registry
+
+#### Описание
+Автоматическое обнаружение и регистрация spawner-плагинов.
+
+#### Interface
+```python
+class SpawnerRegistry:
+    """Registry for agent spawners with auto-discovery."""
+
+    def __init__(self) -> None:
+        self._spawners: dict[str, type[AgentSpawner]] = {}
+        self._discover_spawners()
+
+    def _discover_spawners(self) -> None:
+        """Auto-discover spawner classes in spawners package."""
+        ...
+
+    def register(self, spawner_class: type[AgentSpawner]) -> None:
+        """Register a spawner class."""
+        ...
+
+    def get_spawner(self, agent_type: str) -> AgentSpawner:
+        """Get spawner instance by agent type."""
+        ...
+
+    def list_available(self) -> list[str]:
+        """List available agent types."""
+        ...
+```
+
+**Traces to:** [REQ-011]
+
+---
+
+### DESIGN-040: Notification Manager
+
+#### Описание
+Управляет отправкой уведомлений через разные каналы.
+
+#### Interface
+```python
+from abc import ABC, abstractmethod
+
+class NotificationChannel(ABC):
+    """Base class for notification channels."""
+
+    @abstractmethod
+    async def send(self, title: str, message: str, level: str = "info") -> bool:
+        """Send notification. Returns True if successful."""
+        ...
+
+class DesktopNotifier(NotificationChannel):
+    """Desktop notifications (macOS/Linux)."""
+
+    async def send(self, title: str, message: str, level: str = "info") -> bool:
+        ...
+
+class NotificationManager:
+    """Manages multiple notification channels."""
+
+    def __init__(self) -> None:
+        self._channels: list[NotificationChannel] = []
+
+    def add_channel(self, channel: NotificationChannel) -> None:
+        ...
+
+    async def notify(self, title: str, message: str, level: str = "info") -> None:
+        """Send notification to all channels."""
+        ...
+```
+
+**Traces to:** [REQ-040]
+
+---
+
+### DESIGN-050: Dashboard
+
+#### Описание
+Веб-интерфейс для мониторинга с DAG визуализацией и real-time обновлениями.
+
+#### Interface
+```python
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, StreamingResponse
+
+app = FastAPI(title="Maestro Dashboard")
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard() -> HTMLResponse:
+    """Serve dashboard HTML with Mermaid.js DAG visualization."""
+    ...
+
+@app.get("/events")
+async def events(db_path: str) -> StreamingResponse:
+    """SSE endpoint for real-time task status updates."""
+    ...
+
+@app.post("/tasks/{task_id}/retry")
+async def retry_task(task_id: str, db_path: str) -> dict:
+    """Retry a failed task from the dashboard."""
+    ...
+```
+
+**Traces to:** [REQ-050]
+
+---
+
+### DESIGN-060: Cost Tracker
+
+#### Описание
+Парсинг token usage из логов агентов и расчёт стоимости.
+
+#### Interface
+```python
+@dataclass
+class TokenUsage:
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+
+@dataclass
+class CostReport:
+    task_id: str
+    agent_type: str
+    usage: TokenUsage
+    estimated_cost_usd: float
+
+class CostTracker:
+    """Track token usage and costs from agent logs."""
+
+    # Pricing per million tokens
+    PRICING: dict[str, dict[str, float]] = {
+        "claude_code": {"input": 3.0, "output": 15.0},
+        ...
+    }
+
+    def parse_log(self, log_content: str, agent_type: str) -> TokenUsage | None:
+        """Parse token usage from agent log output."""
+        ...
+
+    def calculate_cost(self, usage: TokenUsage, agent_type: str) -> float:
+        """Calculate estimated cost in USD."""
+        ...
+
+    async def save_cost(self, db: Database, report: CostReport) -> None:
+        """Save cost report to database."""
+        ...
+```
+
+**Traces to:** —
+
+---
+
 ## 3. Схемы данных
 
 ### 3.1 Task
@@ -698,41 +853,63 @@ CREATE INDEX idx_messages_to_agent ON messages(to_agent, read);
 maestro/
 ├── maestro/
 │   ├── __init__.py
-│   ├── cli.py                  # CLI: run, status, retry, stop
+│   ├── cli.py                  # Typer CLI: run, status, retry, stop
 │   ├── config.py               # YAML parsing, validation
 │   ├── models.py               # Task, Status, pydantic models
 │   ├── dag.py                  # DAG building, validation, topological sort
-│   ├── db.py                   # SQLite CRUD, migrations
-│   ├── scheduler.py            # Main loop: resolve → spawn → monitor
-│   ├── git.py                  # Git operations
+│   ├── database.py             # SQLite async CRUD, WAL mode
+│   ├── scheduler.py            # Main asyncio loop: resolve → spawn → monitor
+│   ├── git.py                  # Git operations (branch, push, rebase)
+│   ├── validator.py            # Post-task validation (validation_cmd)
+│   ├── retry.py                # Exponential backoff retry logic
+│   ├── recovery.py             # State recovery after crash
+│   ├── cost_tracker.py         # Token usage parsing, cost calculation
 │   ├── spawners/
 │   │   ├── __init__.py
 │   │   ├── base.py             # AgentSpawner ABC
+│   │   ├── registry.py         # SpawnerRegistry (auto-discovery)
 │   │   ├── claude_code.py      # Claude Code headless
 │   │   ├── codex.py            # Codex CLI
 │   │   ├── aider.py            # Aider
-│   │   └── announce.py         # Announce-only
+│   │   └── announce.py         # Announce-only (notification)
 │   ├── coordination/
 │   │   ├── __init__.py
 │   │   ├── mcp_server.py       # FastMCP tools
 │   │   └── rest_api.py         # FastAPI endpoints
 │   ├── notifications/
 │   │   ├── __init__.py
-│   │   ├── desktop.py
-│   │   ├── telegram.py
-│   │   └── webhook.py
+│   │   ├── base.py             # NotificationChannel ABC
+│   │   ├── manager.py          # NotificationManager
+│   │   └── desktop.py          # Desktop notifications (macOS/Linux)
 │   └── dashboard/
-│       ├── app.py              # FastAPI + static
-│       └── static/             # HTML/JS for DAG visualization
+│       ├── __init__.py
+│       ├── app.py              # FastAPI + SSE + static
+│       └── static/             # HTML/JS (Mermaid.js DAG visualization)
 ├── tests/
 │   ├── conftest.py
+│   ├── test_models.py
+│   ├── test_config.py
+│   ├── test_database.py
 │   ├── test_dag.py
 │   ├── test_scheduler.py
 │   ├── test_spawners.py
-│   └── test_coordination.py
+│   ├── test_spawner_registry.py
+│   ├── test_git.py
+│   ├── test_validator.py
+│   ├── test_retry.py
+│   ├── test_recovery.py
+│   ├── test_cost_tracker.py
+│   ├── test_mcp_server.py
+│   ├── test_rest_api.py
+│   ├── test_messages.py
+│   ├── test_notifications.py
+│   ├── test_dashboard.py
+│   └── test_cli.py
+├── spec/
+│   ├── requirements.md
+│   ├── design.md
+│   └── tasks.md
 ├── examples/
-│   ├── simple-two-tasks.yaml
-│   └── multi-branch-refactor.yaml
 ├── pyproject.toml
 ├── CLAUDE.md
 └── README.md
