@@ -215,10 +215,7 @@ def load_config(path: Path | str) -> ProjectConfig:
         )
 
     # Resolve environment variables
-    try:
-        resolved_config = resolve_env_vars(raw_config, path)
-    except ConfigError:
-        raise
+    resolved_config = resolve_env_vars(raw_config, path)
 
     # Validate through Pydantic
     try:
@@ -259,10 +256,7 @@ def load_config_from_string(content: str, path: Path | None = None) -> ProjectCo
         )
 
     # Resolve environment variables
-    try:
-        resolved_config = resolve_env_vars(raw_config, dummy_path)
-    except ConfigError:
-        raise
+    resolved_config = resolve_env_vars(raw_config, dummy_path)
 
     # Validate through Pydantic
     try:

@@ -660,8 +660,12 @@ class TestProjectConfig:
                 project="test",
                 repo="/path/to/repo",
                 tasks=[
-                    TaskConfig(id="task-a", title="A", prompt="A", depends_on=["task-b"]),
-                    TaskConfig(id="task-b", title="B", prompt="B", depends_on=["task-a"]),
+                    TaskConfig(
+                        id="task-a", title="A", prompt="A", depends_on=["task-b"]
+                    ),
+                    TaskConfig(
+                        id="task-b", title="B", prompt="B", depends_on=["task-a"]
+                    ),
                 ],
             )
 
@@ -672,9 +676,15 @@ class TestProjectConfig:
                 project="test",
                 repo="/path/to/repo",
                 tasks=[
-                    TaskConfig(id="task-a", title="A", prompt="A", depends_on=["task-c"]),
-                    TaskConfig(id="task-b", title="B", prompt="B", depends_on=["task-a"]),
-                    TaskConfig(id="task-c", title="C", prompt="C", depends_on=["task-b"]),
+                    TaskConfig(
+                        id="task-a", title="A", prompt="A", depends_on=["task-c"]
+                    ),
+                    TaskConfig(
+                        id="task-b", title="B", prompt="B", depends_on=["task-a"]
+                    ),
+                    TaskConfig(
+                        id="task-c", title="C", prompt="C", depends_on=["task-b"]
+                    ),
                 ],
             )
 
@@ -686,7 +696,9 @@ class TestProjectConfig:
                 project="test",
                 repo="/path/to/repo",
                 tasks=[
-                    TaskConfig(id="task-a", title="A", prompt="A", depends_on=["task-a"]),
+                    TaskConfig(
+                        id="task-a", title="A", prompt="A", depends_on=["task-a"]
+                    ),
                 ],
             )
 
@@ -699,7 +711,9 @@ class TestProjectConfig:
                 TaskConfig(id="task-a", title="A", prompt="A"),
                 TaskConfig(id="task-b", title="B", prompt="B", depends_on=["task-a"]),
                 TaskConfig(id="task-c", title="C", prompt="C", depends_on=["task-a"]),
-                TaskConfig(id="task-d", title="D", prompt="D", depends_on=["task-b", "task-c"]),
+                TaskConfig(
+                    id="task-d", title="D", prompt="D", depends_on=["task-b", "task-c"]
+                ),
             ],
         )
         assert len(config.tasks) == 4
@@ -712,8 +726,15 @@ class TestProjectConfig:
             tasks=[
                 TaskConfig(id="root", title="Root", prompt="Root"),
                 TaskConfig(id="left", title="Left", prompt="Left", depends_on=["root"]),
-                TaskConfig(id="right", title="Right", prompt="Right", depends_on=["root"]),
-                TaskConfig(id="bottom", title="Bottom", prompt="Bottom", depends_on=["left", "right"]),
+                TaskConfig(
+                    id="right", title="Right", prompt="Right", depends_on=["root"]
+                ),
+                TaskConfig(
+                    id="bottom",
+                    title="Bottom",
+                    prompt="Bottom",
+                    depends_on=["left", "right"],
+                ),
             ],
         )
         assert len(config.tasks) == 4

@@ -105,23 +105,23 @@
 ---
 
 ### TASK-002: Config Parser
-🔴 P0 | 🔄 IN_PROGRESS | Est: 1d
+🔴 P0 | ✅ DONE | Est: 1d
 
 **Description:**
 Парсер YAML-конфигурации с поддержкой defaults и env variables.
 
 **Checklist:**
-- [ ] YAML loading с PyYAML
-- [ ] Defaults merging (project-level → task-level)
-- [ ] Environment variable substitution (${VAR})
-- [ ] Schema validation через Pydantic
-- [ ] Error messages с указанием позиции
+- [x] YAML loading с PyYAML
+- [x] Defaults merging (project-level → task-level)
+- [x] Environment variable substitution (${VAR})
+- [x] Schema validation через Pydantic
+- [x] Error messages с указанием позиции
 
 **Tests:**
-- [ ] Unit: valid config parsing
-- [ ] Unit: defaults merging
-- [ ] Unit: env variable substitution
-- [ ] Unit: validation errors
+- [x] Unit: valid config parsing
+- [x] Unit: defaults merging
+- [x] Unit: env variable substitution
+- [x] Unit: validation errors
 
 **Traces to:** [REQ-001], [DESIGN-001]
 **Depends on:** [TASK-001]
@@ -130,7 +130,7 @@
 ---
 
 ### TASK-003: SQLite Database Layer
-🔴 P0 | ⬜ TODO | Est: 1d
+🔴 P0 | 🔄 IN_PROGRESS | Est: 1d
 
 **Description:**
 Database layer для хранения состояния задач.

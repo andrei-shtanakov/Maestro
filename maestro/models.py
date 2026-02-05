@@ -401,7 +401,9 @@ class ProjectConfig(BaseModel):
     def validate_no_cyclic_dependencies(self) -> Self:
         """Ensure there are no cyclic dependencies in the task DAG."""
         # Build adjacency list for dependency graph
-        graph: dict[str, list[str]] = {task.id: list(task.depends_on) for task in self.tasks}
+        graph: dict[str, list[str]] = {
+            task.id: list(task.depends_on) for task in self.tasks
+        }
 
         # Track visited nodes and nodes in current recursion stack
         visited: set[str] = set()
