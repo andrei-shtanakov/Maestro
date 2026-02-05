@@ -8,7 +8,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from maestro.models import AgentType, Task
-from maestro.spawners import AgentSpawner, ClaudeCodeSpawner
+from maestro.spawners import (
+    AgentSpawner,
+    AiderSpawner,
+    AnnounceSpawner,
+    ClaudeCodeSpawner,
+    CodexSpawner,
+)
 
 
 # =============================================================================
@@ -573,3 +579,503 @@ class TestSpawnerInheritance:
 
         prompt = spawner.build_prompt(task, "context")
         assert prompt == "CUSTOM: Test Task"
+
+
+# =============================================================================
+# Test Fixtures: Additional Spawners
+# =============================================================================
+
+
+@pytest.fixture
+def codex_spawner() -> CodexSpawner:
+    """Provide a Codex spawner instance."""
+    return CodexSpawner()
+
+
+@pytest.fixture
+def aider_spawner() -> AiderSpawner:
+    """Provide an Aider spawner instance."""
+    return AiderSpawner()
+
+
+@pytest.fixture
+def announce_spawner() -> AnnounceSpawner:
+    """Provide an Announce spawner instance."""
+    return AnnounceSpawner()
+
+
+# =============================================================================
+# Unit Tests: CodexSpawner
+# =============================================================================
+
+
+class TestCodexSpawner:
+    """Tests for CodexSpawner."""
+
+    def test_agent_type(self, codex_spawner: CodexSpawner) -> None:
+        """Test that agent_type returns correct value."""
+        assert codex_spawner.agent_type == "codex"
+
+    def test_codex_available_when_in_path(
+        self,
+        codex_spawner: CodexSpawner,
+    ) -> None:
+        """Test is_available returns True when codex is in PATH."""
+        with patch(
+            "maestro.spawners.codex.shutil.which",
+            return_value="/usr/local/bin/codex",
+        ):
+            assert codex_spawner.is_available() is True
+
+    def test_codex_unavailable_when_not_in_path(
+        self,
+        codex_spawner: CodexSpawner,
+    ) -> None:
+        """Test is_available returns False when codex is not in PATH."""
+        with patch(
+            "maestro.spawners.codex.shutil.which",
+            return_value=None,
+        ):
+            assert codex_spawner.is_available() is False
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
+    def test_spawn_creates_process_with_correct_args(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        codex_spawner: CodexSpawner,
+        sample_task: Task,
+        temp_dir: Path,
+    ) -> None:
+        """Test that spawn creates process with correct arguments."""
+        mock_process = MagicMock()
+        mock_popen.return_value = mock_process
+        mock_os_open.return_value = 42
+
+        log_file = temp_dir / "task.log"
+        context = "Some context"
+        workdir = Path(sample_task.workdir)
+
+        result = codex_spawner.spawn(sample_task, context, workdir, log_file)
+
+        mock_popen.assert_called_once()
+        call_args = mock_popen.call_args
+        cmd = call_args[0][0]
+
+        assert cmd[0] == "codex"
+        assert "--quiet" in cmd
+        assert "--approval-mode" in cmd
+        assert "auto-edit" in cmd
+        assert call_args[1]["cwd"] == workdir
+        assert call_args[1]["stdout"] == 42
+        assert call_args[1]["stderr"] == subprocess.STDOUT
+        mock_os_close.assert_called_once_with(42)
+        assert result == mock_process
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
+    def test_spawn_prompt_contains_task_info(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        codex_spawner: CodexSpawner,
+        sample_task: Task,
+        temp_dir: Path,
+    ) -> None:
+        """Test that spawn passes prompt with task information."""
+        mock_popen.return_value = MagicMock()
+        mock_os_open.return_value = 42
+
+        log_file = temp_dir / "task.log"
+        context = "Previous task completed"
+        workdir = Path(sample_task.workdir)
+
+        codex_spawner.spawn(sample_task, context, workdir, log_file)
+
+        call_args = mock_popen.call_args
+        cmd = call_args[0][0]
+
+        # Prompt is the last positional argument for codex
+        prompt = cmd[-1]
+        assert sample_task.title in prompt
+        assert sample_task.prompt in prompt
+        assert context in prompt
+
+
+# =============================================================================
+# Unit Tests: AiderSpawner
+# =============================================================================
+
+
+class TestAiderSpawner:
+    """Tests for AiderSpawner."""
+
+    def test_agent_type(self, aider_spawner: AiderSpawner) -> None:
+        """Test that agent_type returns correct value."""
+        assert aider_spawner.agent_type == "aider"
+
+    def test_aider_available_when_in_path(
+        self,
+        aider_spawner: AiderSpawner,
+    ) -> None:
+        """Test is_available returns True when aider is in PATH."""
+        with patch(
+            "maestro.spawners.aider.shutil.which",
+            return_value="/usr/local/bin/aider",
+        ):
+            assert aider_spawner.is_available() is True
+
+    def test_aider_unavailable_when_not_in_path(
+        self,
+        aider_spawner: AiderSpawner,
+    ) -> None:
+        """Test is_available returns False when aider is not in PATH."""
+        with patch(
+            "maestro.spawners.aider.shutil.which",
+            return_value=None,
+        ):
+            assert aider_spawner.is_available() is False
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
+    def test_spawn_creates_process_with_correct_args(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        aider_spawner: AiderSpawner,
+        sample_task: Task,
+        temp_dir: Path,
+    ) -> None:
+        """Test that spawn creates process with correct arguments."""
+        mock_process = MagicMock()
+        mock_popen.return_value = mock_process
+        mock_os_open.return_value = 42
+
+        log_file = temp_dir / "task.log"
+        context = "Some context"
+        workdir = Path(sample_task.workdir)
+
+        result = aider_spawner.spawn(sample_task, context, workdir, log_file)
+
+        mock_popen.assert_called_once()
+        call_args = mock_popen.call_args
+        cmd = call_args[0][0]
+
+        assert cmd[0] == "aider"
+        assert "--yes-always" in cmd
+        assert "--no-auto-commits" in cmd
+        assert "--message" in cmd
+        assert call_args[1]["cwd"] == workdir
+        assert call_args[1]["stdout"] == 42
+        assert call_args[1]["stderr"] == subprocess.STDOUT
+        mock_os_close.assert_called_once_with(42)
+        assert result == mock_process
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
+    def test_spawn_includes_scope_files(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        aider_spawner: AiderSpawner,
+        sample_task: Task,
+        temp_dir: Path,
+    ) -> None:
+        """Test that spawn includes scope files as arguments."""
+        mock_popen.return_value = MagicMock()
+        mock_os_open.return_value = 42
+
+        log_file = temp_dir / "task.log"
+        workdir = Path(sample_task.workdir)
+
+        aider_spawner.spawn(sample_task, "", workdir, log_file)
+
+        call_args = mock_popen.call_args
+        cmd = call_args[0][0]
+
+        # Scope files should be appended after --message <prompt>
+        assert "src/module.py" in cmd
+        assert "tests/test_module.py" in cmd
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
+    def test_spawn_no_scope_files_when_empty(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        aider_spawner: AiderSpawner,
+        sample_task_no_scope: Task,
+        temp_dir: Path,
+    ) -> None:
+        """Test that spawn omits scope files when scope is empty."""
+        mock_popen.return_value = MagicMock()
+        mock_os_open.return_value = 42
+
+        log_file = temp_dir / "task.log"
+        workdir = Path(sample_task_no_scope.workdir)
+
+        aider_spawner.spawn(sample_task_no_scope, "", workdir, log_file)
+
+        call_args = mock_popen.call_args
+        cmd = call_args[0][0]
+
+        # Command should be: aider --yes-always --no-auto-commits
+        #                     --message <prompt>
+        # No extra file args
+        assert len(cmd) == 5
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
+    def test_spawn_prompt_contains_task_info(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        aider_spawner: AiderSpawner,
+        sample_task: Task,
+        temp_dir: Path,
+    ) -> None:
+        """Test that spawn passes prompt with task information."""
+        mock_popen.return_value = MagicMock()
+        mock_os_open.return_value = 42
+
+        log_file = temp_dir / "task.log"
+        context = "Previous task completed"
+        workdir = Path(sample_task.workdir)
+
+        aider_spawner.spawn(sample_task, context, workdir, log_file)
+
+        call_args = mock_popen.call_args
+        cmd = call_args[0][0]
+
+        # Find --message and get the prompt
+        msg_index = cmd.index("--message")
+        prompt = cmd[msg_index + 1]
+
+        assert sample_task.title in prompt
+        assert sample_task.prompt in prompt
+        assert context in prompt
+
+
+# =============================================================================
+# Unit Tests: AnnounceSpawner
+# =============================================================================
+
+
+class TestAnnounceSpawner:
+    """Tests for AnnounceSpawner."""
+
+    def test_agent_type(self, announce_spawner: AnnounceSpawner) -> None:
+        """Test that agent_type returns correct value."""
+        assert announce_spawner.agent_type == "announce"
+
+    def test_announce_always_available(self, announce_spawner: AnnounceSpawner) -> None:
+        """Test that announce spawner is always available."""
+        assert announce_spawner.is_available() is True
+
+    @patch("subprocess.Popen")
+    @patch("os.close")
+    @patch("os.open")
+    def test_spawn_creates_echo_process(
+        self,
+        mock_os_open: MagicMock,
+        mock_os_close: MagicMock,
+        mock_popen: MagicMock,
+        announce_spawner: AnnounceSpawner,
+        sample_task: Task,
+        temp_dir: Path,
+    ) -> None:
+        """Test that spawn creates an echo process."""
+        mock_process = MagicMock()
+        mock_popen.return_value = mock_process
+        mock_os_open.return_value = 42
+
+        log_file = temp_dir / "task.log"
+        context = "Some context"
+        workdir = Path(sample_task.workdir)
+
+        result = announce_spawner.spawn(sample_task, context, workdir, log_file)
+
+        mock_popen.assert_called_once()
+        call_args = mock_popen.call_args
+        cmd = call_args[0][0]
+
+        assert cmd[0] == "echo"
+        assert call_args[1]["cwd"] == workdir
+        assert call_args[1]["stdout"] == 42
+        assert call_args[1]["stderr"] == subprocess.STDOUT
+        mock_os_close.assert_called_once_with(42)
+        assert result == mock_process
+
+    @pytest.mark.integration
+    def test_announce_spawn_writes_to_log(
+        self,
+        announce_spawner: AnnounceSpawner,
+        temp_dir: Path,
+    ) -> None:
+        """Integration test: announce spawner writes to log file."""
+        task = Task(
+            id="announce-task",
+            title="Milestone Alpha",
+            prompt="All alpha tasks completed",
+            workdir=str(temp_dir),
+            agent_type=AgentType.ANNOUNCE,
+            scope=["docs/"],
+        )
+
+        log_file = temp_dir / "announce.log"
+        context = "Previous milestones done"
+
+        process = announce_spawner.spawn(task, context, temp_dir, log_file)
+        return_code = process.wait()
+
+        assert return_code == 0
+        log_content = log_file.read_text()
+        assert task.title in log_content
+        assert task.prompt in log_content
+        assert context in log_content
+
+
+# =============================================================================
+# Unit Tests: is_available checks (all spawners)
+# =============================================================================
+
+
+class TestIsAvailableAllSpawners:
+    """Cross-spawner is_available tests."""
+
+    def test_codex_checks_codex_binary(self) -> None:
+        """Test that CodexSpawner checks for 'codex' binary."""
+        spawner = CodexSpawner()
+        with patch("maestro.spawners.codex.shutil.which") as mock_which:
+            mock_which.return_value = None
+            assert spawner.is_available() is False
+            mock_which.assert_called_once_with("codex")
+
+    def test_aider_checks_aider_binary(self) -> None:
+        """Test that AiderSpawner checks for 'aider' binary."""
+        spawner = AiderSpawner()
+        with patch("maestro.spawners.aider.shutil.which") as mock_which:
+            mock_which.return_value = None
+            assert spawner.is_available() is False
+            mock_which.assert_called_once_with("aider")
+
+    def test_claude_checks_claude_binary(self) -> None:
+        """Test that ClaudeCodeSpawner checks for 'claude' binary."""
+        spawner = ClaudeCodeSpawner()
+        with patch("maestro.spawners.claude_code.shutil.which") as mock_which:
+            mock_which.return_value = None
+            assert spawner.is_available() is False
+            mock_which.assert_called_once_with("claude")
+
+    def test_announce_needs_no_binary(self) -> None:
+        """Test that AnnounceSpawner requires no external binary."""
+        spawner = AnnounceSpawner()
+        # Should always be available regardless of PATH
+        assert spawner.is_available() is True
+
+
+# =============================================================================
+# Integration Tests: Spawn with Mock (Additional Spawners)
+# =============================================================================
+
+
+class TestSpawnIntegrationAdditional:
+    """Integration tests for new spawners with real subprocess."""
+
+    @pytest.mark.integration
+    def test_codex_spawn_with_mock(self, temp_dir: Path) -> None:
+        """Test CodexSpawner with mocked Popen arguments."""
+        spawner = CodexSpawner()
+        task = Task(
+            id="codex-task",
+            title="Codex Test",
+            prompt="Test prompt for codex",
+            workdir=str(temp_dir),
+            agent_type=AgentType.CODEX,
+            scope=["app.py"],
+        )
+
+        log_file = temp_dir / "codex.log"
+
+        with (
+            patch("subprocess.Popen") as mock_popen,
+            patch("os.open", return_value=42),
+            patch("os.close"),
+        ):
+            mock_process = MagicMock()
+            mock_process.wait.return_value = 0
+            mock_popen.return_value = mock_process
+
+            process = spawner.spawn(task, "ctx", temp_dir, log_file)
+
+            cmd = mock_popen.call_args[0][0]
+            assert cmd[0] == "codex"
+            assert "--quiet" in cmd
+            assert process.wait() == 0
+
+    @pytest.mark.integration
+    def test_aider_spawn_with_mock(self, temp_dir: Path) -> None:
+        """Test AiderSpawner with mocked Popen arguments."""
+        spawner = AiderSpawner()
+        task = Task(
+            id="aider-task",
+            title="Aider Test",
+            prompt="Test prompt for aider",
+            workdir=str(temp_dir),
+            agent_type=AgentType.AIDER,
+            scope=["main.py", "utils.py"],
+        )
+
+        log_file = temp_dir / "aider.log"
+
+        with (
+            patch("subprocess.Popen") as mock_popen,
+            patch("os.open", return_value=42),
+            patch("os.close"),
+        ):
+            mock_process = MagicMock()
+            mock_process.wait.return_value = 0
+            mock_popen.return_value = mock_process
+
+            process = spawner.spawn(task, "ctx", temp_dir, log_file)
+
+            cmd = mock_popen.call_args[0][0]
+            assert cmd[0] == "aider"
+            assert "--yes-always" in cmd
+            assert "main.py" in cmd
+            assert "utils.py" in cmd
+            assert process.wait() == 0
+
+    @pytest.mark.integration
+    def test_announce_spawn_real_process(self, temp_dir: Path) -> None:
+        """Test AnnounceSpawner with real subprocess (echo)."""
+        spawner = AnnounceSpawner()
+        task = Task(
+            id="announce-int",
+            title="Integration Announce",
+            prompt="Announce integration test",
+            workdir=str(temp_dir),
+            agent_type=AgentType.ANNOUNCE,
+        )
+
+        log_file = temp_dir / "announce_int.log"
+
+        process = spawner.spawn(task, "context", temp_dir, log_file)
+        return_code = process.wait()
+
+        assert return_code == 0
+        log_content = log_file.read_text()
+        assert "Integration Announce" in log_content

@@ -405,22 +405,22 @@ FastAPI REST API с теми же эндпоинтами.
 ---
 
 ### TASK-031: Retry Logic
-🟠 P1 | 🔄 IN_PROGRESS | Est: 0.5d
+🟠 P1 | ✅ DONE | Est: 0.5d
 
 **Description:**
 Retry с exponential backoff и контекстом ошибки.
 
 **Checklist:**
-- [ ] RetryManager class
-- [ ] Exponential backoff calculation
-- [ ] Error context injection в prompt
-- [ ] max_retries limit
-- [ ] NEEDS_REVIEW transition
+- [x] RetryManager class
+- [x] Exponential backoff calculation
+- [x] Error context injection в prompt
+- [x] max_retries limit
+- [x] NEEDS_REVIEW transition
 
 **Tests:**
-- [ ] Unit: backoff calculation
-- [ ] Unit: context building
-- [ ] Integration: retry flow
+- [x] Unit: backoff calculation
+- [x] Unit: context building
+- [x] Integration: retry flow
 
 **Traces to:** [REQ-031], [DESIGN-031]
 **Depends on:** [TASK-030]
@@ -475,7 +475,7 @@ Desktop notifications через notify-send или macOS.
 ---
 
 ### TASK-041: Additional Spawners
-🟡 P2 | ⬜ TODO | Est: 1d
+🟡 P2 | 🔄 IN_PROGRESS | Est: 1d
 
 **Description:**
 Spawners для Codex CLI и Aider.

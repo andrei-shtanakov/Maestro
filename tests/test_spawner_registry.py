@@ -10,7 +10,10 @@ import pytest
 from maestro.models import Task
 from maestro.spawners import (
     AgentSpawner,
+    AiderSpawner,
+    AnnounceSpawner,
     ClaudeCodeSpawner,
+    CodexSpawner,
     SpawnerNotFoundError,
     SpawnerRegistry,
     create_default_registry,
@@ -442,6 +445,22 @@ class TestDirectoryDiscovery:
         assert "claude_code" in registry
         assert isinstance(registry.get_spawner("claude_code"), ClaudeCodeSpawner)
 
+    def test_discover_from_directory_finds_all_spawners(
+        self,
+        registry: SpawnerRegistry,
+    ) -> None:
+        """Test that directory discovery finds all built-in spawners."""
+        count = registry.discover_from_directory()
+
+        assert count >= 4
+        assert "claude_code" in registry
+        assert "codex" in registry
+        assert "aider" in registry
+        assert "announce" in registry
+        assert isinstance(registry.get_spawner("codex"), CodexSpawner)
+        assert isinstance(registry.get_spawner("aider"), AiderSpawner)
+        assert isinstance(registry.get_spawner("announce"), AnnounceSpawner)
+
     def test_discover_from_directory_custom_path(
         self,
         registry: SpawnerRegistry,
@@ -614,3 +633,29 @@ class TestRegistryIntegration:
             assert hasattr(spawner, "agent_type")
             assert hasattr(spawner, "is_available")
             assert hasattr(spawner, "spawn")
+
+    def test_registry_with_all_spawner_types(
+        self,
+        registry: SpawnerRegistry,
+    ) -> None:
+        """Test registry with all concrete spawner types."""
+        registry.register(ClaudeCodeSpawner())
+        registry.register(CodexSpawner())
+        registry.register(AiderSpawner())
+        registry.register(AnnounceSpawner())
+
+        assert len(registry) == 4
+        assert isinstance(registry.get_spawner("claude_code"), ClaudeCodeSpawner)
+        assert isinstance(registry.get_spawner("codex"), CodexSpawner)
+        assert isinstance(registry.get_spawner("aider"), AiderSpawner)
+        assert isinstance(registry.get_spawner("announce"), AnnounceSpawner)
+
+    def test_default_registry_discovers_all_spawners(self) -> None:
+        """Test that create_default_registry finds all spawners."""
+        with patch("importlib.metadata.entry_points", return_value=[]):
+            registry = create_default_registry()
+
+        assert "claude_code" in registry
+        assert "codex" in registry
+        assert "aider" in registry
+        assert "announce" in registry
