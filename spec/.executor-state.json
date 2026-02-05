@@ -1,0 +1,21 @@
+{
+  "tasks": {
+    "TASK-000": {
+      "status": "running",
+      "attempts": [
+        {
+          "timestamp": "2026-02-05T15:37:53.588274",
+          "success": false,
+          "duration_seconds": 153.901656,
+          "error": "Lint errors (not auto-fixable):\nF841 Local variable `tasks` is assigned to but never used\n   --> .claude/skills/spec-generator-skill/templates/executor.py:550:5\n    |\n549 |     state = ExecutorState(config)\n550 |     tasks = parse_tasks(TASKS_FILE)\n    |     ^^^^^\n551 |     \n552 |     print(\"\\n\ud83d\udcca Executor Status\")\n    |\nhelp: Remove assignment to unused variable `tasks`\n\nF841 Local variable `priority_icon` is assigned to but never used\n   --> .claude/skills/spec-generator-skill/templates/task.py:550:9\n    |\n548 |         prefix = \"  \" * indent + (\"\u251c\u2500\u2500 \" if indent > 0 else \"\")\n549 |         status_icon = STATUS_EMOJI.get(task.status, '?')\n550 |         priority_icon = PRIORITY_EMOJI.get(task.priority, '?')\n    |         ^^^^^^^^^^^^^\n551 |         \n552 |         print(f\"{prefix}{status_icon} {task.id}: {task.name[:30]}\")\n    |\nhelp: Remove assignment to unused variable `priority_icon`\n\nFound 2 errors.\nNo fixes available (2 hidden fixes can be enabled with the `--unsafe-fixes` option).\n\n"
+        }
+      ],
+      "started_at": "2026-02-05T15:37:58.677122",
+      "completed_at": null
+    }
+  },
+  "consecutive_failures": 1,
+  "total_completed": 0,
+  "total_failed": 0,
+  "last_updated": "2026-02-05T15:37:58.677194"
+}
