@@ -82,21 +82,21 @@
 ## Milestone 1: MVP
 
 ### TASK-001: Pydantic Models
-🔴 P0 | 🔄 IN_PROGRESS | Est: 1d
+🔴 P0 | ✅ DONE | Est: 1d
 
 **Description:**
 Создать Pydantic модели для Task, TaskConfig, ProjectConfig и связанных типов.
 
 **Checklist:**
-- [ ] TaskStatus enum с валидными переходами
-- [ ] TaskConfig модель для YAML parsing
-- [ ] Task модель для runtime state
-- [ ] ProjectConfig с defaults и git settings
-- [ ] Валидация через Pydantic validators
+- [x] TaskStatus enum с валидными переходами
+- [x] TaskConfig модель для YAML parsing
+- [x] Task модель для runtime state
+- [x] ProjectConfig с defaults и git settings
+- [x] Валидация через Pydantic validators
 
 **Tests:**
-- [ ] Unit: model validation, status transitions
-- [ ] Unit: serialization/deserialization
+- [x] Unit: model validation, status transitions
+- [x] Unit: serialization/deserialization
 
 **Traces to:** [REQ-001], [DESIGN-001], [DESIGN-003]
 **Depends on:** [TASK-100]
@@ -105,7 +105,7 @@
 ---
 
 ### TASK-002: Config Parser
-🔴 P0 | ⬜ TODO | Est: 1d
+🔴 P0 | 🔄 IN_PROGRESS | Est: 1d
 
 **Description:**
 Парсер YAML-конфигурации с поддержкой defaults и env variables.

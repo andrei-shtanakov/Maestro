@@ -653,6 +653,71 @@ class TestProjectConfig:
                 ],
             )
 
+    def test_cyclic_dependency_two_tasks_rejected(self) -> None:
+        """Test that cyclic dependency between two tasks is rejected."""
+        with pytest.raises(ValueError, match="Cyclic dependency detected"):
+            ProjectConfig(
+                project="test",
+                repo="/path/to/repo",
+                tasks=[
+                    TaskConfig(id="task-a", title="A", prompt="A", depends_on=["task-b"]),
+                    TaskConfig(id="task-b", title="B", prompt="B", depends_on=["task-a"]),
+                ],
+            )
+
+    def test_cyclic_dependency_three_tasks_rejected(self) -> None:
+        """Test that cyclic dependency among three tasks is rejected."""
+        with pytest.raises(ValueError, match="Cyclic dependency detected"):
+            ProjectConfig(
+                project="test",
+                repo="/path/to/repo",
+                tasks=[
+                    TaskConfig(id="task-a", title="A", prompt="A", depends_on=["task-c"]),
+                    TaskConfig(id="task-b", title="B", prompt="B", depends_on=["task-a"]),
+                    TaskConfig(id="task-c", title="C", prompt="C", depends_on=["task-b"]),
+                ],
+            )
+
+    def test_cyclic_dependency_self_loop_in_project(self) -> None:
+        """Test that self-dependency at project level is caught (redundant with TaskConfig check)."""
+        # This is already caught by TaskConfig, but verify ProjectConfig doesn't break
+        with pytest.raises(ValueError, match="cannot depend on itself"):
+            ProjectConfig(
+                project="test",
+                repo="/path/to/repo",
+                tasks=[
+                    TaskConfig(id="task-a", title="A", prompt="A", depends_on=["task-a"]),
+                ],
+            )
+
+    def test_valid_dag_accepted(self) -> None:
+        """Test that a valid DAG with no cycles is accepted."""
+        config = ProjectConfig(
+            project="test",
+            repo="/path/to/repo",
+            tasks=[
+                TaskConfig(id="task-a", title="A", prompt="A"),
+                TaskConfig(id="task-b", title="B", prompt="B", depends_on=["task-a"]),
+                TaskConfig(id="task-c", title="C", prompt="C", depends_on=["task-a"]),
+                TaskConfig(id="task-d", title="D", prompt="D", depends_on=["task-b", "task-c"]),
+            ],
+        )
+        assert len(config.tasks) == 4
+
+    def test_diamond_dependency_accepted(self) -> None:
+        """Test that diamond-shaped dependencies (valid DAG) are accepted."""
+        config = ProjectConfig(
+            project="test",
+            repo="/path/to/repo",
+            tasks=[
+                TaskConfig(id="root", title="Root", prompt="Root"),
+                TaskConfig(id="left", title="Left", prompt="Left", depends_on=["root"]),
+                TaskConfig(id="right", title="Right", prompt="Right", depends_on=["root"]),
+                TaskConfig(id="bottom", title="Bottom", prompt="Bottom", depends_on=["left", "right"]),
+            ],
+        )
+        assert len(config.tasks) == 4
+
     def test_max_concurrent_bounds(self) -> None:
         """Test max_concurrent validation bounds."""
         ProjectConfig(project="test", repo="/path", max_concurrent=1)

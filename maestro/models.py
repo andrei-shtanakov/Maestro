@@ -398,6 +398,46 @@ class ProjectConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def validate_no_cyclic_dependencies(self) -> Self:
+        """Ensure there are no cyclic dependencies in the task DAG."""
+        # Build adjacency list for dependency graph
+        graph: dict[str, list[str]] = {task.id: list(task.depends_on) for task in self.tasks}
+
+        # Track visited nodes and nodes in current recursion stack
+        visited: set[str] = set()
+        rec_stack: set[str] = set()
+        cycle_path: list[str] = []
+
+        def detect_cycle(node: str, path: list[str]) -> bool:
+            """DFS to detect cycles, returns True if cycle found."""
+            visited.add(node)
+            rec_stack.add(node)
+            path.append(node)
+
+            for neighbor in graph.get(node, []):
+                if neighbor not in visited:
+                    if detect_cycle(neighbor, path):
+                        return True
+                elif neighbor in rec_stack:
+                    # Found a cycle - capture the cycle path
+                    cycle_start = path.index(neighbor)
+                    cycle_path.extend(path[cycle_start:])
+                    cycle_path.append(neighbor)
+                    return True
+
+            path.pop()
+            rec_stack.remove(node)
+            return False
+
+        for task_id in graph:
+            if task_id not in visited and detect_cycle(task_id, []):
+                cycle_str = " -> ".join(cycle_path)
+                msg = f"Cyclic dependency detected: {cycle_str}"
+                raise ValueError(msg)
+
+        return self
+
+    @model_validator(mode="after")
     def apply_defaults_to_tasks(self) -> Self:
         """Apply default values to tasks that don't specify them.
 
