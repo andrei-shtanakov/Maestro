@@ -13,10 +13,20 @@ from maestro.database import (
     TaskNotFoundError,
     create_database,
 )
+from maestro.scheduler import (
+    BaseSpawner,
+    RunningTask,
+    Scheduler,
+    SchedulerConfig,
+    SchedulerError,
+    TaskTimeoutError,
+    create_scheduler_from_config,
+)
 
 
 __all__ = [
     "DAG",
+    "BaseSpawner",
     "ConcurrentModificationError",
     "ConfigError",
     "CycleError",
@@ -24,10 +34,16 @@ __all__ = [
     "Database",
     "DatabaseError",
     "DependencyNotFoundError",
+    "RunningTask",
+    "Scheduler",
+    "SchedulerConfig",
+    "SchedulerError",
     "ScopeWarning",
     "TaskAlreadyExistsError",
     "TaskNotFoundError",
+    "TaskTimeoutError",
     "create_database",
+    "create_scheduler_from_config",
     "load_config",
     "load_config_from_string",
 ]

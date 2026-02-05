@@ -284,21 +284,24 @@ class DAG:
         Returns:
             True if tasks can run in parallel.
         """
-        # Get all transitive dependencies and dependents
-        deps_a = self._get_transitive_dependencies(task_a)
-        deps_b = self._get_transitive_dependencies(task_b)
+        # Get all transitive closures (dependencies and dependents)
+        closure_a = self._get_transitive_closure(task_a)
+        closure_b = self._get_transitive_closure(task_b)
 
-        # Tasks are parallel if neither is in the other's dependency chain
-        return task_b not in deps_a and task_a not in deps_b
+        # Tasks are parallel if neither is in the other's transitive closure
+        return task_b not in closure_a and task_a not in closure_b
 
-    def _get_transitive_dependencies(self, task_id: str) -> set[str]:
-        """Get all transitive dependencies of a task.
+    def _get_transitive_closure(self, task_id: str) -> set[str]:
+        """Get all tasks in the transitive closure (dependencies and dependents).
+
+        This includes both upstream (dependencies) and downstream (dependents)
+        to determine if two tasks are in the same dependency chain.
 
         Args:
-            task_id: Task ID to get dependencies for.
+            task_id: Task ID to get closure for.
 
         Returns:
-            Set of all task IDs that this task depends on (transitively).
+            Set of all task IDs connected to this task in either direction.
         """
         result: set[str] = set()
         queue: deque[str] = deque([task_id])

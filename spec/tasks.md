@@ -155,24 +155,24 @@ Database layer для хранения состояния задач.
 ---
 
 ### TASK-004: DAG Builder
-🔴 P0 | 🔄 IN_PROGRESS | Est: 1d
+🔴 P0 | ✅ DONE | Est: 1d
 
 **Description:**
 Построение DAG из конфигурации, валидация, topological sort.
 
 **Checklist:**
-- [ ] Graph construction из depends_on
-- [ ] Cycle detection (Kahn's algorithm)
-- [ ] Topological sort
-- [ ] get_ready_tasks() по completed set
-- [ ] Scope overlap detection
+- [x] Graph construction из depends_on
+- [x] Cycle detection (Kahn's algorithm)
+- [x] Topological sort
+- [x] get_ready_tasks() по completed set
+- [x] Scope overlap detection
 
 **Tests:**
-- [ ] Unit: simple DAG construction
-- [ ] Unit: cycle detection
-- [ ] Unit: topological sort
-- [ ] Unit: ready tasks calculation
-- [ ] Unit: scope overlap warning
+- [x] Unit: simple DAG construction
+- [x] Unit: cycle detection
+- [x] Unit: topological sort
+- [x] Unit: ready tasks calculation
+- [x] Unit: scope overlap warning
 
 **Traces to:** [REQ-002], [REQ-004], [DESIGN-002]
 **Depends on:** [TASK-002]
@@ -181,7 +181,7 @@ Database layer для хранения состояния задач.
 ---
 
 ### TASK-005: Scheduler Core
-🔴 P0 | ⬜ TODO | Est: 2d
+🔴 P0 | 🔄 IN_PROGRESS | Est: 2d
 
 **Description:**
 Основной scheduler loop: resolve ready tasks → spawn → monitor.
