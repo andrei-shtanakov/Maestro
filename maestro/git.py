@@ -305,3 +305,62 @@ class GitManager:
         result = self._run_git(["branch", "--format=%(refname:short)"])
         branches = result.stdout.decode("utf-8", errors="replace").strip().split("\n")
         return [b for b in branches if b]
+
+    def add_all(self) -> None:
+        """Stage all changes in the working directory.
+
+        Equivalent to `git add -A`.
+
+        Raises:
+            GitError: If git command fails.
+        """
+        self._run_git(["add", "-A"])
+
+    def commit(self, message: str) -> str | None:
+        """Create a commit with the staged changes.
+
+        Args:
+            message: Commit message.
+
+        Returns:
+            Commit hash if successful, None if nothing to commit.
+
+        Raises:
+            GitError: If git command fails (other than nothing to commit).
+        """
+        result = self._run_git(["commit", "-m", message], check=False)
+
+        if result.returncode != 0:
+            stdout = result.stdout.decode("utf-8", errors="replace")
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            # "nothing to commit" is not an error (can be in stdout or stderr)
+            if "nothing to commit" in stdout.lower() or "nothing to commit" in stderr.lower():
+                return None
+            msg = f"Commit failed:\n{stderr or stdout}"
+            raise GitError(msg)
+
+        # Get the commit hash
+        hash_result = self._run_git(["rev-parse", "HEAD"])
+        return hash_result.stdout.decode("utf-8", errors="replace").strip()
+
+    def auto_commit(self, task_id: str, task_title: str) -> str | None:
+        """Stage all changes and create a commit for a task.
+
+        Convenience method that combines add_all() and commit().
+
+        Args:
+            task_id: Task identifier for the commit message.
+            task_title: Task title for the commit message.
+
+        Returns:
+            Commit hash if changes were committed, None if nothing to commit.
+
+        Raises:
+            GitError: If git command fails.
+        """
+        if not self.has_uncommitted_changes():
+            return None
+
+        self.add_all()
+        message = f"[{task_id}] {task_title}\n\nAutomatically committed by Maestro."
+        return self.commit(message)

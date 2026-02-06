@@ -359,6 +359,44 @@ async def _retry_task(db_path: Path, task_id: str) -> None:
         await db.close()
 
 
+async def _approve_task(db_path: Path, task_id: str) -> None:
+    """Approve a task that is waiting for approval."""
+    # Path.exists() is fast sync I/O, acceptable in async context
+    if not db_path.exists():  # noqa: ASYNC240
+        err_console.print(f"[red]Database not found:[/red] {db_path}")
+        raise typer.Exit(1)
+
+    db = Database(db_path)
+    await db.connect()
+
+    try:
+        # Get the task
+        try:
+            task = await db.get_task(task_id)
+        except TaskNotFoundError:
+            err_console.print(f"[red]Task not found:[/red] {task_id}")
+            raise typer.Exit(1) from None
+
+        # Check if task is awaiting approval
+        if task.status != TaskStatus.AWAITING_APPROVAL:
+            err_console.print(
+                f"[red]Task is not awaiting approval:[/red] {task.status.value}"
+            )
+            err_console.print(
+                "Only tasks with status 'awaiting_approval' can be approved."
+            )
+            raise typer.Exit(1)
+
+        # Approve the task by transitioning to RUNNING
+        await db.update_task_status(task_id, TaskStatus.READY)
+
+        console.print(f"[green]Task '{task_id}' approved and set to READY[/green]")
+        console.print("The scheduler will pick it up on the next iteration.")
+
+    finally:
+        await db.close()
+
+
 def _stop_scheduler() -> None:
     """Stop the running scheduler by sending SIGTERM."""
     pid = _read_pid_file()
@@ -524,6 +562,37 @@ def stop_command() -> None:
         maestro stop
     """
     _stop_scheduler()
+
+
+@app.command("approve")
+def approve_command(
+    task_id: Annotated[
+        str,
+        typer.Argument(help="ID of the task to approve"),
+    ],
+    db: Annotated[
+        Path | None,
+        typer.Option(
+            "--db",
+            "-d",
+            help="Path to SQLite database file",
+            file_okay=True,
+            dir_okay=False,
+            resolve_path=True,
+        ),
+    ] = None,
+) -> None:
+    """Approve a task waiting for approval.
+
+    Approves a task that has requires_approval=true and is in
+    AWAITING_APPROVAL status, allowing the scheduler to execute it.
+
+    Examples:
+        maestro approve task-001
+        maestro approve task-001 --db /path/to/state.db
+    """
+    db_path = db or DEFAULT_DB_PATH
+    asyncio.run(_approve_task(db_path, task_id))
 
 
 @app.callback()

@@ -1016,3 +1016,111 @@ class TestEntryPoint:
         from maestro.cli import main
 
         assert callable(main)
+
+
+# =============================================================================
+# Helper: Setup DB with Awaiting Approval Task
+# =============================================================================
+
+
+def _setup_db_with_awaiting_approval_task(temp_dir: Path) -> Path:
+    """Create a database with a task awaiting approval."""
+
+    async def _setup() -> Path:
+        db_path = temp_dir / "test.db"
+        db = await create_database(db_path)
+
+        task = Task(
+            id="approval-task",
+            title="Task Needing Approval",
+            prompt="Do something critical",
+            workdir=str(temp_dir),
+            status=TaskStatus.AWAITING_APPROVAL,
+            requires_approval=True,
+        )
+        await db.create_task(task)
+        await db.close()
+        return db_path
+
+    return asyncio.run(_setup())
+
+
+# =============================================================================
+# Test: Approve Command
+# =============================================================================
+
+
+class TestApproveCommand:
+    """Tests for the approve command."""
+
+    def test_approve_help(self) -> None:
+        """Test approve command help."""
+        result = runner.invoke(app, ["approve", "--help"])
+
+        assert result.exit_code == 0
+        assert "approve" in result.output.lower()
+        assert (
+            "awaiting" in result.output.lower() or "approval" in result.output.lower()
+        )
+
+    def test_approve_db_not_found(self, temp_dir: Path) -> None:
+        """Test approve command when database doesn't exist."""
+        result = runner.invoke(
+            app, ["approve", "task-1", "--db", str(temp_dir / "nonexistent.db")]
+        )
+
+        assert result.exit_code != 0
+        assert (
+            "not found" in result.output.lower() or "database" in result.output.lower()
+        )
+
+    def test_approve_task_not_found(self, temp_dir: Path) -> None:
+        """Test approve command when task doesn't exist."""
+        db_path = _setup_empty_db(temp_dir)
+
+        result = runner.invoke(
+            app, ["approve", "nonexistent-task", "--db", str(db_path)]
+        )
+
+        assert result.exit_code != 0
+        assert "not found" in result.output.lower()
+
+    def test_approve_task_wrong_status(self, temp_dir: Path) -> None:
+        """Test approve command when task is not awaiting approval."""
+        db_path = _setup_db_with_running_task(temp_dir)
+
+        result = runner.invoke(app, ["approve", "test-task", "--db", str(db_path)])
+
+        assert result.exit_code != 0
+        assert "not awaiting approval" in result.output.lower()
+
+    def test_approve_awaiting_task(self, temp_dir: Path) -> None:
+        """Test approve command for a task awaiting approval."""
+        db_path = _setup_db_with_awaiting_approval_task(temp_dir)
+
+        result = runner.invoke(app, ["approve", "approval-task", "--db", str(db_path)])
+
+        assert result.exit_code == 0
+        assert "approved" in result.output.lower()
+        assert "ready" in result.output.lower()
+
+    def test_approve_updates_status_to_ready(self, temp_dir: Path) -> None:
+        """Test that approve command actually updates the task status."""
+        db_path = _setup_db_with_awaiting_approval_task(temp_dir)
+
+        # Approve the task
+        result = runner.invoke(app, ["approve", "approval-task", "--db", str(db_path)])
+        assert result.exit_code == 0
+
+        # Verify status changed
+        async def verify():
+            from maestro.database import Database
+
+            db = Database(db_path)
+            await db.connect()
+            task = await db.get_task("approval-task")
+            await db.close()
+            return task.status
+
+        status = asyncio.run(verify())
+        assert status == TaskStatus.READY

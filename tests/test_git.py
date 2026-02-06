@@ -687,3 +687,157 @@ class TestErrorHandling:
 
         assert "nonexistent-branch" in str(exc_info.value)
         assert "does not exist" in str(exc_info.value)
+
+
+# =============================================================================
+# Integration Tests: Commit Operations
+# =============================================================================
+
+
+class TestAddAll:
+    """Tests for add_all functionality."""
+
+    @pytest.mark.integration
+    def test_add_all_stages_untracked_files(self, git_repo: Path) -> None:
+        """Test that add_all stages untracked files."""
+        manager = GitManager(git_repo)
+
+        # Create untracked files
+        (git_repo / "file1.txt").write_text("content1")
+        (git_repo / "file2.txt").write_text("content2")
+
+        manager.add_all()
+
+        # Check that files are staged
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+        )
+        staged = result.stdout.decode("utf-8").strip().split("\n")
+        assert "file1.txt" in staged
+        assert "file2.txt" in staged
+
+    @pytest.mark.integration
+    def test_add_all_stages_modified_files(self, git_repo: Path) -> None:
+        """Test that add_all stages modified files."""
+        manager = GitManager(git_repo)
+
+        # Modify existing file
+        (git_repo / "README.md").write_text("Modified content\n")
+
+        manager.add_all()
+
+        # Check that file is staged
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+        )
+        assert "README.md" in result.stdout.decode("utf-8")
+
+
+class TestCommit:
+    """Tests for commit functionality."""
+
+    @pytest.mark.integration
+    def test_commit_creates_commit(self, git_repo: Path) -> None:
+        """Test that commit creates a commit with staged changes."""
+        manager = GitManager(git_repo)
+
+        # Stage a new file
+        (git_repo / "newfile.txt").write_text("content")
+        manager.add_all()
+
+        # Commit
+        commit_hash = manager.commit("Test commit message")
+
+        # Verify commit was created
+        assert commit_hash is not None
+        assert len(commit_hash) == 40  # SHA-1 hash
+
+        # Verify commit message
+        result = subprocess.run(
+            ["git", "log", "-1", "--format=%s"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+        )
+        assert result.stdout.decode("utf-8").strip() == "Test commit message"
+
+    @pytest.mark.integration
+    def test_commit_returns_none_when_nothing_to_commit(self, git_repo: Path) -> None:
+        """Test that commit returns None when nothing to commit."""
+        manager = GitManager(git_repo)
+
+        # No changes staged
+        result = manager.commit("No changes")
+
+        assert result is None
+
+    @pytest.mark.integration
+    def test_commit_returns_none_with_clean_working_dir(self, git_repo: Path) -> None:
+        """Test that commit returns None with clean working directory."""
+        manager = GitManager(git_repo)
+
+        # Working directory is clean (no staged or unstaged changes)
+        result = manager.commit("Should not commit")
+
+        assert result is None
+
+
+class TestAutoCommit:
+    """Tests for auto_commit functionality."""
+
+    @pytest.mark.integration
+    def test_auto_commit_with_changes(self, git_repo: Path) -> None:
+        """Test auto_commit stages and commits changes."""
+        manager = GitManager(git_repo)
+
+        # Create changes
+        (git_repo / "feature.py").write_text('print("Hello")\n')
+
+        # Auto commit
+        commit_hash = manager.auto_commit("task-001", "Implement feature X")
+
+        # Verify commit
+        assert commit_hash is not None
+
+        result = subprocess.run(
+            ["git", "log", "-1", "--format=%B"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+        )
+        commit_msg = result.stdout.decode("utf-8")
+        assert "[task-001]" in commit_msg
+        assert "Implement feature X" in commit_msg
+        assert "Automatically committed by Maestro" in commit_msg
+
+    @pytest.mark.integration
+    def test_auto_commit_no_changes(self, git_repo: Path) -> None:
+        """Test auto_commit returns None when no changes."""
+        manager = GitManager(git_repo)
+
+        # No changes
+        result = manager.auto_commit("task-001", "No changes")
+
+        assert result is None
+
+    @pytest.mark.integration
+    def test_auto_commit_cleans_working_directory(self, git_repo: Path) -> None:
+        """Test that auto_commit results in clean working directory."""
+        manager = GitManager(git_repo)
+
+        # Create multiple changes
+        (git_repo / "file1.py").write_text("content1")
+        (git_repo / "file2.py").write_text("content2")
+        (git_repo / "README.md").write_text("Updated readme\n")
+
+        assert manager.has_uncommitted_changes() is True
+
+        manager.auto_commit("task-001", "Multiple files")
+
+        assert manager.has_uncommitted_changes() is False
