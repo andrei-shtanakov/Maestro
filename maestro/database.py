@@ -15,7 +15,15 @@ from typing import Any
 
 import aiosqlite
 
-from maestro.models import AgentType, Message, Task, TaskCost, TaskStatus
+from maestro.models import (
+    AgentType,
+    Message,
+    Task,
+    TaskCost,
+    TaskStatus,
+    Zadacha,
+    ZadachaStatus,
+)
 
 
 class DatabaseError(Exception):
@@ -110,6 +118,36 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_messages_to_agent ON messages(to_agent, read);
 CREATE INDEX IF NOT EXISTS idx_agent_logs_task_id ON agent_logs(task_id);
 CREATE INDEX IF NOT EXISTS idx_task_costs_task_id ON task_costs(task_id);
+
+CREATE TABLE IF NOT EXISTS zadachi (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    workspace_path TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    scope TEXT,  -- JSON array
+    priority INTEGER DEFAULT 0,
+    pr_url TEXT,
+    process_pid INTEGER,
+    subtask_progress TEXT,
+    error_message TEXT,
+    retry_count INTEGER DEFAULT 0,
+    max_retries INTEGER DEFAULT 2,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS zadacha_dependencies (
+    zadacha_id TEXT NOT NULL,
+    depends_on TEXT NOT NULL,
+    PRIMARY KEY (zadacha_id, depends_on),
+    FOREIGN KEY (zadacha_id) REFERENCES zadachi(id) ON DELETE CASCADE,
+    FOREIGN KEY (depends_on) REFERENCES zadachi(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_zadachi_status ON zadachi(status);
 """
 
 
@@ -203,6 +241,41 @@ def _row_to_task_cost(row: aiosqlite.Row) -> TaskCost:
         estimated_cost_usd=row["estimated_cost_usd"],
         attempt=row["attempt"],
         created_at=_parse_datetime(row["created_at"]) or datetime.now(UTC),
+    )
+
+
+class ZadachaNotFoundError(DatabaseError):
+    """Raised when a zadacha is not found in the database."""
+
+
+class ZadachaAlreadyExistsError(DatabaseError):
+    """Raised when attempting to create a zadacha that already exists."""
+
+
+def _row_to_zadacha(row: aiosqlite.Row) -> Zadacha:
+    """Convert a database row to a Zadacha model."""
+    scope_json = row["scope"]
+    scope = json.loads(scope_json) if scope_json else []
+
+    return Zadacha(
+        id=row["id"],
+        title=row["title"],
+        description=row["description"],
+        branch=row["branch"],
+        workspace_path=row["workspace_path"],
+        status=ZadachaStatus(row["status"]),
+        scope=scope,
+        priority=row["priority"],
+        pr_url=row["pr_url"],
+        process_pid=row["process_pid"],
+        subtask_progress=row["subtask_progress"],
+        error_message=row["error_message"],
+        retry_count=row["retry_count"],
+        max_retries=row["max_retries"],
+        created_at=(_parse_datetime(row["created_at"]) or datetime.now(UTC)),
+        started_at=_parse_datetime(row["started_at"]),
+        completed_at=_parse_datetime(row["completed_at"]),
+        depends_on=[],  # Populated separately
     )
 
 
@@ -1181,6 +1254,302 @@ class Database:
             "total_cost_usd": float(row["total_cost_usd"]),
             "task_count": int(row["task_count"]),
         }
+
+    # =========================================================================
+    # Zadachi CRUD Operations
+    # =========================================================================
+
+    async def create_zadacha(self, zadacha: Zadacha) -> Zadacha:
+        """Create a new zadacha in the database.
+
+        Args:
+            zadacha: Zadacha model to persist.
+
+        Returns:
+            The created zadacha.
+
+        Raises:
+            ZadachaAlreadyExistsError: If zadacha with same ID exists.
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        try:
+            await self._connection.execute(
+                """
+                INSERT INTO zadachi (
+                    id, title, description, branch,
+                    workspace_path, status, scope, priority,
+                    pr_url, process_pid, subtask_progress,
+                    error_message, retry_count, max_retries,
+                    created_at, started_at, completed_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    zadacha.id,
+                    zadacha.title,
+                    zadacha.description,
+                    zadacha.branch,
+                    zadacha.workspace_path,
+                    zadacha.status.value,
+                    json.dumps(zadacha.scope),
+                    zadacha.priority,
+                    zadacha.pr_url,
+                    zadacha.process_pid,
+                    zadacha.subtask_progress,
+                    zadacha.error_message,
+                    zadacha.retry_count,
+                    zadacha.max_retries,
+                    _format_datetime(zadacha.created_at),
+                    _format_datetime(zadacha.started_at),
+                    _format_datetime(zadacha.completed_at),
+                ),
+            )
+        except sqlite3.IntegrityError as e:
+            if "UNIQUE" in str(e) or "PRIMARY KEY" in str(e):
+                msg = f"Zadacha with ID '{zadacha.id}' already exists"
+                raise ZadachaAlreadyExistsError(msg) from e
+            raise
+
+        # Insert dependencies
+        for dep_id in zadacha.depends_on:
+            await self._connection.execute(
+                "INSERT INTO zadacha_dependencies "
+                "(zadacha_id, depends_on) VALUES (?, ?)",
+                (zadacha.id, dep_id),
+            )
+
+        await self._connection.commit()
+        return zadacha
+
+    async def get_zadacha(self, zadacha_id: str) -> Zadacha:
+        """Get a zadacha by ID.
+
+        Args:
+            zadacha_id: Zadacha identifier.
+
+        Returns:
+            Zadacha model with dependencies populated.
+
+        Raises:
+            ZadachaNotFoundError: If zadacha not found.
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            "SELECT * FROM zadachi WHERE id = ?",
+            (zadacha_id,),
+        )
+        row = await cursor.fetchone()
+
+        if row is None:
+            msg = f"Zadacha with ID '{zadacha_id}' not found"
+            raise ZadachaNotFoundError(msg)
+
+        zadacha = _row_to_zadacha(row)
+
+        # Fetch dependencies
+        deps_cursor = await self._connection.execute(
+            "SELECT depends_on FROM zadacha_dependencies WHERE zadacha_id = ?",
+            (zadacha_id,),
+        )
+        deps = await deps_cursor.fetchall()
+        depends_on = [dep["depends_on"] for dep in deps]
+
+        return zadacha.model_copy(update={"depends_on": depends_on})
+
+    async def get_all_zadachi(self) -> list[Zadacha]:
+        """Get all zadachi from the database.
+
+        Returns:
+            List of all Zadacha models with dependencies.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            "SELECT * FROM zadachi ORDER BY priority DESC, created_at"
+        )
+        rows = await cursor.fetchall()
+
+        zadachi = []
+        for row in rows:
+            z = _row_to_zadacha(row)
+            deps_cursor = await self._connection.execute(
+                "SELECT depends_on FROM zadacha_dependencies WHERE zadacha_id = ?",
+                (z.id,),
+            )
+            deps = await deps_cursor.fetchall()
+            depends_on = [dep["depends_on"] for dep in deps]
+            zadachi.append(z.model_copy(update={"depends_on": depends_on}))
+
+        return zadachi
+
+    async def update_zadacha_status(
+        self,
+        zadacha_id: str,
+        new_status: ZadachaStatus,
+        expected_status: ZadachaStatus | None = None,
+        **extra_fields: Any,
+    ) -> Zadacha:
+        """Atomically update zadacha status.
+
+        Args:
+            zadacha_id: Zadacha identifier.
+            new_status: New status to set.
+            expected_status: If provided, update only if current
+                status matches.
+            **extra_fields: Additional fields to update.
+
+        Returns:
+            Updated zadacha.
+
+        Raises:
+            ZadachaNotFoundError: If zadacha not found.
+            ConcurrentModificationError: If expected_status
+                doesn't match.
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        set_clauses = ["status = ?"]
+        params: list[Any] = [new_status.value]
+
+        # Handle timestamp updates
+        if new_status == ZadachaStatus.RUNNING:
+            set_clauses.append("started_at = COALESCE(started_at, ?)")
+            params.append(_format_datetime(datetime.now(UTC)))
+        elif new_status in (
+            ZadachaStatus.DONE,
+            ZadachaStatus.ABANDONED,
+        ):
+            set_clauses.append("completed_at = ?")
+            params.append(_format_datetime(datetime.now(UTC)))
+
+        # Add extra fields
+        allowed = {
+            "error_message",
+            "workspace_path",
+            "process_pid",
+            "subtask_progress",
+            "pr_url",
+            "retry_count",
+            "branch",
+        }
+        for field_name, value in extra_fields.items():
+            if field_name in allowed:
+                set_clauses.append(f"{field_name} = ?")
+                params.append(value)
+
+        # Build WHERE clause
+        where_clauses = ["id = ?"]
+        params.append(zadacha_id)
+
+        if expected_status is not None:
+            where_clauses.append("status = ?")
+            params.append(expected_status.value)
+
+        query = (
+            f"UPDATE zadachi SET {', '.join(set_clauses)} "
+            f"WHERE {' AND '.join(where_clauses)}"
+        )
+
+        cursor = await self._connection.execute(query, params)
+        await self._connection.commit()
+
+        if cursor.rowcount == 0:
+            check = await self._connection.execute(
+                "SELECT status FROM zadachi WHERE id = ?",
+                (zadacha_id,),
+            )
+            row = await check.fetchone()
+
+            if row is None:
+                msg = f"Zadacha with ID '{zadacha_id}' not found"
+                raise ZadachaNotFoundError(msg)
+
+            if expected_status is not None:
+                msg = (
+                    f"Zadacha '{zadacha_id}' status is "
+                    f"'{row['status']}', expected "
+                    f"'{expected_status.value}'"
+                )
+                raise ConcurrentModificationError(msg)
+
+        return await self.get_zadacha(zadacha_id)
+
+    async def get_zadachi_by_status(self, status: ZadachaStatus) -> list[Zadacha]:
+        """Get all zadachi with a specific status.
+
+        Args:
+            status: Status to filter by.
+
+        Returns:
+            List of zadachi with the specified status.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            "SELECT * FROM zadachi WHERE status = ? ORDER BY priority DESC, created_at",
+            (status.value,),
+        )
+        rows = await cursor.fetchall()
+
+        zadachi = []
+        for row in rows:
+            z = _row_to_zadacha(row)
+            deps_cursor = await self._connection.execute(
+                "SELECT depends_on FROM zadacha_dependencies WHERE zadacha_id = ?",
+                (z.id,),
+            )
+            deps = await deps_cursor.fetchall()
+            depends_on = [dep["depends_on"] for dep in deps]
+            zadachi.append(z.model_copy(update={"depends_on": depends_on}))
+
+        return zadachi
+
+    async def delete_zadacha(self, zadacha_id: str) -> bool:
+        """Delete a zadacha by ID.
+
+        Args:
+            zadacha_id: Zadacha identifier.
+
+        Returns:
+            True if deleted, False if not found.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            "DELETE FROM zadachi WHERE id = ?",
+            (zadacha_id,),
+        )
+        await self._connection.commit()
+
+        return cursor.rowcount > 0
 
 
 # Convenience function for creating and initializing a database

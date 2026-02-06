@@ -2,7 +2,12 @@
 
 __version__ = "0.1.0"
 
-from maestro.config import ConfigError, load_config, load_config_from_string
+from maestro.config import (
+    ConfigError,
+    load_config,
+    load_config_from_string,
+    load_orchestrator_config,
+)
 from maestro.dag import DAG, CycleError, DAGNode, ScopeWarning
 from maestro.database import (
     ConcurrentModificationError,
@@ -27,9 +32,11 @@ from maestro.git import (
     GitError,
     GitManager,
     GitNotFoundError,
+    MergeConflictError,
     NotARepositoryError,
     RebaseConflictError,
     RemoteError,
+    WorktreeError,
 )
 from maestro.notifications import (
     DesktopNotifier,
@@ -67,34 +74,27 @@ from maestro.validator import (
 
 
 __all__ = [
-    # DAG
     "DAG",
-    # Spawners
     "AgentSpawner",
-    # Scheduler
     "BaseSpawner",
-    # Git
     "BranchExistsError",
     "BranchNotFoundError",
     "ClaudeCodeSpawner",
-    # Database
     "ConcurrentModificationError",
-    # Config
     "ConfigError",
     "CycleError",
     "DAGNode",
     "Database",
     "DatabaseError",
     "DependencyNotFoundError",
-    # Notifications
     "DesktopNotifier",
-    # Event logging
     "Event",
     "EventLogger",
     "EventType",
     "GitError",
     "GitManager",
     "GitNotFoundError",
+    "MergeConflictError",
     "NotARepositoryError",
     "Notification",
     "NotificationChannel",
@@ -102,10 +102,8 @@ __all__ = [
     "NotificationManager",
     "Platform",
     "RebaseConflictError",
-    # Recovery
     "RecoveryStatistics",
     "RemoteError",
-    # Retry
     "RetryManager",
     "RunningTask",
     "Scheduler",
@@ -118,11 +116,11 @@ __all__ = [
     "TaskAlreadyExistsError",
     "TaskNotFoundError",
     "TaskTimeoutError",
-    # Validation
     "ValidationError",
     "ValidationResult",
     "ValidationTimeoutError",
     "Validator",
+    "WorktreeError",
     "create_database",
     "create_default_registry",
     "create_event_logger",
@@ -131,5 +129,6 @@ __all__ = [
     "get_event_logger",
     "load_config",
     "load_config_from_string",
+    "load_orchestrator_config",
     "set_event_logger",
 ]

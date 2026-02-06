@@ -1,0 +1,87 @@
+# =============================================================================
+# Maestro Task Scheduler — Example Configuration
+# =============================================================================
+#
+# This file configures Maestro to run tasks in a shared directory
+# with DAG-based dependency resolution and parallel execution.
+#
+# Usage:
+#   uv run maestro run tasks.yaml
+#   uv run maestro run tasks.yaml --resume
+#   uv run maestro status
+#
+# =============================================================================
+
+project: my-app
+repo: ~/projects/my-app
+max_concurrent: 3
+
+# Default values applied to all tasks (can be overridden per-task)
+defaults:
+  timeout_minutes: 30
+  max_retries: 2
+  agent_type: claude_code
+
+# Git settings
+git:
+  base_branch: main
+  auto_push: true
+  branch_prefix: "agent/"
+
+# Desktop notifications on task completion/failure
+notifications:
+  desktop: true
+
+tasks:
+  # --- Foundation layer (no dependencies) ---
+
+  - id: setup-models
+    title: "Create data models"
+    prompt: |
+      Create SQLAlchemy models for User and Post in src/models/.
+      Include proper relationships, indexes, and Alembic migration.
+    scope: ["src/models/**", "alembic/**"]
+    priority: 10
+
+  - id: setup-config
+    title: "Setup configuration"
+    prompt: |
+      Create a config module using pydantic-settings in src/config.py.
+      Support .env files and environment variables for database URL,
+      secret key, and API settings.
+    scope: ["src/config.py", ".env.example"]
+    priority: 10
+
+  # --- API layer (depends on models + config) ---
+
+  - id: create-api
+    title: "Create API endpoints"
+    prompt: |
+      Create FastAPI CRUD endpoints for User and Post in src/api/.
+      Include proper request/response schemas with Pydantic.
+    scope: ["src/api/**", "src/schemas/**"]
+    depends_on: [setup-models, setup-config]
+    validation_cmd: "uv run pytest tests/test_api.py"
+
+  # --- Auth (depends on models) ---
+
+  - id: add-auth
+    title: "Add authentication"
+    prompt: |
+      Add JWT authentication with login and register endpoints.
+      Include middleware for protected routes.
+    scope: ["src/auth/**", "src/middleware/**"]
+    depends_on: [setup-models, setup-config]
+    requires_approval: true   # Manual review before starting
+
+  # --- Tests (depends on API + auth) ---
+
+  - id: write-tests
+    title: "Write test suite"
+    prompt: |
+      Write comprehensive pytest tests covering models, API endpoints,
+      and authentication. Include fixtures and test database setup.
+    scope: ["tests/**"]
+    depends_on: [create-api, add-auth]
+    validation_cmd: "uv run pytest --tb=short"
+    timeout_minutes: 45

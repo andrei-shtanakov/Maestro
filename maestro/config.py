@@ -17,7 +17,7 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
-from maestro.models import ProjectConfig
+from maestro.models import OrchestratorConfig, ProjectConfig
 
 
 class ConfigError(Exception):
@@ -220,6 +220,57 @@ def load_config(path: Path | str) -> ProjectConfig:
     # Validate through Pydantic
     try:
         return ProjectConfig(**resolved_config)
+    except ValidationError as exc:
+        raise _format_validation_error(exc, path) from exc
+
+
+def load_orchestrator_config(
+    path: Path | str,
+) -> OrchestratorConfig:
+    """Load and validate an orchestrator YAML config.
+
+    Args:
+        path: Path to the YAML configuration file.
+
+    Returns:
+        Validated OrchestratorConfig.
+
+    Raises:
+        ConfigError: If file cannot be read or validated.
+    """
+    if isinstance(path, str):
+        path = Path(path)
+
+    if not path.exists():
+        raise ConfigError(
+            f"Configuration file not found: {path}",
+            path=path,
+        )
+
+    if not path.is_file():
+        raise ConfigError(f"Path is not a file: {path}", path=path)
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            raw_config = yaml.safe_load(f)
+    except yaml.YAMLError as exc:
+        raise _format_yaml_error(exc, path) from exc
+    except OSError as exc:
+        raise ConfigError(f"Cannot read file: {exc}", path=path) from exc
+
+    if raw_config is None:
+        raise ConfigError("Configuration file is empty", path=path)
+
+    if not isinstance(raw_config, dict):
+        raise ConfigError(
+            f"Configuration must be a YAML mapping, got {type(raw_config).__name__}",
+            path=path,
+        )
+
+    resolved_config = resolve_env_vars(raw_config, path)
+
+    try:
+        return OrchestratorConfig(**resolved_config)
     except ValidationError as exc:
         raise _format_validation_error(exc, path) from exc
 

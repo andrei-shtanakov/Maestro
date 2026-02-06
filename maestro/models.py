@@ -2,13 +2,14 @@
 
 This module defines the core data models for task configuration, runtime state,
 and project configuration. It includes the TaskStatus enum with valid state
-transitions and comprehensive validation.
+transitions and comprehensive validation. Also defines models for multi-process
+orchestration with zadachi (independent work units).
 """
 
 import re
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Self
+from typing import Any, Self
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -520,3 +521,373 @@ class Message(BaseModel):
         default_factory=lambda: datetime.now(UTC),
         description="Message creation timestamp",
     )
+
+
+# =============================================================================
+# Multi-Process Orchestration Models
+# =============================================================================
+
+
+class WorkspaceType(StrEnum):
+    """Workspace isolation strategy for zadachi."""
+
+    WORKTREE = "worktree"
+
+
+class ZadachaStatus(StrEnum):
+    """Zadacha execution status with valid state transitions.
+
+    State machine:
+        PENDING → DECOMPOSING → READY → RUNNING → MERGING → PR_CREATED → DONE
+                                  │        │
+                                  │        └→ FAILED → READY (retry)
+                                  │                      │
+                                  │                      └→ NEEDS_REVIEW
+                                  │
+                                  └→ ABANDONED
+    """
+
+    PENDING = "pending"
+    DECOMPOSING = "decomposing"
+    READY = "ready"
+    RUNNING = "running"
+    MERGING = "merging"
+    PR_CREATED = "pr_created"
+    DONE = "done"
+    FAILED = "failed"
+    NEEDS_REVIEW = "needs_review"
+    ABANDONED = "abandoned"
+
+    @classmethod
+    def valid_transitions(
+        cls,
+    ) -> dict["ZadachaStatus", set["ZadachaStatus"]]:
+        """Return the mapping of valid state transitions."""
+        return {
+            cls.PENDING: {cls.DECOMPOSING, cls.READY},
+            cls.DECOMPOSING: {cls.READY, cls.FAILED},
+            cls.READY: {cls.RUNNING, cls.ABANDONED},
+            cls.RUNNING: {cls.MERGING, cls.FAILED},
+            cls.MERGING: {cls.PR_CREATED, cls.FAILED},
+            cls.PR_CREATED: {cls.DONE, cls.FAILED},
+            cls.FAILED: {cls.READY, cls.NEEDS_REVIEW},
+            cls.NEEDS_REVIEW: {cls.READY, cls.ABANDONED},
+            cls.DONE: set(),
+            cls.ABANDONED: set(),
+        }
+
+    def can_transition_to(self, target: "ZadachaStatus") -> bool:
+        """Check if transition to target status is valid."""
+        return target in self.valid_transitions().get(self, set())
+
+    def is_terminal(self) -> bool:
+        """Check if this is a terminal state."""
+        return self in (ZadachaStatus.DONE, ZadachaStatus.ABANDONED)
+
+
+class ZadachaConfig(BaseModel):
+    """Configuration for a single zadacha (independent work unit).
+
+    Used in YAML config or produced by auto-decomposition.
+    """
+
+    id: str = Field(..., min_length=1, description="Unique zadacha identifier")
+    title: str = Field(..., min_length=1, description="Human-readable title")
+    description: str = Field(..., min_length=1, description="Detailed description")
+    scope: list[str] = Field(
+        default_factory=list,
+        description="File/directory globs this zadacha owns",
+    )
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description="IDs of zadachi this one depends on",
+    )
+    priority: int = Field(
+        default=0,
+        ge=-100,
+        le=100,
+        description="Execution priority (-100 to 100)",
+    )
+
+    @field_validator("id")
+    @classmethod
+    def validate_id_format(cls, v: str) -> str:
+        """Validate zadacha ID format."""
+        if not re.match(r"^[a-zA-Z0-9_-]+$", v):
+            msg = (
+                "Zadacha ID must contain only alphanumeric "
+                "characters, hyphens, and underscores"
+            )
+            raise ValueError(msg)
+        return v
+
+    @field_validator("scope", mode="before")
+    @classmethod
+    def normalize_scope(cls, v: list[str] | str | None) -> list[str]:
+        """Normalize scope to a list of strings."""
+        if v is None:
+            return []
+        if isinstance(v, str):
+            return [v]
+        return v
+
+    @field_validator("depends_on", mode="before")
+    @classmethod
+    def normalize_depends_on(cls, v: list[str] | str | None) -> list[str]:
+        """Normalize depends_on to a list of strings."""
+        if v is None:
+            return []
+        if isinstance(v, str):
+            return [v]
+        return v
+
+    @model_validator(mode="after")
+    def validate_no_self_dependency(self) -> Self:
+        """Ensure zadacha does not depend on itself."""
+        if self.id in self.depends_on:
+            msg = f"Zadacha '{self.id}' cannot depend on itself"
+            raise ValueError(msg)
+        return self
+
+
+class Zadacha(BaseModel):
+    """Runtime zadacha model with execution state.
+
+    A zadacha is an independent work unit that runs in its own
+    git worktree via spec-runner.
+    """
+
+    id: str = Field(..., min_length=1, description="Unique zadacha identifier")
+    title: str = Field(..., min_length=1, description="Human-readable title")
+    description: str = Field(..., min_length=1, description="Detailed description")
+    branch: str = Field(..., min_length=1, description="Git branch name")
+    workspace_path: str | None = Field(default=None, description="Path to git worktree")
+    status: ZadachaStatus = Field(
+        default=ZadachaStatus.PENDING,
+        description="Current execution status",
+    )
+    scope: list[str] = Field(
+        default_factory=list,
+        description="File/directory globs this zadacha owns",
+    )
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description="IDs of zadachi this one depends on",
+    )
+    priority: int = Field(default=0, description="Execution priority")
+    process_pid: int | None = Field(
+        default=None, description="PID of spec-runner process"
+    )
+    subtask_progress: str | None = Field(
+        default=None, description="Progress string e.g. '3/7 done'"
+    )
+    pr_url: str | None = Field(default=None, description="GitHub PR URL after creation")
+    error_message: str | None = Field(
+        default=None, description="Error message if failed"
+    )
+    retry_count: int = Field(default=0, ge=0, description="Current retry count")
+    max_retries: int = Field(
+        default=2, ge=0, le=10, description="Maximum retry attempts"
+    )
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        description="Creation timestamp",
+    )
+    started_at: datetime | None = Field(default=None, description="Start timestamp")
+    completed_at: datetime | None = Field(
+        default=None, description="Completion timestamp"
+    )
+
+    def can_transition_to(self, target: ZadachaStatus) -> bool:
+        """Check if transition to target status is valid."""
+        return self.status.can_transition_to(target)
+
+    def transition_to(self, target: ZadachaStatus) -> "Zadacha":
+        """Create a new Zadacha with the target status.
+
+        Raises:
+            ValueError: If the transition is not valid.
+        """
+        if not self.can_transition_to(target):
+            msg = f"Invalid transition from {self.status.value} to {target.value}"
+            raise ValueError(msg)
+
+        updates: dict[str, datetime | ZadachaStatus] = {"status": target}
+
+        if target == ZadachaStatus.RUNNING and self.started_at is None:
+            updates["started_at"] = datetime.now(UTC)
+
+        if (
+            target
+            in (
+                ZadachaStatus.DONE,
+                ZadachaStatus.ABANDONED,
+            )
+            and self.started_at
+        ):
+            updates["completed_at"] = datetime.now(UTC)
+
+        return self.model_copy(update=updates)
+
+    def can_retry(self) -> bool:
+        """Check if zadacha can be retried."""
+        return self.retry_count < self.max_retries
+
+    @classmethod
+    def from_config(
+        cls,
+        config: ZadachaConfig,
+        branch_prefix: str = "feature/",
+    ) -> "Zadacha":
+        """Create a Zadacha from a ZadachaConfig."""
+        return cls(
+            id=config.id,
+            title=config.title,
+            description=config.description,
+            branch=f"{branch_prefix}{config.id}",
+            scope=config.scope,
+            depends_on=config.depends_on,
+            priority=config.priority,
+        )
+
+
+class SpecRunnerConfig(BaseModel):
+    """Configuration passed through to spec-runner."""
+
+    max_retries: int = Field(default=3, ge=0, description="Max retries per task")
+    task_timeout_minutes: int = Field(
+        default=30, ge=1, description="Timeout per task in minutes"
+    )
+    claude_command: str = Field(default="claude", description="Claude CLI command")
+    auto_commit: bool = Field(default=True, description="Auto-commit after task")
+    create_git_branch: bool = Field(
+        default=True,
+        description="Create sub-branch per task",
+    )
+    run_tests_on_done: bool = Field(default=True, description="Run tests after task")
+    test_command: str = Field(
+        default="uv run pytest",
+        description="Test command to run",
+    )
+    lint_command: str = Field(
+        default="uv run ruff check .",
+        description="Lint command to run",
+    )
+    run_lint_on_done: bool = Field(default=True, description="Run lint after task")
+
+    def to_executor_config(self) -> dict[str, Any]:
+        """Convert to executor.config.yaml format."""
+        return {
+            "executor": {
+                "max_retries": self.max_retries,
+                "task_timeout_minutes": self.task_timeout_minutes,
+                "claude_command": self.claude_command,
+                "auto_commit": self.auto_commit,
+                "hooks": {
+                    "pre_start": {
+                        "create_git_branch": self.create_git_branch,
+                    },
+                    "post_done": {
+                        "run_tests": self.run_tests_on_done,
+                        "run_lint": self.run_lint_on_done,
+                        "auto_commit": self.auto_commit,
+                    },
+                },
+                "commands": {
+                    "test": self.test_command,
+                    "lint": self.lint_command,
+                },
+            },
+        }
+
+
+class OrchestratorConfig(BaseModel):
+    """Configuration for multi-process orchestration.
+
+    Root model for project.yaml configuration files.
+    """
+
+    project: str = Field(..., min_length=1, description="Project name")
+    description: str = Field(
+        default="",
+        description="Project description for auto-decomposition",
+    )
+    repo_url: str = Field(..., min_length=1, description="GitHub remote URL")
+    repo_path: str = Field(..., min_length=1, description="Local repository path")
+    workspace_base: str = Field(
+        ...,
+        min_length=1,
+        description="Base directory for worktrees",
+    )
+    max_concurrent: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Max concurrent zadachi",
+    )
+    base_branch: str = Field(default="main", description="Base branch name")
+    branch_prefix: str = Field(
+        default="feature/",
+        description="Prefix for zadacha branches",
+    )
+    auto_pr: bool = Field(
+        default=True,
+        description="Auto-create PR after zadacha completes",
+    )
+    spec_runner: SpecRunnerConfig = Field(
+        default_factory=SpecRunnerConfig,
+        description="Spec-runner configuration",
+    )
+    zadachi: list[ZadachaConfig] = Field(
+        default_factory=list,
+        description="Manual zadachi list (auto-decompose if empty)",
+    )
+    callback_url: str = Field(
+        default="",
+        description="URL for spec-runner to POST task status callbacks",
+    )
+    notifications: NotificationConfig | None = Field(
+        default=None, description="Notification configuration"
+    )
+
+    @field_validator("repo_path")
+    @classmethod
+    def validate_repo_path(cls, v: str) -> str:
+        """Validate repository path format."""
+        if not v.startswith("/") and not v.startswith("~"):
+            msg = "Repository path must be an absolute path (starting with / or ~)"
+            raise ValueError(msg)
+        return v
+
+    @field_validator("branch_prefix")
+    @classmethod
+    def validate_branch_prefix(cls, v: str) -> str:
+        """Validate branch prefix format."""
+        if not re.match(r"^[a-zA-Z0-9_/-]*$", v):
+            msg = (
+                "Branch prefix must contain only alphanumeric "
+                "characters, hyphens, underscores, and slashes"
+            )
+            raise ValueError(msg)
+        return v
+
+    @model_validator(mode="after")
+    def validate_unique_zadacha_ids(self) -> Self:
+        """Ensure all zadacha IDs are unique."""
+        ids = [z.id for z in self.zadachi]
+        if len(ids) != len(set(ids)):
+            duplicates = [i for i in ids if ids.count(i) > 1]
+            msg = f"Duplicate zadacha IDs: {set(duplicates)}"
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def validate_zadacha_dependencies_exist(self) -> Self:
+        """Ensure all zadacha dependencies reference existing IDs."""
+        ids = {z.id for z in self.zadachi}
+        for z in self.zadachi:
+            missing = set(z.depends_on) - ids
+            if missing:
+                msg = f"Zadacha '{z.id}' has unknown dependencies: {missing}"
+                raise ValueError(msg)
+        return self

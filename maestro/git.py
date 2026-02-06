@@ -1,7 +1,8 @@
 """Git management operations for task isolation.
 
 This module provides GitManager for handling git branch creation,
-rebasing, and pushing operations to ensure task execution isolation.
+rebasing, pushing, and worktree operations to ensure task execution
+isolation in both single-process and multi-process modes.
 """
 
 import contextlib
@@ -36,6 +37,14 @@ class RebaseConflictError(GitError):
 
 class NotARepositoryError(GitError):
     """Raised when the path is not a git repository."""
+
+
+class MergeConflictError(GitError):
+    """Raised when merge encounters conflicts."""
+
+
+class WorktreeError(GitError):
+    """Raised when worktree operations fail."""
 
 
 class GitManager:
@@ -334,7 +343,10 @@ class GitManager:
             stdout = result.stdout.decode("utf-8", errors="replace")
             stderr = result.stderr.decode("utf-8", errors="replace")
             # "nothing to commit" is not an error (can be in stdout or stderr)
-            if "nothing to commit" in stdout.lower() or "nothing to commit" in stderr.lower():
+            if (
+                "nothing to commit" in stdout.lower()
+                or "nothing to commit" in stderr.lower()
+            ):
                 return None
             msg = f"Commit failed:\n{stderr or stdout}"
             raise GitError(msg)
@@ -364,3 +376,175 @@ class GitManager:
         self.add_all()
         message = f"[{task_id}] {task_title}\n\nAutomatically committed by Maestro."
         return self.commit(message)
+
+    # =================================================================
+    # Worktree Operations
+    # =================================================================
+
+    def create_worktree(self, path: Path, branch: str) -> None:
+        """Create a git worktree at the given path on a new branch.
+
+        Args:
+            path: Filesystem path for the worktree.
+            branch: Branch name to create for this worktree.
+
+        Raises:
+            BranchExistsError: If branch already exists.
+            WorktreeError: If worktree creation fails.
+        """
+        if self.branch_exists(branch):
+            msg = f"Branch '{branch}' already exists"
+            raise BranchExistsError(msg)
+
+        try:
+            self._run_git(["worktree", "add", str(path), "-b", branch])
+        except GitError as e:
+            msg = f"Failed to create worktree at '{path}' on branch '{branch}': {e}"
+            raise WorktreeError(msg) from e
+
+    def create_worktree_existing_branch(self, path: Path, branch: str) -> None:
+        """Create a git worktree for an existing branch.
+
+        Args:
+            path: Filesystem path for the worktree.
+            branch: Existing branch to checkout.
+
+        Raises:
+            BranchNotFoundError: If branch does not exist.
+            WorktreeError: If worktree creation fails.
+        """
+        if not self.branch_exists(branch):
+            msg = f"Branch '{branch}' does not exist"
+            raise BranchNotFoundError(msg)
+
+        try:
+            self._run_git(["worktree", "add", str(path), branch])
+        except GitError as e:
+            msg = f"Failed to create worktree at '{path}' for branch '{branch}': {e}"
+            raise WorktreeError(msg) from e
+
+    def remove_worktree(self, path: Path, force: bool = False) -> None:
+        """Remove a git worktree.
+
+        Args:
+            path: Filesystem path of the worktree to remove.
+            force: Force removal even if worktree is dirty.
+
+        Raises:
+            WorktreeError: If worktree removal fails.
+        """
+        args = ["worktree", "remove", str(path)]
+        if force:
+            args.append("--force")
+
+        try:
+            self._run_git(args)
+        except GitError as e:
+            msg = f"Failed to remove worktree at '{path}': {e}"
+            raise WorktreeError(msg) from e
+
+    def list_worktrees(self) -> list[dict[str, str]]:
+        """List all git worktrees.
+
+        Returns:
+            List of dicts with 'path', 'branch', and 'head' keys.
+        """
+        result = self._run_git(["worktree", "list", "--porcelain"])
+        output = result.stdout.decode("utf-8", errors="replace").strip()
+
+        if not output:
+            return []
+
+        worktrees: list[dict[str, str]] = []
+        current: dict[str, str] = {}
+
+        for line in output.split("\n"):
+            if line.startswith("worktree "):
+                if current:
+                    worktrees.append(current)
+                current = {"path": line[9:]}
+            elif line.startswith("HEAD "):
+                current["head"] = line[5:]
+            elif line.startswith("branch "):
+                # refs/heads/feature/xxx → feature/xxx
+                ref = line[7:]
+                if ref.startswith("refs/heads/"):
+                    ref = ref[11:]
+                current["branch"] = ref
+            elif line == "detached":
+                current["branch"] = "(detached)"
+
+        if current:
+            worktrees.append(current)
+
+        return worktrees
+
+    def prune_worktrees(self) -> None:
+        """Prune stale worktree references."""
+        self._run_git(["worktree", "prune"])
+
+    # =================================================================
+    # Merge Operations
+    # =================================================================
+
+    def merge_branch(
+        self,
+        source: str,
+        target: str,
+        no_ff: bool = True,
+    ) -> None:
+        """Merge source branch into target branch.
+
+        Checks out target, merges source, then stays on target.
+
+        Args:
+            source: Branch to merge from.
+            target: Branch to merge into.
+            no_ff: Use --no-ff for merge commit (default True).
+
+        Raises:
+            BranchNotFoundError: If either branch not found.
+            MergeConflictError: If merge has conflicts.
+            GitError: If git command fails.
+        """
+        for branch in (source, target):
+            if not self.branch_exists(branch):
+                msg = f"Branch '{branch}' does not exist"
+                raise BranchNotFoundError(msg)
+
+        self.checkout(target)
+
+        args = ["merge", source]
+        if no_ff:
+            args.append("--no-ff")
+        args.extend(["-m", f"Merge '{source}' into '{target}'"])
+
+        result = self._run_git(args, check=False)
+
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            # Abort merge on conflict
+            self._run_git(["merge", "--abort"], check=False)
+            if "CONFLICT" in stderr or "conflict" in stderr.lower():
+                msg = f"Merge conflicts merging '{source}' into '{target}':\n{stderr}"
+                raise MergeConflictError(msg)
+            msg = f"Merge failed:\n{stderr}"
+            raise GitError(msg)
+
+    def delete_branch(self, branch: str, force: bool = False) -> None:
+        """Delete a local branch.
+
+        Args:
+            branch: Branch name to delete.
+            force: Force delete with -D instead of -d.
+
+        Raises:
+            BranchNotFoundError: If branch does not exist.
+            GitError: If git command fails.
+        """
+        if not self.branch_exists(branch):
+            msg = f"Branch '{branch}' does not exist"
+            raise BranchNotFoundError(msg)
+
+        flag = "-D" if force else "-d"
+        self._run_git(["branch", flag, branch])

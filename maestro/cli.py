@@ -32,8 +32,14 @@ from maestro import (
     create_scheduler_from_config,
     load_config,
 )
+from maestro.config import load_orchestrator_config
 from maestro.dag import DAG
-from maestro.models import TaskStatus
+from maestro.decomposer import ProjectDecomposer
+from maestro.git import GitManager
+from maestro.models import OrchestratorConfig, TaskStatus, ZadachaStatus
+from maestro.orchestrator import Orchestrator
+from maestro.pr_manager import PRManager
+from maestro.workspace import WorkspaceManager
 
 
 # Default paths
@@ -593,6 +599,318 @@ def approve_command(
     """
     db_path = db or DEFAULT_DB_PATH
     asyncio.run(_approve_task(db_path, task_id))
+
+
+# =================================================================
+# Multi-Process Orchestration Commands
+# =================================================================
+
+
+def _get_zadacha_status_style(
+    status: ZadachaStatus,
+) -> str:
+    """Return Rich style for zadacha status."""
+    styles = {
+        ZadachaStatus.DONE: "green",
+        ZadachaStatus.RUNNING: "yellow",
+        ZadachaStatus.DECOMPOSING: "yellow",
+        ZadachaStatus.MERGING: "yellow",
+        ZadachaStatus.PR_CREATED: "blue",
+        ZadachaStatus.FAILED: "red",
+        ZadachaStatus.NEEDS_REVIEW: "red",
+        ZadachaStatus.PENDING: "dim",
+        ZadachaStatus.READY: "cyan",
+        ZadachaStatus.ABANDONED: "dim red",
+    }
+    return styles.get(status, "white")
+
+
+def _display_zadachi_table(zadachi: list, title: str = "Zadachi") -> None:
+    """Display zadachi in a rich table."""
+    if not zadachi:
+        console.print("[dim]No zadachi found.[/dim]")
+        return
+
+    table = Table(
+        title=title,
+        show_header=True,
+        header_style="bold",
+    )
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Title", style="white")
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Branch", style="dim")
+    table.add_column("Progress", justify="center")
+    table.add_column("PR", style="blue", max_width=30)
+
+    for z in zadachi:
+        style = _get_zadacha_status_style(z.status)
+        status_text = Text(z.status.value.upper(), style=style)
+        pr_text = z.pr_url or ""
+        if len(pr_text) > 30:
+            pr_text = pr_text[-27:] + "..."
+
+        table.add_row(
+            z.id,
+            z.title,
+            status_text,
+            z.branch,
+            z.subtask_progress or "-",
+            pr_text,
+        )
+
+    console.print(table)
+
+
+def _resolve_orchestrator_paths(
+    config: OrchestratorConfig,
+    log_dir: Path | None,
+) -> tuple[Path, Path, Path]:
+    """Resolve paths from orchestrator config.
+
+    Returns:
+        Tuple of (repo_path, workspace_base, log_dir).
+    """
+    repo_path = Path(config.repo_path).expanduser()
+    workspace_base = Path(config.workspace_base).expanduser()
+    resolved_log_dir = log_dir if log_dir is not None else repo_path / "logs"
+    return repo_path, workspace_base, resolved_log_dir
+
+
+async def _run_orchestrator(
+    config_path: Path,
+    db_path: Path,
+    resume: bool,
+    log_dir: Path | None,
+) -> None:
+    """Run the multi-process orchestrator."""
+    try:
+        config = load_orchestrator_config(config_path)
+    except ConfigError as e:
+        err_console.print(f"[red]Configuration error:[/red] {e}")
+        raise typer.Exit(1) from e
+
+    # Ensure DB directory exists
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Create or connect to database
+    db = await create_database(db_path)
+
+    repo_path, workspace_base, log_dir = _resolve_orchestrator_paths(config, log_dir)
+
+    try:
+        # Initialize components
+        git_mgr = GitManager(
+            repo_path=repo_path,
+            base_branch=config.base_branch,
+            branch_prefix=config.branch_prefix,
+        )
+        workspace_mgr = WorkspaceManager(
+            git_manager=git_mgr,
+            workspace_base=workspace_base,
+        )
+        decomposer = ProjectDecomposer(
+            repo_path=repo_path,
+        )
+        pr_manager = PRManager(git_manager=git_mgr)
+
+        # Create orchestrator
+        orchestrator = Orchestrator(
+            db=db,
+            workspace_mgr=workspace_mgr,
+            decomposer=decomposer,
+            pr_manager=pr_manager,
+            config=config,
+            log_dir=log_dir,
+        )
+
+        # Write PID
+        _write_pid_file(os.getpid())
+
+        console.print(
+            Panel(
+                f"[green]Orchestrator started[/green]\n"
+                f"Project: {config.project}\n"
+                f"Max concurrent: {config.max_concurrent}\n"
+                f"Workspace: {workspace_base}\n"
+                f"Auto PR: {config.auto_pr}",
+                title="Maestro Orchestrator",
+            )
+        )
+
+        # Run
+        stats = await orchestrator.run()
+
+        # Display final state
+        zadachi = await db.get_all_zadachi()
+        console.print()
+        _display_zadachi_table(zadachi, "Final Status")
+
+        console.print(
+            Panel(
+                f"Total: {stats.total_zadachi}\n"
+                f"Completed: {stats.completed}\n"
+                f"Failed: {stats.failed}\n"
+                f"PRs created: {stats.prs_created}",
+                title="Summary",
+            )
+        )
+
+        if stats.failed > 0:
+            raise typer.Exit(1)
+
+    finally:
+        await db.close()
+        _remove_pid_file()
+
+
+async def _show_zadachi_status(db_path: Path) -> None:
+    """Show status of all zadachi."""
+    if not db_path.exists():  # noqa: ASYNC240
+        err_console.print(f"[red]Database not found:[/red] {db_path}")
+        raise typer.Exit(1)
+
+    db = Database(db_path)
+    await db.connect()
+
+    try:
+        zadachi = await db.get_all_zadachi()
+        _display_zadachi_table(zadachi, "Zadachi Status")
+    finally:
+        await db.close()
+
+
+@app.command("orchestrate")
+def orchestrate_command(
+    config: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to project YAML configuration",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+        ),
+    ],
+    db: Annotated[
+        Path | None,
+        typer.Option(
+            "--db",
+            "-d",
+            help="Path to SQLite database file",
+        ),
+    ] = None,
+    resume: Annotated[
+        bool,
+        typer.Option(
+            "--resume",
+            "-r",
+            help="Resume from existing database state",
+        ),
+    ] = False,
+    log_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--log-dir",
+            "-l",
+            help="Directory for log files",
+        ),
+    ] = None,
+) -> None:
+    """Run multi-process orchestration from project config.
+
+    Decomposes the project into independent zadachi,
+    creates isolated worktrees, and runs spec-runner
+    in each one.
+
+    Examples:
+        maestro orchestrate project.yaml
+        maestro orchestrate project.yaml --resume
+    """
+    db_path = db or DEFAULT_DB_PATH
+
+    # Check if already running
+    pid = _read_pid_file()
+    if pid is not None:
+        try:
+            os.kill(pid, 0)
+            err_console.print(f"[red]Already running (PID: {pid})[/red]")
+            raise typer.Exit(1)
+        except ProcessLookupError:
+            _remove_pid_file()
+
+    try:
+        asyncio.run(_run_orchestrator(config, db_path, resume, log_dir))
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted by user[/yellow]")
+        raise typer.Exit(130) from None
+
+
+@app.command("zadachi")
+def zadachi_command(
+    db: Annotated[
+        Path | None,
+        typer.Option(
+            "--db",
+            "-d",
+            help="Path to SQLite database file",
+        ),
+    ] = None,
+) -> None:
+    """Show status of all zadachi.
+
+    Examples:
+        maestro zadachi
+        maestro zadachi --db /path/to/state.db
+    """
+    db_path = db or DEFAULT_DB_PATH
+    asyncio.run(_show_zadachi_status(db_path))
+
+
+@app.command("workspaces")
+def workspaces_command(
+    workspace_base: Annotated[
+        Path | None,
+        typer.Option(
+            "--path",
+            "-p",
+            help="Base directory for workspaces",
+        ),
+    ] = None,
+) -> None:
+    """List active workspaces.
+
+    Examples:
+        maestro workspaces
+        maestro workspaces --path /tmp/maestro-ws
+    """
+    base = workspace_base or Path("/tmp/maestro-ws")
+
+    if not base.exists():
+        console.print("[dim]No workspaces found.[/dim]")
+        return
+
+    dirs = [
+        p for p in sorted(base.iterdir()) if p.is_dir() and not p.name.startswith(".")
+    ]
+
+    if not dirs:
+        console.print("[dim]No workspaces found.[/dim]")
+        return
+
+    table = Table(
+        title="Active Workspaces",
+        show_header=True,
+        header_style="bold",
+    )
+    table.add_column("Zadacha", style="cyan")
+    table.add_column("Path", style="dim")
+
+    for d in dirs:
+        table.add_row(d.name, str(d))
+
+    console.print(table)
 
 
 @app.callback()

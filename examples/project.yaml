@@ -1,0 +1,132 @@
+# =============================================================================
+# Maestro Multi-Process Orchestrator — Example Configuration
+# =============================================================================
+#
+# This file configures Maestro to decompose a project into independent
+# work units ("zadachi"), run each in an isolated git worktree via
+# spec-runner, and auto-create PRs on completion.
+#
+# Usage:
+#   uv run maestro orchestrate project.yaml
+#   uv run maestro orchestrate project.yaml --resume
+#   uv run maestro zadachi                    # check progress
+#   uv run maestro workspaces                 # list worktrees
+#
+# =============================================================================
+
+# --- Project metadata ---
+
+# Human-readable project name (used in logs and PR titles)
+project: my-web-app
+
+# Natural-language description of the project.
+# If `zadachi` section is omitted, Maestro uses this description
+# to auto-decompose the project via Claude CLI.
+description: |
+  Build a REST API with:
+  - JWT authentication (login, register, refresh)
+  - User management (CRUD, roles, permissions)
+  - Admin dashboard (React, role-based access)
+  Use FastAPI for the backend, SQLAlchemy for ORM,
+  and React + TypeScript for the frontend.
+
+# --- Repository settings ---
+
+# GitHub remote URL (used for PR creation via gh CLI)
+repo_url: https://github.com/user/my-web-app
+
+# Local path to the repository (must be an absolute path or start with ~)
+repo_path: ~/projects/my-web-app
+
+# Base directory where git worktrees will be created.
+# Each zadacha gets its own subdirectory: {workspace_base}/{zadacha-id}/
+workspace_base: /tmp/maestro-ws/my-web-app
+
+# --- Execution settings ---
+
+# Maximum number of zadachi running in parallel (1-10)
+max_concurrent: 3
+
+# Git base branch that zadachi branch from and PRs target
+base_branch: main
+
+# Prefix for zadacha branch names.
+# Final branch: {branch_prefix}{zadacha-id}  e.g. "feature/auth-system"
+branch_prefix: "feature/"
+
+# Automatically create a GitHub PR when a zadacha completes.
+# Requires gh CLI to be authenticated.
+auto_pr: true
+
+# --- Spec-runner configuration ---
+# These settings are written to executor.config.yaml in each worktree.
+# They control how spec-runner executes subtasks within a zadacha.
+
+spec_runner:
+  # Max retries per subtask within spec-runner
+  max_retries: 3
+
+  # Timeout per subtask in minutes
+  task_timeout_minutes: 30
+
+  # Claude CLI command (can be a path or alias)
+  claude_command: claude
+
+  # Automatically commit changes after each subtask
+  auto_commit: true
+
+  # Create a sub-branch per subtask (merged into zadacha branch)
+  create_git_branch: true
+
+  # Run tests after each subtask completes
+  run_tests_on_done: true
+  test_command: "uv run pytest"
+
+  # Run linter after each subtask completes
+  run_lint_on_done: true
+  lint_command: "uv run ruff check ."
+
+# --- Manual zadachi (optional) ---
+# If omitted, Maestro auto-decomposes the project using the `description`
+# field above. Define zadachi manually for fine-grained control.
+
+# zadachi:
+#   - id: auth-system
+#     title: "Authentication System"
+#     description: |
+#       Implement JWT authentication with login, register,
+#       and token refresh endpoints. Include middleware for
+#       route protection and role-based access.
+#     scope:
+#       - "src/auth/**"
+#       - "src/middleware/auth.py"
+#     depends_on: []
+#     priority: 10           # Higher priority = runs first
+#
+#   - id: user-management
+#     title: "User Management"
+#     description: |
+#       CRUD operations for users: create, read, update, delete.
+#       Include role assignment and permission checking.
+#     scope:
+#       - "src/users/**"
+#       - "src/models/user.py"
+#     depends_on: [auth-system]  # Needs auth to be done first
+#     priority: 5
+#
+#   - id: admin-dashboard
+#     title: "Admin Dashboard"
+#     description: |
+#       React admin dashboard with role-based views,
+#       user management table, and activity logs.
+#     scope:
+#       - "frontend/src/admin/**"
+#       - "frontend/src/components/UserTable.tsx"
+#     depends_on: [user-management]
+#     priority: 0
+
+# --- Notifications (optional) ---
+
+# notifications:
+#   desktop: true              # macOS/Linux desktop notifications
+#   webhook_url: "https://..."  # Webhook for status updates

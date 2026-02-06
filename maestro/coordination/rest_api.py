@@ -28,9 +28,10 @@ from maestro.database import (
     Database,
     MessageNotFoundError,
     TaskNotFoundError,
+    ZadachaNotFoundError,
     create_database,
 )
-from maestro.models import Message, TaskCost, TaskStatus
+from maestro.models import Message, TaskCost, TaskStatus, ZadachaStatus
 
 
 # =============================================================================
@@ -942,5 +943,159 @@ def create_app_with_lifespan(db_path: str | Path | None = None) -> FastAPI:
             costs_by_task=summary.costs_by_task,
             report=report,
         )
+
+    # =========================================================================
+    # Zadachi Endpoints
+    # =========================================================================
+
+    class ZadachaResponse(BaseModel):
+        """Response model for a zadacha."""
+
+        id: str
+        title: str
+        description: str
+        branch: str
+        workspace_path: str | None
+        status: str
+        scope: list[str]
+        priority: int
+        pr_url: str | None
+        subtask_progress: str | None
+        error_message: str | None
+        retry_count: int
+        max_retries: int
+
+    class ZadachaListResponse(BaseModel):
+        """Response model for zadachi list."""
+
+        zadachi: list[ZadachaResponse]
+        count: int
+
+    class CallbackRequest(BaseModel):
+        """Request body for spec-runner callback."""
+
+        task_id: str = Field(..., description="Spec-runner task ID")
+        status: str = Field(..., description="Task status")
+        duration_seconds: float = Field(
+            default=0.0,
+            description="Task duration",
+        )
+        error: str | None = Field(default=None, description="Error message")
+
+    class CallbackResponse(BaseModel):
+        """Response for callback."""
+
+        success: bool
+        message: str = ""
+
+    @app.get(
+        "/zadachi",
+        response_model=ZadachaListResponse,
+        tags=["Zadachi"],
+    )
+    async def list_zadachi() -> ZadachaListResponse:
+        """Get all zadachi with their statuses."""
+        if _db is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Database not available",
+            )
+        zadachi = await _db.get_all_zadachi()
+        responses = [
+            ZadachaResponse(
+                id=z.id,
+                title=z.title,
+                description=z.description,
+                branch=z.branch,
+                workspace_path=z.workspace_path,
+                status=z.status.value,
+                scope=z.scope,
+                priority=z.priority,
+                pr_url=z.pr_url,
+                subtask_progress=z.subtask_progress,
+                error_message=z.error_message,
+                retry_count=z.retry_count,
+                max_retries=z.max_retries,
+            )
+            for z in zadachi
+        ]
+        return ZadachaListResponse(zadachi=responses, count=len(responses))
+
+    @app.get(
+        "/zadachi/{zadacha_id}",
+        response_model=ZadachaResponse,
+        tags=["Zadachi"],
+    )
+    async def get_zadacha_detail(
+        zadacha_id: str,
+    ) -> ZadachaResponse:
+        """Get details of a specific zadacha."""
+        if _db is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Database not available",
+            )
+        try:
+            z = await _db.get_zadacha(zadacha_id)
+            return ZadachaResponse(
+                id=z.id,
+                title=z.title,
+                description=z.description,
+                branch=z.branch,
+                workspace_path=z.workspace_path,
+                status=z.status.value,
+                scope=z.scope,
+                priority=z.priority,
+                pr_url=z.pr_url,
+                subtask_progress=z.subtask_progress,
+                error_message=z.error_message,
+                retry_count=z.retry_count,
+                max_retries=z.max_retries,
+            )
+        except ZadachaNotFoundError as err:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Zadacha '{zadacha_id}' not found",
+            ) from err
+
+    @app.post(
+        "/zadachi/{zadacha_id}/callback",
+        response_model=CallbackResponse,
+        tags=["Zadachi"],
+    )
+    async def zadacha_callback(
+        zadacha_id: str,
+        request: CallbackRequest,
+    ) -> CallbackResponse:
+        """Receive callback from spec-runner process.
+
+        Spec-runner sends POST here when a subtask
+        starts, completes, or fails.
+        """
+        if _db is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Database not available",
+            )
+        try:
+            z = await _db.get_zadacha(zadacha_id)
+
+            note = f"{request.task_id}: {request.status}"
+
+            await _db.update_zadacha_status(
+                zadacha_id,
+                ZadachaStatus(z.status.value),
+                subtask_progress=note,
+            )
+
+            return CallbackResponse(
+                success=True,
+                message=f"Updated {zadacha_id}",
+            )
+        except ZadachaNotFoundError:
+            return CallbackResponse(
+                success=False,
+                message=(f"Zadacha '{zadacha_id}' not found"),
+            )
 
     return app
