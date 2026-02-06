@@ -13,6 +13,24 @@ from maestro.database import (
     TaskNotFoundError,
     create_database,
 )
+from maestro.event_log import (
+    Event,
+    EventLogger,
+    EventType,
+    create_event_logger,
+    get_event_logger,
+    set_event_logger,
+)
+from maestro.git import (
+    BranchExistsError,
+    BranchNotFoundError,
+    GitError,
+    GitManager,
+    GitNotFoundError,
+    NotARepositoryError,
+    RebaseConflictError,
+    RemoteError,
+)
 from maestro.notifications import (
     DesktopNotifier,
     Notification,
@@ -49,24 +67,45 @@ from maestro.validator import (
 
 
 __all__ = [
+    # DAG
     "DAG",
+    # Spawners
     "AgentSpawner",
+    # Scheduler
     "BaseSpawner",
+    # Git
+    "BranchExistsError",
+    "BranchNotFoundError",
     "ClaudeCodeSpawner",
+    # Database
     "ConcurrentModificationError",
+    # Config
     "ConfigError",
     "CycleError",
     "DAGNode",
     "Database",
     "DatabaseError",
     "DependencyNotFoundError",
+    # Notifications
     "DesktopNotifier",
+    # Event logging
+    "Event",
+    "EventLogger",
+    "EventType",
+    "GitError",
+    "GitManager",
+    "GitNotFoundError",
+    "NotARepositoryError",
     "Notification",
     "NotificationChannel",
     "NotificationEvent",
     "NotificationManager",
     "Platform",
+    "RebaseConflictError",
+    # Recovery
     "RecoveryStatistics",
+    "RemoteError",
+    # Retry
     "RetryManager",
     "RunningTask",
     "Scheduler",
@@ -79,14 +118,18 @@ __all__ = [
     "TaskAlreadyExistsError",
     "TaskNotFoundError",
     "TaskTimeoutError",
+    # Validation
     "ValidationError",
     "ValidationResult",
     "ValidationTimeoutError",
     "Validator",
     "create_database",
     "create_default_registry",
+    "create_event_logger",
     "create_notification_manager",
     "create_scheduler_from_config",
+    "get_event_logger",
     "load_config",
     "load_config_from_string",
+    "set_event_logger",
 ]
