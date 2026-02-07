@@ -696,6 +696,22 @@ async def _run_orchestrator(
     # Create or connect to database
     db = await create_database(db_path)
 
+    if resume:
+        existing_zadachi = await db.get_all_zadachi()
+        if existing_zadachi:
+            console.print(
+                f"[cyan]Resuming with {len(existing_zadachi)} existing zadachi[/cyan]"
+            )
+    else:
+        existing_zadachi = await db.get_all_zadachi()
+        if existing_zadachi:
+            console.print(
+                f"[yellow]Clearing {len(existing_zadachi)} existing zadachi "
+                "state (use --resume to continue where you left off).[/yellow]"
+            )
+            for zadacha in existing_zadachi:
+                await db.delete_zadacha(zadacha.id)
+
     repo_path, workspace_base, log_dir = _resolve_orchestrator_paths(config, log_dir)
 
     try:

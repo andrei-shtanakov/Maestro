@@ -14,7 +14,7 @@ import logging
 import signal
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from subprocess import Popen
 from typing import Protocol
@@ -187,6 +187,7 @@ class Scheduler:
         self._retry_manager = retry_manager or RetryManager()
 
         self._running_tasks: dict[str, RunningTask] = {}
+        self._retry_ready_times: dict[str, datetime] = {}
         self._shutdown_requested = False
         self._shutdown_event = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -300,22 +301,29 @@ class Scheduler:
             ready_task_ids: List of task IDs ready to run.
         """
         available_slots = self._config.max_concurrent - len(self._running_tasks)
+        started = 0
 
-        for task_id in ready_task_ids[:available_slots]:
-            if self._shutdown_requested:
+        for task_id in ready_task_ids:
+            if self._shutdown_requested or started >= available_slots:
                 break
 
             try:
-                await self._spawn_task(task_id)
+                launched = await self._spawn_task(task_id)
             except Exception as e:
                 # Log error and mark task as failed
                 await self._handle_spawn_error(task_id, e)
+            else:
+                if launched:
+                    started += 1
 
-    async def _spawn_task(self, task_id: str) -> None:
-        """Spawn a single task.
+    async def _spawn_task(self, task_id: str) -> bool:
+        """Attempt to spawn a single task.
 
         Args:
             task_id: ID of the task to spawn.
+
+        Returns:
+            True if the task was started, False if deferred or skipped.
         """
         # Get task from database
         task = await self._db.get_task(task_id)
@@ -327,11 +335,11 @@ class Scheduler:
                 TaskStatus.AWAITING_APPROVAL,
                 expected_status=TaskStatus.READY,
             )
-            return
+            return False
 
         # Skip if task is awaiting approval
         if task.status == TaskStatus.AWAITING_APPROVAL:
-            return
+            return False
 
         # Promote PENDING to READY if needed
         if task.status == TaskStatus.PENDING:
@@ -343,7 +351,7 @@ class Scheduler:
 
         # Skip if not in READY status
         if task.status != TaskStatus.READY:
-            return
+            return False
 
         # Get spawner for this task's agent type
         spawner = self._spawners.get(task.agent_type.value)
@@ -355,6 +363,14 @@ class Scheduler:
         if not spawner.is_available():
             msg = f"Agent '{task.agent_type}' is not available on this system"
             raise SchedulerError(msg)
+
+        # Apply retry backoff without blocking scheduler loop
+        if task.retry_count > 0:
+            if not self._retry_delay_elapsed(task):
+                return False
+        else:
+            # Clean up any stale delay tracking if task was reset
+            self._retry_ready_times.pop(task_id, None)
 
         # Prepare log file
         log_file = self._config.log_dir / f"{task_id}.log"
@@ -373,23 +389,12 @@ class Scheduler:
         # Build context from completed dependencies
         context = await self._build_dependency_context(task)
 
-        # Apply retry delay if this is a retry attempt
+        # Build retry context from previous error if needed
         retry_context = ""
-        if task.retry_count > 0:
-            delay = self._retry_manager.get_delay(task.retry_count - 1)
-            logging.info(
-                "Applying retry delay of %.1f seconds for task %s (attempt %d)",
-                delay,
-                task_id,
-                task.retry_count + 1,
+        if task.retry_count > 0 and task.error_message:
+            retry_context = self._retry_manager.build_retry_context(
+                task, task.error_message
             )
-            await asyncio.sleep(delay)
-
-            # Build retry context from previous error
-            if task.error_message:
-                retry_context = self._retry_manager.build_retry_context(
-                    task, task.error_message
-                )
 
         # Transition to RUNNING
         task = await self._db.update_task_status(
@@ -397,6 +402,7 @@ class Scheduler:
             TaskStatus.RUNNING,
             expected_status=TaskStatus.READY,
         )
+        self._retry_ready_times.pop(task_id, None)
 
         # Spawn the process with retry context
         process = spawner.spawn(task, context, workdir, log_file, retry_context)
@@ -410,6 +416,7 @@ class Scheduler:
         )
 
         await self._notify(task, NotificationEvent.TASK_STARTED)
+        return True
 
     async def _build_dependency_context(self, task: Task) -> str:
         """Build context string from completed dependency tasks.
@@ -442,6 +449,31 @@ class Scheduler:
                 )
 
         return "\n".join(context_parts)
+
+    def _retry_delay_elapsed(self, task: Task) -> bool:
+        """Check whether retry backoff delay has elapsed for a task."""
+        task_id = task.id
+        available_at = self._retry_ready_times.get(task_id)
+        now = datetime.now(UTC)
+
+        if available_at is None:
+            delay = self._retry_manager.get_delay(task.retry_count - 1)
+            if delay <= 0:
+                return True
+            available_at = now + timedelta(seconds=delay)
+            self._retry_ready_times[task_id] = available_at
+            logging.info(
+                "Delaying retry of task %s by %.1f seconds (attempt %d)",
+                task_id,
+                delay,
+                task.retry_count,
+            )
+
+        if now < available_at:
+            return False
+
+        self._retry_ready_times.pop(task_id, None)
+        return True
 
     async def _handle_spawn_error(self, task_id: str, error: Exception) -> None:
         """Handle error during task spawn.
@@ -858,9 +890,14 @@ async def create_scheduler_from_config(
     existing_tasks = await db.get_all_tasks()
     existing_ids = {t.id for t in existing_tasks}
 
-    for task_config in tasks:
-        if task_config.id not in existing_ids:
-            task = Task.from_config(task_config, str(config.workdir))
-            await db.create_task(task)
+    task_map = {task_config.id: task_config for task_config in tasks}
+    for task_id in dag.topological_sort():
+        if task_id in existing_ids:
+            continue
+        task_config = task_map.get(task_id)
+        if task_config is None:
+            continue
+        task = Task.from_config(task_config, str(config.workdir))
+        await db.create_task(task)
 
     return Scheduler(db, dag, spawners, config, notification_manager)

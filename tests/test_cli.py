@@ -5,6 +5,7 @@ import os
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -21,13 +22,65 @@ from maestro.cli import (
     _read_pid_file,
     _remove_pid_file,
     _write_pid_file,
+    _run_orchestrator,
     app,
 )
 from maestro.database import create_database
-from maestro.models import AgentType, Task, TaskStatus
+from maestro.models import AgentType, Task, TaskStatus, Zadacha, ZadachaConfig
 
 
 runner = CliRunner()
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+
+def _write_orchestrator_config(base_dir: Path) -> Path:
+    """Create a minimal orchestrator config file for testing."""
+    repo_dir = base_dir / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    workspace_dir = base_dir / "workspaces"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    config = {
+        "project": "orchestrator-test",
+        "description": "Test project",
+        "repo_url": "https://example.com/test.git",
+        "repo_path": str(repo_dir),
+        "workspace_base": str(workspace_dir),
+        "max_concurrent": 1,
+        "zadachi": [
+            {
+                "id": "z-new",
+                "title": "New Zadacha",
+                "description": "Do work",
+                "scope": ["*"],
+            }
+        ],
+    }
+
+    config_path = base_dir / "project.yaml"
+    with config_path.open("w") as f:
+        yaml.safe_dump(config, f)
+    return config_path
+
+
+async def _seed_zadacha(db_path: Path, zadacha_id: str) -> None:
+    """Insert a zadacha record into the database."""
+    db = await create_database(db_path)
+    try:
+        config = ZadachaConfig(
+            id=zadacha_id,
+            title=f"Zadacha {zadacha_id}",
+            description="Existing work",
+            scope=["*"],
+        )
+        zadacha = Zadacha.from_config(config, branch_prefix="feature/")
+        await db.create_zadacha(zadacha)
+    finally:
+        await db.close()
 
 
 # =============================================================================
@@ -198,6 +251,76 @@ class TestCLIHelp:
         # Typer returns exit code 0 with no_args_is_help=True
         # But it shows usage info
         assert "Usage" in result.output or "usage" in result.output.lower()
+
+
+class TestOrchestratorResumeFlag:
+    """Tests for orchestrator resume CLI behavior."""
+
+    async def _run_with_patches(
+        self,
+        config_path: Path,
+        db_path: Path,
+        resume: bool,
+    ) -> None:
+        stats = SimpleNamespace(total_zadachi=0, completed=0, failed=0, prs_created=0)
+
+        with (
+            patch("maestro.cli.GitManager") as mock_git_mgr,
+            patch("maestro.cli.WorkspaceManager"),
+            patch("maestro.cli.ProjectDecomposer"),
+            patch("maestro.cli.PRManager"),
+            patch("maestro.cli.Orchestrator") as mock_orchestrator,
+            patch("maestro.cli._write_pid_file"),
+            patch("maestro.cli._remove_pid_file"),
+        ):
+            mock_git_mgr.return_value.repo_path = config_path.parent
+            orchestrator_instance = MagicMock()
+            orchestrator_instance.run = AsyncMock(return_value=stats)
+            mock_orchestrator.return_value = orchestrator_instance
+
+            await _run_orchestrator(
+                config_path=config_path,
+                db_path=db_path,
+                resume=resume,
+                log_dir=None,
+            )
+
+    @pytest.mark.anyio
+    async def test_run_orchestrator_clears_state_without_resume(
+        self,
+        temp_dir: Path,
+    ) -> None:
+        config_path = _write_orchestrator_config(temp_dir)
+        db_path = temp_dir / "state.db"
+        await _seed_zadacha(db_path, "existing")
+
+        await self._run_with_patches(config_path, db_path, resume=False)
+
+        db = await create_database(db_path)
+        try:
+            zadachi = await db.get_all_zadachi()
+            assert zadachi == []
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_run_orchestrator_preserves_state_with_resume(
+        self,
+        temp_dir: Path,
+    ) -> None:
+        config_path = _write_orchestrator_config(temp_dir)
+        db_path = temp_dir / "state.db"
+        await _seed_zadacha(db_path, "existing")
+
+        await self._run_with_patches(config_path, db_path, resume=True)
+
+        db = await create_database(db_path)
+        try:
+            zadachi = await db.get_all_zadachi()
+            assert len(zadachi) == 1
+            assert zadachi[0].id == "existing"
+        finally:
+            await db.close()
 
 
 # =============================================================================

@@ -1155,6 +1155,43 @@ class TestCreateSchedulerFromConfig:
         finally:
             await db.close()
 
+    @pytest.mark.anyio
+    async def test_creates_tasks_when_configs_out_of_order(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """Tasks should be inserted even if configs aren't topologically sorted."""
+        configs = [
+            TaskConfig(
+                id="unordered-child",
+                title="Child",
+                prompt="Child task",
+                depends_on=["unordered-parent"],
+            ),
+            TaskConfig(
+                id="unordered-parent",
+                title="Parent",
+                prompt="Parent task",
+            ),
+        ]
+
+        db = await create_database(temp_db_path)
+        try:
+            mock_spawner = MockSpawner()
+
+            await create_scheduler_from_config(
+                db=db,
+                tasks=configs,
+                spawners={"claude_code": mock_spawner},
+                workdir=temp_dir,
+            )
+
+            task_ids = {task.id for task in await db.get_all_tasks()}
+            assert task_ids == {"unordered-parent", "unordered-child"}
+        finally:
+            await db.close()
+
 
 # =============================================================================
 # Tests: Running Task Dataclass
