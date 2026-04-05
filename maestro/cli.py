@@ -9,6 +9,8 @@ This module provides a command-line interface using Typer for:
 """
 
 import asyncio
+import contextlib
+import fcntl
 import os
 import signal
 from pathlib import Path
@@ -87,10 +89,52 @@ def _ensure_db_dir() -> None:
     DEFAULT_DB_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _write_pid_file(pid: int) -> None:
-    """Write PID to file for stop command."""
+def _acquire_pid_lock(pid_file: Path | None = None) -> int:
+    """Acquire exclusive lock on PID file.
+
+    Args:
+        pid_file: Path to PID file. Defaults to PID_FILE.
+
+    Returns:
+        File descriptor for the lock (caller must keep it open).
+
+    Raises:
+        SystemExit: If another Maestro instance is already running.
+    """
+    if pid_file is None:
+        pid_file = PID_FILE
     _ensure_db_dir()
-    PID_FILE.write_text(str(pid))
+    fd = os.open(str(pid_file), os.O_CREAT | os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        try:
+            existing_pid = os.read(fd, 32).decode().strip()
+        except OSError:
+            existing_pid = "unknown"
+        os.close(fd)
+        err_console.print(
+            f"[red]Maestro is already running (PID: {existing_pid}). "
+            f"Stop it first with 'maestro stop'.[/red]"
+        )
+        raise SystemExit(1) from None
+    os.ftruncate(fd, 0)
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.write(fd, str(os.getpid()).encode())
+    return fd
+
+
+def _release_pid_lock(fd: int, pid_file: Path | None = None) -> None:
+    """Release PID file lock and remove the file."""
+    if pid_file is None:
+        pid_file = PID_FILE
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    except OSError:
+        pass
+    with contextlib.suppress(FileNotFoundError):
+        pid_file.unlink()
 
 
 def _read_pid_file() -> int | None:
@@ -101,12 +145,6 @@ def _read_pid_file() -> int | None:
         return int(PID_FILE.read_text().strip())
     except (ValueError, OSError):
         return None
-
-
-def _remove_pid_file() -> None:
-    """Remove PID file."""
-    if PID_FILE.exists():
-        PID_FILE.unlink()
 
 
 def _display_tasks_table(tasks: list, title: str = "Tasks") -> None:
@@ -192,6 +230,7 @@ async def _run_scheduler(
 
     # Create or connect to database
     db = await create_database(db_path)
+    lock_fd: int | None = None
 
     try:
         # Check if resuming
@@ -253,8 +292,8 @@ async def _run_scheduler(
         all_tasks = await db.get_all_tasks()
         _display_tasks_table(all_tasks, "Starting Tasks")
 
-        # Write PID for stop command
-        _write_pid_file(os.getpid())
+        # Acquire PID lock
+        lock_fd = _acquire_pid_lock()
 
         console.print(
             Panel(
@@ -291,7 +330,8 @@ async def _run_scheduler(
 
     finally:
         await db.close()
-        _remove_pid_file()
+        if lock_fd is not None:
+            _release_pid_lock(lock_fd)
 
 
 async def _show_status(db_path: Path) -> None:
@@ -413,12 +453,12 @@ def _stop_scheduler() -> None:
     try:
         os.kill(pid, signal.SIGTERM)
         console.print(f"[green]Sent stop signal to scheduler (PID: {pid})[/green]")
-        _remove_pid_file()
     except ProcessLookupError:
         err_console.print(
             f"[yellow]Process {pid} not found, removing stale PID file[/yellow]"
         )
-        _remove_pid_file()
+        with contextlib.suppress(FileNotFoundError):
+            PID_FILE.unlink()
     except PermissionError:
         err_console.print(f"[red]Permission denied to stop process {pid}[/red]")
         raise typer.Exit(1) from None
@@ -479,18 +519,6 @@ def run_command(
         maestro run tasks.yaml --db /path/to/state.db
     """
     db_path = db or DEFAULT_DB_PATH
-
-    # Check if scheduler is already running
-    pid = _read_pid_file()
-    if pid is not None:
-        try:
-            os.kill(pid, 0)  # Check if process exists
-            err_console.print(f"[red]Scheduler already running (PID: {pid})[/red]")
-            err_console.print("Use 'maestro stop' to stop it first.")
-            raise typer.Exit(1)
-        except ProcessLookupError:
-            # Process doesn't exist, remove stale PID file
-            _remove_pid_file()
 
     try:
         asyncio.run(_run_scheduler(config, db_path, resume, log_dir))
@@ -713,6 +741,7 @@ async def _run_orchestrator(
                 await db.delete_zadacha(zadacha.id)
 
     repo_path, workspace_base, log_dir = _resolve_orchestrator_paths(config, log_dir)
+    lock_fd: int | None = None
 
     try:
         # Initialize components
@@ -740,8 +769,8 @@ async def _run_orchestrator(
             log_dir=log_dir,
         )
 
-        # Write PID
-        _write_pid_file(os.getpid())
+        # Acquire PID lock
+        lock_fd = _acquire_pid_lock()
 
         console.print(
             Panel(
@@ -777,7 +806,8 @@ async def _run_orchestrator(
 
     finally:
         await db.close()
-        _remove_pid_file()
+        if lock_fd is not None:
+            _release_pid_lock(lock_fd)
 
 
 async def _show_zadachi_status(db_path: Path) -> None:
@@ -845,16 +875,6 @@ def orchestrate_command(
         maestro orchestrate project.yaml --resume
     """
     db_path = db or DEFAULT_DB_PATH
-
-    # Check if already running
-    pid = _read_pid_file()
-    if pid is not None:
-        try:
-            os.kill(pid, 0)
-            err_console.print(f"[red]Already running (PID: {pid})[/red]")
-            raise typer.Exit(1)
-        except ProcessLookupError:
-            _remove_pid_file()
 
     try:
         asyncio.run(_run_orchestrator(config, db_path, resume, log_dir))

@@ -1,6 +1,7 @@
 """Tests for the CLI module."""
 
 import asyncio
+import contextlib
 import os
 import tempfile
 from collections.abc import Generator
@@ -15,13 +16,13 @@ from typer.testing import CliRunner
 from maestro.cli import (
     DEFAULT_DB_DIR,
     PID_FILE,
+    _acquire_pid_lock,
     _display_summary,
     _display_tasks_table,
     _format_status,
     _get_status_style,
     _read_pid_file,
-    _remove_pid_file,
-    _write_pid_file,
+    _release_pid_lock,
     _run_orchestrator,
     app,
 )
@@ -270,8 +271,8 @@ class TestOrchestratorResumeFlag:
             patch("maestro.cli.ProjectDecomposer"),
             patch("maestro.cli.PRManager"),
             patch("maestro.cli.Orchestrator") as mock_orchestrator,
-            patch("maestro.cli._write_pid_file"),
-            patch("maestro.cli._remove_pid_file"),
+            patch("maestro.cli._acquire_pid_lock", return_value=99),
+            patch("maestro.cli._release_pid_lock"),
         ):
             mock_git_mgr.return_value.repo_path = config_path.parent
             orchestrator_instance = MagicMock()
@@ -545,17 +546,6 @@ class TestStopCommand:
 class TestPIDFileManagement:
     """Tests for PID file management functions."""
 
-    def test_write_and_read_pid_file(self) -> None:
-        """Test writing and reading PID file."""
-        test_pid = os.getpid()
-        _write_pid_file(test_pid)
-
-        try:
-            read_pid = _read_pid_file()
-            assert read_pid == test_pid
-        finally:
-            _remove_pid_file()
-
     def test_read_pid_file_not_exists(self) -> None:
         """Test reading PID file when it doesn't exist."""
         if PID_FILE.exists():
@@ -573,23 +563,46 @@ class TestPIDFileManagement:
             result = _read_pid_file()
             assert result is None
         finally:
-            _remove_pid_file()
+            if PID_FILE.exists():
+                PID_FILE.unlink()
 
-    def test_remove_pid_file(self) -> None:
-        """Test removing PID file."""
-        _write_pid_file(12345)
-        assert PID_FILE.exists()
 
-        _remove_pid_file()
-        assert not PID_FILE.exists()
+class TestPidFileLocking:
+    """Tests for PID file exclusive locking."""
 
-    def test_remove_pid_file_not_exists(self) -> None:
-        """Test removing PID file when it doesn't exist."""
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+    def test_acquire_lock_creates_pid_file(self, tmp_path: Path) -> None:
+        """Test that acquiring lock creates PID file with current PID."""
+        pid_file = tmp_path / "maestro.pid"
+        lock_fd = _acquire_pid_lock(pid_file)
+        assert lock_fd is not None
+        assert pid_file.exists()
+        assert pid_file.read_text().strip() == str(os.getpid())
+        _release_pid_lock(lock_fd, pid_file)
 
-        # Should not raise
-        _remove_pid_file()
+    def test_acquire_lock_fails_when_already_locked(self, tmp_path: Path) -> None:
+        """Test that second lock attempt raises SystemExit."""
+        pid_file = tmp_path / "maestro.pid"
+        lock_fd = _acquire_pid_lock(pid_file)
+        assert lock_fd is not None
+        with pytest.raises(SystemExit):
+            _acquire_pid_lock(pid_file)
+        _release_pid_lock(lock_fd, pid_file)
+
+    def test_release_lock_removes_pid_file(self, tmp_path: Path) -> None:
+        """Test that releasing lock removes PID file."""
+        pid_file = tmp_path / "maestro.pid"
+        lock_fd = _acquire_pid_lock(pid_file)
+        _release_pid_lock(lock_fd, pid_file)
+        assert not pid_file.exists()
+
+    def test_stale_pid_file_is_overwritten(self, tmp_path: Path) -> None:
+        """Test that a stale PID file is overwritten on lock acquire."""
+        pid_file = tmp_path / "maestro.pid"
+        pid_file.write_text("99999")
+        lock_fd = _acquire_pid_lock(pid_file)
+        assert lock_fd is not None
+        assert pid_file.read_text().strip() == str(os.getpid())
+        _release_pid_lock(lock_fd, pid_file)
 
 
 # =============================================================================
@@ -874,20 +887,33 @@ class TestSchedulerAlreadyRunning:
     def test_run_when_scheduler_already_running(
         self, valid_config_file: Path, temp_dir: Path
     ) -> None:
-        """Test run command when scheduler is already running."""
-        # Write a PID file with our own PID (which definitely exists)
+        """Test run command when lock is already held."""
+        import fcntl
+
+        # Hold an exclusive lock on the PID file
         DEFAULT_DB_DIR.mkdir(parents=True, exist_ok=True)
-        PID_FILE.write_text(str(os.getpid()))
+        fd = os.open(str(PID_FILE), os.O_CREAT | os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.write(fd, str(os.getpid()).encode())
 
         try:
             result = runner.invoke(
-                app, ["run", str(valid_config_file), "--db", str(temp_dir / "test.db")]
+                app,
+                [
+                    "run",
+                    str(valid_config_file),
+                    "--db",
+                    str(temp_dir / "test.db"),
+                ],
             )
 
             assert result.exit_code != 0
             assert "already running" in result.output.lower()
         finally:
-            _remove_pid_file()
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+            with contextlib.suppress(FileNotFoundError):
+                PID_FILE.unlink()
 
 
 class TestStopSchedulerScenarios:
@@ -998,15 +1024,17 @@ class TestStatusWithPID:
         """Test status shows scheduler PID when running."""
         db_path = _setup_db_with_pending_task(temp_dir)
 
-        # Write a PID file
-        _write_pid_file(12345)
+        # Write a PID file directly
+        DEFAULT_DB_DIR.mkdir(parents=True, exist_ok=True)
+        PID_FILE.write_text("12345")
 
         try:
             result = runner.invoke(app, ["status", "--db", str(db_path)])
             assert result.exit_code == 0
             assert "12345" in result.output or "running" in result.output.lower()
         finally:
-            _remove_pid_file()
+            with contextlib.suppress(FileNotFoundError):
+                PID_FILE.unlink()
 
 
 def _setup_db_with_existing_task(temp_dir: Path) -> Path:
@@ -1062,8 +1090,8 @@ class TestRunScheduler:
         # Create a mock scheduler
         with (
             patch("maestro.cli.create_scheduler_from_config") as mock_create,
-            patch("maestro.cli._write_pid_file"),
-            patch("maestro.cli._remove_pid_file"),
+            patch("maestro.cli._acquire_pid_lock", return_value=99),
+            patch("maestro.cli._release_pid_lock"),
         ):
             mock_scheduler = MagicMock()
             mock_scheduler.run = AsyncMock()
@@ -1084,8 +1112,8 @@ class TestRunScheduler:
 
         with (
             patch("maestro.cli.create_scheduler_from_config") as mock_create,
-            patch("maestro.cli._write_pid_file"),
-            patch("maestro.cli._remove_pid_file"),
+            patch("maestro.cli._acquire_pid_lock", return_value=99),
+            patch("maestro.cli._release_pid_lock"),
         ):
             mock_scheduler = MagicMock()
             mock_scheduler.run = AsyncMock()
@@ -1111,8 +1139,8 @@ class TestRunScheduler:
 
         with (
             patch("maestro.cli.create_scheduler_from_config") as mock_create,
-            patch("maestro.cli._write_pid_file"),
-            patch("maestro.cli._remove_pid_file"),
+            patch("maestro.cli._acquire_pid_lock", return_value=99),
+            patch("maestro.cli._release_pid_lock"),
         ):
             mock_scheduler = MagicMock()
             mock_scheduler.run = AsyncMock()
