@@ -7,6 +7,7 @@ This module provides the RetryManager class that handles:
 """
 
 import logging
+import random
 
 from maestro.models import Task
 
@@ -42,9 +43,10 @@ class RetryManager:
         self.max_delay = max_delay
 
     def get_delay(self, retry_count: int) -> float:
-        """Calculate exponential backoff delay.
+        """Calculate exponential backoff delay with jitter.
 
-        Uses formula: base_delay * (2 ** retry_count), capped at max_delay.
+        Uses formula: base_delay * (2 ** retry_count) * uniform(0.7, 1.3),
+        capped at max_delay.
 
         Args:
             retry_count: Current retry attempt (0-indexed).
@@ -53,6 +55,7 @@ class RetryManager:
             Delay in seconds before next retry.
         """
         delay = self.base_delay * (2**retry_count)
+        delay *= random.uniform(0.7, 1.3)
         return min(delay, self.max_delay)
 
     def should_retry(self, task: Task) -> bool:

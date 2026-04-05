@@ -1,0 +1,287 @@
+{
+  "$defs": {
+    "AgentType": {
+      "description": "Supported agent types for task execution.",
+      "enum": [
+        "claude_code",
+        "codex",
+        "aider",
+        "announce"
+      ],
+      "title": "AgentType",
+      "type": "string"
+    },
+    "DefaultsConfig": {
+      "description": "Default values for task configuration.",
+      "properties": {
+        "timeout_minutes": {
+          "default": 30,
+          "description": "Default timeout in minutes",
+          "maximum": 1440,
+          "minimum": 1,
+          "title": "Timeout Minutes",
+          "type": "integer"
+        },
+        "max_retries": {
+          "default": 2,
+          "description": "Default max retries",
+          "maximum": 10,
+          "minimum": 0,
+          "title": "Max Retries",
+          "type": "integer"
+        },
+        "agent_type": {
+          "$ref": "#/$defs/AgentType",
+          "default": "claude_code",
+          "description": "Default agent type"
+        }
+      },
+      "title": "DefaultsConfig",
+      "type": "object"
+    },
+    "GitConfig": {
+      "description": "Git configuration for project.",
+      "properties": {
+        "base_branch": {
+          "default": "main",
+          "description": "Base branch name",
+          "title": "Base Branch",
+          "type": "string"
+        },
+        "auto_push": {
+          "default": true,
+          "description": "Automatically push after task",
+          "title": "Auto Push",
+          "type": "boolean"
+        },
+        "branch_prefix": {
+          "default": "agent/",
+          "description": "Prefix for task branches",
+          "title": "Branch Prefix",
+          "type": "string"
+        }
+      },
+      "title": "GitConfig",
+      "type": "object"
+    },
+    "NotificationConfig": {
+      "description": "Notification configuration.",
+      "properties": {
+        "desktop": {
+          "default": true,
+          "description": "Enable desktop notifications",
+          "title": "Desktop",
+          "type": "boolean"
+        },
+        "telegram_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Telegram bot token",
+          "title": "Telegram Token"
+        },
+        "telegram_chat_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Telegram chat ID",
+          "title": "Telegram Chat Id"
+        },
+        "webhook_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Webhook URL for notifications",
+          "title": "Webhook Url"
+        }
+      },
+      "title": "NotificationConfig",
+      "type": "object"
+    },
+    "TaskConfig": {
+      "description": "Task configuration model for YAML parsing.\n\nThis model represents a task definition as specified in the YAML config file.\nIt is used for parsing and validating task configurations before they are\nconverted to runtime Task instances.",
+      "properties": {
+        "id": {
+          "description": "Unique task identifier",
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "title": {
+          "description": "Human-readable task title",
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        },
+        "prompt": {
+          "description": "Task prompt for the agent",
+          "minLength": 1,
+          "title": "Prompt",
+          "type": "string"
+        },
+        "agent_type": {
+          "$ref": "#/$defs/AgentType",
+          "default": "claude_code",
+          "description": "Type of agent to execute the task"
+        },
+        "scope": {
+          "description": "File/directory globs that the task can modify",
+          "items": {
+            "type": "string"
+          },
+          "title": "Scope",
+          "type": "array"
+        },
+        "depends_on": {
+          "description": "List of task IDs this task depends on",
+          "items": {
+            "type": "string"
+          },
+          "title": "Depends On",
+          "type": "array"
+        },
+        "timeout_minutes": {
+          "default": 30,
+          "description": "Task timeout in minutes (1-1440)",
+          "maximum": 1440,
+          "minimum": 1,
+          "title": "Timeout Minutes",
+          "type": "integer"
+        },
+        "max_retries": {
+          "default": 2,
+          "description": "Maximum retry attempts (0-10)",
+          "maximum": 10,
+          "minimum": 0,
+          "title": "Max Retries",
+          "type": "integer"
+        },
+        "validation_cmd": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Command to validate task completion",
+          "title": "Validation Cmd"
+        },
+        "requires_approval": {
+          "default": false,
+          "description": "Whether task requires manual approval before start",
+          "title": "Requires Approval",
+          "type": "boolean"
+        },
+        "priority": {
+          "default": 0,
+          "description": "Task priority (-100 to 100)",
+          "maximum": 100,
+          "minimum": -100,
+          "title": "Priority",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "prompt"
+      ],
+      "title": "TaskConfig",
+      "type": "object"
+    }
+  },
+  "description": "Project configuration model for YAML parsing.\n\nThis is the root configuration model that represents the entire YAML\nconfiguration file including project settings, defaults, and task list.",
+  "properties": {
+    "project": {
+      "description": "Project name",
+      "minLength": 1,
+      "title": "Project",
+      "type": "string"
+    },
+    "repo": {
+      "description": "Repository path",
+      "minLength": 1,
+      "title": "Repo",
+      "type": "string"
+    },
+    "max_concurrent": {
+      "default": 3,
+      "description": "Maximum concurrent tasks (1-10)",
+      "maximum": 10,
+      "minimum": 1,
+      "title": "Max Concurrent",
+      "type": "integer"
+    },
+    "tasks": {
+      "description": "List of task configurations",
+      "items": {
+        "$ref": "#/$defs/TaskConfig"
+      },
+      "title": "Tasks",
+      "type": "array"
+    },
+    "defaults": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DefaultsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Default values for tasks"
+    },
+    "git": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GitConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Git configuration"
+    },
+    "notifications": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NotificationConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Notification configuration"
+    }
+  },
+  "required": [
+    "project",
+    "repo"
+  ],
+  "title": "ProjectConfig",
+  "type": "object"
+}

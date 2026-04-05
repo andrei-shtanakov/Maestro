@@ -86,53 +86,61 @@ class TestGetDelay:
     """Tests for exponential backoff delay calculation."""
 
     def test_first_retry_uses_base_delay(self, retry_manager: RetryManager) -> None:
-        """Test that first retry (count=0) uses base delay."""
+        """Test that first retry (count=0) uses ~base delay with jitter."""
         delay = retry_manager.get_delay(0)
-        assert delay == 5.0
+        assert 5.0 * 0.7 <= delay <= 5.0 * 1.3
 
     def test_second_retry_doubles_delay(self, retry_manager: RetryManager) -> None:
-        """Test exponential growth: delay doubles each retry."""
+        """Test exponential growth: delay ~doubles each retry."""
         delay = retry_manager.get_delay(1)
-        assert delay == 10.0
+        assert 10.0 * 0.7 <= delay <= 10.0 * 1.3
 
     def test_third_retry_quadruples_delay(self, retry_manager: RetryManager) -> None:
-        """Test exponential growth: third retry = base * 4."""
+        """Test exponential growth: third retry ~= base * 4."""
         delay = retry_manager.get_delay(2)
-        assert delay == 20.0
+        assert 20.0 * 0.7 <= delay <= 20.0 * 1.3
 
     def test_exponential_formula(self, retry_manager: RetryManager) -> None:
-        """Test delay = base_delay * 2^retry_count."""
+        """Test delay ~= base_delay * 2^retry_count within jitter range."""
         for count in range(5):
-            expected = 5.0 * (2**count)
-            expected = min(expected, 300.0)
-            assert retry_manager.get_delay(count) == expected
+            nominal = 5.0 * (2**count)
+            nominal = min(nominal, 300.0)
+            delay = retry_manager.get_delay(count)
+            assert nominal * 0.7 <= delay <= nominal * 1.3
 
     def test_delay_capped_at_max(self, retry_manager: RetryManager) -> None:
-        """Test that delay is capped at max_delay."""
+        """Test that delay is capped at max_delay even after jitter."""
         # 5 * 2^10 = 5120, should be capped at 300
         delay = retry_manager.get_delay(10)
-        assert delay == 300.0
+        assert delay <= 300.0
 
     def test_custom_base_delay(self, retry_manager_custom: RetryManager) -> None:
         """Test with custom base delay."""
         delay = retry_manager_custom.get_delay(0)
-        assert delay == 10.0
+        assert 10.0 * 0.7 <= delay <= 10.0 * 1.3
 
     def test_custom_max_delay(self, retry_manager_custom: RetryManager) -> None:
         """Test with custom max delay cap."""
         # 10 * 2^5 = 320, capped at 120
         delay = retry_manager_custom.get_delay(5)
-        assert delay == 120.0
+        assert delay <= 120.0
 
     def test_zero_retry_count(self, retry_manager: RetryManager) -> None:
         """Test delay with zero retry count."""
         delay = retry_manager.get_delay(0)
-        assert delay == 5.0
+        assert 5.0 * 0.7 <= delay <= 5.0 * 1.3
 
     def test_large_retry_count_stays_capped(self, retry_manager: RetryManager) -> None:
         """Test that very large retry counts are capped."""
         delay = retry_manager.get_delay(100)
-        assert delay == 300.0
+        assert delay <= 300.0
+
+    def test_jitter_produces_varying_values(
+        self, retry_manager: RetryManager
+    ) -> None:
+        """Test that jitter produces non-identical values across calls."""
+        delays = [retry_manager.get_delay(0) for _ in range(100)]
+        assert len(set(delays)) > 1
 
 
 # =============================================================================
@@ -479,18 +487,14 @@ class TestRetryFlowIntegration:
         assert "Got: None" in context
 
     @pytest.mark.anyio
-    async def test_backoff_delay_increases(self) -> None:
-        """Test that backoff delay increases with each retry."""
+    async def test_backoff_delay_within_jitter_range(self) -> None:
+        """Test that backoff delays fall within expected jitter ranges."""
         rm = RetryManager(base_delay=1.0, max_delay=100.0)
 
-        delays = [rm.get_delay(i) for i in range(5)]
-
-        # Verify strictly increasing (until cap)
-        assert delays == [1.0, 2.0, 4.0, 8.0, 16.0]
-
-        # Verify each is double the previous
-        for i in range(1, len(delays)):
-            assert delays[i] == delays[i - 1] * 2
+        for i in range(5):
+            nominal = 1.0 * (2**i)
+            delay = rm.get_delay(i)
+            assert nominal * 0.7 <= delay <= nominal * 1.3
 
     @pytest.mark.anyio
     async def test_zero_retries_goes_directly_to_needs_review(

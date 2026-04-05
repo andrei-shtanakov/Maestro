@@ -1,0 +1,270 @@
+{
+  "$defs": {
+    "NotificationConfig": {
+      "description": "Notification configuration.",
+      "properties": {
+        "desktop": {
+          "default": true,
+          "description": "Enable desktop notifications",
+          "title": "Desktop",
+          "type": "boolean"
+        },
+        "telegram_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Telegram bot token",
+          "title": "Telegram Token"
+        },
+        "telegram_chat_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Telegram chat ID",
+          "title": "Telegram Chat Id"
+        },
+        "webhook_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Webhook URL for notifications",
+          "title": "Webhook Url"
+        }
+      },
+      "title": "NotificationConfig",
+      "type": "object"
+    },
+    "SpecRunnerConfig": {
+      "description": "Configuration passed through to spec-runner.",
+      "properties": {
+        "max_retries": {
+          "default": 3,
+          "description": "Max retries per task",
+          "minimum": 0,
+          "title": "Max Retries",
+          "type": "integer"
+        },
+        "task_timeout_minutes": {
+          "default": 30,
+          "description": "Timeout per task in minutes",
+          "minimum": 1,
+          "title": "Task Timeout Minutes",
+          "type": "integer"
+        },
+        "claude_command": {
+          "default": "claude",
+          "description": "Claude CLI command",
+          "title": "Claude Command",
+          "type": "string"
+        },
+        "auto_commit": {
+          "default": true,
+          "description": "Auto-commit after task",
+          "title": "Auto Commit",
+          "type": "boolean"
+        },
+        "create_git_branch": {
+          "default": true,
+          "description": "Create sub-branch per task",
+          "title": "Create Git Branch",
+          "type": "boolean"
+        },
+        "run_tests_on_done": {
+          "default": true,
+          "description": "Run tests after task",
+          "title": "Run Tests On Done",
+          "type": "boolean"
+        },
+        "test_command": {
+          "default": "uv run pytest",
+          "description": "Test command to run",
+          "title": "Test Command",
+          "type": "string"
+        },
+        "lint_command": {
+          "default": "uv run ruff check .",
+          "description": "Lint command to run",
+          "title": "Lint Command",
+          "type": "string"
+        },
+        "run_lint_on_done": {
+          "default": true,
+          "description": "Run lint after task",
+          "title": "Run Lint On Done",
+          "type": "boolean"
+        }
+      },
+      "title": "SpecRunnerConfig",
+      "type": "object"
+    },
+    "ZadachaConfig": {
+      "description": "Configuration for a single zadacha (independent work unit).\n\nUsed in YAML config or produced by auto-decomposition.",
+      "properties": {
+        "id": {
+          "description": "Unique zadacha identifier",
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "title": {
+          "description": "Human-readable title",
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        },
+        "description": {
+          "description": "Detailed description",
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "scope": {
+          "description": "File/directory globs this zadacha owns",
+          "items": {
+            "type": "string"
+          },
+          "title": "Scope",
+          "type": "array"
+        },
+        "depends_on": {
+          "description": "IDs of zadachi this one depends on",
+          "items": {
+            "type": "string"
+          },
+          "title": "Depends On",
+          "type": "array"
+        },
+        "priority": {
+          "default": 0,
+          "description": "Execution priority (-100 to 100)",
+          "maximum": 100,
+          "minimum": -100,
+          "title": "Priority",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "description"
+      ],
+      "title": "ZadachaConfig",
+      "type": "object"
+    }
+  },
+  "description": "Configuration for multi-process orchestration.\n\nRoot model for project.yaml configuration files.",
+  "properties": {
+    "project": {
+      "description": "Project name",
+      "minLength": 1,
+      "title": "Project",
+      "type": "string"
+    },
+    "description": {
+      "default": "",
+      "description": "Project description for auto-decomposition",
+      "title": "Description",
+      "type": "string"
+    },
+    "repo_url": {
+      "description": "GitHub remote URL",
+      "minLength": 1,
+      "title": "Repo Url",
+      "type": "string"
+    },
+    "repo_path": {
+      "description": "Local repository path",
+      "minLength": 1,
+      "title": "Repo Path",
+      "type": "string"
+    },
+    "workspace_base": {
+      "description": "Base directory for worktrees",
+      "minLength": 1,
+      "title": "Workspace Base",
+      "type": "string"
+    },
+    "max_concurrent": {
+      "default": 3,
+      "description": "Max concurrent zadachi",
+      "maximum": 10,
+      "minimum": 1,
+      "title": "Max Concurrent",
+      "type": "integer"
+    },
+    "base_branch": {
+      "default": "main",
+      "description": "Base branch name",
+      "title": "Base Branch",
+      "type": "string"
+    },
+    "branch_prefix": {
+      "default": "feature/",
+      "description": "Prefix for zadacha branches",
+      "title": "Branch Prefix",
+      "type": "string"
+    },
+    "auto_pr": {
+      "default": true,
+      "description": "Auto-create PR after zadacha completes",
+      "title": "Auto Pr",
+      "type": "boolean"
+    },
+    "spec_runner": {
+      "$ref": "#/$defs/SpecRunnerConfig",
+      "description": "Spec-runner configuration"
+    },
+    "zadachi": {
+      "description": "Manual zadachi list (auto-decompose if empty)",
+      "items": {
+        "$ref": "#/$defs/ZadachaConfig"
+      },
+      "title": "Zadachi",
+      "type": "array"
+    },
+    "callback_url": {
+      "default": "",
+      "description": "URL for spec-runner to POST task status callbacks",
+      "title": "Callback Url",
+      "type": "string"
+    },
+    "notifications": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NotificationConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Notification configuration"
+    }
+  },
+  "required": [
+    "project",
+    "repo_url",
+    "repo_path",
+    "workspace_base"
+  ],
+  "title": "OrchestratorConfig",
+  "type": "object"
+}

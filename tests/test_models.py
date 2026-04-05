@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from maestro.dag import DAG, CycleError
 from maestro.models import (
     AgentType,
     DefaultsConfig,
@@ -687,39 +688,33 @@ class TestProjectConfig:
             )
 
     def test_cyclic_dependency_two_tasks_rejected(self) -> None:
-        """Test that cyclic dependency between two tasks is rejected."""
-        with pytest.raises(ValueError, match="Cyclic dependency detected"):
-            ProjectConfig(
-                project="test",
-                repo="/path/to/repo",
-                tasks=[
-                    TaskConfig(
-                        id="task-a", title="A", prompt="A", depends_on=["task-b"]
-                    ),
-                    TaskConfig(
-                        id="task-b", title="B", prompt="B", depends_on=["task-a"]
-                    ),
-                ],
-            )
+        """Test that cyclic dependency between two tasks is rejected via DAG."""
+        tasks = [
+            TaskConfig(
+                id="task-a", title="A", prompt="A", depends_on=["task-b"]
+            ),
+            TaskConfig(
+                id="task-b", title="B", prompt="B", depends_on=["task-a"]
+            ),
+        ]
+        with pytest.raises(CycleError, match="Cyclic dependency detected"):
+            DAG(tasks)
 
     def test_cyclic_dependency_three_tasks_rejected(self) -> None:
-        """Test that cyclic dependency among three tasks is rejected."""
-        with pytest.raises(ValueError, match="Cyclic dependency detected"):
-            ProjectConfig(
-                project="test",
-                repo="/path/to/repo",
-                tasks=[
-                    TaskConfig(
-                        id="task-a", title="A", prompt="A", depends_on=["task-c"]
-                    ),
-                    TaskConfig(
-                        id="task-b", title="B", prompt="B", depends_on=["task-a"]
-                    ),
-                    TaskConfig(
-                        id="task-c", title="C", prompt="C", depends_on=["task-b"]
-                    ),
-                ],
-            )
+        """Test that cyclic dependency among three tasks is rejected via DAG."""
+        tasks = [
+            TaskConfig(
+                id="task-a", title="A", prompt="A", depends_on=["task-c"]
+            ),
+            TaskConfig(
+                id="task-b", title="B", prompt="B", depends_on=["task-a"]
+            ),
+            TaskConfig(
+                id="task-c", title="C", prompt="C", depends_on=["task-b"]
+            ),
+        ]
+        with pytest.raises(CycleError, match="Cyclic dependency detected"):
+            DAG(tasks)
 
     def test_cyclic_dependency_self_loop_in_project(self) -> None:
         """Test that self-dependency at project level is caught (redundant with TaskConfig check)."""
@@ -775,13 +770,20 @@ class TestProjectConfig:
     def test_max_concurrent_bounds(self) -> None:
         """Test max_concurrent validation bounds."""
         ProjectConfig(project="test", repo="/path", max_concurrent=1)
-        ProjectConfig(project="test", repo="/path", max_concurrent=10)
+        ProjectConfig(project="test", repo="/path", max_concurrent=100)
 
         # type: ignore needed for intentional validation testing
         with pytest.raises(ValueError):
             ProjectConfig(project="test", repo="/path", max_concurrent=0)  # type: ignore[arg-type]
         with pytest.raises(ValueError):
-            ProjectConfig(project="test", repo="/path", max_concurrent=11)  # type: ignore[arg-type]
+            ProjectConfig(project="test", repo="/path", max_concurrent=101)  # type: ignore[arg-type]
+
+    def test_max_concurrent_mid_range(self) -> None:
+        """Test max_concurrent=50 is valid within the 1-100 range."""
+        config = ProjectConfig(
+            project="test", repo="/path", max_concurrent=50
+        )
+        assert config.max_concurrent == 50
 
     def test_get_task_by_id(self) -> None:
         """Test get_task_by_id method."""

@@ -18,6 +18,12 @@ dependencies = [
 [project.scripts]
 maestro = "maestro.cli:main"
 
+[project.entry-points."maestro.spawners"]
+claude_code = "maestro.spawners.claude_code:ClaudeCodeSpawner"
+codex = "maestro.spawners.codex:CodexSpawner"
+aider = "maestro.spawners.aider:AiderSpawner"
+announce = "maestro.spawners.announce:AnnounceSpawner"
+
 [tool.uv]
 package = true
 

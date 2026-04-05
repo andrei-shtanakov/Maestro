@@ -356,7 +356,7 @@ class ProjectConfig(BaseModel):
     project: str = Field(..., min_length=1, description="Project name")
     repo: str = Field(..., min_length=1, description="Repository path")
     max_concurrent: int = Field(
-        default=3, ge=1, le=10, description="Maximum concurrent tasks (1-10)"
+        default=3, ge=1, le=100, description="Maximum concurrent tasks (1-100)"
     )
     tasks: list[TaskConfig] = Field(
         default_factory=list, description="List of task configurations"
@@ -397,48 +397,6 @@ class ProjectConfig(BaseModel):
             if missing:
                 msg = f"Task '{task.id}' has unknown dependencies: {missing}"
                 raise ValueError(msg)
-        return self
-
-    @model_validator(mode="after")
-    def validate_no_cyclic_dependencies(self) -> Self:
-        """Ensure there are no cyclic dependencies in the task DAG."""
-        # Build adjacency list for dependency graph
-        graph: dict[str, list[str]] = {
-            task.id: list(task.depends_on) for task in self.tasks
-        }
-
-        # Track visited nodes and nodes in current recursion stack
-        visited: set[str] = set()
-        rec_stack: set[str] = set()
-        cycle_path: list[str] = []
-
-        def detect_cycle(node: str, path: list[str]) -> bool:
-            """DFS to detect cycles, returns True if cycle found."""
-            visited.add(node)
-            rec_stack.add(node)
-            path.append(node)
-
-            for neighbor in graph.get(node, []):
-                if neighbor not in visited:
-                    if detect_cycle(neighbor, path):
-                        return True
-                elif neighbor in rec_stack:
-                    # Found a cycle - capture the cycle path
-                    cycle_start = path.index(neighbor)
-                    cycle_path.extend(path[cycle_start:])
-                    cycle_path.append(neighbor)
-                    return True
-
-            path.pop()
-            rec_stack.remove(node)
-            return False
-
-        for task_id in graph:
-            if task_id not in visited and detect_cycle(task_id, []):
-                cycle_str = " -> ".join(cycle_path)
-                msg = f"Cyclic dependency detected: {cycle_str}"
-                raise ValueError(msg)
-
         return self
 
     @model_validator(mode="after")
@@ -822,8 +780,8 @@ class OrchestratorConfig(BaseModel):
     max_concurrent: int = Field(
         default=3,
         ge=1,
-        le=10,
-        description="Max concurrent zadachi",
+        le=100,
+        description="Max concurrent zadachi (1-100)",
     )
     base_branch: str = Field(default="main", description="Base branch name")
     branch_prefix: str = Field(
