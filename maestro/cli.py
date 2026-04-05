@@ -13,6 +13,7 @@ import contextlib
 import fcntl
 import os
 import signal
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
@@ -146,6 +147,47 @@ def _read_pid_file() -> int | None:
         return int(PID_FILE.read_text().strip())
     except (ValueError, OSError):
         return None
+
+
+def _display_git_summary(workdir: Path) -> None:
+    """Display git diff summary of changes made during the run."""
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--stat"],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            console.print("\n[bold]Changes made by agents:[/bold]")
+            console.print(result.stdout.rstrip())
+
+        # Also show new untracked files
+        result_untracked = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if (
+            result_untracked.returncode == 0
+            and result_untracked.stdout.strip()
+        ):
+            new_files = [
+                line
+                for line in result_untracked.stdout.strip().split("\n")
+                if line.startswith("??")
+            ]
+            if new_files:
+                console.print("\n[bold]New files:[/bold]")
+                for f in new_files:
+                    console.print(f"  [green]{f[3:]}[/green]")
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass  # git not available or timeout
 
 
 def _display_tasks_table(tasks: list, title: str = "Tasks") -> None:
@@ -355,6 +397,9 @@ async def _run_scheduler(
 
         # Run scheduler
         await scheduler.run()
+
+        # Show what agents changed
+        _display_git_summary(workdir)
 
         # Display final state
         all_tasks = await db.get_all_tasks()
