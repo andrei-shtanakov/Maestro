@@ -13,6 +13,7 @@ import contextlib
 import fcntl
 import os
 import signal
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -277,6 +278,52 @@ async def _run_scheduler(
         # Setup notifications
         notifications = create_notification_manager(config.notifications)
 
+        # Setup streaming progress callback
+        _task_start_times: dict[str, datetime] = {}
+
+        def _on_status_change(
+            task_id: str,
+            old_status: str,
+            new_status: str,
+        ) -> None:
+            now = datetime.now(UTC)
+            timestamp = now.strftime("%H:%M:%S")
+            if new_status == "running":
+                _task_start_times[task_id] = now
+                console.print(
+                    f"[dim]{timestamp}[/dim] "
+                    f"[cyan]{task_id}[/cyan]: "
+                    f"[yellow]RUNNING[/yellow]"
+                )
+            elif new_status == "done":
+                elapsed = ""
+                if task_id in _task_start_times:
+                    delta = now - _task_start_times[task_id]
+                    minutes = int(delta.total_seconds() // 60)
+                    seconds = int(delta.total_seconds() % 60)
+                    elapsed = f" [dim]({minutes}m{seconds:02d}s)[/dim]"
+                console.print(
+                    f"[dim]{timestamp}[/dim] "
+                    f"[cyan]{task_id}[/cyan]: "
+                    f"[green]DONE[/green]{elapsed}"
+                )
+            elif new_status == "failed":
+                console.print(
+                    f"[dim]{timestamp}[/dim] [cyan]{task_id}[/cyan]: [red]FAILED[/red]"
+                )
+            elif new_status == "needs_review":
+                console.print(
+                    f"[dim]{timestamp}[/dim] "
+                    f"[cyan]{task_id}[/cyan]: "
+                    f"[red]NEEDS_REVIEW[/red]"
+                )
+            elif new_status == "ready" and old_status == "failed":
+                console.print(
+                    f"[dim]{timestamp}[/dim] "
+                    f"[cyan]{task_id}[/cyan]: "
+                    f"[yellow]RETRYING[/yellow]"
+                )
+
         # Create scheduler
         scheduler = await create_scheduler_from_config(
             db=db,
@@ -286,6 +333,7 @@ async def _run_scheduler(
             workdir=workdir,
             log_dir=log_dir,
             notification_manager=notifications,
+            on_status_change=_on_status_change,
         )
 
         # Display initial state

@@ -55,6 +55,7 @@ from maestro.scheduler import (
     Scheduler,
     SchedulerConfig,
     SchedulerError,
+    StatusChangeCallback,
     TaskTimeoutError,
     create_scheduler_from_config,
 )
@@ -113,6 +114,7 @@ __all__ = [
     "SpawnerNotFoundError",
     "SpawnerRegistry",
     "StateRecovery",
+    "StatusChangeCallback",
     "TaskAlreadyExistsError",
     "TaskNotFoundError",
     "TaskTimeoutError",

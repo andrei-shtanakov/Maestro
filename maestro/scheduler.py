@@ -13,6 +13,7 @@ import contextlib
 import logging
 import signal
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -29,6 +30,8 @@ from maestro.validator import ValidationResult, Validator
 
 
 logger = logging.getLogger(__name__)
+
+StatusChangeCallback = Callable[[str, str, str], None]
 
 
 class SpawnerProtocol(Protocol):
@@ -172,6 +175,7 @@ class Scheduler:
         config: SchedulerConfig | None = None,
         notification_manager: NotificationManager | None = None,
         retry_manager: RetryManager | None = None,
+        on_status_change: StatusChangeCallback | None = None,
     ) -> None:
         """Initialize scheduler.
 
@@ -182,6 +186,7 @@ class Scheduler:
             config: Scheduler configuration.
             notification_manager: Optional notification manager.
             retry_manager: Optional retry manager for backoff/context.
+            on_status_change: Optional callback for task status changes.
         """
         self._db = db
         self._dag = dag
@@ -189,6 +194,7 @@ class Scheduler:
         self._config = config or SchedulerConfig()
         self._notifications = notification_manager
         self._retry_manager = retry_manager or RetryManager()
+        self._on_status_change = on_status_change
 
         self._running_tasks: dict[str, RunningTask] = {}
         self._retry_ready_times: dict[str, datetime] = {}
@@ -229,6 +235,22 @@ class Scheduler:
             return
         notification = Notification.from_task(task, event, message)
         await self._notifications.notify(notification)
+
+    def _report_status_change(
+        self,
+        task_id: str,
+        old_status: str,
+        new_status: str,
+    ) -> None:
+        """Report a task status change via callback.
+
+        Args:
+            task_id: ID of the task.
+            old_status: Previous status value.
+            new_status: New status value.
+        """
+        if self._on_status_change is not None:
+            self._on_status_change(task_id, old_status, new_status)
 
     async def run(self) -> None:
         """Run the scheduler main loop.
@@ -406,6 +428,7 @@ class Scheduler:
             TaskStatus.RUNNING,
             expected_status=TaskStatus.READY,
         )
+        self._report_status_change(task_id, "ready", "running")
         self._retry_ready_times.pop(task_id, None)
 
         # Spawn the process with retry context
@@ -491,6 +514,7 @@ class Scheduler:
             TaskStatus.FAILED,
             error_message=str(error),
         )
+        self._report_status_change(task_id, "running", "failed")
 
     async def _monitor_running_tasks(self) -> None:
         """Monitor all running tasks for completion or timeout."""
@@ -540,6 +564,7 @@ class Scheduler:
                     TaskStatus.VALIDATING,
                     expected_status=TaskStatus.RUNNING,
                 )
+                self._report_status_change(task_id, "running", "validating")
                 # Run validation with the Validator class
                 validation_result = await self._run_validation(task)
                 if validation_result.success:
@@ -549,6 +574,7 @@ class Scheduler:
                         expected_status=TaskStatus.VALIDATING,
                         result_summary="Task completed successfully",
                     )
+                    self._report_status_change(task_id, "validating", "done")
                     await self._notify(task, NotificationEvent.TASK_COMPLETED)
                 else:
                     # Include validation output in error for retry context
@@ -564,6 +590,7 @@ class Scheduler:
                     expected_status=TaskStatus.RUNNING,
                     result_summary="Task completed successfully",
                 )
+                self._report_status_change(task_id, "running", "done")
                 await self._notify(task, NotificationEvent.TASK_COMPLETED)
         else:
             # Process failed
@@ -628,12 +655,14 @@ class Scheduler:
                 error_message=full_error,
                 retry_count=new_retry_count,
             )
+            self._report_status_change(task_id, "validating", "failed")
             # Transition back to READY for retry
             await self._db.update_task_status(
                 task_id,
                 TaskStatus.READY,
                 expected_status=TaskStatus.FAILED,
             )
+            self._report_status_change(task_id, "failed", "ready")
         else:
             # No more retries - needs review
             logging.warning(
@@ -647,11 +676,13 @@ class Scheduler:
                 expected_status=TaskStatus.VALIDATING,
                 error_message=full_error,
             )
+            self._report_status_change(task_id, "validating", "failed")
             await self._db.update_task_status(
                 task_id,
                 TaskStatus.NEEDS_REVIEW,
                 expected_status=TaskStatus.FAILED,
             )
+            self._report_status_change(task_id, "failed", "needs_review")
             await self._notify(
                 current_task,
                 NotificationEvent.TASK_NEEDS_REVIEW,
@@ -686,12 +717,14 @@ class Scheduler:
                 error_message=error_message,
                 retry_count=new_retry_count,
             )
+            self._report_status_change(task_id, "running", "failed")
             # Transition back to READY for retry
             await self._db.update_task_status(
                 task_id,
                 TaskStatus.READY,
                 expected_status=TaskStatus.FAILED,
             )
+            self._report_status_change(task_id, "failed", "ready")
         else:
             # No more retries - needs review
             logging.warning(
@@ -704,11 +737,13 @@ class Scheduler:
                 TaskStatus.FAILED,
                 error_message=error_message,
             )
+            self._report_status_change(task_id, "running", "failed")
             await self._db.update_task_status(
                 task_id,
                 TaskStatus.NEEDS_REVIEW,
                 expected_status=TaskStatus.FAILED,
             )
+            self._report_status_change(task_id, "failed", "needs_review")
             await self._notify(
                 current_task,
                 NotificationEvent.TASK_NEEDS_REVIEW,
@@ -872,6 +907,7 @@ async def create_scheduler_from_config(
     workdir: Path | None = None,
     log_dir: Path | None = None,
     notification_manager: NotificationManager | None = None,
+    on_status_change: StatusChangeCallback | None = None,
 ) -> Scheduler:
     """Create a scheduler from task configurations.
 
@@ -888,6 +924,7 @@ async def create_scheduler_from_config(
         workdir: Base working directory.
         log_dir: Directory for log files.
         notification_manager: Optional notification manager.
+        on_status_change: Optional callback for task status changes.
 
     Returns:
         Configured Scheduler instance.
@@ -916,4 +953,11 @@ async def create_scheduler_from_config(
         task = Task.from_config(task_config, str(config.workdir))
         await db.create_task(task)
 
-    return Scheduler(db, dag, spawners, config, notification_manager)
+    return Scheduler(
+        db,
+        dag,
+        spawners,
+        config,
+        notification_manager,
+        on_status_change=on_status_change,
+    )

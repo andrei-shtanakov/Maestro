@@ -1415,3 +1415,47 @@ class TestSchedulerGracePeriod:
     def test_custom_grace_period(self) -> None:
         config = SchedulerConfig(shutdown_grace_seconds=10.0)
         assert config.shutdown_grace_seconds == 10.0
+
+
+# =============================================================================
+# Test StatusChangeCallback
+# =============================================================================
+
+
+class TestStatusChangeCallback:
+    """Tests for the on_status_change callback."""
+
+    def test_scheduler_accepts_callback(self) -> None:
+        """Test that Scheduler.__init__ accepts on_status_change."""
+        db = MagicMock(spec=Database)
+        dag = MagicMock(spec=DAG)
+        changes: list[tuple[str, str, str]] = []
+
+        def callback(
+            task_id: str,
+            old_status: str,
+            new_status: str,
+        ) -> None:
+            changes.append((task_id, old_status, new_status))
+
+        scheduler = Scheduler(
+            db=db,
+            dag=dag,
+            spawners={},
+            on_status_change=callback,
+        )
+        # Verify the helper invokes the callback
+        scheduler._report_status_change("t1", "ready", "running")
+        assert changes == [("t1", "ready", "running")]
+
+    def test_scheduler_no_callback(self) -> None:
+        """Test that Scheduler works without a callback."""
+        db = MagicMock(spec=Database)
+        dag = MagicMock(spec=DAG)
+        scheduler = Scheduler(
+            db=db,
+            dag=dag,
+            spawners={},
+        )
+        # Should not raise
+        scheduler._report_status_change("t1", "ready", "running")
