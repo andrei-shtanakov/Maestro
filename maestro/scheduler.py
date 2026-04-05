@@ -28,6 +28,9 @@ from maestro.retry import RetryManager
 from maestro.validator import ValidationResult, Validator
 
 
+logger = logging.getLogger(__name__)
+
+
 class SpawnerProtocol(Protocol):
     """Protocol for agent spawners."""
 
@@ -730,8 +733,12 @@ class Scheduler:
                 running_task.process.kill()
             # Reap the child process to avoid zombies
             running_task.process.wait()
-        except OSError:
-            pass  # Process may have already exited
+        except OSError as e:
+            logger.debug(
+                "Failed to terminate timed-out process for task %s: %s",
+                task_id,
+                e,
+            )
 
         # Notify timeout
         error_msg = f"Task timed out after {running_task.task.timeout_minutes} minutes"
@@ -816,8 +823,12 @@ class Scheduler:
                     running_task.process.kill()
                 # Reap the child process to avoid zombies
                 running_task.process.wait()
-            except OSError:
-                pass
+            except OSError as e:
+                logger.debug(
+                    "Failed to terminate process for task %s during cleanup: %s",
+                    task_id,
+                    e,
+                )
 
             # Update task status
             try:

@@ -160,8 +160,8 @@ class PRManager:
             )
             if result.returncode == 0:
                 return result.stdout.strip()
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            self._logger.debug("Failed to get default branch: %s", e)
         return ""
 
     def push_and_create_pr(

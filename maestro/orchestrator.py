@@ -424,8 +424,12 @@ class Orchestrator:
                 ZadachaStatus.RUNNING,
                 subtask_progress=progress,
             )
-        except (json.JSONDecodeError, OSError):
-            pass  # State file may be partially written
+        except (json.JSONDecodeError, OSError) as e:
+            self._logger.debug(
+                "Failed to read state file for zadacha %s: %s",
+                zadacha_id,
+                e,
+            )
 
     async def _handle_completion(
         self,
@@ -616,8 +620,12 @@ class Orchestrator:
                 if running.process.returncode is None:
                     running.process.kill()
                 await running.process.wait()
-            except OSError:
-                pass
+            except OSError as e:
+                self._logger.debug(
+                    "Failed to terminate process for zadacha %s during cleanup: %s",
+                    zid,
+                    e,
+                )
 
             try:
                 await self._db.update_zadacha_status(
