@@ -246,6 +246,7 @@ async def _run_scheduler(
     db_path: Path,
     resume: bool,
     log_dir: Path | None,
+    clean: bool = False,
 ) -> None:
     """Run the scheduler with the given configuration."""
     # Load configuration
@@ -267,6 +268,11 @@ async def _run_scheduler(
 
     # Ensure DB directory exists
     db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Clean existing state if requested
+    if clean and db_path.exists():  # noqa: ASYNC240
+        db_path.unlink()  # noqa: ASYNC240
+        console.print("[yellow]Cleaned database for fresh start[/yellow]")
 
     # Create or connect to database
     db = await create_database(db_path)
@@ -598,6 +604,13 @@ def run_command(
             resolve_path=True,
         ),
     ] = None,
+    clean: Annotated[
+        bool,
+        typer.Option(
+            "--clean",
+            help="Reset all tasks and start fresh",
+        ),
+    ] = False,
 ) -> None:
     """Run tasks from a YAML configuration file.
 
@@ -607,12 +620,13 @@ def run_command(
     Examples:
         maestro run tasks.yaml
         maestro run tasks.yaml --resume
+        maestro run tasks.yaml --clean
         maestro run tasks.yaml --db /path/to/state.db
     """
     db_path = db or DEFAULT_DB_PATH
 
     try:
-        asyncio.run(_run_scheduler(config, db_path, resume, log_dir))
+        asyncio.run(_run_scheduler(config, db_path, resume, log_dir, clean))
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user[/yellow]")
         raise typer.Exit(130) from None
