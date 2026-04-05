@@ -64,6 +64,7 @@ Each entry:
 - **Description**: Running `maestro run` again with the same config exits instantly because all tasks are DONE in SQLite. No way to re-run without manually deleting `~/.maestro/maestro.db`. The `--resume` flag exists but there's no `--clean` or `--force`.
 - **Expected**: `maestro run config.yaml --clean` should reset all tasks to PENDING. Or `maestro run config.yaml --force` should re-run regardless of DB state.
 - **Workaround**: `rm ~/.maestro/maestro.db` before re-run.
+- **FIXED**: 2026-04-05 — `maestro run config.yaml --clean` deletes DB for fresh start.
 
 ### 6. Auto-commit summary not shown in final output
 - **Date**: 2026-04-05
@@ -73,3 +74,4 @@ Each entry:
 - **Description**: When `auto_commit: true`, the git diff summary shows nothing (changes already committed). But user has no way to see WHICH commits were created. The final output should list auto-commits made during the run.
 - **Expected**: After "All tasks completed", show: `Auto-commits: 3 commits created` with `git log --oneline` of those commits.
 - **Workaround**: `git log --oneline` manually after run.
+- **FIXED**: 2026-04-05 — Shows `git log --oneline --stat before..HEAD` with per-task file changes.
