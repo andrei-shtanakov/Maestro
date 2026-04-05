@@ -14,6 +14,9 @@ project: maestro-dogfood
 repo: /Users/Andrei_Shtanakov/labs/all_ai_orchestrators/Maestro
 max_concurrent: 2
 
+git:
+  auto_commit: true
+
 defaults:
   timeout_minutes: 15
   max_retries: 1

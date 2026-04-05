@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import logging
 import signal
+import subprocess
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -139,6 +140,7 @@ class SchedulerConfig:
     workdir: Path = field(default_factory=lambda: Path.cwd())
     log_dir: Path = field(default_factory=lambda: Path.cwd() / "logs")
     shutdown_grace_seconds: float = 5.0
+    auto_commit: bool = False
 
 
 class SchedulerError(Exception):
@@ -251,6 +253,58 @@ class Scheduler:
         """
         if self._on_status_change is not None:
             self._on_status_change(task_id, old_status, new_status)
+
+    def _auto_commit_task(self, task: Task) -> None:
+        """Auto-commit changes for a completed task."""
+        if not self._config.auto_commit:
+            return
+        try:
+            workdir = self._config.workdir
+            # Stage files matching task scope
+            if task.scope:
+                for pattern in task.scope:
+                    subprocess.run(
+                        ["git", "add", pattern],
+                        cwd=workdir,
+                        capture_output=True,
+                        timeout=30,
+                        check=False,
+                    )
+            else:
+                subprocess.run(
+                    ["git", "add", "-A"],
+                    cwd=workdir,
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+            # Check if there's anything staged
+            result = subprocess.run(
+                ["git", "diff", "--cached", "--quiet"],
+                cwd=workdir,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            if result.returncode != 0:  # There are staged changes
+                subprocess.run(
+                    [
+                        "git",
+                        "commit",
+                        "-m",
+                        f"maestro: {task.title} ({task.id})",
+                    ],
+                    cwd=workdir,
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            logger.debug(
+                "Auto-commit failed for task %s: %s",
+                task.id,
+                e,
+            )
 
     async def run(self) -> None:
         """Run the scheduler main loop.
@@ -576,6 +630,7 @@ class Scheduler:
                     )
                     self._report_status_change(task_id, "validating", "done")
                     await self._notify(task, NotificationEvent.TASK_COMPLETED)
+                    self._auto_commit_task(task)
                 else:
                     # Include validation output in error for retry context
                     error_msg = self._format_validation_error(validation_result)
@@ -592,6 +647,7 @@ class Scheduler:
                 )
                 self._report_status_change(task_id, "running", "done")
                 await self._notify(task, NotificationEvent.TASK_COMPLETED)
+                self._auto_commit_task(task)
         else:
             # Process failed
             error_msg = f"Process exited with code {return_code}"
@@ -908,6 +964,7 @@ async def create_scheduler_from_config(
     log_dir: Path | None = None,
     notification_manager: NotificationManager | None = None,
     on_status_change: StatusChangeCallback | None = None,
+    auto_commit: bool = False,
 ) -> Scheduler:
     """Create a scheduler from task configurations.
 
@@ -925,6 +982,7 @@ async def create_scheduler_from_config(
         log_dir: Directory for log files.
         notification_manager: Optional notification manager.
         on_status_change: Optional callback for task status changes.
+        auto_commit: Whether to auto-commit after task completion.
 
     Returns:
         Configured Scheduler instance.
@@ -937,6 +995,7 @@ async def create_scheduler_from_config(
         max_concurrent=max_concurrent,
         workdir=workdir or Path.cwd(),
         log_dir=log_dir or Path.cwd() / "logs",
+        auto_commit=auto_commit,
     )
 
     # Create tasks in database if they don't exist

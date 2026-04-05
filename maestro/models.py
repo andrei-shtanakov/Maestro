@@ -301,6 +301,10 @@ class GitConfig(BaseModel):
 
     base_branch: str = Field(default="main", description="Base branch name")
     auto_push: bool = Field(default=True, description="Automatically push after task")
+    auto_commit: bool = Field(
+        default=False,
+        description="Auto-commit changes after each task completes",
+    )
     branch_prefix: str = Field(default="agent/", description="Prefix for task branches")
 
     @field_validator("branch_prefix")

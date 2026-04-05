@@ -173,10 +173,7 @@ def _display_git_summary(workdir: Path) -> None:
             timeout=10,
             check=False,
         )
-        if (
-            result_untracked.returncode == 0
-            and result_untracked.stdout.strip()
-        ):
+        if result_untracked.returncode == 0 and result_untracked.stdout.strip():
             new_files = [
                 line
                 for line in result_untracked.stdout.strip().split("\n")
@@ -376,6 +373,7 @@ async def _run_scheduler(
             log_dir=log_dir,
             notification_manager=notifications,
             on_status_change=_on_status_change,
+            auto_commit=(config.git.auto_commit if config.git else False),
         )
 
         # Display initial state

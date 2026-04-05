@@ -1459,3 +1459,17 @@ class TestStatusChangeCallback:
         )
         # Should not raise
         scheduler._report_status_change("t1", "ready", "running")
+
+
+class TestAutoCommit:
+    """Tests for auto-commit configuration."""
+
+    def test_scheduler_config_has_auto_commit(self) -> None:
+        """Test SchedulerConfig accepts auto_commit=True."""
+        config = SchedulerConfig(auto_commit=True)
+        assert config.auto_commit is True
+
+    def test_scheduler_config_default_no_auto_commit(self) -> None:
+        """Test SchedulerConfig defaults auto_commit to False."""
+        config = SchedulerConfig()
+        assert config.auto_commit is False
