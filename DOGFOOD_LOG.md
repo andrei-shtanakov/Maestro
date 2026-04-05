@@ -55,3 +55,21 @@ Each entry:
 - **Description**: `warning: VIRTUAL_ENV=/Users/.../Maestro/.venv does not match the project environment path .venv` shown at start. Confusing but harmless.
 - **Expected**: No warning, or suppress it.
 - **Workaround**: Ignore.
+
+### 5. No `--clean` / `--force` flag to re-run completed tasks
+- **Date**: 2026-04-05
+- **Severity**: HIGH
+- **Mode**: Mode 1 (Scheduler)
+- **Backlog ref**: new
+- **Description**: Running `maestro run` again with the same config exits instantly because all tasks are DONE in SQLite. No way to re-run without manually deleting `~/.maestro/maestro.db`. The `--resume` flag exists but there's no `--clean` or `--force`.
+- **Expected**: `maestro run config.yaml --clean` should reset all tasks to PENDING. Or `maestro run config.yaml --force` should re-run regardless of DB state.
+- **Workaround**: `rm ~/.maestro/maestro.db` before re-run.
+
+### 6. Auto-commit summary not shown in final output
+- **Date**: 2026-04-05
+- **Severity**: MEDIUM
+- **Mode**: Mode 1 (Scheduler)
+- **Backlog ref**: new
+- **Description**: When `auto_commit: true`, the git diff summary shows nothing (changes already committed). But user has no way to see WHICH commits were created. The final output should list auto-commits made during the run.
+- **Expected**: After "All tasks completed", show: `Auto-commits: 3 commits created` with `git log --oneline` of those commits.
+- **Workaround**: `git log --oneline` manually after run.
