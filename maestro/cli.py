@@ -187,6 +187,53 @@ def _display_git_summary(workdir: Path) -> None:
         pass  # git not available or timeout
 
 
+def _get_git_head(workdir: Path) -> str:
+    """Get current git HEAD SHA."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+def _display_auto_commits(
+    workdir: Path,
+    head_before: str,
+) -> None:
+    """Display commits created during the run (by auto-commit)."""
+    if not head_before:
+        return
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "log",
+                "--oneline",
+                "--stat",
+                f"{head_before}..HEAD",
+            ],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            console.print(
+                "\n[bold]Commits created during run:[/bold]"
+            )
+            console.print(result.stdout.rstrip())
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+
 def _display_tasks_table(tasks: list, title: str = "Tasks") -> None:
     """Display tasks in a rich table."""
     if not tasks:
@@ -399,11 +446,15 @@ async def _run_scheduler(
             )
         )
 
+        # Record HEAD before run for commit summary
+        head_before = _get_git_head(workdir)
+
         # Run scheduler
         await scheduler.run()
 
         # Show what agents changed
         _display_git_summary(workdir)
+        _display_auto_commits(workdir, head_before)
 
         # Display final state
         all_tasks = await db.get_all_tasks()
