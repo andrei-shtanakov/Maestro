@@ -135,9 +135,7 @@ class TestGetDelay:
         delay = retry_manager.get_delay(100)
         assert delay <= 300.0
 
-    def test_jitter_produces_varying_values(
-        self, retry_manager: RetryManager
-    ) -> None:
+    def test_jitter_produces_varying_values(self, retry_manager: RetryManager) -> None:
         """Test that jitter produces non-identical values across calls."""
         delays = [retry_manager.get_delay(0) for _ in range(100)]
         assert len(set(delays)) > 1
