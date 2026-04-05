@@ -132,6 +132,7 @@ class SchedulerConfig:
     poll_interval: float = 1.0
     workdir: Path = field(default_factory=lambda: Path.cwd())
     log_dir: Path = field(default_factory=lambda: Path.cwd() / "logs")
+    shutdown_grace_seconds: float = 5.0
 
 
 class SchedulerError(Exception):
@@ -724,7 +725,7 @@ class Scheduler:
         try:
             running_task.process.terminate()
             # Give it a moment to terminate gracefully
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(self._config.shutdown_grace_seconds)
             if running_task.process.poll() is None:
                 running_task.process.kill()
             # Reap the child process to avoid zombies
@@ -810,7 +811,7 @@ class Scheduler:
             try:
                 running_task.process.terminate()
                 # Give processes time to terminate gracefully
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(self._config.shutdown_grace_seconds)
                 if running_task.process.poll() is None:
                     running_task.process.kill()
                 # Reap the child process to avoid zombies

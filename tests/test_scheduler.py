@@ -996,6 +996,7 @@ class TestGracefulShutdown:
                 max_concurrent=1,
                 poll_interval=0.1,
                 log_dir=temp_dir / "logs",
+                shutdown_grace_seconds=0.5,
             )
 
             scheduler = Scheduler(
@@ -1397,3 +1398,20 @@ class TestSpawnerErrorHandling:
             assert "Working directory" in (task.error_message or "")
         finally:
             await db.close()
+
+
+# =============================================================================
+# Test SchedulerConfig Grace Period
+# =============================================================================
+
+
+class TestSchedulerGracePeriod:
+    """Tests for shutdown_grace_seconds configuration."""
+
+    def test_default_grace_period_is_5(self) -> None:
+        config = SchedulerConfig()
+        assert config.shutdown_grace_seconds == 5.0
+
+    def test_custom_grace_period(self) -> None:
+        config = SchedulerConfig(shutdown_grace_seconds=10.0)
+        assert config.shutdown_grace_seconds == 10.0

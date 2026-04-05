@@ -91,6 +91,7 @@ class Orchestrator:
         self._log_dir = log_dir or Path(config.repo_path).expanduser() / "logs"
 
         self._running: dict[str, RunningZadacha] = {}
+        self._shutdown_grace_seconds: float = 5.0
         self._shutdown_requested = False
         self._shutdown_event = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -611,7 +612,7 @@ class Orchestrator:
         for zid, running in list(self._running.items()):
             try:
                 running.process.terminate()
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(self._shutdown_grace_seconds)
                 if running.process.returncode is None:
                     running.process.kill()
                 await running.process.wait()
