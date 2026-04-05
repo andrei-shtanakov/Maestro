@@ -690,12 +690,8 @@ class TestProjectConfig:
     def test_cyclic_dependency_two_tasks_rejected(self) -> None:
         """Test that cyclic dependency between two tasks is rejected via DAG."""
         tasks = [
-            TaskConfig(
-                id="task-a", title="A", prompt="A", depends_on=["task-b"]
-            ),
-            TaskConfig(
-                id="task-b", title="B", prompt="B", depends_on=["task-a"]
-            ),
+            TaskConfig(id="task-a", title="A", prompt="A", depends_on=["task-b"]),
+            TaskConfig(id="task-b", title="B", prompt="B", depends_on=["task-a"]),
         ]
         with pytest.raises(CycleError, match="Cyclic dependency detected"):
             DAG(tasks)
@@ -703,15 +699,9 @@ class TestProjectConfig:
     def test_cyclic_dependency_three_tasks_rejected(self) -> None:
         """Test that cyclic dependency among three tasks is rejected via DAG."""
         tasks = [
-            TaskConfig(
-                id="task-a", title="A", prompt="A", depends_on=["task-c"]
-            ),
-            TaskConfig(
-                id="task-b", title="B", prompt="B", depends_on=["task-a"]
-            ),
-            TaskConfig(
-                id="task-c", title="C", prompt="C", depends_on=["task-b"]
-            ),
+            TaskConfig(id="task-a", title="A", prompt="A", depends_on=["task-c"]),
+            TaskConfig(id="task-b", title="B", prompt="B", depends_on=["task-a"]),
+            TaskConfig(id="task-c", title="C", prompt="C", depends_on=["task-b"]),
         ]
         with pytest.raises(CycleError, match="Cyclic dependency detected"):
             DAG(tasks)
@@ -780,9 +770,7 @@ class TestProjectConfig:
 
     def test_max_concurrent_mid_range(self) -> None:
         """Test max_concurrent=50 is valid within the 1-100 range."""
-        config = ProjectConfig(
-            project="test", repo="/path", max_concurrent=50
-        )
+        config = ProjectConfig(project="test", repo="/path", max_concurrent=50)
         assert config.max_concurrent == 50
 
     def test_get_task_by_id(self) -> None:
