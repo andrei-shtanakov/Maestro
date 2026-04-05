@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import signal
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -345,12 +346,17 @@ class Orchestrator:
         if self._config.callback_url:
             cmd.extend(["--callback-url", self._config.callback_url])
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=workspace,
-            stdout=log_file.open("w"),
-            stderr=asyncio.subprocess.STDOUT,
-        )
+        log_fd = os.open(str(log_file), os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=workspace,
+                stdout=log_fd,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except Exception:
+            os.close(log_fd)
+            raise
 
         # Update PID in DB
         await self._db.update_zadacha_status(

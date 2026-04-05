@@ -732,7 +732,9 @@ class Scheduler:
             if running_task.process.poll() is None:
                 running_task.process.kill()
             # Reap the child process to avoid zombies
-            running_task.process.wait()
+            await asyncio.get_event_loop().run_in_executor(
+                None, running_task.process.wait
+            )
         except OSError as e:
             logger.debug(
                 "Failed to terminate timed-out process for task %s: %s",
@@ -822,7 +824,9 @@ class Scheduler:
                 if running_task.process.poll() is None:
                     running_task.process.kill()
                 # Reap the child process to avoid zombies
-                running_task.process.wait()
+                await asyncio.get_event_loop().run_in_executor(
+                    None, running_task.process.wait
+                )
             except OSError as e:
                 logger.debug(
                     "Failed to terminate process for task %s during cleanup: %s",
