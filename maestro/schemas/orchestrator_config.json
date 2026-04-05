@@ -204,8 +204,8 @@
     },
     "max_concurrent": {
       "default": 3,
-      "description": "Max concurrent zadachi",
-      "maximum": 10,
+      "description": "Max concurrent zadachi (1-100)",
+      "maximum": 100,
       "minimum": 1,
       "title": "Max Concurrent",
       "type": "integer"

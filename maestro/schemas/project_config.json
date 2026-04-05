@@ -54,6 +54,12 @@
           "title": "Auto Push",
           "type": "boolean"
         },
+        "auto_commit": {
+          "default": false,
+          "description": "Auto-commit changes after each task completes",
+          "title": "Auto Commit",
+          "type": "boolean"
+        },
         "branch_prefix": {
           "default": "agent/",
           "description": "Prefix for task branches",
@@ -227,8 +233,8 @@
     },
     "max_concurrent": {
       "default": 3,
-      "description": "Maximum concurrent tasks (1-10)",
-      "maximum": 10,
+      "description": "Maximum concurrent tasks (1-100)",
+      "maximum": 100,
       "minimum": 1,
       "title": "Max Concurrent",
       "type": "integer"
