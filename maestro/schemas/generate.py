@@ -5,6 +5,7 @@ from pathlib import Path
 
 from maestro.models import OrchestratorConfig, ProjectConfig
 
+
 SCHEMA_DIR = Path(__file__).parent
 
 
