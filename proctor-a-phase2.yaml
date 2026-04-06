@@ -1,0 +1,49 @@
+project: proctor-a-phase2
+description: "Proctor-a Phase 2: Telegram trigger + Episodic memory"
+repo_url: https://github.com/andrei-shtanakov/proctor
+repo_path: /Users/Andrei_Shtanakov/labs/all_ai_orchestrators/proctor-a
+workspace_base: /tmp/maestro-ws/proctor-a
+max_concurrent: 2
+base_branch: master
+branch_prefix: "feature/"
+auto_pr: false
+
+spec_runner:
+  max_retries: 2
+  task_timeout_minutes: 30
+  auto_commit: true
+  run_tests_on_done: true
+  test_command: "uv run pytest tests/ -v"
+  run_lint_on_done: true
+  lint_command: "uv run ruff check ."
+
+zadachi:
+  - id: telegram-trigger
+    title: "Implement TelegramTrigger"
+    description: |
+      Add TelegramTrigger to src/proctor/triggers/.
+      - Inherits from Trigger ABC (see src/proctor/triggers/base.py)
+      - Uses aiohttp to poll Telegram Bot API (getUpdates long polling)
+      - Emits trigger.telegram events on EventBus with message text as payload
+      - Config: telegram section in ProctorConfig (bot_token, allowed_chat_ids)
+      - Tests in tests/test_triggers/test_telegram.py (mock aiohttp)
+      - Follow patterns from TerminalTrigger
+    scope:
+      - "src/proctor/triggers/telegram.py"
+      - "tests/test_triggers/test_telegram.py"
+    priority: 10
+
+  - id: episodic-memory
+    title: "Implement EpisodicMemory store"
+    description: |
+      Add episodic memory to src/proctor/core/memory.py.
+      - SQLite-backed store for conversation episodes (via aiosqlite)
+      - Each episode: id, timestamp, trigger_type, user_input, agent_response, workflow_result
+      - CRUD: save_episode, get_episode, list_episodes(limit), search_episodes(query)
+      - Integrates with StateManager (shares same DB or separate memory.db)
+      - Tests in tests/test_core/test_memory.py
+      - Follow patterns from StateManager (src/proctor/core/state.py)
+    scope:
+      - "src/proctor/core/memory.py"
+      - "tests/test_core/test_memory.py"
+    priority: 10
