@@ -1,9 +1,17 @@
 [project]
 name = "maestro"
 version = "0.1.0"
-description = "AI Agent Orchestrator for coordinating multiple coding agents"
+description = "AI Agent Orchestrator — coordinate multiple coding agents with DAG-based scheduling and git worktree isolation"
+authors = [{name = "Andrei Shtanakov"}]
+license = {text = "MIT"}
 readme = "README.md"
 requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Software Development :: Build Tools",
+]
 dependencies = [
     "aiosqlite>=0.22.1",
     "fastapi>=0.128.1",
@@ -14,6 +22,11 @@ dependencies = [
     "typer>=0.21.1",
     "uvicorn>=0.40.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/andrei-shtanakov/maestro"
+Repository = "https://github.com/andrei-shtanakov/maestro"
+Issues = "https://github.com/andrei-shtanakov/maestro/issues"
 
 [project.scripts]
 maestro = "maestro.cli:main"
