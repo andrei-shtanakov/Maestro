@@ -417,6 +417,38 @@ class Orchestrator:
             check=False,
         )
 
+    def _merge_into_base(self, feature_branch: str) -> None:
+        """Merge feature branch into base branch in the main repo.
+
+        Prevents accumulation of unmerged branches that diverge
+        and cause conflicts. Each zadacha is merged immediately
+        after completion so the next zadacha sees all prior work.
+        """
+        repo = Path(self._config.repo_path).expanduser()
+        base = self._config.base_branch
+
+        result = subprocess.run(
+            ["git", "merge", feature_branch, "--no-edit"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        if result.returncode == 0:
+            self._logger.info(
+                "Merged '%s' into '%s'",
+                feature_branch,
+                base,
+            )
+        else:
+            self._logger.warning(
+                "Failed to merge '%s' into '%s': %s",
+                feature_branch,
+                base,
+                result.stderr.strip(),
+            )
+
     async def _monitor_running(self) -> None:
         """Monitor running spec-runner processes."""
         completed: list[str] = []
@@ -569,6 +601,14 @@ class Orchestrator:
             )
 
         self._stats.completed += 1
+
+        # Auto-merge feature branch into base branch to avoid
+        # accumulating unmerged branches with diverging changes
+        await asyncio.get_running_loop().run_in_executor(
+            None,
+            self._merge_into_base,
+            zadacha.branch,
+        )
 
         # Cleanup workspace
         self._workspace_mgr.cleanup_workspace(zadacha_id)

@@ -133,3 +133,13 @@ Each entry:
 - **Expected**: Always generate fresh spec for each zadacha.
 - **Workaround**: None.
 - **FIXED**: 2026-04-06 — Removed the exists() check, always regenerate spec.
+
+### 13. Parallel zadachi create merge conflicts in shared files
+- **Date**: 2026-04-06
+- **Severity**: HIGH
+- **Mode**: Mode 2 (Orchestrator)
+- **Backlog ref**: new
+- **Description**: Three parallel zadachi (scheduler, telegram, memory) for proctor-a created 3 feature branches with 47 commits total. All touched shared infrastructure files (bootstrap.py, config.py, `__init__.py`, test_bootstrap.py) not declared in scope. Manual merge required resolving 19 conflicts across 2 merges.
+- **Expected**: Maestro should merge each completed zadacha immediately, so the next zadacha starts from an up-to-date base.
+- **Workaround**: Manual sequential merge with conflict resolution.
+- **FIXED**: 2026-04-06 — Added auto-merge of feature branch into base branch after each zadacha completes. Future: deeper investigation into scope overlap detection and rebase-based pipelines.
