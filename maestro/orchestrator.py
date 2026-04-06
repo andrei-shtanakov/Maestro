@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -327,6 +328,15 @@ class Orchestrator:
         executor_config.setdefault("executor", {})["main_branch"] = zadacha.branch
         self._workspace_mgr.setup_spec_runner(workspace, executor_config)
 
+        # Commit generated spec + config so spec-runner subtask
+        # branches don't lose them during merge
+        await asyncio.get_running_loop().run_in_executor(
+            None,
+            self._commit_spec_in_workspace,
+            workspace,
+            zadacha_id,
+        )
+
         # Transition to READY then RUNNING
         await self._db.update_zadacha_status(zadacha_id, ZadachaStatus.READY)
         await self._db.update_zadacha_status(
@@ -382,6 +392,29 @@ class Orchestrator:
             zadacha_id,
             process.pid,
             workspace,
+        )
+
+    @staticmethod
+    def _commit_spec_in_workspace(
+        workspace: Path,
+        zadacha_id: str,
+    ) -> None:
+        """Commit generated spec files in the worktree.
+
+        This ensures spec-runner subtask branches inherit
+        the generated tasks.md when they branch off.
+        """
+        subprocess.run(
+            ["git", "add", "spec/", "spec-runner.config.yaml"],
+            cwd=workspace,
+            capture_output=True,
+            check=False,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", f"maestro: add spec for {zadacha_id}"],
+            cwd=workspace,
+            capture_output=True,
+            check=False,
         )
 
     async def _monitor_running(self) -> None:
