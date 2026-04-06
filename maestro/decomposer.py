@@ -83,42 +83,54 @@ scope: glob patterns for files/dirs this zadacha will modify.
 """
 
 SPEC_GENERATION_PROMPT = """\
-You are a spec writer. Generate specification files for the \
-following development task.
+Generate a tasks.md file for the following development task. \
+Output ONLY the file content, no explanations or preamble.
 
 ## Task
 Title: {title}
 Description: {description}
 Scope: {scope}
 
-## Output Requirements
+## Required Format
 
-Generate THREE files in the spec/ directory:
+spec-runner parses this EXACT format — deviations break parsing.
 
-### 1. spec/requirements.md
-Write requirements with user stories and acceptance criteria \
-in GIVEN-WHEN-THEN format. Use REQ-XXX identifiers.
+```
+# Title — Tasks Specification
 
-### 2. spec/design.md
-Write technical design with components, interfaces, data \
-models. Use DESIGN-XXX identifiers. Reference requirements.
+## Milestone 1: Core Implementation
 
-### 3. spec/tasks.md
-Write implementation tasks. Each task should have:
-- TASK-XXX identifier
-- Priority emoji (🔴 P0, 🟠 P1, 🟡 P2, 🟢 P3)
-- Status: ⬜ TODO
-- Estimate
-- Checklist of subtasks
-- Dependencies on other tasks
-- Traceability to requirements and design
+### TASK-001: First Task Name
+🔴 P0 | ⬜ TODO | Est: 2h
 
-Keep tasks granular (30min-4h each). Include test tasks.
+Description of what this task does.
 
-Write all three files now. Separate them with:
---- FILE: spec/requirements.md ---
---- FILE: spec/design.md ---
---- FILE: spec/tasks.md ---
+**Checklist:**
+- [ ] First step
+- [ ] Second step
+
+**Depends on:**
+
+### TASK-002: Second Task Name
+🟠 P1 | ⬜ TODO | Est: 1h
+
+Description here.
+
+**Checklist:**
+- [ ] Step one
+- [ ] Step two
+
+**Depends on:** TASK-001
+```
+
+Rules for tasks.md:
+- Task headers MUST be exactly: ### TASK-NNN: Name
+- Metadata line MUST be: EMOJI PRIORITY | EMOJI STATUS | Est: TIME
+- Priority emojis: 🔴 P0 (critical), 🟠 P1 (high), 🟡 P2 (medium), 🟢 P3 (low)
+- Status MUST be: ⬜ TODO (for all new tasks)
+- Estimate format: 1h, 2h, 1-2h, 1d
+- Keep tasks granular (30min-4h each). Include test tasks.
+- Every task MUST have a **Checklist:** section with checkboxes
 """
 
 
@@ -182,7 +194,7 @@ class ProjectDecomposer:
         except FileNotFoundError:
             return "(unable to list directory)"
 
-    def _run_claude(self, prompt: str, timeout_minutes: int = 10) -> str:
+    def _run_claude(self, prompt: str, timeout_minutes: int = 15) -> str:
         """Run Claude CLI with a prompt.
 
         Args:
@@ -200,6 +212,11 @@ class ProjectDecomposer:
             "--print",
             "-p",
             prompt,
+            "--disallowedTools",
+            "Edit",
+            "Write",
+            "Bash",
+            "NotebookEdit",
         ]
 
         try:
@@ -336,8 +353,10 @@ class ProjectDecomposer:
         self._logger.info("Generating spec for zadacha '%s'", zadacha.id)
         response = self._run_claude(prompt)
 
-        # Parse response into separate files
-        self._write_spec_files(spec_dir, response)
+        # Write tasks.md directly (prompt generates only tasks.md)
+        tasks_path = spec_dir / "tasks.md"
+        tasks_path.write_text(response.strip() + "\n")
+        self._logger.info("Wrote %s", tasks_path)
 
     def _write_spec_files(self, spec_dir: Path, response: str) -> None:
         """Parse and write spec files from Claude response.

@@ -1,0 +1,34 @@
+project: proctor-a-scheduler
+description: "Add SchedulerTrigger to proctor-a"
+repo_url: https://github.com/andrei-shtanakov/proctor
+repo_path: /Users/Andrei_Shtanakov/labs/all_ai_orchestrators/proctor-a
+workspace_base: /tmp/maestro-ws/proctor-a
+max_concurrent: 1
+base_branch: master
+branch_prefix: "feature/"
+auto_pr: false
+
+spec_runner:
+  max_retries: 2
+  task_timeout_minutes: 30
+  auto_commit: true
+  run_tests_on_done: true
+  test_command: "uv run pytest tests/ -v"
+  run_lint_on_done: true
+  lint_command: "uv run ruff check ."
+
+zadachi:
+  - id: scheduler-trigger
+    title: "Implement SchedulerTrigger (cron/interval)"
+    description: |
+      Add SchedulerTrigger to src/proctor/triggers/.
+      - Inherits from Trigger ABC (see src/proctor/triggers/base.py)
+      - Supports cron expressions (via croniter or similar) and fixed intervals
+      - Integrates with EventBus to emit TaskSubmitted events
+      - Config via YAML (schedules section in proctor config)
+      - Tests in tests/test_triggers/test_scheduler.py
+      - Follow existing patterns from TerminalTrigger
+    scope:
+      - "src/proctor/triggers/**"
+      - "tests/test_triggers/**"
+    priority: 10

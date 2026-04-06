@@ -106,14 +106,27 @@ class WorkspaceManager:
             msg = f"Workspace not found: {workspace_path}"
             raise WorkspaceNotFoundError(msg)
 
-        # Write executor.config.yaml
-        config_file = workspace_path / "executor.config.yaml"
-        with config_file.open("w") as f:
-            yaml.dump(config, f, default_flow_style=False)
-
         # Ensure spec/ directory exists
         spec_dir = workspace_path / "spec"
         spec_dir.mkdir(exist_ok=True)
+
+        # Clean stale spec-runner state from previous runs
+        # (the worktree inherits spec/ from the base branch)
+        for stale in [
+            spec_dir / ".executor-state.db",
+            spec_dir / ".executor-state.db-wal",
+            spec_dir / ".executor-state.db-shm",
+            spec_dir / ".executor-state.json",
+            spec_dir / ".executor-state.lock",
+            spec_dir / ".executor-progress.txt",
+            spec_dir / ".task-history.log",
+        ]:
+            stale.unlink(missing_ok=True)
+
+        # Write spec-runner.config.yaml in workspace root (v2.0 location)
+        config_file = workspace_path / "spec-runner.config.yaml"
+        with config_file.open("w") as f:
+            yaml.dump(config, f, default_flow_style=False)
 
     def cleanup_workspace(self, zadacha_id: str, force: bool = True) -> None:
         """Remove a workspace and its worktree.

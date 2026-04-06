@@ -55,24 +55,22 @@ def _make_zadacha_json(
 
 
 def _make_spec_response() -> str:
-    """Build a valid spec file response from Claude.
+    """Build a valid tasks.md response from Claude.
 
     Returns:
-        String with file markers and spec content.
+        String with tasks.md content.
     """
     return (
-        "--- FILE: spec/requirements.md ---\n"
-        "# Requirements\n"
-        "## REQ-001\n"
-        "As a user I want to authenticate.\n"
-        "--- FILE: spec/design.md ---\n"
-        "# Design\n"
-        "## DESIGN-001\n"
-        "JWT-based auth.\n"
-        "--- FILE: spec/tasks.md ---\n"
         "# Tasks\n"
-        "## TASK-001\n"
-        "Implement login endpoint.\n"
+        "\n"
+        "### TASK-001: Implement login endpoint\n"
+        "🔴 P0 | ⬜ TODO | Est: 2h\n"
+        "\n"
+        "Implement JWT login.\n"
+        "\n"
+        "**Checklist:**\n"
+        "- [ ] Create endpoint\n"
+        "- [ ] Add tests\n"
     )
 
 
@@ -330,10 +328,10 @@ class TestGenerateSpec:
     """Tests for the generate_spec method."""
 
     @patch("maestro.decomposer.subprocess.run")
-    def test_generate_spec_creates_spec_files(
+    def test_generate_spec_creates_tasks_file(
         self, mock_run: MagicMock, temp_dir: Path
     ) -> None:
-        """Test generate_spec creates requirements.md, design.md, tasks.md."""
+        """Test generate_spec creates tasks.md in spec/ directory."""
         mock_run.return_value = _make_subprocess_result(
             stdout=_make_spec_response(),
         )
@@ -352,15 +350,13 @@ class TestGenerateSpec:
 
         spec_dir = workspace / "spec"
         assert spec_dir.is_dir()
-        assert (spec_dir / "requirements.md").exists()
-        assert (spec_dir / "design.md").exists()
         assert (spec_dir / "tasks.md").exists()
 
     @patch("maestro.decomposer.subprocess.run")
-    def test_generate_spec_file_contents(
+    def test_generate_spec_tasks_content(
         self, mock_run: MagicMock, temp_dir: Path
     ) -> None:
-        """Test generate_spec writes correct content to each file."""
+        """Test generate_spec writes correct content to tasks.md."""
         mock_run.return_value = _make_subprocess_result(
             stdout=_make_spec_response(),
         )
@@ -378,15 +374,6 @@ class TestGenerateSpec:
         decomposer.generate_spec(zadacha, workspace)
 
         spec_dir = workspace / "spec"
-
-        requirements_text = (spec_dir / "requirements.md").read_text()
-        assert "Requirements" in requirements_text
-        assert "REQ-001" in requirements_text
-
-        design_text = (spec_dir / "design.md").read_text()
-        assert "Design" in design_text
-        assert "DESIGN-001" in design_text
-
         tasks_text = (spec_dir / "tasks.md").read_text()
         assert "Tasks" in tasks_text
         assert "TASK-001" in tasks_text
@@ -786,7 +773,17 @@ class TestRunClaude:
         mock_run.assert_called_once()
         call_args = mock_run.call_args
         cmd = call_args[0][0]
-        assert cmd == ["claude", "--print", "-p", "test prompt"]
+        assert cmd == [
+            "claude",
+            "--print",
+            "-p",
+            "test prompt",
+            "--disallowedTools",
+            "Edit",
+            "Write",
+            "Bash",
+            "NotebookEdit",
+        ]
         assert call_args[1]["cwd"] == temp_dir
 
     @patch("maestro.decomposer.subprocess.run")

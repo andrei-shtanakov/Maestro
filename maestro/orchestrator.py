@@ -307,19 +307,18 @@ class Orchestrator:
             workspace_path=str(workspace),
         )
 
-        # Generate spec if not exists
-        spec_dir = workspace / "spec"
-        tasks_file = spec_dir / "tasks.md"
-        if not tasks_file.exists():
-            zadacha_config = ZadachaConfig(
-                id=zadacha.id,
-                title=zadacha.title,
-                description=zadacha.description,
-                scope=zadacha.scope,
-                depends_on=zadacha.depends_on,
-                priority=zadacha.priority,
-            )
-            self._decomposer.generate_spec(zadacha_config, workspace)
+        # Generate spec for this zadacha
+        # Always regenerate: the repo may already have spec/tasks.md
+        # from a previous run or different project phase
+        zadacha_config = ZadachaConfig(
+            id=zadacha.id,
+            title=zadacha.title,
+            description=zadacha.description,
+            scope=zadacha.scope,
+            depends_on=zadacha.depends_on,
+            priority=zadacha.priority,
+        )
+        self._decomposer.generate_spec(zadacha_config, workspace)
 
         # Setup spec-runner config
         executor_config = self._config.spec_runner.to_executor_config()

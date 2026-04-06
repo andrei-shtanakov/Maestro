@@ -149,7 +149,7 @@ class TestSetupSpecRunner:
 
         workspace_mgr.setup_spec_runner(workspace_path, config)
 
-        config_file = workspace_path / "executor.config.yaml"
+        config_file = workspace_path / "spec-runner.config.yaml"
         assert config_file.exists()
 
         with config_file.open() as f:
@@ -203,7 +203,7 @@ class TestSetupSpecRunner:
         workspace_mgr.setup_spec_runner(workspace_path, config)
 
         assert (workspace_path / "spec").is_dir()
-        assert (workspace_path / "executor.config.yaml").exists()
+        assert (workspace_path / "spec-runner.config.yaml").exists()
 
 
 # =============================================================================

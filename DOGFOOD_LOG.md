@@ -75,3 +75,61 @@ Each entry:
 - **Expected**: After "All tasks completed", show: `Auto-commits: 3 commits created` with `git log --oneline` of those commits.
 - **Workaround**: `git log --oneline` manually after run.
 - **FIXED**: 2026-04-05 — Shows `git log --oneline --stat before..HEAD` with per-task file changes.
+
+### 7. Spec generation prompt produces unparseable tasks.md
+- **Date**: 2026-04-06
+- **Severity**: BLOCKER
+- **Mode**: Mode 2 (Orchestrator)
+- **Backlog ref**: new
+- **Description**: `SPEC_GENERATION_PROMPT` in `decomposer.py` describes the tasks.md format loosely. spec-runner's parser (`task.py`) requires exact format: `### TASK-NNN: Name` headers and `🔴 P0 | ⬜ TODO | Est: 2h` metadata lines. Generated tasks.md had 6 validation warnings and 0 parseable tasks, causing "No tasks ready to execute".
+- **Expected**: Generated tasks.md should be parseable by spec-runner without warnings.
+- **Workaround**: None (pipeline silently "succeeds" with no work done).
+- **FIXED**: 2026-04-06 — Updated prompt with exact format template and strict rules.
+
+### 8. spec-runner exit code 0 on "No tasks ready" = false success
+- **Date**: 2026-04-06
+- **Severity**: HIGH
+- **Mode**: Mode 2 (Orchestrator)
+- **Backlog ref**: new
+- **Description**: When spec-runner finds no ready tasks it logs "No tasks ready to execute" and exits with code 0. Maestro treats exit code 0 as success, transitions zadacha to DONE. Result: empty branch, no work done, reported as successful.
+- **Expected**: Either spec-runner should exit non-zero when no tasks executed, or Maestro should verify the branch has new commits before marking DONE.
+- **Workaround**: None yet. Need to add commit check in `_handle_success()`.
+
+### 9. Worktree cleaned up before inspection on false success
+- **Date**: 2026-04-06
+- **Severity**: MEDIUM
+- **Mode**: Mode 2 (Orchestrator)
+- **Backlog ref**: new
+- **Description**: After "success" (bug #8), Maestro immediately cleans up the worktree. The generated spec files (requirements.md, design.md, tasks.md) are lost — impossible to diagnose why spec-runner didn't parse tasks.
+- **Expected**: On DONE, keep worktree if no commits were made (suspicious). Or always keep worktree for manual inspection, add explicit cleanup command.
+- **Workaround**: None.
+
+### 10. executor.config.yaml written to wrong path
+- **Date**: 2026-04-06
+- **Severity**: BLOCKER
+- **Mode**: Mode 2 (Orchestrator)
+- **Backlog ref**: new
+- **Description**: `WorkspaceManager.setup_spec_runner()` wrote `executor.config.yaml` to workspace root, but spec-runner reads it from `spec/executor.config.yaml`. Config was silently ignored — `main_branch`, `max_retries`, `test_command` etc. all used defaults.
+- **Expected**: Config should be at `spec/executor.config.yaml`.
+- **Workaround**: None.
+- **FIXED**: 2026-04-06 — Config now written to `spec/executor.config.yaml`.
+
+### 11. Stale spec-runner state DB in worktree
+- **Date**: 2026-04-06
+- **Severity**: BLOCKER
+- **Mode**: Mode 2 (Orchestrator)
+- **Backlog ref**: new
+- **Description**: When proctor-a has `spec/.executor-state.db` committed to git, the worktree inherits it. spec-runner reads the old state (11/12 tasks DONE from Phase 1) and only executes 1 new task instead of all generated tasks.
+- **Expected**: Fresh worktree should have clean spec-runner state.
+- **Workaround**: None.
+- **FIXED**: 2026-04-06 — `setup_spec_runner()` now cleans stale state files (.db, .json, .lock, .progress, .history).
+
+### 12. Spec generation skipped when tasks.md exists in repo
+- **Date**: 2026-04-06
+- **Severity**: BLOCKER
+- **Mode**: Mode 2 (Orchestrator)
+- **Backlog ref**: new
+- **Description**: `_spawn_zadacha()` checked `if not tasks_file.exists()` before generating spec. When the repo already has `spec/tasks.md` (from previous project phase), generation was skipped entirely. spec-runner then ran old completed tasks.
+- **Expected**: Always generate fresh spec for each zadacha.
+- **Workaround**: None.
+- **FIXED**: 2026-04-06 — Removed the exists() check, always regenerate spec.
