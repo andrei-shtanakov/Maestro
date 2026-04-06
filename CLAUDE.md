@@ -52,11 +52,13 @@ uv add --dev <package>
 - **database.py**: SQLite layer with async CRUD, WAL mode (tasks + zadachi tables)
 - **dag.py**: DAG building, cycle detection, topological sort, scope overlap warnings
 - **git.py**: Git operations (branch, rebase, push, worktree, merge)
-- **cli.py**: Typer CLI (run, status, retry, stop, orchestrate, zadachi, workspaces)
+- **cli.py**: Typer CLI (run, status, retry, stop, approve, orchestrate, zadachi, workspaces)
+- **scheduler.py**: Main scheduler loop — polls DAG, spawns agents, monitors completion
 - **validator.py**: Post-task validation (run validation_cmd)
-- **retry.py**: Exponential backoff retry logic
+- **retry.py**: Exponential backoff retry logic with jitter
 - **recovery.py**: State recovery after crash
 - **cost_tracker.py**: Token usage parsing and cost calculation
+- **event_log.py**: Structured event logging for task lifecycle
 
 **Multi-process orchestration (new):**
 - **orchestrator.py**: Main async loop — decompose, spawn, monitor, PR creation
@@ -96,7 +98,7 @@ PENDING -> DECOMPOSING -> READY -> RUNNING -> MERGING -> PR_CREATED -> DONE
 - **Workspace isolation**: git worktree per zadacha (lightweight, shares .git)
 - **Two-level hierarchy**: Orchestrator manages zadachi, spec-runner manages subtasks within each
 - **Git strategy**: `feature/<zadacha-id>` branch per zadacha, subtask branches merge into it, then PR to main
-- **Communication**: REST API callbacks + state file polling (dual mechanism)
+- **Communication**: REST API callbacks from spec-runner (state file polling deprecated)
 - **Conflict prevention**: Zadachi define `scope` (file/dir globs), decomposer validates non-overlap
 - **Storage**: SQLite (single file, no external services)
 - **Spec-runner**: External package (PyPI) handles subtask execution within a worktree
@@ -108,11 +110,12 @@ PENDING -> DECOMPOSING -> READY -> RUNNING -> MERGING -> PR_CREATED -> DONE
 2. Decompose project into zadachi (Claude CLI or manual config)
 3. For each ready zadacha:
    a. Create git worktree + branch
-   b. Generate spec (requirements.md, design.md, tasks.md)
-   c. Write executor.config.yaml
-   d. Spawn `spec-runner run --all` subprocess
-4. Monitor processes (poll returncode + read .executor-state.json)
-5. On success: push branch, create PR via gh CLI, cleanup worktree
+   b. Generate spec/tasks.md via Claude CLI (read-only tools)
+   c. Write spec-runner.config.yaml
+   d. Commit spec in feature branch
+   e. Spawn `spec-runner run --all` subprocess
+4. Monitor processes (poll returncode + callbacks)
+5. On success: auto-merge feature branch into base, create PR (if auto_pr), cleanup worktree
 6. On failure: retry or mark NEEDS_REVIEW
 ```
 

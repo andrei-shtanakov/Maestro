@@ -63,7 +63,7 @@ Decompose a project into isolated work units ("zadachi"), each running in its ow
 
 - Auto-decompose a project description into zadachi, or define them manually
 - Each zadacha gets an isolated git worktree and feature branch
-- Specs (requirements, design, tasks) are generated per zadacha and executed via [spec-runner](https://pypi.org/project/spec-runner/)
+- Task specs are generated per zadacha and executed via spec-runner
 - Completed zadachi are pushed and PRs are auto-created via `gh`
 
 See [`examples/project.yaml`](examples/project.yaml) for a fully annotated config.
