@@ -5,7 +5,7 @@
 ## Quick Start
 
 ```bash
-uv add maestro-ai
+uv add maestro
 uv run maestro run examples/hello.yaml
 ```
 

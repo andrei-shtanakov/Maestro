@@ -1,0 +1,152 @@
+project: maestro-v010-prep
+repo: /Users/Andrei_Shtanakov/labs/all_ai_orchestrators/Maestro
+max_concurrent: 3
+
+git:
+  auto_commit: true
+
+defaults:
+  timeout_minutes: 15
+  max_retries: 1
+  agent_type: claude_code
+
+tasks:
+  - id: license
+    title: "Add LICENSE (MIT) and CHANGELOG.md"
+    prompt: |
+      Create two files:
+
+      1. LICENSE — MIT license, year 2026, copyright holder "Andrei Shtanakov".
+         Use the standard MIT license text.
+
+      2. CHANGELOG.md — Initial changelog with this content:
+         # Changelog
+
+         ## v0.1.0 (2026-04-06)
+
+         First public release.
+
+         ### Features
+         - **Mode 1 (Task Scheduler):** DAG-based scheduling of AI coding agents
+           (Claude Code, Codex, Aider) in a shared directory
+         - **Mode 2 (Multi-Process Orchestrator):** Decompose projects into independent
+           zadachi, run each in isolated git worktrees via spec-runner, auto-create PRs
+         - Spawner registry with 4 built-in spawners (claude_code, codex, aider, announce)
+         - SQLite state persistence with crash recovery
+         - CLI: run, status, retry, stop, orchestrate, zadachi, workspaces
+         - Web dashboard with DAG visualization and SSE updates
+         - Desktop notifications (macOS/Linux)
+         - Auto-commit per task with git diff summary
+         - Dogfood-tested: Maestro builds itself (3 weeks of real usage)
+
+      Do not modify any other files.
+    scope:
+      - "LICENSE"
+      - "CHANGELOG.md"
+
+  - id: pyproject-meta
+    title: "Update pyproject.toml metadata for open-source"
+    prompt: |
+      Update pyproject.toml with proper open-source metadata.
+      Read the current file first, then update ONLY these fields
+      (keep everything else unchanged):
+
+      - description = "AI Agent Orchestrator — coordinate multiple coding agents with DAG-based scheduling and git worktree isolation"
+      - authors = [{name = "Andrei Shtanakov"}]
+      - license = {text = "MIT"}
+      - Add [project.urls] section:
+        Homepage = "https://github.com/andrei-shtanakov/maestro"
+        Repository = "https://github.com/andrei-shtanakov/maestro"
+        Issues = "https://github.com/andrei-shtanakov/maestro/issues"
+      - Add classifiers:
+        "Development Status :: 3 - Alpha"
+        "Programming Language :: Python :: 3.12"
+        "License :: OSI Approved :: MIT License"
+        "Topic :: Software Development :: Build Tools"
+
+      Do NOT change dependencies, scripts, build system, or tool configs.
+      Run: uv run python -c "import maestro; print('import ok')"
+    scope:
+      - "pyproject.toml"
+
+  - id: examples
+    title: "Create working YAML example configs"
+    prompt: |
+      Update example YAML configs in examples/ directory.
+      Read existing files first to understand the format.
+
+      1. examples/hello.yaml — MINIMAL example for quick start:
+         - project: hello-maestro
+         - 3 tasks using agent_type: announce (no real agents needed)
+         - Task 1: "greet" (no deps), Task 2: "compute" (no deps), Task 3: "summarize" (depends on greet, compute)
+         - Keep it under 30 lines, heavily commented for new users
+
+      2. examples/parallel-refactor.yaml — Mode 1 showcase:
+         - project: my-refactor
+         - 5 tasks with Claude Code agent, realistic prompts
+         - DAG: 2 independent tasks -> 2 dependent tasks -> 1 final task
+         - Show scope, depends_on, validation_cmd features
+
+      3. examples/project.yaml — already exists, update to be more realistic:
+         - Uncomment the zadachi section with 2-3 example zadachi
+         - Make sure all field names match OrchestratorConfig model
+
+      4. examples/maestro-builds-maestro.yaml — copy from dogfood-maestro.yaml,
+         clean up paths to use relative paths, add comments explaining meta-dogfooding
+
+      Each file must be valid YAML. Add comments explaining key features.
+      Run: uv run python -c "import yaml; [yaml.safe_load(open(f'examples/{f}')) for f in ['hello.yaml', 'parallel-refactor.yaml', 'project.yaml', 'maestro-builds-maestro.yaml']]; print('all valid')"
+    scope:
+      - "examples/**"
+
+  - id: readme
+    title: "Rewrite README.md for open-source release"
+    depends_on: [license, pyproject-meta, examples]
+    prompt: |
+      Rewrite README.md completely. Read the current CLAUDE.md for architecture
+      reference, and read examples/ for the YAML configs to reference.
+
+      Structure (under 300 lines total):
+
+      # Maestro
+      > AI Agent Orchestrator — coordinate multiple coding agents with DAG-based scheduling and git worktree isolation
+
+      ## Quick Start
+      ```bash
+      uv add maestro
+      uv run maestro run examples/hello.yaml
+      ```
+
+      ## What It Does
+      Brief paragraph: Maestro coordinates AI coding agents (Claude Code, Codex, Aider)
+      on complex tasks. Two modes: Task Scheduler (shared dir) and Multi-Process
+      Orchestrator (isolated worktrees + PRs).
+
+      ## Mode 1: Task Scheduler
+      - What it does (3-4 bullet points)
+      - Example: show hello.yaml inline or link to it
+      - CLI: `maestro run`, `maestro status`, `maestro retry`
+
+      ## Mode 2: Multi-Process Orchestrator
+      - What it does (3-4 bullet points)
+      - Example: link to project.yaml
+      - CLI: `maestro orchestrate`, `maestro zadachi`, `maestro workspaces`
+
+      ## Examples
+      Table linking to each example with one-line description.
+
+      ## Development
+      ```bash
+      git clone ... && cd maestro
+      uv sync
+      uv run pytest
+      ```
+
+      ## License
+      MIT — see LICENSE
+
+      Do NOT include badges, screenshots, or GIFs (we don't have them yet).
+      Do NOT include the full architecture — that's in CLAUDE.md.
+      Keep it concise and practical.
+    scope:
+      - "README.md"
