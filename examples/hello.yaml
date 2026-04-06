@@ -1,0 +1,27 @@
+# Maestro Quick Start — Hello World
+#
+# A minimal config to see Maestro in action.
+# Uses "announce" agent (prints to console, no AI needed).
+#
+# Run:  uv run maestro run examples/hello.yaml
+
+project: hello-maestro
+repo: ~/projects/hello       # Any valid absolute path
+
+defaults:
+  agent_type: announce       # No real agent — just logs the task
+
+tasks:
+  - id: greet
+    title: "Say hello"
+    prompt: "Hello from Maestro!"
+
+  - id: compute
+    title: "Crunch numbers"
+    prompt: "Computing 2 + 2 = 4"
+
+  # This task waits for both greet and compute to finish
+  - id: summarize
+    title: "Summarize results"
+    prompt: "All tasks completed successfully."
+    depends_on: [greet, compute]

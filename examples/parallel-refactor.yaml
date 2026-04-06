@@ -1,0 +1,75 @@
+# Maestro Mode 1 — Parallel Refactoring with Claude Code
+#
+# Demonstrates DAG-based task scheduling:
+#   extract-utils ──┐
+#                    ├──> update-api ──┐
+#   extract-types  ──┘                 ├──> final-tests
+#                    ┌──> update-cli ──┘
+#   extract-types  ──┘
+#
+# Run:  uv run maestro run examples/parallel-refactor.yaml
+
+project: my-refactor
+repo: ~/projects/my-app
+max_concurrent: 3
+
+defaults:
+  timeout_minutes: 20
+  max_retries: 2
+  agent_type: claude_code
+
+git:
+  base_branch: main
+  auto_push: true
+  branch_prefix: "refactor/"
+
+tasks:
+  # --- Layer 1: independent extractions (run in parallel) ---
+
+  - id: extract-utils
+    title: "Extract utility functions"
+    prompt: |
+      Move all helper functions from src/app.py into src/utils.py.
+      Update imports across the codebase. Keep the public API unchanged.
+    scope: ["src/app.py", "src/utils.py"]
+    priority: 10
+
+  - id: extract-types
+    title: "Extract type definitions"
+    prompt: |
+      Move all TypedDict and dataclass definitions from src/models.py
+      into src/types.py. Update all imports. Run mypy to verify.
+    scope: ["src/models.py", "src/types.py"]
+    priority: 10
+
+  # --- Layer 2: depend on extractions ---
+
+  - id: update-api
+    title: "Update API layer"
+    prompt: |
+      Refactor src/api/ to import from src/utils.py and src/types.py
+      instead of the old locations. Simplify handler functions.
+    scope: ["src/api/**"]
+    depends_on: [extract-utils, extract-types]
+    validation_cmd: "uv run pytest tests/test_api.py -v"
+
+  - id: update-cli
+    title: "Update CLI layer"
+    prompt: |
+      Refactor src/cli.py to use the new src/types.py definitions.
+      Remove any duplicated type aliases.
+    scope: ["src/cli.py"]
+    depends_on: [extract-types]
+    validation_cmd: "uv run pytest tests/test_cli.py -v"
+
+  # --- Layer 3: final validation ---
+
+  - id: final-tests
+    title: "Run full test suite and fix"
+    prompt: |
+      Run the full test suite. Fix any broken imports or type errors
+      caused by the refactoring. Do not change any business logic.
+    scope: ["tests/**", "src/**"]
+    depends_on: [update-api, update-cli]
+    validation_cmd: "uv run pytest --tb=short"
+    timeout_minutes: 30

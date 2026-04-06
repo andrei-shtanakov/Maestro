@@ -1,0 +1,105 @@
+# =============================================================================
+# Meta-Dogfooding — Maestro Builds Maestro
+# =============================================================================
+#
+# Maestro uses itself to implement improvements from its own backlog.
+# This is the ultimate integration test: if Maestro can orchestrate
+# changes to its own codebase, it works.
+#
+# Tasks are independent or have minimal dependencies, safe for parallel
+# execution. Each task targets a specific module with scoped file access.
+#
+# Usage:
+#   uv run maestro run examples/maestro-builds-maestro.yaml
+#
+# =============================================================================
+
+project: maestro-dogfood
+repo: .                      # Relative to where you run the command
+max_concurrent: 2
+
+git:
+  auto_commit: true
+
+defaults:
+  timeout_minutes: 15
+  max_retries: 1
+  agent_type: claude_code
+
+tasks:
+  - id: add-jitter
+    title: "Add jitter to retry backoff"
+    prompt: |
+      In maestro/retry.py, modify RetryManager.get_delay() to add random jitter.
+      Current formula: base_delay * (2 ** retry_count), capped at max_delay.
+      New formula: after calculating delay, multiply by random.uniform(0.7, 1.3).
+      Add import random at the top of the file.
+
+      Update tests in tests/test_retry.py:
+      - Tests that check exact delay values should check within +-30% range.
+      - Add a new test: call get_delay(0) 100 times, verify not all values equal.
+      - Keep the max_delay cap test (cap still applies after jitter).
+
+      Run: uv run python -m pytest tests/test_retry.py -v
+    scope:
+      - "maestro/retry.py"
+      - "tests/test_retry.py"
+
+  - id: json-schema
+    title: "Generate JSON Schema for YAML configs"
+    prompt: |
+      Create maestro/schemas/ directory with __init__.py.
+      Write maestro/schemas/generate.py that:
+      1. Imports ProjectConfig and OrchestratorConfig from maestro.models
+      2. Calls .model_json_schema() on each
+      3. Writes results as formatted JSON to:
+         - maestro/schemas/project_config.json
+         - maestro/schemas/orchestrator_config.json
+      Run the script to generate the files.
+      Run: uv run python maestro/schemas/generate.py
+    scope:
+      - "maestro/schemas/**"
+
+  - id: dedup-cycles
+    title: "Remove duplicate cycle detection from models.py"
+    prompt: |
+      In maestro/models.py, the validate_no_cyclic_dependencies() method in
+      ProjectConfig (model_validator) duplicates cycle detection from DAG.__init__()
+      in maestro/dag.py. Remove validate_no_cyclic_dependencies from ProjectConfig.
+
+      Update tests in tests/test_models.py: if any tests check cycle detection
+      through ProjectConfig validation, they should now create a DAG instead.
+      Run: uv run python -m pytest tests/test_models.py tests/test_dag.py -v
+    scope:
+      - "maestro/models.py"
+      - "tests/test_models.py"
+      - "tests/test_dag.py"
+
+  - id: entry-points
+    title: "Formalize spawner entry points"
+    prompt: |
+      In pyproject.toml, add an entry-points section:
+
+      [project.entry-points."maestro.spawners"]
+      claude_code = "maestro.spawners.claude_code:ClaudeCodeSpawner"
+      codex = "maestro.spawners.codex:CodexSpawner"
+      aider = "maestro.spawners.aider:AiderSpawner"
+      announce = "maestro.spawners.announce:AnnounceSpawner"
+
+      Verify class names match actual exports by reading each spawner file.
+      Run: uv run python -c "from importlib.metadata import entry_points; eps = entry_points(group='maestro.spawners'); print([(e.name, e.value) for e in eps])"
+    scope:
+      - "pyproject.toml"
+
+  - id: max-concurrent-cap
+    title: "Raise max_concurrent cap from 10 to 100"
+    prompt: |
+      In maestro/models.py, find Field() definitions with le=10 for max_concurrent
+      in ProjectConfig and OrchestratorConfig. Change le=10 to le=100.
+      Update description strings to say "(1-100)".
+      Add a test in tests/test_models.py: config with max_concurrent=50 is valid.
+      Run: uv run python -m pytest tests/test_models.py -v -k "concurrent"
+    scope:
+      - "maestro/models.py"
+      - "tests/test_models.py"
+    depends_on: [dedup-cycles]  # Touches same file, run after

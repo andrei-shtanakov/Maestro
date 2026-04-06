@@ -86,44 +86,44 @@ spec_runner:
   run_lint_on_done: true
   lint_command: "uv run ruff check ."
 
-# --- Manual zadachi (optional) ---
-# If omitted, Maestro auto-decomposes the project using the `description`
-# field above. Define zadachi manually for fine-grained control.
+# --- Manual zadachi ---
+# Define work units explicitly for fine-grained control.
+# If omitted, Maestro auto-decomposes using `description` above.
 
-# zadachi:
-#   - id: auth-system
-#     title: "Authentication System"
-#     description: |
-#       Implement JWT authentication with login, register,
-#       and token refresh endpoints. Include middleware for
-#       route protection and role-based access.
-#     scope:
-#       - "src/auth/**"
-#       - "src/middleware/auth.py"
-#     depends_on: []
-#     priority: 10           # Higher priority = runs first
-#
-#   - id: user-management
-#     title: "User Management"
-#     description: |
-#       CRUD operations for users: create, read, update, delete.
-#       Include role assignment and permission checking.
-#     scope:
-#       - "src/users/**"
-#       - "src/models/user.py"
-#     depends_on: [auth-system]  # Needs auth to be done first
-#     priority: 5
-#
-#   - id: admin-dashboard
-#     title: "Admin Dashboard"
-#     description: |
-#       React admin dashboard with role-based views,
-#       user management table, and activity logs.
-#     scope:
-#       - "frontend/src/admin/**"
-#       - "frontend/src/components/UserTable.tsx"
-#     depends_on: [user-management]
-#     priority: 0
+zadachi:
+  - id: auth-system
+    title: "Authentication System"
+    description: |
+      Implement JWT authentication with login, register,
+      and token refresh endpoints. Include middleware for
+      route protection and role-based access.
+    scope:
+      - "src/auth/**"
+      - "src/middleware/auth.py"
+    depends_on: []
+    priority: 10           # Higher priority = runs first
+
+  - id: user-management
+    title: "User Management"
+    description: |
+      CRUD operations for users: create, read, update, delete.
+      Include role assignment and permission checking.
+    scope:
+      - "src/users/**"
+      - "src/models/user.py"
+    depends_on: [auth-system]  # Needs auth to be done first
+    priority: 5
+
+  - id: admin-dashboard
+    title: "Admin Dashboard"
+    description: |
+      React admin dashboard with role-based views,
+      user management table, and activity logs.
+    scope:
+      - "frontend/src/admin/**"
+      - "frontend/src/components/UserTable.tsx"
+    depends_on: [user-management]
+    priority: 0
 
 # --- Notifications (optional) ---
 
