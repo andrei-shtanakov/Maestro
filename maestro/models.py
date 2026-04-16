@@ -229,7 +229,8 @@ class ArbiterConfig(BaseModel):
 
         missing: list[str] = []
         for name in ("binary_path", "config_dir", "tree_path"):
-            if getattr(self, name) is None:
+            val = getattr(self, name)
+            if val is None or not val.strip():
                 missing.append(name)
         if missing:
             msg = (

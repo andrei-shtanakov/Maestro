@@ -49,6 +49,17 @@ class TestArbiterConfigValidationWhenEnabled:
         )
         assert cfg.binary_path == "/usr/local/bin/arbiter"
 
+    def test_empty_string_binary_path_rejected(self) -> None:
+        """Empty-string path (common YAML mistake: `binary_path: ""`) is treated as missing."""
+        with pytest.raises(ValidationError, match="binary_path"):
+            ArbiterConfig(enabled=True, binary_path="", config_dir="/c", tree_path="/t")
+
+    def test_whitespace_only_binary_path_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="binary_path"):
+            ArbiterConfig(
+                enabled=True, binary_path="   ", config_dir="/c", tree_path="/t"
+            )
+
 
 class TestArbiterConfigUnresolvedEnvVar:
     """Config parser only supports ${VAR}; ${VAR:-default} leaks through unresolved."""
