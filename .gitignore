@@ -43,3 +43,6 @@ Thumbs.db
 
 # Spec executor state
 spec/.executor-*
+
+# Git worktrees
+.worktrees/
