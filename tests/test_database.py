@@ -1409,3 +1409,61 @@ class TestUpdateTaskRouting:
             assert refetched.status is TaskStatus.READY
         finally:
             await db.close()
+
+
+class TestMarkOutcomeReported:
+    @pytest.mark.anyio
+    async def test_sets_timestamp_when_decision_matches(self, tmp_path) -> None:
+        from datetime import UTC, datetime
+
+        from maestro.database import Database
+        from maestro.models import Task
+
+        db = Database(tmp_path / "m.db")
+        await db.connect()
+        try:
+            task = Task(
+                id="t1",
+                title="T",
+                prompt="P",
+                workdir="/tmp",
+                arbiter_decision_id="dec-7",
+            )
+            await db.create_task(task)
+
+            ts = datetime.now(UTC)
+            ok = await db.mark_outcome_reported("t1", ts, "dec-7")
+            assert ok is True
+
+            refetched = await db.get_task("t1")
+            assert refetched.arbiter_outcome_reported_at is not None
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_guard_rejects_wrong_decision_id(self, tmp_path) -> None:
+        """decision_id mismatch → rowcount=0, returns False, no write."""
+        from datetime import UTC, datetime
+
+        from maestro.database import Database
+        from maestro.models import Task
+
+        db = Database(tmp_path / "g.db")
+        await db.connect()
+        try:
+            task = Task(
+                id="t1",
+                title="T",
+                prompt="P",
+                workdir="/tmp",
+                arbiter_decision_id="current-dec",
+            )
+            await db.create_task(task)
+
+            ok = await db.mark_outcome_reported("t1", datetime.now(UTC), "stale-dec")
+            assert ok is False
+
+            refetched = await db.get_task("t1")
+            assert refetched.arbiter_outcome_reported_at is None
+        finally:
+            await db.close()

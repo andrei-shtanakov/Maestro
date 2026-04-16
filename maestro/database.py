@@ -724,6 +724,38 @@ class Database:
         )
         await self._connection.commit()
 
+    async def mark_outcome_reported(
+        self,
+        task_id: str,
+        reported_at: datetime,
+        decision_id: str,
+    ) -> bool:
+        """R-03: Atomically record that report_outcome succeeded.
+
+        The `decision_id` guard prevents a stale call from marking the current
+        attempt as reported — if a retry already overwrote arbiter_decision_id,
+        this call returns False and the caller (scheduler re-attempt pass)
+        drops the stale outcome.
+
+        Returns:
+            True if a row was updated, False if the decision_id no longer
+            matches (external interference or stale recovery attempt).
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            """
+            UPDATE tasks
+            SET arbiter_outcome_reported_at = ?
+            WHERE id = ? AND arbiter_decision_id = ?
+            """,
+            (_format_datetime(reported_at), task_id, decision_id),
+        )
+        await self._connection.commit()
+        return cursor.rowcount > 0
+
     async def delete_task(self, task_id: str) -> bool:
         """Delete a task by ID.
 
