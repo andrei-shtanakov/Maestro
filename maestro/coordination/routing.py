@@ -59,7 +59,11 @@ class StaticRouting:
             reason="static",
         )
 
-    async def report_outcome(self, _task: Task, _outcome: TaskOutcome) -> None:
+    async def report_outcome(
+        self,
+        task: Task,  # noqa: ARG002
+        outcome: TaskOutcome,  # noqa: ARG002
+    ) -> None:
         # Static decisions have no correlation id; nothing to report.
         return None
 
