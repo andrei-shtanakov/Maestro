@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Self
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class TaskStatus(StrEnum):
@@ -145,6 +145,50 @@ class Priority(StrEnum):
     NORMAL = "normal"
     HIGH = "high"
     URGENT = "urgent"
+
+
+class RouteAction(StrEnum):
+    """Routing decision action (mirrors arbiter `AgentAction`)."""
+
+    ASSIGN = "assign"
+    HOLD = "hold"
+    REJECT = "reject"
+
+
+class RouteDecision(BaseModel):
+    """Routing decision returned by RoutingStrategy.route().
+
+    Frozen so scheduler cannot accidentally mutate a decision after
+    receiving it from the routing layer.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    action: RouteAction
+    chosen_agent: str | None = None
+    decision_id: str | None = None
+    reason: str
+
+
+class TaskOutcomeStatus(StrEnum):
+    """Terminal status reported back to arbiter via report_outcome."""
+
+    SUCCESS = "success"
+    FAILURE = "failure"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
+    INTERRUPTED = "interrupted"
+
+
+class TaskOutcome(BaseModel):
+    """Task completion report sent to arbiter for learning signal."""
+
+    status: TaskOutcomeStatus
+    agent_used: str
+    duration_min: float | None = None
+    tokens_used: int | None = None
+    cost_usd: float | None = None
+    error_code: str | None = None
 
 
 # ---------------------------------------------------------------------------
