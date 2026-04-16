@@ -1467,3 +1467,93 @@ class TestMarkOutcomeReported:
             assert refetched.arbiter_outcome_reported_at is None
         finally:
             await db.close()
+
+
+class TestResetForRetryAtomic:
+    @pytest.mark.anyio
+    async def test_failed_to_ready_with_fields_cleared(self, tmp_path) -> None:
+        from maestro.database import Database
+        from maestro.models import Task, TaskStatus
+
+        db = Database(tmp_path / "r.db")
+        await db.connect()
+        try:
+            task = Task(
+                id="t1",
+                title="T",
+                prompt="P",
+                workdir="/tmp",
+                status=TaskStatus.FAILED,
+                routed_agent_type="codex_cli",
+                arbiter_decision_id="dec-9",
+                arbiter_route_reason="dt",
+            )
+            await db.create_task(task)
+
+            ok = await db.reset_for_retry_atomic("t1", "dec-9")
+            assert ok is True
+
+            refetched = await db.get_task("t1")
+            assert refetched.status is TaskStatus.READY
+            assert refetched.routed_agent_type is None
+            assert refetched.arbiter_decision_id is None
+            assert refetched.arbiter_route_reason is None
+            assert refetched.arbiter_outcome_reported_at is None
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_external_status_change_is_skipped(self, tmp_path) -> None:
+        """If status is not FAILED (external abandon/approve), reset is a no-op."""
+        from maestro.database import Database
+        from maestro.models import Task, TaskStatus
+
+        db = Database(tmp_path / "e.db")
+        await db.connect()
+        try:
+            task = Task(
+                id="t1",
+                title="T",
+                prompt="P",
+                workdir="/tmp",
+                status=TaskStatus.NEEDS_REVIEW,
+                arbiter_decision_id="dec-9",
+            )
+            await db.create_task(task)
+
+            ok = await db.reset_for_retry_atomic("t1", "dec-9")
+            assert ok is False
+
+            refetched = await db.get_task("t1")
+            assert refetched.status is TaskStatus.NEEDS_REVIEW
+            # fields NOT cleared
+            assert refetched.arbiter_decision_id == "dec-9"
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_none_decision_id_skips_guard(self, tmp_path) -> None:
+        """Advisory path calls without decision_id guard (best-effort)."""
+        from maestro.database import Database
+        from maestro.models import Task, TaskStatus
+
+        db = Database(tmp_path / "n.db")
+        await db.connect()
+        try:
+            task = Task(
+                id="t1",
+                title="T",
+                prompt="P",
+                workdir="/tmp",
+                status=TaskStatus.FAILED,
+                arbiter_decision_id="dec-9",
+            )
+            await db.create_task(task)
+
+            ok = await db.reset_for_retry_atomic("t1", decision_id=None)
+            assert ok is True
+
+            refetched = await db.get_task("t1")
+            assert refetched.status is TaskStatus.READY
+        finally:
+            await db.close()

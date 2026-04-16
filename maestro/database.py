@@ -756,6 +756,60 @@ class Database:
         await self._connection.commit()
         return cursor.rowcount > 0
 
+    async def reset_for_retry_atomic(
+        self,
+        task_id: str,
+        decision_id: str | None,
+    ) -> bool:
+        """R-03: Atomically transition FAILED → READY and clear arbiter fields.
+
+        Single UPDATE closes the race window that `report_outcome`'s network
+        latency would otherwise widen: an external `abandon` / `approve` /
+        dashboard action during outcome delivery cannot interleave with
+        retry transition.
+
+        Args:
+            task_id: Task to reset.
+            decision_id: If not None, an additional guard that the row's
+                current `arbiter_decision_id` matches; used by authoritative
+                mode after successful outcome delivery. Pass None to skip
+                the guard (advisory best-effort retry).
+
+        Returns:
+            True if the row transitioned; False if status != FAILED or the
+            decision_id guard failed (external interference).
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        if decision_id is None:
+            sql = """
+                UPDATE tasks
+                SET status = 'ready',
+                    routed_agent_type = NULL,
+                    arbiter_decision_id = NULL,
+                    arbiter_route_reason = NULL,
+                    arbiter_outcome_reported_at = NULL
+                WHERE id = ? AND status = 'failed'
+            """
+            params: tuple[Any, ...] = (task_id,)
+        else:
+            sql = """
+                UPDATE tasks
+                SET status = 'ready',
+                    routed_agent_type = NULL,
+                    arbiter_decision_id = NULL,
+                    arbiter_route_reason = NULL,
+                    arbiter_outcome_reported_at = NULL
+                WHERE id = ? AND status = 'failed' AND arbiter_decision_id = ?
+            """
+            params = (task_id, decision_id)
+
+        cursor = await self._connection.execute(sql, params)
+        await self._connection.commit()
+        return cursor.rowcount > 0
+
     async def delete_task(self, task_id: str) -> bool:
         """Delete a task by ID.
 
