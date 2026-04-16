@@ -1278,6 +1278,7 @@ class TestArbiterRoutingMigration:
         db = Database(tmp_path / "fresh.db")
         await db.connect()
         try:
+            assert db._connection is not None  # pyrefly narrowing
             cursor = await db._connection.execute("PRAGMA table_info(tasks)")
             cols = {row["name"] for row in await cursor.fetchall()}
             assert "routed_agent_type" in cols
@@ -1335,6 +1336,7 @@ class TestArbiterRoutingMigration:
         db = Database(db_path)
         await db.connect()
         try:
+            assert db._connection is not None  # pyrefly narrowing
             cursor = await db._connection.execute("PRAGMA table_info(tasks)")
             cols = {row["name"] for row in await cursor.fetchall()}
             assert "routed_agent_type" in cols
@@ -1345,6 +1347,7 @@ class TestArbiterRoutingMigration:
                 "SELECT routed_agent_type, arbiter_decision_id FROM tasks WHERE id='t1'"
             )
             row = await cursor.fetchone()
+            assert row is not None
             assert row["routed_agent_type"] is None
             assert row["arbiter_decision_id"] is None
         finally:
@@ -1358,6 +1361,7 @@ class TestArbiterRoutingMigration:
         db = Database(tmp_path / "idem.db")
         await db.connect()
         try:
+            assert db._connection is not None  # pyrefly narrowing
             # connect() already ran migrate once. Run it again manually.
             await db._migrate_tasks_arbiter_routing()
             await db._migrate_tasks_arbiter_routing()
