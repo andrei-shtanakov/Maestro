@@ -611,13 +611,35 @@ class Task(BaseModel):
         return self.model_copy(update={"retry_count": self.retry_count + 1})
 
     @classmethod
-    def from_config(cls, config: TaskConfig, workdir: str) -> "Task":
+    def from_config(
+        cls,
+        config: TaskConfig,
+        workdir: str,
+        arbiter_enabled: bool = False,
+    ) -> "Task":
         """Create a Task instance from a TaskConfig.
 
         Fills Arbiter-compatible fields (`task_type`, `language`, `complexity`)
         from explicit TaskConfig values when present, otherwise falls back to
         inference helpers so the runtime Task always has concrete enum values.
+
+        Args:
+            config: Declarative task config from YAML.
+            workdir: Working directory path.
+            arbiter_enabled: Whether arbiter is enabled in the runtime.
+                Required to validate agent_type=AUTO; AUTO is a routing
+                sentinel and cannot be spawned without a router.
+
+        Raises:
+            ValueError: If agent_type=AUTO but arbiter is not enabled.
         """
+        if config.agent_type is AgentType.AUTO and not arbiter_enabled:
+            msg = (
+                f"Task {config.id!r}: agent_type=auto requires "
+                f"arbiter.enabled=true. Set an explicit agent_type or "
+                f"enable arbiter in the project config."
+            )
+            raise ValueError(msg)
         return cls(
             id=config.id,
             title=config.title,

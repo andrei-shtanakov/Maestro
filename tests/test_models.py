@@ -1237,3 +1237,28 @@ class TestSerialization:
         )
         data = task.model_dump(mode="json")
         assert isinstance(data["created_at"], str)
+
+
+class TestFromConfigAutoValidation:
+    """Task.from_config must reject agent_type=AUTO when arbiter is not enabled."""
+
+    def test_auto_without_arbiter_raises(self) -> None:
+        cfg = TaskConfig(id="t1", title="T", prompt="P", agent_type=AgentType.AUTO)
+        with pytest.raises(ValueError, match=r"arbiter\.enabled=true"):
+            Task.from_config(cfg, workdir="/tmp", arbiter_enabled=False)
+
+    def test_auto_with_arbiter_enabled_passes(self) -> None:
+        cfg = TaskConfig(id="t2", title="T", prompt="P", agent_type=AgentType.AUTO)
+        task = Task.from_config(cfg, workdir="/tmp", arbiter_enabled=True)
+        assert task.agent_type is AgentType.AUTO
+
+    def test_explicit_agent_without_arbiter_passes(self) -> None:
+        cfg = TaskConfig(id="t3", title="T", prompt="P", agent_type=AgentType.CODEX)
+        task = Task.from_config(cfg, workdir="/tmp", arbiter_enabled=False)
+        assert task.agent_type is AgentType.CODEX
+
+    def test_from_config_default_arbiter_flag_false(self) -> None:
+        """Backward compat: callers that don't pass arbiter_enabled default to False."""
+        cfg = TaskConfig(id="t4", title="T", prompt="P")  # default agent=CLAUDE_CODE
+        task = Task.from_config(cfg, workdir="/tmp")
+        assert task.agent_type is AgentType.CLAUDE_CODE
