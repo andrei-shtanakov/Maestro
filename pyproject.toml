@@ -30,6 +30,11 @@ Homepage = "https://github.com/andrei-shtanakov/maestro"
 Repository = "https://github.com/andrei-shtanakov/maestro"
 Issues = "https://github.com/andrei-shtanakov/maestro/issues"
 
+# Spec-runner is launched as an external subprocess, not imported, so it is
+# not listed in `dependencies`. The expected version is pinned as a constant
+# in `maestro/spec_runner.py::SPEC_RUNNER_REQUIRED_VERSION` and enforced by
+# the contract tests in tests/test_spec_runner.py.
+
 [project.scripts]
 maestro = "maestro.cli:main"
 

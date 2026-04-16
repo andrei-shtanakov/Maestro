@@ -964,6 +964,103 @@ class SpecRunnerConfig(BaseModel):
         }
 
 
+class ExecutorTaskStatus(StrEnum):
+    """Task status written by spec-runner into its state file.
+
+    Values match `spec_runner.state.TaskState.status` in spec-runner 2.0
+    (free-form string; we enforce the known set so format drift fails loudly).
+    """
+
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class ExecutorTaskAttempt(BaseModel):
+    """One attempt record from spec-runner's per-task attempts list.
+
+    Mirrors `spec_runner.state.TaskAttempt`. Tolerates unknown fields from
+    newer spec-runner versions via `model_config.extra = "ignore"` so a
+    minor spec-runner release does not break Maestro's progress polling.
+    """
+
+    model_config = {"extra": "ignore"}
+
+    timestamp: str = Field(..., description="ISO 8601 timestamp of the attempt")
+    success: bool = Field(..., description="Whether the attempt succeeded")
+    duration_seconds: float = Field(
+        ..., ge=0, description="Wall-clock duration of the attempt"
+    )
+    error: str | None = Field(default=None, description="Error message if failed")
+    error_code: str | None = Field(
+        default=None,
+        description="Structured error classification (spec_runner.state.ErrorCode)",
+    )
+    claude_output: str | None = Field(default=None, description="Captured CLI output")
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    cost_usd: float | None = Field(default=None, ge=0)
+
+
+class ExecutorTaskEntry(BaseModel):
+    """Per-task entry in spec-runner's state file."""
+
+    model_config = {"extra": "ignore"}
+
+    status: ExecutorTaskStatus = Field(
+        default=ExecutorTaskStatus.PENDING, description="Current task status"
+    )
+    started_at: str | None = Field(default=None, description="ISO 8601 start timestamp")
+    completed_at: str | None = Field(
+        default=None, description="ISO 8601 completion timestamp"
+    )
+    attempts: list[ExecutorTaskAttempt] = Field(
+        default_factory=list, description="Ordered list of execution attempts"
+    )
+
+
+class ExecutorState(BaseModel):
+    """Typed view of spec-runner's executor state.
+
+    Maestro uses this for progress polling and completion detection. The
+    underlying on-disk format may be JSON (pre-2.0) or SQLite (2.0+); use
+    `maestro.spec_runner.read_executor_state()` to parse from disk.
+    """
+
+    model_config = {"extra": "ignore"}
+
+    tasks: dict[str, ExecutorTaskEntry] = Field(
+        default_factory=dict, description="Task id → state mapping"
+    )
+    consecutive_failures: int = Field(
+        default=0, ge=0, description="Current consecutive failure count"
+    )
+    total_completed: int = Field(
+        default=0, ge=0, description="Total successfully completed tasks"
+    )
+    total_failed: int = Field(
+        default=0, ge=0, description="Total permanently failed tasks"
+    )
+
+    @property
+    def total(self) -> int:
+        """Total number of tracked tasks."""
+        return len(self.tasks)
+
+    @property
+    def done(self) -> int:
+        """Number of tasks in SUCCESS status."""
+        return sum(
+            1 for t in self.tasks.values() if t.status == ExecutorTaskStatus.SUCCESS
+        )
+
+    def progress_label(self) -> str:
+        """Human-readable progress summary for logs/UI (e.g. `3/10 done`)."""
+        return f"{self.done}/{self.total} done"
+
+
 class OrchestratorConfig(BaseModel):
     """Configuration for multi-process orchestration.
 

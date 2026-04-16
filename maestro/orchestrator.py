@@ -8,7 +8,6 @@ setup, process spawning, monitoring, and PR creation.
 
 import asyncio
 import contextlib
-import json
 import logging
 import os
 import signal
@@ -26,6 +25,7 @@ from maestro.models import (
     ZadachaStatus,
 )
 from maestro.pr_manager import PRManager, PRManagerError
+from maestro.spec_runner import read_executor_state
 from maestro.workspace import WorkspaceManager
 
 
@@ -472,34 +472,24 @@ class Orchestrator:
         zadacha_id: str,
         running: RunningZadacha,
     ) -> None:
-        """Read spec-runner state file for progress."""
-        state_file = running.workspace_path / "spec" / ".executor-state.json"
+        """Read spec-runner state file for progress.
 
-        if not state_file.exists():
+        Delegates to `maestro.spec_runner.read_executor_state()` so SQLite
+        (spec-runner 2.0) and JSON (legacy) are handled uniformly. Runs the
+        blocking read in a thread so the orchestrator loop stays responsive.
+        """
+        spec_dir = running.workspace_path / "spec"
+        loop = asyncio.get_running_loop()
+        state = await loop.run_in_executor(None, read_executor_state, spec_dir)
+
+        if state is None:
             return
 
-        try:
-            loop = asyncio.get_running_loop()
-            content = await loop.run_in_executor(None, state_file.read_text)
-            state = json.loads(content)
-
-            # Count task statuses
-            tasks = state.get("tasks", {})
-            total = len(tasks)
-            done = sum(1 for t in tasks.values() if t.get("status") == "success")
-            progress = f"{done}/{total} done"
-
-            await self._db.update_zadacha_status(
-                zadacha_id,
-                ZadachaStatus.RUNNING,
-                subtask_progress=progress,
-            )
-        except (json.JSONDecodeError, OSError) as e:
-            self._logger.debug(
-                "Failed to read state file for zadacha %s: %s",
-                zadacha_id,
-                e,
-            )
+        await self._db.update_zadacha_status(
+            zadacha_id,
+            ZadachaStatus.RUNNING,
+            subtask_progress=state.progress_label(),
+        )
 
     async def _handle_completion(
         self,
