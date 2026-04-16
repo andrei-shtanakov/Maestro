@@ -78,6 +78,166 @@ class AgentType(StrEnum):
     ANNOUNCE = "announce"
 
 
+class TaskType(StrEnum):
+    """Arbiter-compatible task type classification.
+
+    Values match `arbiter-core/src/types.rs::TaskType` (snake_case serde).
+    Used by Arbiter's routing decision tree (ordinal feature, index 0).
+    """
+
+    FEATURE = "feature"
+    BUGFIX = "bugfix"
+    REFACTOR = "refactor"
+    TEST = "test"
+    DOCS = "docs"
+    REVIEW = "review"
+    RESEARCH = "research"
+
+
+class Language(StrEnum):
+    """Arbiter-compatible primary language classification.
+
+    Values match `arbiter-core/src/types.rs::Language`. `MIXED` means the
+    task spans multiple languages; `OTHER` is the fallback when inference
+    cannot determine a single language.
+    """
+
+    PYTHON = "python"
+    RUST = "rust"
+    TYPESCRIPT = "typescript"
+    GO = "go"
+    MIXED = "mixed"
+    OTHER = "other"
+
+
+class Complexity(StrEnum):
+    """Arbiter-compatible task complexity classification.
+
+    Values match `arbiter-core/src/types.rs::Complexity`. Maestro's default
+    inference uses scope size as a proxy; callers can override when they
+    have richer signal (token estimates, subtask count, etc.).
+    """
+
+    TRIVIAL = "trivial"
+    SIMPLE = "simple"
+    MODERATE = "moderate"
+    COMPLEX = "complex"
+    CRITICAL = "critical"
+
+
+class Priority(StrEnum):
+    """Arbiter-compatible priority classification.
+
+    Values match `arbiter-core/src/types.rs::Priority`. Maestro stores
+    priority as an int(-100..100) on TaskConfig/Task; use
+    `priority_int_to_enum()` to convert for Arbiter payloads.
+    """
+
+    LOW = "low"
+    NORMAL = "normal"
+    HIGH = "high"
+    URGENT = "urgent"
+
+
+# ---------------------------------------------------------------------------
+# Arbiter field inference helpers
+# ---------------------------------------------------------------------------
+
+# Keywords mapped to task_type. First match wins, order matters: `bugfix`
+# is checked before `feature` so "fix a feature" classifies as bugfix.
+_TASK_TYPE_KEYWORDS: tuple[tuple[TaskType, tuple[str, ...]], ...] = (
+    (TaskType.BUGFIX, ("fix", "bug", "hotfix", "patch")),
+    (TaskType.TEST, ("test", "pytest", "unittest", "regression")),
+    (TaskType.REFACTOR, ("refactor", "restructure", "rewrite", "cleanup")),
+    (TaskType.DOCS, ("doc", "docs", "readme", "documentation")),
+    (TaskType.REVIEW, ("review", "audit")),
+    (TaskType.RESEARCH, ("research", "investigate", "explore", "spike")),
+)
+
+# Map file extensions → language. Extensions without a dot are accepted too
+# so inference works with patterns like `*.py` from YAML globs.
+_LANGUAGE_BY_EXTENSION: dict[str, Language] = {
+    "py": Language.PYTHON,
+    "rs": Language.RUST,
+    "ts": Language.TYPESCRIPT,
+    "tsx": Language.TYPESCRIPT,
+    "go": Language.GO,
+}
+
+
+def infer_task_type(prompt: str) -> TaskType:
+    """Infer `TaskType` from a free-text task prompt.
+
+    Performs case-insensitive keyword matching using `_TASK_TYPE_KEYWORDS`.
+    Falls back to `FEATURE` when no keyword matches — that is Arbiter's
+    neutral default.
+    """
+    lowered = prompt.lower()
+    for task_type, keywords in _TASK_TYPE_KEYWORDS:
+        if any(keyword in lowered for keyword in keywords):
+            return task_type
+    return TaskType.FEATURE
+
+
+def infer_language(scope: list[str]) -> Language:
+    """Infer `Language` from a list of file globs.
+
+    Extracts the final extension from each entry. Returns `MIXED` if
+    multiple languages are detected, `OTHER` if none match.
+    """
+    detected: set[Language] = set()
+    for pattern in scope:
+        # Trim trailing `/**`, `/*`, etc. then take the suffix after the last dot.
+        tail = pattern.rsplit("/", 1)[-1]
+        if "." not in tail:
+            continue
+        ext = tail.rsplit(".", 1)[-1].lower().strip("*")
+        language = _LANGUAGE_BY_EXTENSION.get(ext)
+        if language is not None:
+            detected.add(language)
+
+    if not detected:
+        return Language.OTHER
+    if len(detected) == 1:
+        return next(iter(detected))
+    return Language.MIXED
+
+
+def infer_complexity(scope: list[str]) -> Complexity:
+    """Infer `Complexity` from the number of scope entries.
+
+    Heuristic based on the rough rule-of-thumb that broader scopes demand
+    more planning and risk checks. Coarse on purpose — callers with better
+    signal (token estimates, subtask count) should set complexity explicitly.
+    """
+    size = len(scope)
+    if size <= 1:
+        return Complexity.TRIVIAL
+    if size <= 3:
+        return Complexity.SIMPLE
+    if size <= 10:
+        return Complexity.MODERATE
+    if size <= 30:
+        return Complexity.COMPLEX
+    return Complexity.CRITICAL
+
+
+def priority_int_to_enum(priority: int) -> Priority:
+    """Map Maestro's int priority (-100..100) to Arbiter's `Priority` enum.
+
+    Bands chosen from the roadmap (R-02) to keep `0` — the default — firmly
+    in NORMAL and leave equal room on each side:
+        -100..-26 → low, -25..25 → normal, 26..75 → high, 76..100 → urgent.
+    """
+    if priority <= -26:
+        return Priority.LOW
+    if priority <= 25:
+        return Priority.NORMAL
+    if priority <= 75:
+        return Priority.HIGH
+    return Priority.URGENT
+
+
 class TaskConfig(BaseModel):
     """Task configuration model for YAML parsing.
 
@@ -113,6 +273,27 @@ class TaskConfig(BaseModel):
     )
     priority: int = Field(
         default=0, ge=-100, le=100, description="Task priority (-100 to 100)"
+    )
+    task_type: TaskType | None = Field(
+        default=None,
+        description=(
+            "Arbiter task type. If omitted, inferred from `prompt` at "
+            "Task.from_config() time."
+        ),
+    )
+    language: Language | None = Field(
+        default=None,
+        description=(
+            "Arbiter primary language. If omitted, inferred from `scope` "
+            "globs at Task.from_config() time."
+        ),
+    )
+    complexity: Complexity | None = Field(
+        default=None,
+        description=(
+            "Arbiter complexity. If omitted, inferred from scope size at "
+            "Task.from_config() time."
+        ),
     )
 
     @field_validator("id")
@@ -189,6 +370,18 @@ class Task(BaseModel):
         default=False, description="Whether task requires approval"
     )
     validation_cmd: str | None = Field(default=None, description="Validation command")
+    task_type: TaskType = Field(
+        default=TaskType.FEATURE,
+        description="Arbiter task type (always populated; from_config infers it)",
+    )
+    language: Language = Field(
+        default=Language.OTHER,
+        description="Arbiter primary language (always populated; from_config infers it)",
+    )
+    complexity: Complexity = Field(
+        default=Complexity.MODERATE,
+        description="Arbiter complexity (always populated; from_config infers it)",
+    )
     result_summary: str | None = Field(
         default=None, description="Summary of task completion result"
     )
@@ -279,7 +472,12 @@ class Task(BaseModel):
 
     @classmethod
     def from_config(cls, config: TaskConfig, workdir: str) -> "Task":
-        """Create a Task instance from a TaskConfig."""
+        """Create a Task instance from a TaskConfig.
+
+        Fills Arbiter-compatible fields (`task_type`, `language`, `complexity`)
+        from explicit TaskConfig values when present, otherwise falls back to
+        inference helpers so the runtime Task always has concrete enum values.
+        """
         return cls(
             id=config.id,
             title=config.title,
@@ -292,6 +490,9 @@ class Task(BaseModel):
             timeout_minutes=config.timeout_minutes,
             requires_approval=config.requires_approval,
             validation_cmd=config.validation_cmd,
+            task_type=config.task_type or infer_task_type(config.prompt),
+            language=config.language or infer_language(config.scope),
+            complexity=config.complexity or infer_complexity(config.scope),
             depends_on=config.depends_on,
         )
 

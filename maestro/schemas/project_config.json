@@ -11,6 +11,18 @@
       "title": "AgentType",
       "type": "string"
     },
+    "Complexity": {
+      "description": "Arbiter-compatible task complexity classification.\n\nValues match `arbiter-core/src/types.rs::Complexity`. Maestro's default\ninference uses scope size as a proxy; callers can override when they\nhave richer signal (token estimates, subtask count, etc.).",
+      "enum": [
+        "trivial",
+        "simple",
+        "moderate",
+        "complex",
+        "critical"
+      ],
+      "title": "Complexity",
+      "type": "string"
+    },
     "DefaultsConfig": {
       "description": "Default values for task configuration.",
       "properties": {
@@ -69,6 +81,19 @@
       },
       "title": "GitConfig",
       "type": "object"
+    },
+    "Language": {
+      "description": "Arbiter-compatible primary language classification.\n\nValues match `arbiter-core/src/types.rs::Language`. `MIXED` means the\ntask spans multiple languages; `OTHER` is the fallback when inference\ncannot determine a single language.",
+      "enum": [
+        "python",
+        "rust",
+        "typescript",
+        "go",
+        "mixed",
+        "other"
+      ],
+      "title": "Language",
+      "type": "string"
     },
     "NotificationConfig": {
       "description": "Notification configuration.",
@@ -206,6 +231,42 @@
           "minimum": -100,
           "title": "Priority",
           "type": "integer"
+        },
+        "task_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskType"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Arbiter task type. If omitted, inferred from `prompt` at Task.from_config() time."
+        },
+        "language": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Language"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Arbiter primary language. If omitted, inferred from `scope` globs at Task.from_config() time."
+        },
+        "complexity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Complexity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Arbiter complexity. If omitted, inferred from scope size at Task.from_config() time."
         }
       },
       "required": [
@@ -215,6 +276,20 @@
       ],
       "title": "TaskConfig",
       "type": "object"
+    },
+    "TaskType": {
+      "description": "Arbiter-compatible task type classification.\n\nValues match `arbiter-core/src/types.rs::TaskType` (snake_case serde).\nUsed by Arbiter's routing decision tree (ordinal feature, index 0).",
+      "enum": [
+        "feature",
+        "bugfix",
+        "refactor",
+        "test",
+        "docs",
+        "review",
+        "research"
+      ],
+      "title": "TaskType",
+      "type": "string"
     }
   },
   "description": "Project configuration model for YAML parsing.\n\nThis is the root configuration model that represents the entire YAML\nconfiguration file including project settings, defaults, and task list.",

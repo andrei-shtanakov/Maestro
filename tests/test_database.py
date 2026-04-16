@@ -20,7 +20,14 @@ from maestro.database import (
     TaskNotFoundError,
     create_database,
 )
-from maestro.models import AgentType, Task, TaskStatus
+from maestro.models import (
+    AgentType,
+    Complexity,
+    Language,
+    Task,
+    TaskStatus,
+    TaskType,
+)
 
 
 # =============================================================================
@@ -293,6 +300,80 @@ class TestTaskCRUD:
         assert fetched.requires_approval is True
         assert fetched.validation_cmd == "pytest tests/"
         assert fetched.result_summary == "Task completed successfully"
+
+    @pytest.mark.anyio
+    async def test_create_task_preserves_arbiter_fields(self, db) -> None:
+        """Round-trip non-default task_type/language/complexity values (R-02)."""
+        task = Task(
+            id="arb-task",
+            title="Arbiter fields",
+            prompt="Refactor the retry loop",
+            workdir="/tmp/arb",
+            task_type=TaskType.REFACTOR,
+            language=Language.RUST,
+            complexity=Complexity.COMPLEX,
+        )
+
+        await db.create_task(task)
+        fetched = await db.get_task(task.id)
+
+        assert fetched.task_type == TaskType.REFACTOR
+        assert fetched.language == Language.RUST
+        assert fetched.complexity == Complexity.COMPLEX
+
+    @pytest.mark.anyio
+    async def test_schema_migration_adds_arbiter_columns(
+        self, temp_db_path: Path
+    ) -> None:
+        """A pre-R-02 tasks table gets task_type/language/complexity added.
+
+        Regression guard: ensures users with existing maestro.db files don't
+        crash when they upgrade, because R-02 introduced three NOT NULL columns
+        that SQLite's `CREATE TABLE IF NOT EXISTS` would silently skip.
+        """
+        import aiosqlite
+
+        async with aiosqlite.connect(temp_db_path) as conn:
+            await conn.execute(
+                """
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    branch TEXT,
+                    workdir TEXT NOT NULL,
+                    agent_type TEXT NOT NULL DEFAULT 'claude_code',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    assigned_to TEXT,
+                    scope TEXT,
+                    priority INTEGER DEFAULT 0,
+                    max_retries INTEGER DEFAULT 2,
+                    retry_count INTEGER DEFAULT 0,
+                    timeout_minutes INTEGER DEFAULT 30,
+                    requires_approval BOOLEAN DEFAULT FALSE,
+                    validation_cmd TEXT,
+                    result_summary TEXT,
+                    error_message TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    started_at TIMESTAMP,
+                    completed_at TIMESTAMP
+                )
+                """
+            )
+            await conn.execute(
+                "INSERT INTO tasks (id, title, prompt, workdir) VALUES "
+                "('legacy', 'old', 'do stuff', '/tmp/old')"
+            )
+            await conn.commit()
+
+        database = await create_database(temp_db_path)
+        try:
+            fetched = await database.get_task("legacy")
+            assert fetched.task_type == TaskType.FEATURE
+            assert fetched.language == Language.OTHER
+            assert fetched.complexity == Complexity.MODERATE
+        finally:
+            await database.close()
 
     @pytest.mark.anyio
     async def test_get_task(self, db, sample_task_no_deps) -> None:

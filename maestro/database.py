@@ -17,10 +17,13 @@ import aiosqlite
 
 from maestro.models import (
     AgentType,
+    Complexity,
+    Language,
     Message,
     Task,
     TaskCost,
     TaskStatus,
+    TaskType,
     Zadacha,
     ZadachaStatus,
 )
@@ -68,6 +71,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     timeout_minutes INTEGER DEFAULT 30,
     requires_approval BOOLEAN DEFAULT FALSE,
     validation_cmd TEXT,
+    task_type TEXT NOT NULL DEFAULT 'feature',
+    language TEXT NOT NULL DEFAULT 'other',
+    complexity TEXT NOT NULL DEFAULT 'moderate',
     result_summary TEXT,
     error_message TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -221,6 +227,9 @@ def _row_to_task(row: aiosqlite.Row) -> Task:
         timeout_minutes=row["timeout_minutes"],
         requires_approval=bool(row["requires_approval"]),
         validation_cmd=row["validation_cmd"],
+        task_type=TaskType(row["task_type"]),
+        language=Language(row["language"]),
+        complexity=Complexity(row["complexity"]),
         result_summary=row["result_summary"],
         error_message=row["error_message"],
         created_at=_parse_datetime(row["created_at"]) or datetime.now(UTC),
@@ -320,13 +329,43 @@ class Database:
             self._connection = None
 
     async def initialize_schema(self) -> None:
-        """Create database tables if they don't exist."""
+        """Create database tables if they don't exist, then apply migrations."""
         if self._connection is None:
             msg = "Database not connected"
             raise DatabaseError(msg)
 
         await self._connection.executescript(SCHEMA_SQL)
+        await self._migrate_tasks_arbiter_columns()
         await self._connection.commit()
+
+    async def _migrate_tasks_arbiter_columns(self) -> None:
+        """Add Arbiter-compatible columns to an older `tasks` table in place.
+
+        SQLite `CREATE TABLE IF NOT EXISTS` does not add new columns to a
+        pre-existing table, so databases created before R-02 need an explicit
+        `ALTER TABLE`. Checks `PRAGMA table_info` to stay idempotent.
+        """
+        assert self._connection is not None  # narrowed by caller
+        cursor = await self._connection.execute("PRAGMA table_info(tasks)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+
+        migrations = [
+            (
+                "task_type",
+                "ALTER TABLE tasks ADD COLUMN task_type TEXT NOT NULL DEFAULT 'feature'",
+            ),
+            (
+                "language",
+                "ALTER TABLE tasks ADD COLUMN language TEXT NOT NULL DEFAULT 'other'",
+            ),
+            (
+                "complexity",
+                "ALTER TABLE tasks ADD COLUMN complexity TEXT NOT NULL DEFAULT 'moderate'",
+            ),
+        ]
+        for column, ddl in migrations:
+            if column not in columns:
+                await self._connection.execute(ddl)
 
     @asynccontextmanager
     async def transaction(self) -> AsyncGenerator[aiosqlite.Connection, None]:
@@ -385,8 +424,9 @@ class Database:
                     id, title, prompt, branch, workdir, agent_type, status,
                     assigned_to, scope, priority, max_retries, retry_count,
                     timeout_minutes, requires_approval, validation_cmd,
+                    task_type, language, complexity,
                     result_summary, error_message, created_at, started_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.id,
@@ -404,6 +444,9 @@ class Database:
                     task.timeout_minutes,
                     task.requires_approval,
                     task.validation_cmd,
+                    task.task_type.value,
+                    task.language.value,
+                    task.complexity.value,
                     task.result_summary,
                     task.error_message,
                     _format_datetime(task.created_at),
@@ -540,8 +583,10 @@ class Database:
                 title = ?, prompt = ?, branch = ?, workdir = ?, agent_type = ?,
                 status = ?, assigned_to = ?, scope = ?, priority = ?,
                 max_retries = ?, retry_count = ?, timeout_minutes = ?,
-                requires_approval = ?, validation_cmd = ?, result_summary = ?,
-                error_message = ?, started_at = ?, completed_at = ?
+                requires_approval = ?, validation_cmd = ?,
+                task_type = ?, language = ?, complexity = ?,
+                result_summary = ?, error_message = ?,
+                started_at = ?, completed_at = ?
             WHERE id = ?
             """,
             (
@@ -559,6 +604,9 @@ class Database:
                 task.timeout_minutes,
                 task.requires_approval,
                 task.validation_cmd,
+                task.task_type.value,
+                task.language.value,
+                task.complexity.value,
                 task.result_summary,
                 task.error_message,
                 _format_datetime(task.started_at),

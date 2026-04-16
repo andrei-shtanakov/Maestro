@@ -7,13 +7,21 @@ import pytest
 from maestro.dag import DAG, CycleError
 from maestro.models import (
     AgentType,
+    Complexity,
     DefaultsConfig,
     GitConfig,
+    Language,
     NotificationConfig,
+    Priority,
     ProjectConfig,
     Task,
     TaskConfig,
     TaskStatus,
+    TaskType,
+    infer_complexity,
+    infer_language,
+    infer_task_type,
+    priority_int_to_enum,
 )
 
 
@@ -241,6 +249,163 @@ class TestAgentType:
         """Verify AgentType is a string enum."""
         assert AgentType.CLAUDE_CODE.value == "claude_code"
         assert AgentType.CLAUDE_CODE == "claude_code"
+
+
+class TestArbiterEnums:
+    """Tests for Arbiter-compatible classification enums (R-02)."""
+
+    def test_task_type_values_match_arbiter(self) -> None:
+        """All 7 arbiter-core TaskType variants are present with snake_case values."""
+        expected = {
+            "feature",
+            "bugfix",
+            "refactor",
+            "test",
+            "docs",
+            "review",
+            "research",
+        }
+        assert {t.value for t in TaskType} == expected
+
+    def test_language_values_match_arbiter(self) -> None:
+        """All 6 arbiter-core Language variants are present."""
+        expected = {"python", "rust", "typescript", "go", "mixed", "other"}
+        assert {lang.value for lang in Language} == expected
+
+    def test_complexity_values_match_arbiter(self) -> None:
+        """All 5 arbiter-core Complexity variants are present."""
+        expected = {"trivial", "simple", "moderate", "complex", "critical"}
+        assert {c.value for c in Complexity} == expected
+
+    def test_priority_values_match_arbiter(self) -> None:
+        """All 4 arbiter-core Priority variants are present."""
+        expected = {"low", "normal", "high", "urgent"}
+        assert {p.value for p in Priority} == expected
+
+
+class TestInferTaskType:
+    """Tests for TaskType inference from prompt text."""
+
+    @pytest.mark.parametrize(
+        ("prompt", "expected"),
+        [
+            ("Fix the login bug", TaskType.BUGFIX),
+            ("Write regression tests for auth", TaskType.TEST),
+            ("Refactor the scheduler loop", TaskType.REFACTOR),
+            ("Update the README with new examples", TaskType.DOCS),
+            ("Review the pull request", TaskType.REVIEW),
+            ("Investigate CPU spike in production", TaskType.RESEARCH),
+            ("Add new /search endpoint", TaskType.FEATURE),
+            ("", TaskType.FEATURE),
+        ],
+    )
+    def test_keyword_matching(self, prompt: str, expected: TaskType) -> None:
+        assert infer_task_type(prompt) == expected
+
+    def test_case_insensitive(self) -> None:
+        assert infer_task_type("FIX the thing") == TaskType.BUGFIX
+
+    def test_bugfix_wins_over_feature_when_both_words_present(self) -> None:
+        """Ordering in _TASK_TYPE_KEYWORDS puts bugfix ahead of generic feature work."""
+        assert infer_task_type("Fix the new feature") == TaskType.BUGFIX
+
+
+class TestInferLanguage:
+    """Tests for Language inference from scope globs."""
+
+    @pytest.mark.parametrize(
+        ("scope", "expected"),
+        [
+            (["src/**/*.py"], Language.PYTHON),
+            (["src/lib.rs", "tests/integration.rs"], Language.RUST),
+            (["app.ts", "ui/**/*.tsx"], Language.TYPESCRIPT),
+            (["main.go"], Language.GO),
+            (["src/app.py", "ui/index.ts"], Language.MIXED),
+            ([], Language.OTHER),
+            (["README.md"], Language.OTHER),
+            (["tests/**"], Language.OTHER),
+        ],
+    )
+    def test_inference(self, scope: list[str], expected: Language) -> None:
+        assert infer_language(scope) == expected
+
+
+class TestInferComplexity:
+    """Tests for Complexity inference from scope size."""
+
+    @pytest.mark.parametrize(
+        ("size", "expected"),
+        [
+            (0, Complexity.TRIVIAL),
+            (1, Complexity.TRIVIAL),
+            (2, Complexity.SIMPLE),
+            (3, Complexity.SIMPLE),
+            (5, Complexity.MODERATE),
+            (10, Complexity.MODERATE),
+            (15, Complexity.COMPLEX),
+            (30, Complexity.COMPLEX),
+            (31, Complexity.CRITICAL),
+            (100, Complexity.CRITICAL),
+        ],
+    )
+    def test_inference_by_size(self, size: int, expected: Complexity) -> None:
+        scope = [f"file_{i}.py" for i in range(size)]
+        assert infer_complexity(scope) == expected
+
+
+class TestPriorityIntToEnum:
+    """Tests for priority int → enum mapping (R-02)."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (-100, Priority.LOW),
+            (-27, Priority.LOW),
+            (-26, Priority.LOW),
+            (-25, Priority.NORMAL),
+            (0, Priority.NORMAL),
+            (25, Priority.NORMAL),
+            (26, Priority.HIGH),
+            (75, Priority.HIGH),
+            (76, Priority.URGENT),
+            (100, Priority.URGENT),
+        ],
+    )
+    def test_band_boundaries(self, value: int, expected: Priority) -> None:
+        assert priority_int_to_enum(value) == expected
+
+
+class TestTaskFromConfigInference:
+    """Tests that Task.from_config populates Arbiter fields by inference."""
+
+    def test_inference_when_config_fields_absent(self) -> None:
+        """Omitted task_type/language/complexity in TaskConfig are inferred."""
+        config = TaskConfig(
+            id="t1",
+            title="Fix auth bug",
+            prompt="Fix the broken JWT expiration check",
+            scope=["src/auth/middleware.py", "src/auth/jwt.py"],
+        )
+        task = Task.from_config(config, workdir="/tmp/w")
+        assert task.task_type == TaskType.BUGFIX
+        assert task.language == Language.PYTHON
+        assert task.complexity == Complexity.SIMPLE
+
+    def test_explicit_values_override_inference(self) -> None:
+        """If TaskConfig provides values, inference is skipped."""
+        config = TaskConfig(
+            id="t1",
+            title="Fix auth bug",
+            prompt="Fix the broken JWT expiration check",
+            scope=["src/auth.py"],
+            task_type=TaskType.RESEARCH,
+            language=Language.MIXED,
+            complexity=Complexity.CRITICAL,
+        )
+        task = Task.from_config(config, workdir="/tmp/w")
+        assert task.task_type == TaskType.RESEARCH
+        assert task.language == Language.MIXED
+        assert task.complexity == Complexity.CRITICAL
 
 
 class TestTask:
