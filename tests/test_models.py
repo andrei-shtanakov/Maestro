@@ -697,6 +697,39 @@ class TestTask:
             )
 
 
+class TestTaskArbiterFields:
+    """Fields added in R-03 for arbiter routing persistence."""
+
+    def test_defaults_none(self) -> None:
+        from maestro.models import Task
+
+        task = Task(id="t1", title="T", prompt="P", workdir="/tmp")
+        assert task.routed_agent_type is None
+        assert task.arbiter_decision_id is None
+        assert task.arbiter_route_reason is None
+        assert task.arbiter_outcome_reported_at is None
+
+    def test_can_be_set(self) -> None:
+        from datetime import UTC, datetime
+
+        from maestro.models import Task
+
+        now = datetime.now(UTC)
+        task = Task(
+            id="t2",
+            title="T",
+            prompt="P",
+            workdir="/tmp",
+            routed_agent_type="codex_cli",
+            arbiter_decision_id="dec-9",
+            arbiter_route_reason="dt_path=budget_ok,bugfix",
+            arbiter_outcome_reported_at=now,
+        )
+        assert task.routed_agent_type == "codex_cli"
+        assert task.arbiter_decision_id == "dec-9"
+        assert task.arbiter_outcome_reported_at == now
+
+
 class TestGitConfig:
     """Tests for GitConfig model."""
 

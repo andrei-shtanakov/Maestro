@@ -517,6 +517,30 @@ class Task(BaseModel):
     depends_on: list[str] = Field(
         default_factory=list, description="List of task IDs this task depends on"
     )
+    # ---- R-03: Arbiter routing state (runtime-only, no TaskConfig equivalent) ----
+    routed_agent_type: str | None = Field(
+        default=None,
+        description=(
+            "Agent type chosen by the RoutingStrategy for this run. "
+            "Spawner lookup uses this first, falling back to agent_type. "
+            "Cleared on retry reset so the next attempt routes fresh."
+        ),
+    )
+    arbiter_decision_id: str | None = Field(
+        default=None,
+        description="Arbiter-provided correlation id for matching report_outcome.",
+    )
+    arbiter_route_reason: str | None = Field(
+        default=None,
+        description="Free-form reason string from arbiter (e.g. 'budget_exceeded').",
+    )
+    arbiter_outcome_reported_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Set when report_outcome succeeds; recovery / re-attempt pass "
+            "uses NULL as 'delivery still pending'."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_retry_count(self) -> Self:
