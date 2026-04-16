@@ -128,9 +128,7 @@ def _attach_attempts(
         "claude_output",
     ] + [c for c in optional if c in available]
 
-    cursor = conn.execute(
-        f"SELECT {', '.join(select_cols)} FROM attempts ORDER BY id"
-    )
+    cursor = conn.execute(f"SELECT {', '.join(select_cols)} FROM attempts ORDER BY id")
     for row in cursor.fetchall():
         entry = tasks.get(row["task_id"])
         if entry is None:
