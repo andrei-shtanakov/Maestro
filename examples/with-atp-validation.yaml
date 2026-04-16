@@ -1,0 +1,88 @@
+# =============================================================================
+# Maestro + ATP Platform — Post-Task Validation via CLI
+# =============================================================================
+#
+# Demonstrates how to use ATP Platform as a post-task verifier without any
+# code changes in Maestro. The `validation_cmd` field already runs an arbitrary
+# shell command after a task reaches VALIDATING — point it at `atp test` and
+# ATP's exit codes drive Maestro's state machine:
+#
+#   exit 0 → task -> DONE
+#   exit 1 → task -> FAILED (retry per max_retries, then NEEDS_REVIEW)
+#   exit 2 → task -> FAILED (ATP config/IO error; usually not worth retrying)
+#
+# Prerequisites:
+#   - `atp` CLI on PATH (`uv tool install atp-platform` or equivalent)
+#   - Test suites in `tests/atp/` matching the scope of each task
+#   - ATP agent config (atp.config.yaml) accessible from the repo root
+#
+# Usage:
+#   uv run maestro run with-atp-validation.yaml
+#
+# Roadmap: this is R-06a — quick win, zero Maestro code changes.
+# R-06b (SDK integration via atp.sdk.arun()) comes after R-03 (MCP client).
+# =============================================================================
+
+project: my-app
+repo: ~/projects/my-app
+max_concurrent: 2
+
+defaults:
+  timeout_minutes: 30
+  max_retries: 2
+  agent_type: claude_code
+
+git:
+  base_branch: main
+  auto_push: true
+  branch_prefix: "agent/"
+
+tasks:
+  # -------------------------------------------------------------------------
+  # Pattern 1: Unit tests + ATP behavioral suite chained with `&&`
+  # If pytest fails, ATP never runs. If pytest passes, ATP validates behavior
+  # (LLM-judge, artifact assertions, etc.) per the suite definition.
+  # -------------------------------------------------------------------------
+  - id: implement-search
+    title: "Implement /search endpoint"
+    prompt: |
+      Add a FastAPI endpoint POST /search that accepts {query: str} and
+      returns a ranked list of posts. Use the existing Post model.
+    scope: ["src/api/search.py", "tests/test_search.py"]
+    validation_cmd: >
+      uv run pytest tests/test_search.py -q
+      && atp test tests/atp/search_suite.yaml --agent=search-endpoint
+
+  # -------------------------------------------------------------------------
+  # Pattern 2: ATP-only validation for tasks without conventional unit tests
+  # (prompt quality, refactor correctness, docs coherence). Use --output=json
+  # + --output-file so failed runs leave an artifact for the retry prompt.
+  # -------------------------------------------------------------------------
+  - id: rewrite-docs
+    title: "Rewrite README quick-start section"
+    prompt: |
+      Rewrite README.md "Quick start" so it takes a new user from clone to
+      first successful request in under 5 minutes. Keep commands copy-pasteable.
+    scope: ["README.md"]
+    validation_cmd: >
+      atp test tests/atp/readme_quality.yaml
+      --agent=doc-reviewer
+      --output=json
+      --output-file=_atp_results/readme.json
+
+  # -------------------------------------------------------------------------
+  # Pattern 3: Tagged subset — fast smoke-only for frequently-retried tasks
+  # Full suite runs later (e.g. in CI or a dedicated verification task).
+  # -------------------------------------------------------------------------
+  - id: tune-ranking
+    title: "Tune ranking weights"
+    prompt: |
+      Adjust the ranking function in src/api/ranking.py so semantic similarity
+      contributes 60%, recency 25%, and popularity 15%.
+    scope: ["src/api/ranking.py"]
+    depends_on: [implement-search]
+    validation_cmd: >
+      atp test tests/atp/ranking_suite.yaml
+      --agent=ranking-fn
+      --tags=smoke
+    timeout_minutes: 20
