@@ -226,9 +226,7 @@ def _display_auto_commits(
             check=False,
         )
         if result.returncode == 0 and result.stdout.strip():
-            console.print(
-                "\n[bold]Commits created during run:[/bold]"
-            )
+            console.print("\n[bold]Commits created during run:[/bold]")
             console.print(result.stdout.rstrip())
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
