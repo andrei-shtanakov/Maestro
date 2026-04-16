@@ -1367,3 +1367,45 @@ class TestArbiterRoutingMigration:
             await db._migrate_tasks_arbiter_routing()
         finally:
             await db.close()
+
+
+class TestUpdateTaskRouting:
+    """Database.update_task_routing writes routing fields only."""
+
+    @pytest.mark.anyio
+    async def test_writes_routing_fields_only(self, tmp_path) -> None:
+        from maestro.database import Database
+        from maestro.models import AgentType, Task, TaskStatus
+
+        db = Database(tmp_path / "r.db")
+        await db.connect()
+        try:
+            task = Task(
+                id="t1",
+                title="T",
+                prompt="P",
+                workdir="/tmp",
+                agent_type=AgentType.AUTO,
+                status=TaskStatus.READY,
+            )
+            await db.create_task(task)
+
+            # Update routing fields (as scheduler does pre-spawn)
+            task_updated = task.model_copy(
+                update={
+                    "routed_agent_type": "codex_cli",
+                    "arbiter_decision_id": "dec-42",
+                    "arbiter_route_reason": "dt_path",
+                }
+            )
+            await db.update_task_routing(task_updated)
+
+            refetched = await db.get_task("t1")
+            assert refetched.routed_agent_type == "codex_cli"
+            assert refetched.arbiter_decision_id == "dec-42"
+            assert refetched.arbiter_route_reason == "dt_path"
+            # agent_type and status untouched
+            assert refetched.agent_type is AgentType.AUTO
+            assert refetched.status is TaskStatus.READY
+        finally:
+            await db.close()

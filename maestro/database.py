@@ -688,6 +688,42 @@ class Database:
         await self._connection.commit()
         return task
 
+    async def update_task_routing(self, task: Task) -> None:
+        """R-03: Persist routing decision for a task before spawner lookup.
+
+        Writes only the routing-related columns; does NOT touch `agent_type`,
+        `status`, `assigned_to`, or timestamps. The order matters: routing
+        decision must be persisted BEFORE the agent subprocess is spawned,
+        so a crash mid-spawn still leaves enough state for recovery to
+        correlate the outcome.
+
+        Args:
+            task: Task model with routing fields populated.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        await self._connection.execute(
+            """
+            UPDATE tasks
+            SET routed_agent_type = ?,
+                arbiter_decision_id = ?,
+                arbiter_route_reason = ?
+            WHERE id = ?
+            """,
+            (
+                task.routed_agent_type,
+                task.arbiter_decision_id,
+                task.arbiter_route_reason,
+                task.id,
+            ),
+        )
+        await self._connection.commit()
+
     async def delete_task(self, task_id: str) -> bool:
         """Delete a task by ID.
 
