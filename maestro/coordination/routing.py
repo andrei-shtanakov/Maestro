@@ -18,6 +18,8 @@ from maestro.models import (
     RouteDecision,
     Task,
     TaskOutcome,
+    TaskOutcomeStatus,
+    TaskStatus,
 )
 
 
@@ -69,3 +71,29 @@ class StaticRouting:
 
     async def aclose(self) -> None:
         return None
+
+
+_STATUS_MAP: dict[TaskStatus, TaskOutcomeStatus | None] = {
+    TaskStatus.DONE: TaskOutcomeStatus.SUCCESS,
+    TaskStatus.FAILED: TaskOutcomeStatus.FAILURE,
+    TaskStatus.NEEDS_REVIEW: TaskOutcomeStatus.FAILURE,
+    TaskStatus.ABANDONED: TaskOutcomeStatus.CANCELLED,
+    TaskStatus.RUNNING: TaskOutcomeStatus.INTERRUPTED,
+    TaskStatus.VALIDATING: TaskOutcomeStatus.INTERRUPTED,
+    # Invariant-violation states: decision_id should never be set here.
+    TaskStatus.PENDING: None,
+    TaskStatus.READY: None,
+    TaskStatus.AWAITING_APPROVAL: None,
+}
+
+
+def task_status_to_outcome_status(
+    status: TaskStatus,
+) -> TaskOutcomeStatus | None:
+    """Map a Task lifecycle status to the outcome status arbiter expects.
+
+    Returns None for states that should never carry an arbiter_decision_id
+    (PENDING/READY/AWAITING_APPROVAL). Callers log and skip these as
+    invariant violations.
+    """
+    return _STATUS_MAP.get(status)
