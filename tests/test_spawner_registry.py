@@ -454,10 +454,10 @@ class TestDirectoryDiscovery:
 
         assert count >= 4
         assert "claude_code" in registry
-        assert "codex" in registry
+        assert "codex_cli" in registry
         assert "aider" in registry
         assert "announce" in registry
-        assert isinstance(registry.get_spawner("codex"), CodexSpawner)
+        assert isinstance(registry.get_spawner("codex_cli"), CodexSpawner)
         assert isinstance(registry.get_spawner("aider"), AiderSpawner)
         assert isinstance(registry.get_spawner("announce"), AnnounceSpawner)
 
@@ -646,7 +646,7 @@ class TestRegistryIntegration:
 
         assert len(registry) == 4
         assert isinstance(registry.get_spawner("claude_code"), ClaudeCodeSpawner)
-        assert isinstance(registry.get_spawner("codex"), CodexSpawner)
+        assert isinstance(registry.get_spawner("codex_cli"), CodexSpawner)
         assert isinstance(registry.get_spawner("aider"), AiderSpawner)
         assert isinstance(registry.get_spawner("announce"), AnnounceSpawner)
 
@@ -656,6 +656,6 @@ class TestRegistryIntegration:
             registry = create_default_registry()
 
         assert "claude_code" in registry
-        assert "codex" in registry
+        assert "codex_cli" in registry
         assert "aider" in registry
         assert "announce" in registry

@@ -23,7 +23,7 @@ class CodexSpawner(AgentSpawner):
     @property
     def agent_type(self) -> str:
         """Return the agent type identifier."""
-        return "codex"
+        return "codex_cli"
 
     def is_available(self) -> bool:
         """Check if Codex CLI is installed.

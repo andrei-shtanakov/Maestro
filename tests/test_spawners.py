@@ -614,7 +614,7 @@ class TestCodexSpawner:
 
     def test_agent_type(self, codex_spawner: CodexSpawner) -> None:
         """Test that agent_type returns correct value."""
-        assert codex_spawner.agent_type == "codex"
+        assert codex_spawner.agent_type == "codex_cli"
 
     def test_codex_available_when_in_path(
         self,

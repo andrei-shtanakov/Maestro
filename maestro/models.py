@@ -73,7 +73,7 @@ class AgentType(StrEnum):
     """Supported agent types for task execution."""
 
     CLAUDE_CODE = "claude_code"
-    CODEX = "codex"
+    CODEX = "codex_cli"
     AIDER = "aider"
     ANNOUNCE = "announce"
 

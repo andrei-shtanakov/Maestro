@@ -4,7 +4,7 @@
       "description": "Supported agent types for task execution.",
       "enum": [
         "claude_code",
-        "codex",
+        "codex_cli",
         "aider",
         "announce"
       ],

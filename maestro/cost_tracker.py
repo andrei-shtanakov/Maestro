@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # Claude Code uses Claude Sonnet pricing by default
 PRICING: dict[str, tuple[float, float]] = {
     "claude_code": (3.0 / 1_000_000, 15.0 / 1_000_000),
-    "codex": (2.5 / 1_000_000, 10.0 / 1_000_000),
+    "codex_cli": (2.5 / 1_000_000, 10.0 / 1_000_000),
     "aider": (3.0 / 1_000_000, 15.0 / 1_000_000),
     "announce": (0.0, 0.0),
 }
