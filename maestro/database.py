@@ -810,6 +810,28 @@ class Database:
         await self._connection.commit()
         return cursor.rowcount > 0
 
+    async def get_tasks_with_pending_outcome(self) -> list[Task]:
+        """R-03: Tasks that have a routing decision but no outcome delivered yet.
+
+        Returns tasks in any status (RUNNING/VALIDATING/terminal/FAILED) with
+        `arbiter_decision_id IS NOT NULL AND arbiter_outcome_reported_at IS NULL`.
+        Used by recovery hook and scheduler re-attempt pass.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM tasks
+            WHERE arbiter_decision_id IS NOT NULL
+              AND arbiter_outcome_reported_at IS NULL
+            ORDER BY created_at ASC
+            """,
+        )
+        rows = await cursor.fetchall()
+        return [_row_to_task(row) for row in rows]
+
     async def delete_task(self, task_id: str) -> bool:
         """Delete a task by ID.
 

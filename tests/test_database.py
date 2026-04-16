@@ -1557,3 +1557,50 @@ class TestResetForRetryAtomic:
             assert refetched.status is TaskStatus.READY
         finally:
             await db.close()
+
+
+class TestGetTasksWithPendingOutcome:
+    @pytest.mark.anyio
+    async def test_returns_tasks_with_decision_but_no_reported_at(
+        self, tmp_path
+    ) -> None:
+        """R-03: Return tasks with routing decision but no outcome delivery."""
+        from maestro.database import Database
+        from maestro.models import Task, TaskStatus
+
+        db = Database(tmp_path / "p.db")
+        await db.connect()
+        try:
+            # Three tasks: one pending, one already reported, one without routing
+            t1 = Task(
+                id="pending",
+                title="T",
+                prompt="P",
+                workdir="/tmp",
+                status=TaskStatus.DONE,
+                arbiter_decision_id="dec-pending",
+            )
+            t2 = Task(
+                id="reported",
+                title="T",
+                prompt="P",
+                workdir="/tmp",
+                status=TaskStatus.DONE,
+                arbiter_decision_id="dec-reported",
+                arbiter_outcome_reported_at=datetime.now(UTC),
+            )
+            t3 = Task(
+                id="static",
+                title="T",
+                prompt="P",
+                workdir="/tmp",
+                status=TaskStatus.DONE,
+            )
+            for t in (t1, t2, t3):
+                await db.create_task(t)
+
+            pending = await db.get_tasks_with_pending_outcome()
+            ids = {t.id for t in pending}
+            assert ids == {"pending"}
+        finally:
+            await db.close()
