@@ -28,11 +28,18 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.12", "3.13"]
+    env:
+      NO_COLOR: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
       - uses: astral-sh/setup-uv@v4
+      - name: Configure git identity and default branch
+        run: |
+          git config --global init.defaultBranch main
+          git config --global user.email "ci@maestro.test"
+          git config --global user.name "Maestro CI"
       - run: uv sync
       - run: uv run python -m pytest -m "not slow"
