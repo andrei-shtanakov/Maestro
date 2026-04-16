@@ -191,6 +191,69 @@ class TaskOutcome(BaseModel):
     error_code: str | None = None
 
 
+class ArbiterMode(StrEnum):
+    """Arbiter routing authority.
+
+    ADVISORY — explicit `agent_type` in task config is honored; arbiter is
+    consulted for learning signal and can HOLD/REJECT on invariants.
+    AUTHORITATIVE — arbiter's `chosen_agent` overrides user declaration.
+    """
+
+    ADVISORY = "advisory"
+    AUTHORITATIVE = "authoritative"
+
+
+class ArbiterConfig(BaseModel):
+    """Configuration for the Arbiter MCP integration.
+
+    Validated on YAML load. `enabled=false` (default) keeps Maestro on the
+    zero-config StaticRouting path; no arbiter subprocess ever started.
+    """
+
+    enabled: bool = False
+    mode: ArbiterMode = ArbiterMode.ADVISORY
+    optional: bool = False
+    binary_path: str | None = None
+    config_dir: str | None = None
+    tree_path: str | None = None
+    db_path: str | None = None
+    timeout_ms: int = Field(default=500, ge=1)
+    reconnect_interval_s: int = Field(default=60, ge=1)
+    abandon_outcome_after_s: int = Field(default=300, ge=1)
+    log_level: str = "warn"
+
+    @model_validator(mode="after")
+    def _validate_when_enabled(self) -> Self:
+        if not self.enabled:
+            return self
+
+        missing: list[str] = []
+        for name in ("binary_path", "config_dir", "tree_path"):
+            if getattr(self, name) is None:
+                missing.append(name)
+        if missing:
+            msg = (
+                f"arbiter.{'/'.join(missing)} required when arbiter.enabled=true. "
+                f"Set via env var (e.g. ARBITER_BIN) or inline in config."
+            )
+            raise ValueError(msg)
+
+        # config.py's env-var resolver only supports ${VAR}, not ${VAR:-default}.
+        # Catch any residue of either syntax so users get a clear diagnostic
+        # instead of a cryptic "binary not found" at startup.
+        for name in ("binary_path", "config_dir", "tree_path", "db_path"):
+            val = getattr(self, name)
+            if val is not None and "${" in val:
+                msg = (
+                    f"arbiter.{name}={val!r}: unresolved env var substitution. "
+                    f"config.py supports ${{VAR}} only; "
+                    f"${{VAR:-default}} is not supported."
+                )
+                raise ValueError(msg)
+
+        return self
+
+
 # ---------------------------------------------------------------------------
 # Arbiter field inference helpers
 # ---------------------------------------------------------------------------
