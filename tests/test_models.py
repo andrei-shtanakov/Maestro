@@ -241,7 +241,7 @@ class TestAgentType:
 
     def test_all_agent_types_exist(self) -> None:
         """Verify all expected agent types are defined."""
-        expected = {"claude_code", "codex_cli", "aider", "announce"}
+        expected = {"claude_code", "codex_cli", "aider", "announce", "auto"}
         actual = {a.value for a in AgentType}
         assert actual == expected
 
@@ -249,6 +249,27 @@ class TestAgentType:
         """Verify AgentType is a string enum."""
         assert AgentType.CLAUDE_CODE.value == "claude_code"
         assert AgentType.CLAUDE_CODE == "claude_code"
+
+
+class TestAgentTypeAuto:
+    """Tests for AgentType.AUTO sentinel added in R-03."""
+
+    def test_auto_value_is_lowercase_auto(self) -> None:
+        from maestro.models import AgentType
+
+        assert AgentType.AUTO.value == "auto"
+
+    def test_auto_is_distinct_from_real_agents(self) -> None:
+        from maestro.models import AgentType
+
+        assert AgentType.AUTO != AgentType.CLAUDE_CODE
+        assert AgentType.AUTO != AgentType.CODEX
+        assert AgentType.AUTO != AgentType.AIDER
+
+    def test_auto_round_trips_through_enum(self) -> None:
+        from maestro.models import AgentType
+
+        assert AgentType("auto") is AgentType.AUTO
 
 
 class TestArbiterEnums:

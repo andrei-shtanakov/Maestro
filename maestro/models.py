@@ -76,6 +76,14 @@ class AgentType(StrEnum):
     CODEX = "codex_cli"
     AIDER = "aider"
     ANNOUNCE = "announce"
+    AUTO = "auto"
+    """Routing sentinel: arbiter decides the real agent. NOT a spawnable agent.
+
+    Invariants enforced in code:
+    - Task.from_config raises when agent_type=AUTO and arbiter is not enabled.
+    - Scheduler._spawn_task refuses to proceed with agent_type=AUTO reaching
+      spawner lookup (defensive guard against misbehaving RoutingStrategy).
+    """
 
 
 class TaskType(StrEnum):
