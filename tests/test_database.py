@@ -1266,3 +1266,100 @@ class TestFullLifecycle:
         # Attempting to fetch should raise DatabaseError
         with pytest.raises(DatabaseError, match="Invalid datetime format"):
             await db.get_task(task.id)
+
+
+class TestArbiterRoutingMigration:
+    """_migrate_tasks_arbiter_routing adds R-03 columns idempotently."""
+
+    @pytest.mark.anyio
+    async def test_fresh_db_has_four_new_columns(self, tmp_path) -> None:
+        from maestro.database import Database
+
+        db = Database(tmp_path / "fresh.db")
+        await db.connect()
+        try:
+            cursor = await db._connection.execute("PRAGMA table_info(tasks)")
+            cols = {row["name"] for row in await cursor.fetchall()}
+            assert "routed_agent_type" in cols
+            assert "arbiter_decision_id" in cols
+            assert "arbiter_route_reason" in cols
+            assert "arbiter_outcome_reported_at" in cols
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_legacy_db_migrates(self, tmp_path) -> None:
+        """Pre-R-03 schema (3 arbiter-R02 columns, no routing columns) → migrate."""
+        import aiosqlite
+
+        db_path = tmp_path / "legacy.db"
+        # Create a legacy tasks table without the 4 new columns
+        legacy_sql = """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            branch TEXT,
+            workdir TEXT NOT NULL,
+            agent_type TEXT NOT NULL DEFAULT 'claude_code',
+            status TEXT NOT NULL DEFAULT 'pending',
+            assigned_to TEXT,
+            scope TEXT,
+            priority INTEGER DEFAULT 0,
+            max_retries INTEGER DEFAULT 2,
+            retry_count INTEGER DEFAULT 0,
+            timeout_minutes INTEGER DEFAULT 30,
+            requires_approval BOOLEAN DEFAULT FALSE,
+            validation_cmd TEXT,
+            task_type TEXT NOT NULL DEFAULT 'feature',
+            language TEXT NOT NULL DEFAULT 'other',
+            complexity TEXT NOT NULL DEFAULT 'moderate',
+            result_summary TEXT,
+            error_message TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP
+        )
+        """
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await conn.execute(legacy_sql)
+            await conn.execute(
+                "INSERT INTO tasks (id, title, prompt, workdir) VALUES "
+                "('t1', 'T', 'P', '/tmp')"
+            )
+            await conn.commit()
+
+        # Now connect via Database — should migrate
+        from maestro.database import Database
+
+        db = Database(db_path)
+        await db.connect()
+        try:
+            cursor = await db._connection.execute("PRAGMA table_info(tasks)")
+            cols = {row["name"] for row in await cursor.fetchall()}
+            assert "routed_agent_type" in cols
+            assert "arbiter_outcome_reported_at" in cols
+
+            # Legacy row survives with NULLs in new columns
+            cursor = await db._connection.execute(
+                "SELECT routed_agent_type, arbiter_decision_id FROM tasks WHERE id='t1'"
+            )
+            row = await cursor.fetchone()
+            assert row["routed_agent_type"] is None
+            assert row["arbiter_decision_id"] is None
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_migration_idempotent(self, tmp_path) -> None:
+        """Running migrate twice does not fail."""
+        from maestro.database import Database
+
+        db = Database(tmp_path / "idem.db")
+        await db.connect()
+        try:
+            # connect() already ran migrate once. Run it again manually.
+            await db._migrate_tasks_arbiter_routing()
+            await db._migrate_tasks_arbiter_routing()
+        finally:
+            await db.close()

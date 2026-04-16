@@ -78,7 +78,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     error_message TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     started_at TIMESTAMP,
-    completed_at TIMESTAMP
+    completed_at TIMESTAMP,
+    -- R-03 arbiter routing state
+    routed_agent_type TEXT,
+    arbiter_decision_id TEXT,
+    arbiter_route_reason TEXT,
+    arbiter_outcome_reported_at TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS task_dependencies (
@@ -236,6 +241,10 @@ def _row_to_task(row: aiosqlite.Row) -> Task:
         started_at=_parse_datetime(row["started_at"]),
         completed_at=_parse_datetime(row["completed_at"]),
         depends_on=[],  # Will be populated separately if needed
+        routed_agent_type=row["routed_agent_type"],
+        arbiter_decision_id=row["arbiter_decision_id"],
+        arbiter_route_reason=row["arbiter_route_reason"],
+        arbiter_outcome_reported_at=_parse_datetime(row["arbiter_outcome_reported_at"]),
     )
 
 
@@ -309,7 +318,11 @@ class Database:
         return self._connection is not None
 
     async def connect(self) -> None:
-        """Open database connection with WAL mode and foreign keys."""
+        """Open database connection with WAL mode and foreign keys.
+
+        Also initializes the schema and applies any pending migrations so that
+        callers do not need a separate `initialize_schema()` call.
+        """
         if self._connection is not None:
             return
 
@@ -321,6 +334,8 @@ class Database:
         # Enable foreign key constraints
         await self._connection.execute("PRAGMA foreign_keys=ON")
         await self._connection.commit()
+
+        await self.initialize_schema()
 
     async def close(self) -> None:
         """Close database connection."""
@@ -336,6 +351,7 @@ class Database:
 
         await self._connection.executescript(SCHEMA_SQL)
         await self._migrate_tasks_arbiter_columns()
+        await self._migrate_tasks_arbiter_routing()  # R-03
         await self._connection.commit()
 
     async def _migrate_tasks_arbiter_columns(self) -> None:
@@ -361,6 +377,38 @@ class Database:
             (
                 "complexity",
                 "ALTER TABLE tasks ADD COLUMN complexity TEXT NOT NULL DEFAULT 'moderate'",
+            ),
+        ]
+        for column, ddl in migrations:
+            if column not in columns:
+                await self._connection.execute(ddl)
+
+    async def _migrate_tasks_arbiter_routing(self) -> None:
+        """R-03: Add arbiter routing state columns to an older `tasks` table.
+
+        Idempotent via PRAGMA table_info check. Called from `initialize_schema()`
+        after the R-02 column migration.
+        """
+        assert self._connection is not None
+        cursor = await self._connection.execute("PRAGMA table_info(tasks)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+
+        migrations = [
+            (
+                "routed_agent_type",
+                "ALTER TABLE tasks ADD COLUMN routed_agent_type TEXT",
+            ),
+            (
+                "arbiter_decision_id",
+                "ALTER TABLE tasks ADD COLUMN arbiter_decision_id TEXT",
+            ),
+            (
+                "arbiter_route_reason",
+                "ALTER TABLE tasks ADD COLUMN arbiter_route_reason TEXT",
+            ),
+            (
+                "arbiter_outcome_reported_at",
+                "ALTER TABLE tasks ADD COLUMN arbiter_outcome_reported_at TIMESTAMP",
             ),
         ]
         for column, ddl in migrations:
@@ -425,8 +473,10 @@ class Database:
                     assigned_to, scope, priority, max_retries, retry_count,
                     timeout_minutes, requires_approval, validation_cmd,
                     task_type, language, complexity,
-                    result_summary, error_message, created_at, started_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    result_summary, error_message, created_at, started_at, completed_at,
+                    routed_agent_type, arbiter_decision_id, arbiter_route_reason,
+                    arbiter_outcome_reported_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.id,
@@ -452,6 +502,10 @@ class Database:
                     _format_datetime(task.created_at),
                     _format_datetime(task.started_at),
                     _format_datetime(task.completed_at),
+                    task.routed_agent_type,
+                    task.arbiter_decision_id,
+                    task.arbiter_route_reason,
+                    _format_datetime(task.arbiter_outcome_reported_at),
                 ),
             )
         except sqlite3.IntegrityError as e:
@@ -586,7 +640,9 @@ class Database:
                 requires_approval = ?, validation_cmd = ?,
                 task_type = ?, language = ?, complexity = ?,
                 result_summary = ?, error_message = ?,
-                started_at = ?, completed_at = ?
+                started_at = ?, completed_at = ?,
+                routed_agent_type = ?, arbiter_decision_id = ?,
+                arbiter_route_reason = ?, arbiter_outcome_reported_at = ?
             WHERE id = ?
             """,
             (
@@ -611,6 +667,10 @@ class Database:
                 task.error_message,
                 _format_datetime(task.started_at),
                 _format_datetime(task.completed_at),
+                task.routed_agent_type,
+                task.arbiter_decision_id,
+                task.arbiter_route_reason,
+                _format_datetime(task.arbiter_outcome_reported_at),
                 task.id,
             ),
         )
