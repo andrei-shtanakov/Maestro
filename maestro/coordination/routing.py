@@ -15,8 +15,9 @@ from typing import Any, Protocol
 
 from maestro.coordination.arbiter_errors import ArbiterUnavailable  # noqa: F401
 from maestro.models import (
+    AgentType,
     ArbiterConfig,
-    ArbiterMode,  # noqa: F401
+    ArbiterMode,
     Priority,
     RouteAction,
     RouteDecision,
@@ -167,12 +168,25 @@ class ArbiterRouting:
         reason = raw.get("reasoning") or ""
         decision_id = _extract_decision_id(raw)
 
-        return RouteDecision(
+        decision = RouteDecision(
             action=action,
             chosen_agent=chosen,
             decision_id=decision_id,
             reason=reason or "dt_inference",
         )
+
+        # Advisory override: in advisory mode, an explicit agent_type (not AUTO)
+        # wins over arbiter's suggestion. HOLD/REJECT are always respected.
+        if (
+            action is RouteAction.ASSIGN
+            and self._cfg.mode is ArbiterMode.ADVISORY
+            and task.agent_type is not AgentType.AUTO
+        ):
+            decision = decision.model_copy(
+                update={"chosen_agent": task.agent_type.value}
+            )
+
+        return decision
 
     async def report_outcome(self, task: Task, outcome: TaskOutcome) -> None:
         # Implemented fully in Task 21.

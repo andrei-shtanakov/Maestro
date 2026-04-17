@@ -115,3 +115,83 @@ class TestHoldRejectUnknown:
         d = await routing.route(_task())
         assert d.action is RouteAction.ASSIGN
         assert d.chosen_agent == "new_agent_v2"
+
+
+class TestAdvisoryOverride:
+    @pytest.mark.anyio
+    async def test_advisory_explicit_agent_overrides_arbiter_choice(self) -> None:
+        fake = FakeArbiterClient()
+        fake.route_handler = lambda tid, t, c: {
+            "task_id": tid,
+            "action": "assign",
+            "chosen_agent": "claude_code",
+            "confidence": 0.9,
+            "reasoning": "dt",
+            "decision_path": [],
+            "invariant_checks": [],
+            "metadata": {"decision_id": "dec-5"},
+        }
+        await fake.start()
+        routing = ArbiterRouting(client=fake, cfg=_cfg(mode=ArbiterMode.ADVISORY))
+
+        # Task explicitly asks for CODEX
+        d = await routing.route(_task(AgentType.CODEX))
+
+        assert d.action is RouteAction.ASSIGN
+        assert d.chosen_agent == "codex_cli"  # user wins in advisory
+        assert d.decision_id == "dec-5"  # decision still persisted
+        assert d.reason == "dt"  # arbiter's reason kept as-is
+
+    @pytest.mark.anyio
+    async def test_advisory_auto_task_uses_arbiter_choice(self) -> None:
+        fake = FakeArbiterClient()
+        fake.route_handler = lambda tid, t, c: {
+            "task_id": tid,
+            "action": "assign",
+            "chosen_agent": "aider",
+            "confidence": 0.7,
+            "reasoning": "",
+            "decision_path": [],
+            "invariant_checks": [],
+            "metadata": {"decision_id": "dec-6"},
+        }
+        await fake.start()
+        routing = ArbiterRouting(client=fake, cfg=_cfg(mode=ArbiterMode.ADVISORY))
+        d = await routing.route(_task(AgentType.AUTO))
+        assert d.chosen_agent == "aider"  # AUTO → arbiter wins even in advisory
+
+    @pytest.mark.anyio
+    async def test_authoritative_overrides_explicit_user_choice(self) -> None:
+        fake = FakeArbiterClient()
+        fake.route_handler = lambda tid, t, c: {
+            "task_id": tid,
+            "action": "assign",
+            "chosen_agent": "claude_code",
+            "confidence": 0.9,
+            "reasoning": "",
+            "decision_path": [],
+            "invariant_checks": [],
+            "metadata": {"decision_id": "dec-7"},
+        }
+        await fake.start()
+        routing = ArbiterRouting(client=fake, cfg=_cfg(mode=ArbiterMode.AUTHORITATIVE))
+        d = await routing.route(_task(AgentType.CODEX))
+        assert d.chosen_agent == "claude_code"  # arbiter overrides user
+
+    @pytest.mark.anyio
+    async def test_advisory_hold_still_respected_for_explicit(self) -> None:
+        fake = FakeArbiterClient()
+        fake.route_handler = lambda tid, t, c: {
+            "task_id": tid,
+            "action": "hold",
+            "chosen_agent": "",
+            "confidence": 0.0,
+            "reasoning": "budget",
+            "decision_path": [],
+            "invariant_checks": [],
+            "metadata": {"decision_id": "dec-8"},
+        }
+        await fake.start()
+        routing = ArbiterRouting(client=fake, cfg=_cfg(mode=ArbiterMode.ADVISORY))
+        d = await routing.route(_task(AgentType.CODEX))
+        assert d.action is RouteAction.HOLD  # hold respected even in advisory
