@@ -24,8 +24,15 @@ from typing import Protocol
 from maestro.coordination.routing import RoutingStrategy, StaticRouting
 from maestro.dag import DAG
 from maestro.database import Database
-from maestro.event_log import HoldThrottle
-from maestro.models import ArbiterMode, Task, TaskConfig, TaskStatus
+from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
+from maestro.models import (
+    AgentType,
+    ArbiterMode,
+    RouteAction,
+    Task,
+    TaskConfig,
+    TaskStatus,
+)
 from maestro.notifications.base import Notification, NotificationEvent
 from maestro.notifications.manager import NotificationManager
 from maestro.retry import RetryManager
@@ -266,6 +273,18 @@ class Scheduler:
         if self._on_status_change is not None:
             self._on_status_change(task_id, old_status, new_status)
 
+    def _emit_event(self, event_type: EventType, payload: dict[str, object]) -> None:
+        """Forward a structured event to the default EventLogger, if configured."""
+        event_logger = get_event_logger()
+        if event_logger is None:
+            return
+        task_id = payload.get("task_id")
+        task_id_str = task_id if isinstance(task_id, str) else None
+        details = {k: v for k, v in payload.items() if k != "task_id"}
+        event_logger.log(
+            Event(event_type=event_type, task_id=task_id_str, details=details)
+        )
+
     def _auto_commit_task(self, task: Task) -> None:
         """Auto-commit changes for a completed task."""
         if not self._config.auto_commit:
@@ -445,15 +464,105 @@ class Scheduler:
         if task.status != TaskStatus.READY:
             return False
 
-        # Get spawner for this task's agent type
-        spawner = self._spawners.get(task.agent_type.value)
+        # R-03: consult the routing strategy before picking a spawner.
+        decision = await self._routing.route(task)
+
+        if decision.action is RouteAction.HOLD:
+            if self._hold_throttle.should_log(task_id, decision.reason):
+                self._emit_event(
+                    EventType.ARBITER_ROUTE_HOLD,
+                    {"task_id": task_id, "reason": decision.reason},
+                )
+            return False
+
+        if decision.action is RouteAction.REJECT:
+            self._emit_event(
+                EventType.ARBITER_ROUTE_REJECTED,
+                {"task_id": task_id, "reason": decision.reason},
+            )
+            await self._db.update_task_status(
+                task_id,
+                TaskStatus.NEEDS_REVIEW,
+                error_message=f"arbiter rejected: {decision.reason}",
+            )
+            if decision.decision_id is not None:
+                task = task.model_copy(
+                    update={
+                        "arbiter_decision_id": decision.decision_id,
+                        "arbiter_route_reason": decision.reason,
+                    }
+                )
+                await self._db.update_task_routing(task)
+                await self._db.mark_outcome_reported(
+                    task_id, datetime.now(UTC), decision.decision_id
+                )
+            self._report_status_change(task_id, "ready", "needs_review")
+            return False
+
+        # ASSIGN path
+        if decision.chosen_agent is None:
+            logger.error("assign with None chosen_agent for task %s", task_id)
+            return False
+        try:
+            chosen = AgentType(decision.chosen_agent)
+        except ValueError:
+            logger.warning(
+                "arbiter chose unknown agent %r for task %s — HOLD",
+                decision.chosen_agent,
+                task_id,
+            )
+            if self._hold_throttle.should_log(task_id, "unknown_agent"):
+                self._emit_event(
+                    EventType.ARBITER_ROUTE_HOLD,
+                    {"task_id": task_id, "reason": "unknown_agent"},
+                )
+            return False
+        if chosen is AgentType.AUTO:
+            logger.error(
+                "routing returned AUTO for task %s — refusing to spawn", task_id
+            )
+            if self._hold_throttle.should_log(task_id, "auto_not_resolved"):
+                self._emit_event(
+                    EventType.ARBITER_ROUTE_HOLD,
+                    {"task_id": task_id, "reason": "auto_not_resolved"},
+                )
+            return False
+
+        # Flush any prior HOLD streak now that we're past HOLD.
+        summary = self._hold_throttle.clear_and_summarize(task_id)
+        if summary is not None:
+            count = summary.get("count", 0)
+            if isinstance(count, int) and count > 1:
+                self._emit_event(EventType.ARBITER_ROUTE_HOLD_SUMMARY, summary)
+
+        task = task.model_copy(
+            update={
+                "routed_agent_type": chosen.value,
+                "arbiter_decision_id": decision.decision_id,
+                "arbiter_route_reason": decision.reason,
+            }
+        )
+        await self._db.update_task_routing(task)
+        self._emit_event(
+            EventType.ARBITER_ROUTE_DECIDED,
+            {
+                "task_id": task_id,
+                "decision_id": decision.decision_id,
+                "chosen_agent": chosen.value,
+                "reason": decision.reason,
+            },
+        )
+
+        # Get spawner using routed_agent_type when present, else agent_type.
+        spawner_key = task.routed_agent_type or task.agent_type.value
+        spawner = self._spawners.get(spawner_key)
         if spawner is None:
-            msg = f"No spawner available for agent type '{task.agent_type}'"
+            msg = f"No spawner available for agent type '{spawner_key}'"
             raise SchedulerError(msg)
 
         # Check if spawner is available
         if not spawner.is_available():
-            msg = f"Agent '{task.agent_type}' is not available on this system"
+            msg = f"Agent '{spawner_key}' is not available on this system"
             raise SchedulerError(msg)
 
         # Apply retry backoff without blocking scheduler loop
