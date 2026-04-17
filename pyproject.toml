@@ -1,6 +1,6 @@
 [project]
 name = "maestro"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI Agent Orchestrator — coordinate multiple coding agents with DAG-based scheduling and git worktree isolation"
 authors = [{name = "Andrei Shtanakov"}]
 license = {text = "MIT"}

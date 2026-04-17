@@ -83,6 +83,11 @@ uv run maestro workspaces                # List active worktrees
 | [`parallel-refactor.yaml`](examples/parallel-refactor.yaml) | DAG-based parallel refactoring across multiple modules |
 | [`project.yaml`](examples/project.yaml) | Multi-process orchestrator with manual zadachi definitions |
 | [`maestro-builds-maestro.yaml`](examples/maestro-builds-maestro.yaml) | Meta-dogfooding — Maestro implements its own backlog |
+| [`with-arbiter.yaml`](examples/with-arbiter.yaml) | Optional Arbiter-driven routing (advisory mode) — `agent_type: auto` lets the policy engine pick the best agent |
+
+## Optional: Arbiter routing
+
+Add an `arbiter:` section to your project YAML to delegate per-task agent selection to the [Arbiter](https://github.com/andrei-shtanakov/arbiter) policy engine. Advisory mode honors your explicit `agent_type` and feeds the learning loop; authoritative mode lets the arbiter override your choice and gates retries on outcome delivery. When the section is absent, Maestro runs the zero-config static-routing path — no subprocess, no routing overhead. See [`examples/with-arbiter.yaml`](examples/with-arbiter.yaml).
 
 ## Supported Agents
 
