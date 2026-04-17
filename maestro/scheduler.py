@@ -27,6 +27,7 @@ from maestro.coordination.routing import (
     StaticRouting,
     task_status_to_outcome_status,
 )
+from maestro.cost_tracker import parse_and_create_cost
 from maestro.dag import DAG
 from maestro.database import Database
 from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
@@ -294,6 +295,44 @@ class Scheduler:
         event_logger.log(
             Event(event_type=event_type, task_id=task_id_str, details=details)
         )
+
+    async def _record_cost(self, running_task: RunningTask) -> None:
+        """Parse the agent log for token usage and persist a TaskCost row.
+
+        Best-effort: any parser/DB failure is logged and swallowed so cost
+        accounting never blocks the terminal path. The attempt number is
+        `retry_count + 1` because retry_count has not yet been bumped when a
+        process exits — the bump happens inside the failure handler after
+        this call.
+        """
+        task = running_task.task
+        attempt = task.retry_count + 1
+        try:
+            cost = parse_and_create_cost(
+                task_id=task.id,
+                agent_type=task.agent_type,
+                log_file=running_task.log_file,
+                attempt=attempt,
+            )
+        except Exception:
+            logger.debug(
+                "cost parse failed for task %s attempt %d",
+                task.id,
+                attempt,
+                exc_info=True,
+            )
+            return
+        if cost is None:
+            return
+        try:
+            await self._db.save_task_cost(cost)
+        except Exception:
+            logger.debug(
+                "cost persist failed for task %s attempt %d",
+                task.id,
+                attempt,
+                exc_info=True,
+            )
 
     async def _build_outcome(
         self,
@@ -929,6 +968,11 @@ class Scheduler:
         """
         task = running_task.task
 
+        # Record cost once per process exit, before branching on exit code, so
+        # the task_costs row exists for either the success outcome (DONE) or
+        # the failure outcome (FAILED) when _build_outcome reads it back.
+        await self._record_cost(running_task)
+
         if return_code == 0:
             # Success - check if validation is needed
             if task.validation_cmd:
@@ -1185,6 +1229,9 @@ class Scheduler:
             NotificationEvent.TASK_TIMEOUT,
             error_msg,
         )
+
+        # Record whatever token usage made it into the log before kill.
+        await self._record_cost(running_task)
 
         # Handle as failure
         await self._handle_task_failure(task_id, running_task.task, error_msg)
