@@ -77,12 +77,22 @@
   - Pending manual acceptance (требует локальной сборки arbiter-mcp): (a) advisory + kill arbiter → retry всё равно идёт; (b) authoritative + kill, < abandon_outcome_after_s → FAILED держится; (c) authoritative + kill, > abandon_outcome_after_s → `arbiter.outcome.abandoned` событие + unblock
 
 ### Follow-ups разблокированные R-03
-- [ ] **R-03b**: Mode 2 (`maestro orchestrate`) zadacha-level routing. Gate: ≥1 неделя стабильного Mode-1 dogfood
-- [ ] **R-05**: Maestro↔Arbiter интеграционные тесты с реальным subprocess (зависит от R-10)
-- [ ] **R-10**: Arbiter CI, собирающий `arbiter-mcp` binary как CI artifact
-- [ ] **R-NN**: Wiring `cost_tracker` в scheduler outcomes, чтобы `TaskOutcome.tokens_used/cost_usd` несли реальные значения (сейчас None)
-- [ ] **Mini-R**: `schema_migrations` journal table + линейный migration list (до того как миграций станет > 5)
-- [ ] **R-14**: Вынести vendored `arbiter_client.py` в отдельный PyPI-пакет `arbiter-py`
+
+Дальнейший трек ведётся в Linear (Maestro / Arbiter проекты, team Labs). Ниже — snapshot на 2026-04-17.
+
+- [ ] **R-03b** (LABS-TBD): Mode 2 (`maestro orchestrate`) zadacha-level routing. Gate: ≥1 неделя стабильного Mode-1 dogfood после v0.2.0
+- [ ] **R-05** (LABS-93, blocked on LABS-92): Maestro↔Arbiter e2e тесты с реальным `arbiter-mcp` subprocess. Mock-side уже shipped под LABS-79 (~50 тестов). Реальный subprocess ждёт upstream `metadata.decision_id` fix
+- [ ] **R-10** (LABS-91 / arbiter#8, partially done `7e6de56`): Arbiter CI release-binary. Готово: linux-x64 + macos-arm64 30-day artifacts. Открыто: tag-triggered GitHub Release upload, `pyrefly check` в Python job
+- [x] **R-NN** (LABS-84, commit `ab279f2`): wire `cost_tracker` в `Scheduler._record_cost`. `TaskOutcome.tokens_used` / `cost_usd` теперь несут реальные значения. Model variants / structured usage — отдельно под LABS-49
+- [x] **Mini-R** (LABS-85, commit `627c12d`): `schema_migrations` journal + линейный migration runner. Добавление миграции #3+ = одна строка в `ordered` + метод
+- [ ] **R-14**: Вынести vendored `arbiter_client.py` в отдельный PyPI-пакет `arbiter-py` (upstream arbiter work, не в Linear пока)
+
+### Новое из v0.2.0 dogfood (LABS-87..90)
+
+- [ ] **LABS-87** (High): validation-failure path skips arbiter outcome reporting — pre-existing gap из Task 27
+- [ ] **LABS-88** (Low): CI guard для unreferenced public modules
+- [ ] **LABS-89** (Medium): release automation (version-vs-tag guard + release-drafter)
+- [ ] **LABS-90** (Medium): per-example YAML smoke test в CI
 
 ---
 
