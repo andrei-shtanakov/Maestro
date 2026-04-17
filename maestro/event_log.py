@@ -5,6 +5,7 @@ task lifecycle events: started, completed, failed, retried, etc.
 """
 
 import json
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -40,6 +41,18 @@ class EventType(StrEnum):
     GIT_BRANCH_CREATED = "git_branch_created"
     GIT_COMMITTED = "git_committed"
     GIT_PUSHED = "git_pushed"
+
+    # Arbiter events
+    ARBITER_ROUTE_DECIDED = "arbiter.route.decided"
+    ARBITER_ROUTE_HOLD = "arbiter.route.hold"
+    ARBITER_ROUTE_HOLD_SUMMARY = "arbiter.route.hold_summary"
+    ARBITER_ROUTE_REJECTED = "arbiter.route.rejected"
+    ARBITER_OUTCOME_REPORTED = "arbiter.outcome.reported"
+    ARBITER_OUTCOME_ABANDONED = "arbiter.outcome.abandoned"
+    ARBITER_UNAVAILABLE = "arbiter.unavailable"
+    ARBITER_RECONNECTED = "arbiter.reconnected"
+    ARBITER_RETRY_RESET_SKIPPED = "arbiter.retry_reset.skipped"
+    RECOVERY_ARBITER_DECISIONS_CLOSED = "recovery.arbiter.decisions_closed"
 
 
 class Event(BaseModel):
@@ -246,3 +259,48 @@ def create_event_logger(log_dir: Path, filename: str = "events.jsonl") -> EventL
     logger = EventLogger(log_dir / filename)
     set_event_logger(logger)
     return logger
+
+
+# ---------------------------------------------------------------------------
+# Arbiter HOLD throttle
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _HoldEntry:
+    reason: str
+    count: int = 1
+    first_seen: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+class HoldThrottle:
+    """Per-(task, reason) throttle for arbiter HOLD events.
+
+    Returns True once per unique (task_id, reason) streak. Subsequent calls
+    with the same reason return False (and still increment the counter).
+    A reason change resets, returning True again. On reason change OR
+    transition out of HOLD, call `clear_and_summarize(task_id)` to get a
+    summary payload for an ARBITER_ROUTE_HOLD_SUMMARY event.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[str, _HoldEntry] = {}
+
+    def should_log(self, task_id: str, reason: str) -> bool:
+        entry = self._entries.get(task_id)
+        if entry is None or entry.reason != reason:
+            self._entries[task_id] = _HoldEntry(reason=reason)
+            return True
+        entry.count += 1
+        return False
+
+    def clear_and_summarize(self, task_id: str) -> dict[str, object] | None:
+        entry = self._entries.pop(task_id, None)
+        if entry is None:
+            return None
+        return {
+            "task_id": task_id,
+            "reason": entry.reason,
+            "count": entry.count,
+            "first_seen": entry.first_seen.isoformat(),
+        }
