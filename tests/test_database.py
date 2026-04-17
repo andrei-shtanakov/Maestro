@@ -1369,6 +1369,119 @@ class TestArbiterRoutingMigration:
             await db.close()
 
 
+class TestSchemaMigrationsJournal:
+    """Mini-R: schema_migrations table records every applied migration once."""
+
+    @pytest.mark.anyio
+    async def test_fresh_db_populates_journal(self, tmp_path) -> None:
+        from maestro.database import Database
+
+        db = Database(tmp_path / "journal.db")
+        await db.connect()
+        try:
+            assert db._connection is not None
+            cursor = await db._connection.execute(
+                "SELECT version, name FROM schema_migrations ORDER BY version"
+            )
+            rows = [(r["version"], r["name"]) for r in await cursor.fetchall()]
+            assert rows == [
+                (1, "r02_arbiter_columns"),
+                (2, "r03_arbiter_routing"),
+            ]
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_reinit_is_noop(self, tmp_path) -> None:
+        """Reconnecting an already-migrated DB must not insert duplicate rows."""
+        from maestro.database import Database
+
+        path = tmp_path / "rerun.db"
+        db1 = Database(path)
+        await db1.connect()
+        await db1.close()
+
+        db2 = Database(path)
+        await db2.connect()
+        try:
+            assert db2._connection is not None
+            cursor = await db2._connection.execute(
+                "SELECT COUNT(*) as n FROM schema_migrations"
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row["n"] == 2
+        finally:
+            await db2.close()
+
+    @pytest.mark.anyio
+    async def test_pre_journal_db_backfills(self, tmp_path) -> None:
+        """A DB created before Mini-R (columns present, no journal) gets the
+        journal backfilled on next connect via the idempotent apply path."""
+        import aiosqlite
+
+        from maestro.database import Database
+
+        path = tmp_path / "prejournal.db"
+        # Simulate a v0.2.0 DB: full current tasks schema, but no
+        # schema_migrations table.
+        setup_sql = """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            branch TEXT,
+            workdir TEXT NOT NULL,
+            agent_type TEXT NOT NULL DEFAULT 'claude_code',
+            status TEXT NOT NULL DEFAULT 'pending',
+            assigned_to TEXT,
+            scope TEXT,
+            priority INTEGER DEFAULT 0,
+            max_retries INTEGER DEFAULT 2,
+            retry_count INTEGER DEFAULT 0,
+            timeout_minutes INTEGER DEFAULT 30,
+            requires_approval BOOLEAN DEFAULT FALSE,
+            validation_cmd TEXT,
+            task_type TEXT NOT NULL DEFAULT 'feature',
+            language TEXT NOT NULL DEFAULT 'other',
+            complexity TEXT NOT NULL DEFAULT 'moderate',
+            result_summary TEXT,
+            error_message TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            routed_agent_type TEXT,
+            arbiter_decision_id TEXT,
+            arbiter_route_reason TEXT,
+            arbiter_outcome_reported_at TIMESTAMP
+        )
+        """
+        async with aiosqlite.connect(str(path)) as conn:
+            await conn.execute(setup_sql)
+            await conn.commit()
+
+        db = Database(path)
+        await db.connect()
+        try:
+            assert db._connection is not None
+            cursor = await db._connection.execute(
+                "SELECT version, name FROM schema_migrations ORDER BY version"
+            )
+            rows = [(r["version"], r["name"]) for r in await cursor.fetchall()]
+            assert rows == [
+                (1, "r02_arbiter_columns"),
+                (2, "r03_arbiter_routing"),
+            ]
+            # Sanity: the idempotent ALTERs must not have fired twice.
+            cursor = await db._connection.execute("PRAGMA table_info(tasks)")
+            cols = [r["name"] for r in await cursor.fetchall()]
+            # Each arbiter column appears exactly once.
+            assert cols.count("arbiter_decision_id") == 1
+            assert cols.count("task_type") == 1
+        finally:
+            await db.close()
+
+
 class TestUpdateTaskRouting:
     """Database.update_task_routing writes routing fields only."""
 

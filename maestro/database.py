@@ -7,7 +7,7 @@ CRUD operations for tasks and dependencies.
 
 import json
 import sqlite3
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -123,6 +123,15 @@ CREATE TABLE IF NOT EXISTS task_costs (
     attempt INTEGER DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+
+-- Mini-R: Linear migration journal. Every applied schema migration inserts
+-- exactly one row here so future connects can skip already-applied work
+-- without PRAGMA scanning every startup.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    applied_at TIMESTAMP NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -350,9 +359,36 @@ class Database:
             raise DatabaseError(msg)
 
         await self._connection.executescript(SCHEMA_SQL)
-        await self._migrate_tasks_arbiter_columns()
-        await self._migrate_tasks_arbiter_routing()  # R-03
+        await self._apply_migrations()
         await self._connection.commit()
+
+    async def _apply_migrations(self) -> None:
+        """Mini-R: run the linear migration list, recording each in the journal.
+
+        Each migration body is idempotent (guarded by `PRAGMA table_info`) so
+        pre-journal databases whose columns were already added by the prior
+        PRAGMA-driven path will no-op through the ALTERs and simply have
+        their `schema_migrations` rows backfilled.
+        """
+        assert self._connection is not None  # narrowed by caller
+        cursor = await self._connection.execute("SELECT version FROM schema_migrations")
+        applied = {row["version"] for row in await cursor.fetchall()}
+
+        # Append new migrations at the tail, never reorder or rewrite history.
+        ordered: list[tuple[int, str, Callable[[], Awaitable[None]]]] = [
+            (1, "r02_arbiter_columns", self._migrate_tasks_arbiter_columns),
+            (2, "r03_arbiter_routing", self._migrate_tasks_arbiter_routing),
+        ]
+
+        for version, name, fn in ordered:
+            if version in applied:
+                continue
+            await fn()
+            await self._connection.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) "
+                "VALUES (?, ?, ?)",
+                (version, name, _format_datetime(datetime.now(UTC))),
+            )
 
     async def _migrate_tasks_arbiter_columns(self) -> None:
         """Add Arbiter-compatible columns to an older `tasks` table in place.
