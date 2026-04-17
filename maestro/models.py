@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Self
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class TaskStatus(StrEnum):
@@ -76,6 +76,14 @@ class AgentType(StrEnum):
     CODEX = "codex_cli"
     AIDER = "aider"
     ANNOUNCE = "announce"
+    AUTO = "auto"
+    """Routing sentinel: arbiter decides the real agent. NOT a spawnable agent.
+
+    Invariants enforced in code:
+    - Task.from_config raises when agent_type=AUTO and arbiter is not enabled.
+    - Scheduler._spawn_task refuses to proceed with agent_type=AUTO reaching
+      spawner lookup (defensive guard against misbehaving RoutingStrategy).
+    """
 
 
 class TaskType(StrEnum):
@@ -137,6 +145,116 @@ class Priority(StrEnum):
     NORMAL = "normal"
     HIGH = "high"
     URGENT = "urgent"
+
+
+class RouteAction(StrEnum):
+    """Routing decision action (mirrors arbiter `AgentAction`)."""
+
+    ASSIGN = "assign"
+    HOLD = "hold"
+    REJECT = "reject"
+
+
+class RouteDecision(BaseModel):
+    """Routing decision returned by RoutingStrategy.route().
+
+    Frozen so scheduler cannot accidentally mutate a decision after
+    receiving it from the routing layer.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    action: RouteAction
+    chosen_agent: str | None = None
+    decision_id: str | None = None
+    reason: str
+
+
+class TaskOutcomeStatus(StrEnum):
+    """Terminal status reported back to arbiter via report_outcome."""
+
+    SUCCESS = "success"
+    FAILURE = "failure"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
+    INTERRUPTED = "interrupted"
+
+
+class TaskOutcome(BaseModel):
+    """Task completion report sent to arbiter for learning signal."""
+
+    status: TaskOutcomeStatus
+    agent_used: str
+    duration_min: float | None = None
+    tokens_used: int | None = None
+    cost_usd: float | None = None
+    error_code: str | None = None
+
+
+class ArbiterMode(StrEnum):
+    """Arbiter routing authority.
+
+    ADVISORY — explicit `agent_type` in task config is honored; arbiter is
+    consulted for learning signal and can HOLD/REJECT on invariants.
+    AUTHORITATIVE — arbiter's `chosen_agent` overrides user declaration.
+    """
+
+    ADVISORY = "advisory"
+    AUTHORITATIVE = "authoritative"
+
+
+class ArbiterConfig(BaseModel):
+    """Configuration for the Arbiter MCP integration.
+
+    Validated on YAML load. `enabled=false` (default) keeps Maestro on the
+    zero-config StaticRouting path; no arbiter subprocess ever started.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    mode: ArbiterMode = ArbiterMode.ADVISORY
+    optional: bool = False
+    binary_path: str | None = None
+    config_dir: str | None = None
+    tree_path: str | None = None
+    db_path: str | None = None
+    timeout_ms: int = Field(default=500, ge=1)
+    reconnect_interval_s: int = Field(default=60, ge=1)
+    abandon_outcome_after_s: int = Field(default=300, ge=1)
+    log_level: str = "warn"
+
+    @model_validator(mode="after")
+    def _validate_when_enabled(self) -> Self:
+        if not self.enabled:
+            return self
+
+        missing: list[str] = []
+        for name in ("binary_path", "config_dir", "tree_path"):
+            val = getattr(self, name)
+            if val is None or not val.strip():
+                missing.append(name)
+        if missing:
+            msg = (
+                f"arbiter.{'/'.join(missing)} required when arbiter.enabled=true. "
+                f"Set via env var (e.g. ARBITER_BIN) or inline in config."
+            )
+            raise ValueError(msg)
+
+        # config.py's env-var resolver only supports ${VAR}, not ${VAR:-default}.
+        # Catch any residue of either syntax so users get a clear diagnostic
+        # instead of a cryptic "binary not found" at startup.
+        for name in ("binary_path", "config_dir", "tree_path", "db_path"):
+            val = getattr(self, name)
+            if val is not None and "${" in val:
+                msg = (
+                    f"arbiter.{name}={val!r}: unresolved env var substitution. "
+                    f"config.py supports ${{VAR}} only; "
+                    f"${{VAR:-default}} is not supported."
+                )
+                raise ValueError(msg)
+
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +519,30 @@ class Task(BaseModel):
     depends_on: list[str] = Field(
         default_factory=list, description="List of task IDs this task depends on"
     )
+    # ---- R-03: Arbiter routing state (runtime-only, no TaskConfig equivalent) ----
+    routed_agent_type: str | None = Field(
+        default=None,
+        description=(
+            "Agent type chosen by the RoutingStrategy for this run. "
+            "Spawner lookup uses this first, falling back to agent_type. "
+            "Cleared on retry reset so the next attempt routes fresh."
+        ),
+    )
+    arbiter_decision_id: str | None = Field(
+        default=None,
+        description="Arbiter-provided correlation id for matching report_outcome.",
+    )
+    arbiter_route_reason: str | None = Field(
+        default=None,
+        description="Free-form reason string from arbiter (e.g. 'budget_exceeded').",
+    )
+    arbiter_outcome_reported_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Set when report_outcome succeeds; recovery / re-attempt pass "
+            "uses NULL as 'delivery still pending'."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_retry_count(self) -> Self:
@@ -471,13 +613,35 @@ class Task(BaseModel):
         return self.model_copy(update={"retry_count": self.retry_count + 1})
 
     @classmethod
-    def from_config(cls, config: TaskConfig, workdir: str) -> "Task":
+    def from_config(
+        cls,
+        config: TaskConfig,
+        workdir: str,
+        arbiter_enabled: bool = False,
+    ) -> "Task":
         """Create a Task instance from a TaskConfig.
 
         Fills Arbiter-compatible fields (`task_type`, `language`, `complexity`)
         from explicit TaskConfig values when present, otherwise falls back to
         inference helpers so the runtime Task always has concrete enum values.
+
+        Args:
+            config: Declarative task config from YAML.
+            workdir: Working directory path.
+            arbiter_enabled: Whether arbiter is enabled in the runtime.
+                Required to validate agent_type=AUTO; AUTO is a routing
+                sentinel and cannot be spawned without a router.
+
+        Raises:
+            ValueError: If agent_type=AUTO but arbiter is not enabled.
         """
+        if config.agent_type is AgentType.AUTO and not arbiter_enabled:
+            msg = (
+                f"Task {config.id!r}: agent_type=auto requires "
+                f"arbiter.enabled=true. Set an explicit agent_type or "
+                f"enable arbiter in the project config."
+            )
+            raise ValueError(msg)
         return cls(
             id=config.id,
             title=config.title,
@@ -572,6 +736,13 @@ class ProjectConfig(BaseModel):
     git: GitConfig | None = Field(default=None, description="Git configuration")
     notifications: NotificationConfig | None = Field(
         default=None, description="Notification configuration"
+    )
+    arbiter: ArbiterConfig | None = Field(
+        default=None,
+        description=(
+            "Optional arbiter integration. When omitted/None the scheduler "
+            "stays on zero-config StaticRouting and no subprocess is spawned."
+        ),
     )
 
     @field_validator("repo")
@@ -1108,6 +1279,10 @@ class OrchestratorConfig(BaseModel):
     )
     notifications: NotificationConfig | None = Field(
         default=None, description="Notification configuration"
+    )
+    arbiter: ArbiterConfig | None = Field(
+        default=None,
+        description="Arbiter MCP integration config; None keeps static routing.",
     )
 
     @field_validator("repo_path")

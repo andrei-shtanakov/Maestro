@@ -37,10 +37,11 @@ from maestro import (
     load_config,
 )
 from maestro.config import load_orchestrator_config
+from maestro.coordination.routing import RoutingStrategy, make_routing_strategy
 from maestro.dag import DAG
 from maestro.decomposer import ProjectDecomposer
 from maestro.git import GitManager
-from maestro.models import OrchestratorConfig, TaskStatus, ZadachaStatus
+from maestro.models import ArbiterMode, OrchestratorConfig, TaskStatus, ZadachaStatus
 from maestro.orchestrator import Orchestrator
 from maestro.pr_manager import PRManager
 from maestro.workspace import WorkspaceManager
@@ -323,7 +324,16 @@ async def _run_scheduler(
     db = await create_database(db_path)
     lock_fd: int | None = None
 
+    # R-03: pick routing strategy. StaticRouting if cfg.arbiter is None or
+    # disabled; ArbiterRouting (with its subprocess) when enabled.
+    # Build inside try/finally so db.close() and lock release always run even
+    # if arbiter startup raises (e.g. ArbiterStartupError with optional=false).
+    arbiter_cfg = config.arbiter
+    arbiter_mode = arbiter_cfg.mode if arbiter_cfg is not None else ArbiterMode.ADVISORY
+    routing: RoutingStrategy | None = None
+
     try:
+        routing = await make_routing_strategy(arbiter_cfg)
         # Check if resuming
         if resume:
             existing_tasks = await db.get_all_tasks()
@@ -338,7 +348,7 @@ async def _run_scheduler(
                     console.print(
                         "[yellow]Detected orphaned tasks, performing recovery...[/yellow]"
                     )
-                    stats = await recovery.recover()
+                    stats = await recovery.recover(routing=routing)
                     console.print(
                         Panel(
                             f"[green]Recovery complete[/green]\n"
@@ -425,7 +435,12 @@ async def _run_scheduler(
             notification_manager=notifications,
             on_status_change=_on_status_change,
             auto_commit=(config.git.auto_commit if config.git else False),
+            routing=routing,
+            arbiter_mode=arbiter_mode,
+            arbiter_enabled=arbiter_cfg is not None and arbiter_cfg.enabled,
         )
+        if arbiter_cfg is not None:
+            scheduler._abandon_outcome_after_s = arbiter_cfg.abandon_outcome_after_s
 
         # Display initial state
         all_tasks = await db.get_all_tasks()
@@ -475,6 +490,8 @@ async def _run_scheduler(
         console.print("\n[green]All tasks completed successfully![/green]")
 
     finally:
+        if routing is not None:
+            await routing.aclose()
         await db.close()
         if lock_fd is not None:
             _release_pid_lock(lock_fd)

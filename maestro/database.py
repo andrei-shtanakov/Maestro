@@ -78,7 +78,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     error_message TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     started_at TIMESTAMP,
-    completed_at TIMESTAMP
+    completed_at TIMESTAMP,
+    -- R-03 arbiter routing state
+    routed_agent_type TEXT,
+    arbiter_decision_id TEXT,
+    arbiter_route_reason TEXT,
+    arbiter_outcome_reported_at TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS task_dependencies (
@@ -236,6 +241,10 @@ def _row_to_task(row: aiosqlite.Row) -> Task:
         started_at=_parse_datetime(row["started_at"]),
         completed_at=_parse_datetime(row["completed_at"]),
         depends_on=[],  # Will be populated separately if needed
+        routed_agent_type=row["routed_agent_type"],
+        arbiter_decision_id=row["arbiter_decision_id"],
+        arbiter_route_reason=row["arbiter_route_reason"],
+        arbiter_outcome_reported_at=_parse_datetime(row["arbiter_outcome_reported_at"]),
     )
 
 
@@ -309,7 +318,11 @@ class Database:
         return self._connection is not None
 
     async def connect(self) -> None:
-        """Open database connection with WAL mode and foreign keys."""
+        """Open database connection with WAL mode and foreign keys.
+
+        Also initializes the schema and applies any pending migrations so that
+        callers do not need a separate `initialize_schema()` call.
+        """
         if self._connection is not None:
             return
 
@@ -321,6 +334,8 @@ class Database:
         # Enable foreign key constraints
         await self._connection.execute("PRAGMA foreign_keys=ON")
         await self._connection.commit()
+
+        await self.initialize_schema()
 
     async def close(self) -> None:
         """Close database connection."""
@@ -336,6 +351,7 @@ class Database:
 
         await self._connection.executescript(SCHEMA_SQL)
         await self._migrate_tasks_arbiter_columns()
+        await self._migrate_tasks_arbiter_routing()  # R-03
         await self._connection.commit()
 
     async def _migrate_tasks_arbiter_columns(self) -> None:
@@ -361,6 +377,38 @@ class Database:
             (
                 "complexity",
                 "ALTER TABLE tasks ADD COLUMN complexity TEXT NOT NULL DEFAULT 'moderate'",
+            ),
+        ]
+        for column, ddl in migrations:
+            if column not in columns:
+                await self._connection.execute(ddl)
+
+    async def _migrate_tasks_arbiter_routing(self) -> None:
+        """R-03: Add arbiter routing state columns to an older `tasks` table.
+
+        Idempotent via PRAGMA table_info check. Called from `initialize_schema()`
+        after the R-02 column migration.
+        """
+        assert self._connection is not None
+        cursor = await self._connection.execute("PRAGMA table_info(tasks)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+
+        migrations = [
+            (
+                "routed_agent_type",
+                "ALTER TABLE tasks ADD COLUMN routed_agent_type TEXT",
+            ),
+            (
+                "arbiter_decision_id",
+                "ALTER TABLE tasks ADD COLUMN arbiter_decision_id TEXT",
+            ),
+            (
+                "arbiter_route_reason",
+                "ALTER TABLE tasks ADD COLUMN arbiter_route_reason TEXT",
+            ),
+            (
+                "arbiter_outcome_reported_at",
+                "ALTER TABLE tasks ADD COLUMN arbiter_outcome_reported_at TIMESTAMP",
             ),
         ]
         for column, ddl in migrations:
@@ -425,8 +473,10 @@ class Database:
                     assigned_to, scope, priority, max_retries, retry_count,
                     timeout_minutes, requires_approval, validation_cmd,
                     task_type, language, complexity,
-                    result_summary, error_message, created_at, started_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    result_summary, error_message, created_at, started_at, completed_at,
+                    routed_agent_type, arbiter_decision_id, arbiter_route_reason,
+                    arbiter_outcome_reported_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.id,
@@ -452,6 +502,10 @@ class Database:
                     _format_datetime(task.created_at),
                     _format_datetime(task.started_at),
                     _format_datetime(task.completed_at),
+                    task.routed_agent_type,
+                    task.arbiter_decision_id,
+                    task.arbiter_route_reason,
+                    _format_datetime(task.arbiter_outcome_reported_at),
                 ),
             )
         except sqlite3.IntegrityError as e:
@@ -586,7 +640,9 @@ class Database:
                 requires_approval = ?, validation_cmd = ?,
                 task_type = ?, language = ?, complexity = ?,
                 result_summary = ?, error_message = ?,
-                started_at = ?, completed_at = ?
+                started_at = ?, completed_at = ?,
+                routed_agent_type = ?, arbiter_decision_id = ?,
+                arbiter_route_reason = ?, arbiter_outcome_reported_at = ?
             WHERE id = ?
             """,
             (
@@ -611,6 +667,10 @@ class Database:
                 task.error_message,
                 _format_datetime(task.started_at),
                 _format_datetime(task.completed_at),
+                task.routed_agent_type,
+                task.arbiter_decision_id,
+                task.arbiter_route_reason,
+                _format_datetime(task.arbiter_outcome_reported_at),
                 task.id,
             ),
         )
@@ -627,6 +687,176 @@ class Database:
 
         await self._connection.commit()
         return task
+
+    async def update_task_routing(self, task: Task) -> None:
+        """R-03: Persist routing decision for a task before spawner lookup.
+
+        Writes only the routing-related columns; does NOT touch `agent_type`,
+        `status`, `assigned_to`, or timestamps. The order matters: routing
+        decision must be persisted BEFORE the agent subprocess is spawned,
+        so a crash mid-spawn still leaves enough state for recovery to
+        correlate the outcome.
+
+        Args:
+            task: Task model with routing fields populated.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        await self._connection.execute(
+            """
+            UPDATE tasks
+            SET routed_agent_type = ?,
+                arbiter_decision_id = ?,
+                arbiter_route_reason = ?
+            WHERE id = ?
+            """,
+            (
+                task.routed_agent_type,
+                task.arbiter_decision_id,
+                task.arbiter_route_reason,
+                task.id,
+            ),
+        )
+        await self._connection.commit()
+
+    async def mark_outcome_reported(
+        self,
+        task_id: str,
+        reported_at: datetime,
+        decision_id: str,
+    ) -> bool:
+        """R-03: Atomically record that report_outcome succeeded.
+
+        The `decision_id` guard prevents a stale call from marking the current
+        attempt as reported — if a retry already overwrote arbiter_decision_id,
+        this call returns False and the caller (scheduler re-attempt pass)
+        drops the stale outcome.
+
+        Returns:
+            True if a row was updated, False if the decision_id no longer
+            matches (external interference or stale recovery attempt).
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            """
+            UPDATE tasks
+            SET arbiter_outcome_reported_at = ?
+            WHERE id = ? AND arbiter_decision_id = ?
+            """,
+            (_format_datetime(reported_at), task_id, decision_id),
+        )
+        await self._connection.commit()
+        return cursor.rowcount > 0
+
+    async def reset_for_retry_atomic(
+        self,
+        task_id: str,
+        decision_id: str | None,
+    ) -> bool:
+        """R-03: Atomically transition FAILED → READY and clear arbiter fields.
+
+        Single UPDATE closes the race window that `report_outcome`'s network
+        latency would otherwise widen: an external `abandon` / `approve` /
+        dashboard action during outcome delivery cannot interleave with
+        retry transition.
+
+        Args:
+            task_id: Task to reset.
+            decision_id: If not None, an additional guard that the row's
+                current `arbiter_decision_id` matches; used by authoritative
+                mode after successful outcome delivery. Pass None to skip
+                the guard (advisory best-effort retry).
+
+        Returns:
+            True if the row transitioned; False if status != FAILED or the
+            decision_id guard failed (external interference).
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        if decision_id is None:
+            sql = """
+                UPDATE tasks
+                SET status = 'ready',
+                    routed_agent_type = NULL,
+                    arbiter_decision_id = NULL,
+                    arbiter_route_reason = NULL,
+                    arbiter_outcome_reported_at = NULL
+                WHERE id = ? AND status = 'failed'
+            """
+            params: tuple[Any, ...] = (task_id,)
+        else:
+            sql = """
+                UPDATE tasks
+                SET status = 'ready',
+                    routed_agent_type = NULL,
+                    arbiter_decision_id = NULL,
+                    arbiter_route_reason = NULL,
+                    arbiter_outcome_reported_at = NULL
+                WHERE id = ? AND status = 'failed' AND arbiter_decision_id = ?
+            """
+            params = (task_id, decision_id)
+
+        cursor = await self._connection.execute(sql, params)
+        await self._connection.commit()
+        return cursor.rowcount > 0
+
+    async def abandon_pending_outcome_and_release(self, task_id: str) -> bool:
+        """R-03: Drop a stuck arbiter decision without touching reported_at.
+
+        Paired with `mark_outcome_reported` — caller first stamps
+        `arbiter_outcome_reported_at` as the abandon moment, then calls this
+        to clear routing fields and release FAILED → READY while keeping the
+        audit trail on `arbiter_outcome_reported_at` intact.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            """
+            UPDATE tasks
+            SET status = CASE WHEN status = 'failed' THEN 'ready' ELSE status END,
+                routed_agent_type = NULL,
+                arbiter_decision_id = NULL,
+                arbiter_route_reason = NULL
+            WHERE id = ?
+            """,
+            (task_id,),
+        )
+        await self._connection.commit()
+        return cursor.rowcount > 0
+
+    async def get_tasks_with_pending_outcome(self) -> list[Task]:
+        """R-03: Tasks that have a routing decision but no outcome delivered yet.
+
+        Returns tasks in any status (RUNNING/VALIDATING/terminal/FAILED) with
+        `arbiter_decision_id IS NOT NULL AND arbiter_outcome_reported_at IS NULL`.
+        Used by recovery hook and scheduler re-attempt pass.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM tasks
+            WHERE arbiter_decision_id IS NOT NULL
+              AND arbiter_outcome_reported_at IS NULL
+            ORDER BY created_at ASC
+            """,
+        )
+        rows = await cursor.fetchall()
+        return [_row_to_task(row) for row in rows]
 
     async def delete_task(self, task_id: str) -> bool:
         """Delete a task by ID.
@@ -1611,6 +1841,6 @@ async def create_database(db_path: str | Path) -> Database:
         Connected and initialized Database instance.
     """
     db = Database(db_path)
+    # Database.connect() auto-runs initialize_schema(); no separate call needed.
     await db.connect()
-    await db.initialize_schema()
     return db

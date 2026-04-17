@@ -1266,3 +1266,341 @@ class TestFullLifecycle:
         # Attempting to fetch should raise DatabaseError
         with pytest.raises(DatabaseError, match="Invalid datetime format"):
             await db.get_task(task.id)
+
+
+class TestArbiterRoutingMigration:
+    """_migrate_tasks_arbiter_routing adds R-03 columns idempotently."""
+
+    @pytest.mark.anyio
+    async def test_fresh_db_has_four_new_columns(self, tmp_path) -> None:
+        from maestro.database import Database
+
+        db = Database(tmp_path / "fresh.db")
+        await db.connect()
+        try:
+            assert db._connection is not None  # pyrefly narrowing
+            cursor = await db._connection.execute("PRAGMA table_info(tasks)")
+            cols = {row["name"] for row in await cursor.fetchall()}
+            assert "routed_agent_type" in cols
+            assert "arbiter_decision_id" in cols
+            assert "arbiter_route_reason" in cols
+            assert "arbiter_outcome_reported_at" in cols
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_legacy_db_migrates(self, tmp_path) -> None:
+        """Pre-R-03 schema (3 arbiter-R02 columns, no routing columns) → migrate."""
+        import aiosqlite
+
+        db_path = tmp_path / "legacy.db"
+        # Create a legacy tasks table without the 4 new columns
+        legacy_sql = """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            branch TEXT,
+            workdir TEXT NOT NULL,
+            agent_type TEXT NOT NULL DEFAULT 'claude_code',
+            status TEXT NOT NULL DEFAULT 'pending',
+            assigned_to TEXT,
+            scope TEXT,
+            priority INTEGER DEFAULT 0,
+            max_retries INTEGER DEFAULT 2,
+            retry_count INTEGER DEFAULT 0,
+            timeout_minutes INTEGER DEFAULT 30,
+            requires_approval BOOLEAN DEFAULT FALSE,
+            validation_cmd TEXT,
+            task_type TEXT NOT NULL DEFAULT 'feature',
+            language TEXT NOT NULL DEFAULT 'other',
+            complexity TEXT NOT NULL DEFAULT 'moderate',
+            result_summary TEXT,
+            error_message TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP
+        )
+        """
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await conn.execute(legacy_sql)
+            await conn.execute(
+                "INSERT INTO tasks (id, title, prompt, workdir) VALUES "
+                "('t1', 'T', 'P', '/tmp')"
+            )
+            await conn.commit()
+
+        # Now connect via Database — should migrate
+        from maestro.database import Database
+
+        db = Database(db_path)
+        await db.connect()
+        try:
+            assert db._connection is not None  # pyrefly narrowing
+            cursor = await db._connection.execute("PRAGMA table_info(tasks)")
+            cols = {row["name"] for row in await cursor.fetchall()}
+            assert "routed_agent_type" in cols
+            assert "arbiter_outcome_reported_at" in cols
+
+            # Legacy row survives with NULLs in new columns
+            cursor = await db._connection.execute(
+                "SELECT routed_agent_type, arbiter_decision_id FROM tasks WHERE id='t1'"
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row["routed_agent_type"] is None
+            assert row["arbiter_decision_id"] is None
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_migration_idempotent(self, tmp_path) -> None:
+        """Running migrate twice does not fail."""
+        from maestro.database import Database
+
+        db = Database(tmp_path / "idem.db")
+        await db.connect()
+        try:
+            assert db._connection is not None  # pyrefly narrowing
+            # connect() already ran migrate once. Run it again manually.
+            await db._migrate_tasks_arbiter_routing()
+            await db._migrate_tasks_arbiter_routing()
+        finally:
+            await db.close()
+
+
+class TestUpdateTaskRouting:
+    """Database.update_task_routing writes routing fields only."""
+
+    @pytest.mark.anyio
+    async def test_writes_routing_fields_only(self, tmp_path) -> None:
+        from maestro.database import Database
+        from maestro.models import AgentType, Task, TaskStatus
+
+        db = Database(tmp_path / "r.db")
+        await db.connect()
+        try:
+            task = Task(
+                id="t1",
+                title="T",
+                prompt="P",
+                workdir="/tmp",
+                agent_type=AgentType.AUTO,
+                status=TaskStatus.READY,
+            )
+            await db.create_task(task)
+
+            # Update routing fields (as scheduler does pre-spawn)
+            task_updated = task.model_copy(
+                update={
+                    "routed_agent_type": "codex_cli",
+                    "arbiter_decision_id": "dec-42",
+                    "arbiter_route_reason": "dt_path",
+                }
+            )
+            await db.update_task_routing(task_updated)
+
+            refetched = await db.get_task("t1")
+            assert refetched.routed_agent_type == "codex_cli"
+            assert refetched.arbiter_decision_id == "dec-42"
+            assert refetched.arbiter_route_reason == "dt_path"
+            # agent_type and status untouched
+            assert refetched.agent_type is AgentType.AUTO
+            assert refetched.status is TaskStatus.READY
+        finally:
+            await db.close()
+
+
+class TestMarkOutcomeReported:
+    @pytest.mark.anyio
+    async def test_sets_timestamp_when_decision_matches(self, tmp_path) -> None:
+        from datetime import UTC, datetime
+
+        from maestro.database import Database
+        from maestro.models import Task
+
+        db = Database(tmp_path / "m.db")
+        await db.connect()
+        try:
+            task = Task(
+                id="t1",
+                title="T",
+                prompt="P",
+                workdir="/tmp",
+                arbiter_decision_id="dec-7",
+            )
+            await db.create_task(task)
+
+            ts = datetime.now(UTC)
+            ok = await db.mark_outcome_reported("t1", ts, "dec-7")
+            assert ok is True
+
+            refetched = await db.get_task("t1")
+            assert refetched.arbiter_outcome_reported_at is not None
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_guard_rejects_wrong_decision_id(self, tmp_path) -> None:
+        """decision_id mismatch → rowcount=0, returns False, no write."""
+        from datetime import UTC, datetime
+
+        from maestro.database import Database
+        from maestro.models import Task
+
+        db = Database(tmp_path / "g.db")
+        await db.connect()
+        try:
+            task = Task(
+                id="t1",
+                title="T",
+                prompt="P",
+                workdir="/tmp",
+                arbiter_decision_id="current-dec",
+            )
+            await db.create_task(task)
+
+            ok = await db.mark_outcome_reported("t1", datetime.now(UTC), "stale-dec")
+            assert ok is False
+
+            refetched = await db.get_task("t1")
+            assert refetched.arbiter_outcome_reported_at is None
+        finally:
+            await db.close()
+
+
+class TestResetForRetryAtomic:
+    @pytest.mark.anyio
+    async def test_failed_to_ready_with_fields_cleared(self, tmp_path) -> None:
+        from maestro.database import Database
+        from maestro.models import Task, TaskStatus
+
+        db = Database(tmp_path / "r.db")
+        await db.connect()
+        try:
+            task = Task(
+                id="t1",
+                title="T",
+                prompt="P",
+                workdir="/tmp",
+                status=TaskStatus.FAILED,
+                routed_agent_type="codex_cli",
+                arbiter_decision_id="dec-9",
+                arbiter_route_reason="dt",
+            )
+            await db.create_task(task)
+
+            ok = await db.reset_for_retry_atomic("t1", "dec-9")
+            assert ok is True
+
+            refetched = await db.get_task("t1")
+            assert refetched.status is TaskStatus.READY
+            assert refetched.routed_agent_type is None
+            assert refetched.arbiter_decision_id is None
+            assert refetched.arbiter_route_reason is None
+            assert refetched.arbiter_outcome_reported_at is None
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_external_status_change_is_skipped(self, tmp_path) -> None:
+        """If status is not FAILED (external abandon/approve), reset is a no-op."""
+        from maestro.database import Database
+        from maestro.models import Task, TaskStatus
+
+        db = Database(tmp_path / "e.db")
+        await db.connect()
+        try:
+            task = Task(
+                id="t1",
+                title="T",
+                prompt="P",
+                workdir="/tmp",
+                status=TaskStatus.NEEDS_REVIEW,
+                arbiter_decision_id="dec-9",
+            )
+            await db.create_task(task)
+
+            ok = await db.reset_for_retry_atomic("t1", "dec-9")
+            assert ok is False
+
+            refetched = await db.get_task("t1")
+            assert refetched.status is TaskStatus.NEEDS_REVIEW
+            # fields NOT cleared
+            assert refetched.arbiter_decision_id == "dec-9"
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_none_decision_id_skips_guard(self, tmp_path) -> None:
+        """Advisory path calls without decision_id guard (best-effort)."""
+        from maestro.database import Database
+        from maestro.models import Task, TaskStatus
+
+        db = Database(tmp_path / "n.db")
+        await db.connect()
+        try:
+            task = Task(
+                id="t1",
+                title="T",
+                prompt="P",
+                workdir="/tmp",
+                status=TaskStatus.FAILED,
+                arbiter_decision_id="dec-9",
+            )
+            await db.create_task(task)
+
+            ok = await db.reset_for_retry_atomic("t1", decision_id=None)
+            assert ok is True
+
+            refetched = await db.get_task("t1")
+            assert refetched.status is TaskStatus.READY
+        finally:
+            await db.close()
+
+
+class TestGetTasksWithPendingOutcome:
+    @pytest.mark.anyio
+    async def test_returns_tasks_with_decision_but_no_reported_at(
+        self, tmp_path
+    ) -> None:
+        """R-03: Return tasks with routing decision but no outcome delivery."""
+        from maestro.database import Database
+        from maestro.models import Task, TaskStatus
+
+        db = Database(tmp_path / "p.db")
+        await db.connect()
+        try:
+            # Three tasks: one pending, one already reported, one without routing
+            t1 = Task(
+                id="pending",
+                title="T",
+                prompt="P",
+                workdir="/tmp",
+                status=TaskStatus.DONE,
+                arbiter_decision_id="dec-pending",
+            )
+            t2 = Task(
+                id="reported",
+                title="T",
+                prompt="P",
+                workdir="/tmp",
+                status=TaskStatus.DONE,
+                arbiter_decision_id="dec-reported",
+                arbiter_outcome_reported_at=datetime.now(UTC),
+            )
+            t3 = Task(
+                id="static",
+                title="T",
+                prompt="P",
+                workdir="/tmp",
+                status=TaskStatus.DONE,
+            )
+            for t in (t1, t2, t3):
+                await db.create_task(t)
+
+            pending = await db.get_tasks_with_pending_outcome()
+            ids = {t.id for t in pending}
+            assert ids == {"pending"}
+        finally:
+            await db.close()

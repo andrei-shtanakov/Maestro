@@ -741,3 +741,75 @@ tasks: []
         config = load_config(config_path)
 
         assert config.repo == "~/projects/myapp"
+
+
+# =============================================================================
+# TestArbiterSection — arbiter block parsing in orchestrator YAML
+# =============================================================================
+
+
+_ORCH_MINIMAL_HEADER = """\
+project: test
+repo_url: https://github.com/test/repo
+repo_path: /tmp/test-repo
+workspace_base: /tmp/test-ws
+zadachi: []
+"""
+
+
+class TestArbiterSection:
+    """Verify OrchestratorConfig.arbiter is populated from YAML."""
+
+    def test_no_arbiter_section_defaults_to_none(self, tmp_path: Path) -> None:
+        from maestro.config import load_orchestrator_config
+
+        yaml_path = tmp_path / "p.yaml"
+        yaml_path.write_text(_ORCH_MINIMAL_HEADER)
+        cfg = load_orchestrator_config(yaml_path)
+        assert cfg.arbiter is None
+
+    def test_arbiter_section_parses_to_pydantic(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from maestro.config import load_orchestrator_config
+        from maestro.models import ArbiterMode
+
+        monkeypatch.setenv("ARBITER_BIN", "/opt/arbiter/arbiter-mcp")
+        monkeypatch.setenv("ARBITER_CONFIG", "/etc/arbiter")
+        monkeypatch.setenv("ARBITER_TREE", "/etc/arbiter/tree.json")
+
+        yaml_path = tmp_path / "p.yaml"
+        yaml_path.write_text(
+            _ORCH_MINIMAL_HEADER
+            + """\
+arbiter:
+  enabled: true
+  mode: authoritative
+  binary_path: ${ARBITER_BIN}
+  config_dir: ${ARBITER_CONFIG}
+  tree_path: ${ARBITER_TREE}
+  timeout_ms: 750
+"""
+        )
+        cfg = load_orchestrator_config(yaml_path)
+        assert cfg.arbiter is not None
+        assert cfg.arbiter.enabled is True
+        assert cfg.arbiter.mode is ArbiterMode.AUTHORITATIVE
+        assert cfg.arbiter.binary_path == "/opt/arbiter/arbiter-mcp"
+        assert cfg.arbiter.timeout_ms == 750
+
+    def test_unknown_arbiter_field_is_rejected(self, tmp_path: Path) -> None:
+        """Typos in the arbiter block should fail loudly, not be silently dropped."""
+        from maestro.config import load_orchestrator_config
+
+        yaml_path = tmp_path / "p.yaml"
+        yaml_path.write_text(
+            _ORCH_MINIMAL_HEADER
+            + """\
+arbiter:
+  enabled: false
+  timeout_ms_typo: 123
+"""
+        )
+        with pytest.raises(ConfigError, match="timeout_ms_typo"):
+            load_orchestrator_config(yaml_path)

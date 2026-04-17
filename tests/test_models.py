@@ -241,7 +241,7 @@ class TestAgentType:
 
     def test_all_agent_types_exist(self) -> None:
         """Verify all expected agent types are defined."""
-        expected = {"claude_code", "codex_cli", "aider", "announce"}
+        expected = {"claude_code", "codex_cli", "aider", "announce", "auto"}
         actual = {a.value for a in AgentType}
         assert actual == expected
 
@@ -249,6 +249,27 @@ class TestAgentType:
         """Verify AgentType is a string enum."""
         assert AgentType.CLAUDE_CODE.value == "claude_code"
         assert AgentType.CLAUDE_CODE == "claude_code"
+
+
+class TestAgentTypeAuto:
+    """Tests for AgentType.AUTO sentinel added in R-03."""
+
+    def test_auto_value_is_lowercase_auto(self) -> None:
+        from maestro.models import AgentType
+
+        assert AgentType.AUTO.value == "auto"
+
+    def test_auto_is_distinct_from_real_agents(self) -> None:
+        from maestro.models import AgentType
+
+        assert AgentType.AUTO != AgentType.CLAUDE_CODE
+        assert AgentType.AUTO != AgentType.CODEX
+        assert AgentType.AUTO != AgentType.AIDER
+
+    def test_auto_round_trips_through_enum(self) -> None:
+        from maestro.models import AgentType
+
+        assert AgentType("auto") is AgentType.AUTO
 
 
 class TestArbiterEnums:
@@ -674,6 +695,39 @@ class TestTask:
                 started_at=started,
                 completed_at=completed,
             )
+
+
+class TestTaskArbiterFields:
+    """Fields added in R-03 for arbiter routing persistence."""
+
+    def test_defaults_none(self) -> None:
+        from maestro.models import Task
+
+        task = Task(id="t1", title="T", prompt="P", workdir="/tmp")
+        assert task.routed_agent_type is None
+        assert task.arbiter_decision_id is None
+        assert task.arbiter_route_reason is None
+        assert task.arbiter_outcome_reported_at is None
+
+    def test_can_be_set(self) -> None:
+        from datetime import UTC, datetime
+
+        from maestro.models import Task
+
+        now = datetime.now(UTC)
+        task = Task(
+            id="t2",
+            title="T",
+            prompt="P",
+            workdir="/tmp",
+            routed_agent_type="codex_cli",
+            arbiter_decision_id="dec-9",
+            arbiter_route_reason="dt_path=budget_ok,bugfix",
+            arbiter_outcome_reported_at=now,
+        )
+        assert task.routed_agent_type == "codex_cli"
+        assert task.arbiter_decision_id == "dec-9"
+        assert task.arbiter_outcome_reported_at == now
 
 
 class TestGitConfig:
@@ -1183,3 +1237,28 @@ class TestSerialization:
         )
         data = task.model_dump(mode="json")
         assert isinstance(data["created_at"], str)
+
+
+class TestFromConfigAutoValidation:
+    """Task.from_config must reject agent_type=AUTO when arbiter is not enabled."""
+
+    def test_auto_without_arbiter_raises(self) -> None:
+        cfg = TaskConfig(id="t1", title="T", prompt="P", agent_type=AgentType.AUTO)
+        with pytest.raises(ValueError, match=r"arbiter\.enabled=true"):
+            Task.from_config(cfg, workdir="/tmp", arbiter_enabled=False)
+
+    def test_auto_with_arbiter_enabled_passes(self) -> None:
+        cfg = TaskConfig(id="t2", title="T", prompt="P", agent_type=AgentType.AUTO)
+        task = Task.from_config(cfg, workdir="/tmp", arbiter_enabled=True)
+        assert task.agent_type is AgentType.AUTO
+
+    def test_explicit_agent_without_arbiter_passes(self) -> None:
+        cfg = TaskConfig(id="t3", title="T", prompt="P", agent_type=AgentType.CODEX)
+        task = Task.from_config(cfg, workdir="/tmp", arbiter_enabled=False)
+        assert task.agent_type is AgentType.CODEX
+
+    def test_from_config_default_arbiter_flag_false(self) -> None:
+        """Backward compat: callers that don't pass arbiter_enabled default to False."""
+        cfg = TaskConfig(id="t4", title="T", prompt="P")  # default agent=CLAUDE_CODE
+        task = Task.from_config(cfg, workdir="/tmp")
+        assert task.agent_type is AgentType.CLAUDE_CODE

@@ -21,9 +21,25 @@ from pathlib import Path
 from subprocess import Popen
 from typing import Protocol
 
+from maestro.coordination.arbiter_errors import ArbiterUnavailable
+from maestro.coordination.routing import (
+    RoutingStrategy,
+    StaticRouting,
+    task_status_to_outcome_status,
+)
 from maestro.dag import DAG
 from maestro.database import Database
-from maestro.models import Task, TaskConfig, TaskStatus
+from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
+from maestro.models import (
+    AgentType,
+    ArbiterMode,
+    RouteAction,
+    Task,
+    TaskConfig,
+    TaskOutcome,
+    TaskOutcomeStatus,
+    TaskStatus,
+)
 from maestro.notifications.base import Notification, NotificationEvent
 from maestro.notifications.manager import NotificationManager
 from maestro.retry import RetryManager
@@ -31,6 +47,8 @@ from maestro.validator import ValidationResult, Validator
 
 
 logger = logging.getLogger(__name__)
+
+MAX_REATTEMPTS_PER_TICK = 5
 
 StatusChangeCallback = Callable[[str, str, str], None]
 
@@ -178,6 +196,8 @@ class Scheduler:
         notification_manager: NotificationManager | None = None,
         retry_manager: RetryManager | None = None,
         on_status_change: StatusChangeCallback | None = None,
+        routing: RoutingStrategy | None = None,
+        arbiter_mode: ArbiterMode = ArbiterMode.ADVISORY,
     ) -> None:
         """Initialize scheduler.
 
@@ -189,6 +209,9 @@ class Scheduler:
             notification_manager: Optional notification manager.
             retry_manager: Optional retry manager for backoff/context.
             on_status_change: Optional callback for task status changes.
+            routing: Routing strategy (defaults to StaticRouting).
+            arbiter_mode: ADVISORY (default) or AUTHORITATIVE; drives retry
+                gating when arbiter becomes unavailable.
         """
         self._db = db
         self._dag = dag
@@ -197,6 +220,12 @@ class Scheduler:
         self._notifications = notification_manager
         self._retry_manager = retry_manager or RetryManager()
         self._on_status_change = on_status_change
+        self._routing: RoutingStrategy = (
+            routing if routing is not None else StaticRouting()
+        )
+        self._arbiter_mode: ArbiterMode = arbiter_mode
+        self._hold_throttle: HoldThrottle = HoldThrottle()
+        self._abandon_outcome_after_s: int = 300
 
         self._running_tasks: dict[str, RunningTask] = {}
         self._retry_ready_times: dict[str, datetime] = {}
@@ -253,6 +282,203 @@ class Scheduler:
         """
         if self._on_status_change is not None:
             self._on_status_change(task_id, old_status, new_status)
+
+    def _emit_event(self, event_type: EventType, payload: dict[str, object]) -> None:
+        """Forward a structured event to the default EventLogger, if configured."""
+        event_logger = get_event_logger()
+        if event_logger is None:
+            return
+        task_id = payload.get("task_id")
+        task_id_str = task_id if isinstance(task_id, str) else None
+        details = {k: v for k, v in payload.items() if k != "task_id"}
+        event_logger.log(
+            Event(event_type=event_type, task_id=task_id_str, details=details)
+        )
+
+    async def _build_outcome(
+        self,
+        task: Task,
+        exit_code: int,
+        attempt: int | None = None,
+    ) -> TaskOutcome:
+        """Build a TaskOutcome from a terminal Task for arbiter report_outcome.
+
+        `attempt` is the 1-based attempt number for the run being reported. It
+        must be passed explicitly when the caller already mutated
+        `task.retry_count` (e.g. the failure path increments the counter
+        before building the outcome). When omitted it falls back to
+        `task.retry_count + 1`, which is correct for the success path where
+        `retry_count` has not been touched on the final attempt.
+        """
+        duration_min: float | None = None
+        if task.started_at and task.completed_at:
+            duration_min = (task.completed_at - task.started_at).total_seconds() / 60.0
+
+        tokens_used: int | None = None
+        cost_usd: float | None = None
+        rows = await self._db.get_task_costs(task.id)
+        if attempt is None:
+            attempt = task.retry_count + 1
+        matching = [r for r in rows if r.attempt == attempt]
+        if matching:
+            tokens_used = sum(r.input_tokens + r.output_tokens for r in matching)
+            cost_usd = sum(r.estimated_cost_usd for r in matching)
+
+        error_code: str | None = None
+        if task.error_message:
+            lines = task.error_message.splitlines()
+            first_line = lines[0] if lines else task.error_message
+            error_code = first_line[:200]
+
+        msg_lower = (task.error_message or "").lower()
+        if exit_code == 0:
+            status = TaskOutcomeStatus.SUCCESS
+        elif "timeout" in msg_lower or "timed out" in msg_lower:
+            status = TaskOutcomeStatus.TIMEOUT
+        else:
+            status = TaskOutcomeStatus.FAILURE
+
+        return TaskOutcome(
+            status=status,
+            agent_used=task.routed_agent_type or task.agent_type.value,
+            duration_min=duration_min,
+            tokens_used=tokens_used,
+            cost_usd=cost_usd,
+            error_code=error_code,
+        )
+
+    async def _try_report_outcome(self, task: Task, outcome: TaskOutcome) -> bool:
+        """Deliver an outcome via the routing strategy.
+
+        Returns True when the full round-trip succeeds: the routing strategy
+        accepted the outcome AND `mark_outcome_reported` committed the
+        `reported_at` stamp under its decision_id guard. Returns False on
+        `ArbiterUnavailable` (arbiter is down) OR on a decision_id guard
+        miss — in that case the local state no longer matches the decision
+        the caller intended to report, so callers must treat the attempt as
+        non-delivered and skip the decision_id guard on any subsequent
+        `reset_for_retry_atomic`.
+        """
+        if task.arbiter_decision_id is None:
+            return True
+        try:
+            await self._routing.report_outcome(task, outcome)
+        except ArbiterUnavailable:
+            logger.info(
+                "outcome delivery deferred (arbiter unavailable) for %s", task.id
+            )
+            return False
+        ok = await self._db.mark_outcome_reported(
+            task.id, datetime.now(UTC), task.arbiter_decision_id
+        )
+        if not ok:
+            logger.warning(
+                "mark_outcome_reported guard miss for task %s (decision_id=%s) — "
+                "treating as non-delivery",
+                task.id,
+                task.arbiter_decision_id,
+            )
+            return False
+        self._emit_event(
+            EventType.ARBITER_OUTCOME_REPORTED,
+            {
+                "task_id": task.id,
+                "decision_id": task.arbiter_decision_id,
+                "status": outcome.status.value,
+            },
+        )
+        return True
+
+    async def _outcome_reattempt_pass(self) -> None:
+        """R-03: Deliver deferred outcomes (bounded per tick).
+
+        Called once per main-loop iteration. In AUTHORITATIVE mode, also
+        force-unblocks FAILED tasks whose decision is older than
+        `_abandon_outcome_after_s` — their outcome is abandoned, the task
+        transitions to READY for retry, and an ARBITER_OUTCOME_ABANDONED
+        event is emitted.
+        """
+        pending = await self._db.get_tasks_with_pending_outcome()
+        now = datetime.now(UTC)
+        delivered_count = 0
+
+        for task in pending:
+            if delivered_count >= MAX_REATTEMPTS_PER_TICK:
+                break
+
+            outcome_status = task_status_to_outcome_status(task.status)
+            if outcome_status is None:
+                logger.error(
+                    "task %s has decision_id but unexpected status %s — skipping",
+                    task.id,
+                    task.status,
+                )
+                continue
+            if task.arbiter_decision_id is None:
+                # DB filter should prevent this, but narrow for the type checker.
+                continue
+
+            # FAILED rows already had retry_count bumped at failure; the
+            # attempt being reported is `retry_count`, not `retry_count + 1`.
+            attempt = (
+                task.retry_count
+                if task.status is TaskStatus.FAILED
+                else task.retry_count + 1
+            )
+            outcome = await self._build_outcome(task, exit_code=0, attempt=attempt)
+            outcome = outcome.model_copy(update={"status": outcome_status})
+            try:
+                await self._routing.report_outcome(task, outcome)
+            except ArbiterUnavailable:
+                # Arbiter is down this tick. For AUTHORITATIVE stuck-FAILED
+                # tasks past the abandon window, force-release.
+                if (
+                    self._arbiter_mode is ArbiterMode.AUTHORITATIVE
+                    and task.completed_at is not None
+                    and (now - task.completed_at).total_seconds()
+                    >= self._abandon_outcome_after_s
+                ):
+                    age_s = (now - task.completed_at).total_seconds()
+                    await self._db.mark_outcome_reported(
+                        task.id, now, task.arbiter_decision_id
+                    )
+                    self._emit_event(
+                        EventType.ARBITER_OUTCOME_ABANDONED,
+                        {
+                            "task_id": task.id,
+                            "decision_id": task.arbiter_decision_id,
+                            "age_s": age_s,
+                        },
+                    )
+                    released = await self._db.abandon_pending_outcome_and_release(
+                        task.id
+                    )
+                    if released and task.status is TaskStatus.FAILED:
+                        self._report_status_change(task.id, "failed", "ready")
+                # Arbiter is clearly down — stop for this tick.
+                break
+            else:
+                await self._db.mark_outcome_reported(
+                    task.id, now, task.arbiter_decision_id
+                )
+                self._emit_event(
+                    EventType.ARBITER_OUTCOME_REPORTED,
+                    {
+                        "task_id": task.id,
+                        "decision_id": task.arbiter_decision_id,
+                        "status": outcome_status.value,
+                    },
+                )
+                if (
+                    self._arbiter_mode is ArbiterMode.AUTHORITATIVE
+                    and task.status is TaskStatus.FAILED
+                ):
+                    ok = await self._db.reset_for_retry_atomic(
+                        task.id, task.arbiter_decision_id
+                    )
+                    if ok:
+                        self._report_status_change(task.id, "failed", "ready")
+                delivered_count += 1
 
     def _auto_commit_task(self, task: Task) -> None:
         """Auto-commit changes for a completed task."""
@@ -345,6 +571,9 @@ class Scheduler:
             # Monitor running processes
             await self._monitor_running_tasks()
 
+            # R-03: re-deliver any outcomes that couldn't reach arbiter earlier
+            await self._outcome_reattempt_pass()
+
             # Wait before next iteration
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(
@@ -433,15 +662,105 @@ class Scheduler:
         if task.status != TaskStatus.READY:
             return False
 
-        # Get spawner for this task's agent type
-        spawner = self._spawners.get(task.agent_type.value)
+        # R-03: consult the routing strategy before picking a spawner.
+        decision = await self._routing.route(task)
+
+        if decision.action is RouteAction.HOLD:
+            if self._hold_throttle.should_log(task_id, decision.reason):
+                self._emit_event(
+                    EventType.ARBITER_ROUTE_HOLD,
+                    {"task_id": task_id, "reason": decision.reason},
+                )
+            return False
+
+        if decision.action is RouteAction.REJECT:
+            self._emit_event(
+                EventType.ARBITER_ROUTE_REJECTED,
+                {"task_id": task_id, "reason": decision.reason},
+            )
+            await self._db.update_task_status(
+                task_id,
+                TaskStatus.NEEDS_REVIEW,
+                error_message=f"arbiter rejected: {decision.reason}",
+            )
+            if decision.decision_id is not None:
+                task = task.model_copy(
+                    update={
+                        "arbiter_decision_id": decision.decision_id,
+                        "arbiter_route_reason": decision.reason,
+                    }
+                )
+                await self._db.update_task_routing(task)
+                await self._db.mark_outcome_reported(
+                    task_id, datetime.now(UTC), decision.decision_id
+                )
+            self._report_status_change(task_id, "ready", "needs_review")
+            return False
+
+        # ASSIGN path
+        if decision.chosen_agent is None:
+            logger.error("assign with None chosen_agent for task %s", task_id)
+            return False
+        try:
+            chosen = AgentType(decision.chosen_agent)
+        except ValueError:
+            logger.warning(
+                "arbiter chose unknown agent %r for task %s — HOLD",
+                decision.chosen_agent,
+                task_id,
+            )
+            if self._hold_throttle.should_log(task_id, "unknown_agent"):
+                self._emit_event(
+                    EventType.ARBITER_ROUTE_HOLD,
+                    {"task_id": task_id, "reason": "unknown_agent"},
+                )
+            return False
+        if chosen is AgentType.AUTO:
+            logger.error(
+                "routing returned AUTO for task %s — refusing to spawn", task_id
+            )
+            if self._hold_throttle.should_log(task_id, "auto_not_resolved"):
+                self._emit_event(
+                    EventType.ARBITER_ROUTE_HOLD,
+                    {"task_id": task_id, "reason": "auto_not_resolved"},
+                )
+            return False
+
+        # Flush any prior HOLD streak now that we're past HOLD.
+        summary = self._hold_throttle.clear_and_summarize(task_id)
+        if summary is not None:
+            count = summary.get("count", 0)
+            if isinstance(count, int) and count > 1:
+                self._emit_event(EventType.ARBITER_ROUTE_HOLD_SUMMARY, summary)
+
+        task = task.model_copy(
+            update={
+                "routed_agent_type": chosen.value,
+                "arbiter_decision_id": decision.decision_id,
+                "arbiter_route_reason": decision.reason,
+            }
+        )
+        await self._db.update_task_routing(task)
+        self._emit_event(
+            EventType.ARBITER_ROUTE_DECIDED,
+            {
+                "task_id": task_id,
+                "decision_id": decision.decision_id,
+                "chosen_agent": chosen.value,
+                "reason": decision.reason,
+            },
+        )
+
+        # Get spawner using routed_agent_type when present, else agent_type.
+        spawner_key = task.routed_agent_type or task.agent_type.value
+        spawner = self._spawners.get(spawner_key)
         if spawner is None:
-            msg = f"No spawner available for agent type '{task.agent_type}'"
+            msg = f"No spawner available for agent type '{spawner_key}'"
             raise SchedulerError(msg)
 
         # Check if spawner is available
         if not spawner.is_available():
-            msg = f"Agent '{task.agent_type}' is not available on this system"
+            msg = f"Agent '{spawner_key}' is not available on this system"
             raise SchedulerError(msg)
 
         # Apply retry backoff without blocking scheduler loop
@@ -622,7 +941,7 @@ class Scheduler:
                 # Run validation with the Validator class
                 validation_result = await self._run_validation(task)
                 if validation_result.success:
-                    await self._db.update_task_status(
+                    done_task = await self._db.update_task_status(
                         task_id,
                         TaskStatus.DONE,
                         expected_status=TaskStatus.VALIDATING,
@@ -631,6 +950,8 @@ class Scheduler:
                     self._report_status_change(task_id, "validating", "done")
                     await self._notify(task, NotificationEvent.TASK_COMPLETED)
                     self._auto_commit_task(task)
+                    outcome = await self._build_outcome(done_task, exit_code=0)
+                    await self._try_report_outcome(done_task, outcome)
                 else:
                     # Include validation output in error for retry context
                     error_msg = self._format_validation_error(validation_result)
@@ -639,7 +960,7 @@ class Scheduler:
                     )
             else:
                 # No validation - mark as done
-                await self._db.update_task_status(
+                done_task = await self._db.update_task_status(
                     task_id,
                     TaskStatus.DONE,
                     expected_status=TaskStatus.RUNNING,
@@ -648,6 +969,8 @@ class Scheduler:
                 self._report_status_change(task_id, "running", "done")
                 await self._notify(task, NotificationEvent.TASK_COMPLETED)
                 self._auto_commit_task(task)
+                outcome = await self._build_outcome(done_task, exit_code=0)
+                await self._try_report_outcome(done_task, outcome)
         else:
             # Process failed
             error_msg = f"Process exited with code {return_code}"
@@ -759,7 +1082,7 @@ class Scheduler:
         current_task = await self._db.get_task(task_id)
 
         if self._retry_manager.should_retry(current_task):
-            # Increment retry count and set back to READY
+            # Increment retry count and transition to FAILED.
             new_retry_count = current_task.retry_count + 1
             logging.info(
                 "Scheduling retry %d/%d for task %s",
@@ -767,20 +1090,40 @@ class Scheduler:
                 current_task.max_retries,
                 task_id,
             )
-            await self._db.update_task_status(
+            failed_task = await self._db.update_task_status(
                 task_id,
                 TaskStatus.FAILED,
                 error_message=error_message,
                 retry_count=new_retry_count,
             )
             self._report_status_change(task_id, "running", "failed")
-            # Transition back to READY for retry
-            await self._db.update_task_status(
-                task_id,
-                TaskStatus.READY,
-                expected_status=TaskStatus.FAILED,
+
+            # R-03: deliver outcome (best-effort). Mode decides retry gating.
+            # `attempt` is the run that just finished, before the counter bump
+            # above would have made it off-by-one for cost lookup.
+            outcome = await self._build_outcome(
+                failed_task, exit_code=1, attempt=current_task.retry_count + 1
             )
-            self._report_status_change(task_id, "failed", "ready")
+            delivered = await self._try_report_outcome(failed_task, outcome)
+
+            if self._arbiter_mode is ArbiterMode.ADVISORY or delivered:
+                guard_id = failed_task.arbiter_decision_id if delivered else None
+                ok = await self._db.reset_for_retry_atomic(
+                    task_id, decision_id=guard_id
+                )
+                if ok:
+                    self._report_status_change(task_id, "failed", "ready")
+                else:
+                    self._emit_event(
+                        EventType.ARBITER_RETRY_RESET_SKIPPED,
+                        {
+                            "task_id": task_id,
+                            "expected_decision_id": (failed_task.arbiter_decision_id),
+                        },
+                    )
+            # else: authoritative + not delivered — stay FAILED; the
+            # re-attempt pass (Task 28) will drive the outcome through
+            # before retrying.
         else:
             # No more retries - needs review
             logging.warning(
@@ -788,12 +1131,14 @@ class Scheduler:
                 task_id,
                 current_task.max_retries,
             )
-            await self._db.update_task_status(
+            failed_task = await self._db.update_task_status(
                 task_id,
                 TaskStatus.FAILED,
                 error_message=error_message,
             )
             self._report_status_change(task_id, "running", "failed")
+            outcome = await self._build_outcome(failed_task, exit_code=1)
+            await self._try_report_outcome(failed_task, outcome)
             await self._db.update_task_status(
                 task_id,
                 TaskStatus.NEEDS_REVIEW,
@@ -965,6 +1310,9 @@ async def create_scheduler_from_config(
     notification_manager: NotificationManager | None = None,
     on_status_change: StatusChangeCallback | None = None,
     auto_commit: bool = False,
+    routing: RoutingStrategy | None = None,
+    arbiter_mode: ArbiterMode = ArbiterMode.ADVISORY,
+    arbiter_enabled: bool = False,
 ) -> Scheduler:
     """Create a scheduler from task configurations.
 
@@ -983,6 +1331,8 @@ async def create_scheduler_from_config(
         notification_manager: Optional notification manager.
         on_status_change: Optional callback for task status changes.
         auto_commit: Whether to auto-commit after task completion.
+        routing: Routing strategy (defaults to StaticRouting).
+        arbiter_mode: Arbiter authority mode (ADVISORY by default).
 
     Returns:
         Configured Scheduler instance.
@@ -1009,7 +1359,9 @@ async def create_scheduler_from_config(
         task_config = task_map.get(task_id)
         if task_config is None:
             continue
-        task = Task.from_config(task_config, str(config.workdir))
+        task = Task.from_config(
+            task_config, str(config.workdir), arbiter_enabled=arbiter_enabled
+        )
         await db.create_task(task)
 
     return Scheduler(
@@ -1019,4 +1371,6 @@ async def create_scheduler_from_config(
         config,
         notification_manager,
         on_status_change=on_status_change,
+        routing=routing,
+        arbiter_mode=arbiter_mode,
     )

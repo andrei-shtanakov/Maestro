@@ -6,11 +6,18 @@ state from a crashed scheduler) and transition them back to READY for
 re-execution.
 """
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from maestro.coordination.arbiter_errors import ArbiterUnavailable
+from maestro.coordination.routing import RoutingStrategy, task_status_to_outcome_status
 from maestro.database import Database
-from maestro.models import Task, TaskStatus
+from maestro.event_log import Event, EventType, get_event_logger
+from maestro.models import Task, TaskOutcome, TaskOutcomeStatus, TaskStatus
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -71,12 +78,19 @@ class StateRecovery:
         """
         self._db = db
 
-    async def recover(self) -> RecoveryStatistics:
+    async def recover(
+        self, routing: RoutingStrategy | None = None
+    ) -> RecoveryStatistics:
         """Perform full state recovery.
 
         Finds all tasks in RUNNING or VALIDATING state and transitions
         them back to READY for re-execution. Tasks in terminal states
         (DONE, ABANDONED) are not affected.
+
+        Args:
+            routing: Optional RoutingStrategy. When supplied, arbiter
+                decisions left dangling by the crash are closed via
+                `recover_arbiter_outcomes` as the final recovery step.
 
         Returns:
             RecoveryStatistics with details about recovered tasks.
@@ -86,6 +100,9 @@ class StateRecovery:
 
         # Recover VALIDATING tasks
         validating_recovered = await self._recover_validating_tasks()
+
+        if routing is not None:
+            await recover_arbiter_outcomes(self._db, routing)
 
         # Get counts for statistics
         all_tasks = await self._db.get_all_tasks()
@@ -183,3 +200,79 @@ class StateRecovery:
             True if there are tasks in RUNNING or VALIDATING state.
         """
         return await self.get_orphaned_task_count() > 0
+
+
+def _reconstruct_outcome(task: Task, status: TaskOutcomeStatus) -> TaskOutcome:
+    """Rebuild a TaskOutcome from persisted Task state for recovery delivery."""
+    duration_min: float | None = None
+    if task.started_at and task.completed_at:
+        duration_min = (task.completed_at - task.started_at).total_seconds() / 60.0
+
+    error_code: str | None = None
+    if task.error_message:
+        lines = task.error_message.splitlines()
+        first = lines[0] if lines else task.error_message
+        error_code = first[:200]
+
+    return TaskOutcome(
+        status=status,
+        agent_used=task.routed_agent_type or task.agent_type.value,
+        duration_min=duration_min,
+        tokens_used=None,
+        cost_usd=None,
+        error_code=error_code,
+    )
+
+
+async def recover_arbiter_outcomes(db: Database, routing: RoutingStrategy) -> int:
+    """R-03: Close dangling arbiter decisions after a Maestro crash.
+
+    Iterates tasks with a persisted `arbiter_decision_id` but no
+    `arbiter_outcome_reported_at`, reconstructs an outcome from persisted
+    state (duration, error_code; status from `task_status_to_outcome_status`
+    — e.g. RUNNING/VALIDATING map to INTERRUPTED), and reports it through
+    the supplied routing strategy. StaticRouting's `report_outcome` is a
+    no-op, so passing it keeps the static path safe.
+
+    Tasks whose status can't yield a valid outcome (PENDING / READY /
+    AWAITING_APPROVAL carrying a decision_id — an invariant violation) are
+    logged and skipped. Delivery stops at the first `ArbiterUnavailable`;
+    the scheduler's re-attempt pass picks up where we left off.
+
+    Returns:
+        Count of outcomes successfully re-delivered.
+    """
+    pending = await db.get_tasks_with_pending_outcome()
+    now = datetime.now(UTC)
+    count = 0
+
+    for task in pending:
+        outcome_status = task_status_to_outcome_status(task.status)
+        if outcome_status is None:
+            logger.error(
+                "recovery: task %s has decision_id but status %s — skipping",
+                task.id,
+                task.status.value,
+            )
+            continue
+        if task.arbiter_decision_id is None:
+            continue
+
+        outcome = _reconstruct_outcome(task, outcome_status)
+        try:
+            await routing.report_outcome(task, outcome)
+        except ArbiterUnavailable:
+            logger.info("recovery: arbiter unavailable — stopping at task %s", task.id)
+            break
+        await db.mark_outcome_reported(task.id, now, task.arbiter_decision_id)
+        count += 1
+
+    event_logger = get_event_logger()
+    if event_logger is not None:
+        event_logger.log(
+            Event(
+                event_type=EventType.RECOVERY_ARBITER_DECISIONS_CLOSED,
+                details={"count": count},
+            )
+        )
+    return count
