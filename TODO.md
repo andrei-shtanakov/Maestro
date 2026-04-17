@@ -72,8 +72,9 @@
   - CLI: `maestro run` читает `ProjectConfig.arbiter`, строит routing через `make_routing_strategy`, плюмит `arbiter_enabled`, закрывает subprocess в `finally`
   - Event log: 10 новых `EventType` (ARBITER_ROUTE_DECIDED/HOLD/REJECTED/HOLD_SUMMARY/OUTCOME_REPORTED/OUTCOME_ABANDONED/UNAVAILABLE/RECONNECTED/RETRY_RESET_SKIPPED + RECOVERY_ARBITER_DECISIONS_CLOSED), `HoldThrottle` helper
   - DB: 4 новых колонки на `tasks` + миграция + `update_task_routing` / `mark_outcome_reported` / `reset_for_retry_atomic` / `get_tasks_with_pending_outcome` / `abandon_pending_outcome_and_release`
-  - Тесты: +113 новых (1112/1112), pyrefly clean, `ruff check maestro/` clean
-  - Пример: `examples/with-arbiter.yaml`
+  - Тесты: +113 новых (1112/1112), pyrefly clean, `ruff check .` clean, `ruff format --check .` clean
+  - Пример: `examples/with-arbiter.yaml` (смоук-проверен через `maestro.config.load_config`); `examples/tasks.yaml` — arbiter=None, zero-config путь не задет
+  - Pending manual acceptance (требует локальной сборки arbiter-mcp): (a) advisory + kill arbiter → retry всё равно идёт; (b) authoritative + kill, < abandon_outcome_after_s → FAILED держится; (c) authoritative + kill, > abandon_outcome_after_s → `arbiter.outcome.abandoned` событие + unblock
 
 ### Follow-ups разблокированные R-03
 - [ ] **R-03b**: Mode 2 (`maestro orchestrate`) zadacha-level routing. Gate: ≥1 неделя стабильного Mode-1 dogfood

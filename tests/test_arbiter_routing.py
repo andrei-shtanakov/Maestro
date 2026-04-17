@@ -33,7 +33,7 @@ class TestAssignHappyPath:
     @pytest.mark.anyio
     async def test_auto_task_gets_arbiter_chosen_agent(self) -> None:
         fake = FakeArbiterClient()
-        fake.route_handler = lambda tid, t, c: {
+        fake.route_handler = lambda tid, _t, _c: {
             "task_id": tid,
             "action": "assign",
             "chosen_agent": "codex_cli",
@@ -57,7 +57,7 @@ class TestHoldRejectUnknown:
     @pytest.mark.anyio
     async def test_hold_returns_hold_with_reason(self) -> None:
         fake = FakeArbiterClient()
-        fake.route_handler = lambda tid, t, c: {
+        fake.route_handler = lambda tid, _t, _c: {
             "task_id": tid,
             "action": "hold",
             "chosen_agent": "",
@@ -78,7 +78,7 @@ class TestHoldRejectUnknown:
     @pytest.mark.anyio
     async def test_reject_returns_reject(self) -> None:
         fake = FakeArbiterClient()
-        fake.route_handler = lambda tid, t, c: {
+        fake.route_handler = lambda tid, _t, _c: {
             "task_id": tid,
             "action": "reject",
             "chosen_agent": "",
@@ -100,7 +100,7 @@ class TestHoldRejectUnknown:
         """ArbiterRouting returns ASSIGN with unknown chosen_agent; scheduler
         is responsible for the HOLD conversion (tested in Task 27)."""
         fake = FakeArbiterClient()
-        fake.route_handler = lambda tid, t, c: {
+        fake.route_handler = lambda tid, _t, _c: {
             "task_id": tid,
             "action": "assign",
             "chosen_agent": "new_agent_v2",
@@ -121,7 +121,7 @@ class TestAdvisoryOverride:
     @pytest.mark.anyio
     async def test_advisory_explicit_agent_overrides_arbiter_choice(self) -> None:
         fake = FakeArbiterClient()
-        fake.route_handler = lambda tid, t, c: {
+        fake.route_handler = lambda tid, _t, _c: {
             "task_id": tid,
             "action": "assign",
             "chosen_agent": "claude_code",
@@ -145,7 +145,7 @@ class TestAdvisoryOverride:
     @pytest.mark.anyio
     async def test_advisory_auto_task_uses_arbiter_choice(self) -> None:
         fake = FakeArbiterClient()
-        fake.route_handler = lambda tid, t, c: {
+        fake.route_handler = lambda tid, _t, _c: {
             "task_id": tid,
             "action": "assign",
             "chosen_agent": "aider",
@@ -163,7 +163,7 @@ class TestAdvisoryOverride:
     @pytest.mark.anyio
     async def test_authoritative_overrides_explicit_user_choice(self) -> None:
         fake = FakeArbiterClient()
-        fake.route_handler = lambda tid, t, c: {
+        fake.route_handler = lambda tid, _t, _c: {
             "task_id": tid,
             "action": "assign",
             "chosen_agent": "claude_code",
@@ -181,7 +181,7 @@ class TestAdvisoryOverride:
     @pytest.mark.anyio
     async def test_advisory_hold_still_respected_for_explicit(self) -> None:
         fake = FakeArbiterClient()
-        fake.route_handler = lambda tid, t, c: {
+        fake.route_handler = lambda tid, _t, _c: {
             "task_id": tid,
             "action": "hold",
             "chosen_agent": "",
@@ -203,7 +203,7 @@ class TestTimeoutMapping:
         fake = FakeArbiterClient()
         # Slower than timeout_ms (500 default, we'll force 50 via cfg)
         fake.route_delay_s = 1.0
-        fake.route_handler = lambda tid, t, c: {
+        fake.route_handler = lambda tid, _t, _c: {
             "task_id": tid,
             "action": "assign",
             "chosen_agent": "codex_cli",
@@ -229,7 +229,7 @@ class TestDegradedMode:
         from maestro.coordination.arbiter_errors import ArbiterUnavailable
 
         fake = FakeArbiterClient()
-        fake.route_handler = lambda *a, **kw: (_ for _ in ()).throw(
+        fake.route_handler = lambda *_a, **_kw: (_ for _ in ()).throw(
             ArbiterUnavailable("pipe closed")
         )
         await fake.start()
@@ -247,7 +247,7 @@ class TestDegradedMode:
         from maestro.coordination.arbiter_errors import ArbiterUnavailable
 
         fake = FakeArbiterClient()
-        fake.route_handler = lambda *a, **kw: (_ for _ in ()).throw(
+        fake.route_handler = lambda *_a, **_kw: (_ for _ in ()).throw(
             ArbiterUnavailable("dead")
         )
         await fake.start()
