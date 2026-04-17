@@ -148,10 +148,19 @@ class ArbiterRouting:
         # Happy path only for this task; degraded path comes in Task 20.
         payload = _task_to_arbiter_payload(task)
         timeout_s = self._cfg.timeout_ms / 1000.0
-        raw = await asyncio.wait_for(
-            self._client.route_task(task.id, payload),
-            timeout=timeout_s,
-        )
+        try:
+            raw = await asyncio.wait_for(
+                self._client.route_task(task.id, payload),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("arbiter route_task timeout for task %s", task.id)
+            return RouteDecision(
+                action=RouteAction.HOLD,
+                chosen_agent=None,
+                decision_id=None,
+                reason="timeout",
+            )
         action_str = raw.get("action", "")
         try:
             action = RouteAction(action_str)

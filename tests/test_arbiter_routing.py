@@ -195,3 +195,29 @@ class TestAdvisoryOverride:
         routing = ArbiterRouting(client=fake, cfg=_cfg(mode=ArbiterMode.ADVISORY))
         d = await routing.route(_task(AgentType.CODEX))
         assert d.action is RouteAction.HOLD  # hold respected even in advisory
+
+
+class TestTimeoutMapping:
+    @pytest.mark.anyio
+    async def test_slow_arbiter_returns_hold_not_unavailable(self) -> None:
+        fake = FakeArbiterClient()
+        # Slower than timeout_ms (500 default, we'll force 50 via cfg)
+        fake.route_delay_s = 1.0
+        fake.route_handler = lambda tid, t, c: {
+            "task_id": tid,
+            "action": "assign",
+            "chosen_agent": "codex_cli",
+            "confidence": 1.0,
+            "reasoning": "",
+            "decision_path": [],
+            "invariant_checks": [],
+            "metadata": {"decision_id": "x"},
+        }
+        await fake.start()
+        cfg = _cfg()
+        cfg = cfg.model_copy(update={"timeout_ms": 50})
+        routing = ArbiterRouting(client=fake, cfg=cfg)
+
+        d = await routing.route(_task())
+        assert d.action is RouteAction.HOLD
+        assert d.reason == "timeout"
