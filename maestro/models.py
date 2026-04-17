@@ -737,6 +737,13 @@ class ProjectConfig(BaseModel):
     notifications: NotificationConfig | None = Field(
         default=None, description="Notification configuration"
     )
+    arbiter: ArbiterConfig | None = Field(
+        default=None,
+        description=(
+            "Optional arbiter integration. When omitted/None the scheduler "
+            "stays on zero-config StaticRouting and no subprocess is spawned."
+        ),
+    )
 
     @field_validator("repo")
     @classmethod
