@@ -1473,3 +1473,41 @@ class TestAutoCommit:
         """Test SchedulerConfig defaults auto_commit to False."""
         config = SchedulerConfig()
         assert config.auto_commit is False
+
+
+class TestSchedulerRoutingInjection:
+    """Scheduler must accept an optional RoutingStrategy + arbiter_mode."""
+
+    @pytest.mark.anyio
+    async def test_defaults_to_static_routing(self, tmp_path: Path) -> None:
+        from maestro.coordination.routing import StaticRouting
+        from maestro.models import ArbiterMode
+
+        db = await create_database(tmp_path / "s.db")
+        try:
+            scheduler = Scheduler(db=db, dag=DAG([]), spawners={})
+            assert isinstance(scheduler._routing, StaticRouting)
+            assert scheduler._arbiter_mode is ArbiterMode.ADVISORY
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_accepts_injected_routing(self, tmp_path: Path) -> None:
+        from unittest.mock import AsyncMock
+
+        from maestro.models import ArbiterMode
+
+        db = await create_database(tmp_path / "s.db")
+        try:
+            routing = AsyncMock()
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG([]),
+                spawners={},
+                routing=routing,
+                arbiter_mode=ArbiterMode.AUTHORITATIVE,
+            )
+            assert scheduler._routing is routing
+            assert scheduler._arbiter_mode is ArbiterMode.AUTHORITATIVE
+        finally:
+            await db.close()

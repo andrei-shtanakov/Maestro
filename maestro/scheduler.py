@@ -21,9 +21,11 @@ from pathlib import Path
 from subprocess import Popen
 from typing import Protocol
 
+from maestro.coordination.routing import RoutingStrategy, StaticRouting
 from maestro.dag import DAG
 from maestro.database import Database
-from maestro.models import Task, TaskConfig, TaskStatus
+from maestro.event_log import HoldThrottle
+from maestro.models import ArbiterMode, Task, TaskConfig, TaskStatus
 from maestro.notifications.base import Notification, NotificationEvent
 from maestro.notifications.manager import NotificationManager
 from maestro.retry import RetryManager
@@ -178,6 +180,8 @@ class Scheduler:
         notification_manager: NotificationManager | None = None,
         retry_manager: RetryManager | None = None,
         on_status_change: StatusChangeCallback | None = None,
+        routing: RoutingStrategy | None = None,
+        arbiter_mode: ArbiterMode = ArbiterMode.ADVISORY,
     ) -> None:
         """Initialize scheduler.
 
@@ -189,6 +193,9 @@ class Scheduler:
             notification_manager: Optional notification manager.
             retry_manager: Optional retry manager for backoff/context.
             on_status_change: Optional callback for task status changes.
+            routing: Routing strategy (defaults to StaticRouting).
+            arbiter_mode: ADVISORY (default) or AUTHORITATIVE; drives retry
+                gating when arbiter becomes unavailable.
         """
         self._db = db
         self._dag = dag
@@ -197,6 +204,11 @@ class Scheduler:
         self._notifications = notification_manager
         self._retry_manager = retry_manager or RetryManager()
         self._on_status_change = on_status_change
+        self._routing: RoutingStrategy = (
+            routing if routing is not None else StaticRouting()
+        )
+        self._arbiter_mode: ArbiterMode = arbiter_mode
+        self._hold_throttle: HoldThrottle = HoldThrottle()
 
         self._running_tasks: dict[str, RunningTask] = {}
         self._retry_ready_times: dict[str, datetime] = {}
@@ -965,6 +977,8 @@ async def create_scheduler_from_config(
     notification_manager: NotificationManager | None = None,
     on_status_change: StatusChangeCallback | None = None,
     auto_commit: bool = False,
+    routing: RoutingStrategy | None = None,
+    arbiter_mode: ArbiterMode = ArbiterMode.ADVISORY,
 ) -> Scheduler:
     """Create a scheduler from task configurations.
 
@@ -983,6 +997,8 @@ async def create_scheduler_from_config(
         notification_manager: Optional notification manager.
         on_status_change: Optional callback for task status changes.
         auto_commit: Whether to auto-commit after task completion.
+        routing: Routing strategy (defaults to StaticRouting).
+        arbiter_mode: Arbiter authority mode (ADVISORY by default).
 
     Returns:
         Configured Scheduler instance.
@@ -1019,4 +1035,6 @@ async def create_scheduler_from_config(
         config,
         notification_manager,
         on_status_change=on_status_change,
+        routing=routing,
+        arbiter_mode=arbiter_mode,
     )
