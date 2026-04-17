@@ -1,0 +1,62 @@
+# =============================================================================
+# Example: Maestro with Arbiter policy-engine routing (R-03).
+# =============================================================================
+#
+# Prerequisites:
+#   - Arbiter built:   cd ../arbiter && cargo build --release --bin arbiter-mcp
+#   - ARBITER_BIN, ARBITER_CONFIG, ARBITER_TREE exported in your environment.
+#
+# arbiter.mode:
+#   advisory       — user's agent_type is honored; arbiter provides the
+#                    learning signal and can HOLD/REJECT on invariant
+#                    breaches (budget, rate limit). RECOMMENDED for
+#                    initial adoption.
+#   authoritative  — arbiter's `chosen_agent` overrides the user's
+#                    declaration. Retries are gated on successful
+#                    report_outcome delivery; `abandon_outcome_after_s`
+#                    is the escape hatch if arbiter stays down.
+#
+# Usage:
+#   uv run maestro run examples/with-arbiter.yaml
+#
+# =============================================================================
+
+project: arbiter-demo
+repo: ~/projects/my-app
+max_concurrent: 3
+
+arbiter:
+  enabled: true
+  mode: advisory
+  optional: false                 # true → fall back to static if arbiter is missing
+  binary_path: ${ARBITER_BIN}
+  config_dir: ${ARBITER_CONFIG}
+  tree_path: ${ARBITER_TREE}
+  db_path: ./arbiter.db           # persists decision/outcome history
+  timeout_ms: 500
+  reconnect_interval_s: 60
+  abandon_outcome_after_s: 300    # authoritative-only escape hatch
+  log_level: warn
+
+tasks:
+  - id: fix-auth-bug
+    title: Fix token refresh race
+    prompt: |
+      The token refresh has a race when two calls land in the same second.
+      Fix it and add a regression test.
+    agent_type: auto              # arbiter picks the best agent
+    scope:
+      - "src/auth/*.py"
+      - "tests/test_auth*.py"
+    task_type: bugfix
+    language: python
+    complexity: moderate
+    timeout_minutes: 20
+
+  - id: add-docs
+    title: Document new retry policy
+    prompt: Write /docs/retry.md covering the new policy.
+    agent_type: claude_code       # explicit; advisory mode honors this choice
+    scope: ["docs/**/*.md"]
+    task_type: docs
+    complexity: trivial

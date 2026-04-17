@@ -1275,6 +1275,7 @@ async def create_scheduler_from_config(
     auto_commit: bool = False,
     routing: RoutingStrategy | None = None,
     arbiter_mode: ArbiterMode = ArbiterMode.ADVISORY,
+    arbiter_enabled: bool = False,
 ) -> Scheduler:
     """Create a scheduler from task configurations.
 
@@ -1321,7 +1322,9 @@ async def create_scheduler_from_config(
         task_config = task_map.get(task_id)
         if task_config is None:
             continue
-        task = Task.from_config(task_config, str(config.workdir))
+        task = Task.from_config(
+            task_config, str(config.workdir), arbiter_enabled=arbiter_enabled
+        )
         await db.create_task(task)
 
     return Scheduler(

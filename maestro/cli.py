@@ -434,6 +434,7 @@ async def _run_scheduler(
             auto_commit=(config.git.auto_commit if config.git else False),
             routing=routing,
             arbiter_mode=arbiter_mode,
+            arbiter_enabled=arbiter_cfg is not None and arbiter_cfg.enabled,
         )
         if arbiter_cfg is not None:
             scheduler._abandon_outcome_after_s = arbiter_cfg.abandon_outcome_after_s
