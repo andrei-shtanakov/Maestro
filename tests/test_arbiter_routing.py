@@ -282,3 +282,64 @@ class TestDegradedMode:
         await routing.route(_task(AgentType.CODEX))
         # Within reconnect window — no second call
         assert call_count["n"] == 1
+
+
+class TestReportOutcome:
+    @pytest.mark.anyio
+    async def test_sends_outcome_with_decision_id(self) -> None:
+        from maestro.models import TaskOutcome, TaskOutcomeStatus
+
+        fake = FakeArbiterClient()
+        await fake.start()
+        routing = ArbiterRouting(client=fake, cfg=_cfg())
+
+        task = _task(AgentType.CODEX).model_copy(
+            update={"arbiter_decision_id": "dec-100"}
+        )
+        outcome = TaskOutcome(
+            status=TaskOutcomeStatus.SUCCESS,
+            agent_used="codex_cli",
+            duration_min=3.2,
+            tokens_used=None,
+            cost_usd=None,
+            error_code=None,
+        )
+        await routing.report_outcome(task, outcome)
+
+        outcome_calls = [c for c in fake.calls if c.method == "report_outcome"]
+        assert len(outcome_calls) == 1
+        args = outcome_calls[0].arguments
+        assert args["status"] == "success"
+        assert args["agent_id"] == "codex_cli"
+        # decision_id passed as kwarg
+        assert args.get("decision_id") == "dec-100"
+        # None fields tolerated (arbiter contract)
+        assert args.get("tokens_used") is None
+
+    @pytest.mark.anyio
+    async def test_noop_when_no_decision_id(self) -> None:
+        from maestro.models import TaskOutcome, TaskOutcomeStatus
+
+        fake = FakeArbiterClient()
+        await fake.start()
+        routing = ArbiterRouting(client=fake, cfg=_cfg())
+
+        task = _task()  # no arbiter_decision_id
+        outcome = TaskOutcome(status=TaskOutcomeStatus.SUCCESS, agent_used="codex_cli")
+        await routing.report_outcome(task, outcome)
+        assert [c for c in fake.calls if c.method == "report_outcome"] == []
+
+    @pytest.mark.anyio
+    async def test_reraises_arbiter_unavailable(self) -> None:
+        from maestro.coordination.arbiter_errors import ArbiterUnavailable
+        from maestro.models import TaskOutcome, TaskOutcomeStatus
+
+        fake = FakeArbiterClient()
+        fake.outcome_raises = ArbiterUnavailable("pipe closed")
+        await fake.start()
+        routing = ArbiterRouting(client=fake, cfg=_cfg())
+
+        task = _task().model_copy(update={"arbiter_decision_id": "dec-x"})
+        outcome = TaskOutcome(status=TaskOutcomeStatus.FAILURE, agent_used="codex_cli")
+        with pytest.raises(ArbiterUnavailable):
+            await routing.report_outcome(task, outcome)

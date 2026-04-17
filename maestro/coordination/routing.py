@@ -13,7 +13,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from maestro.coordination.arbiter_errors import ArbiterUnavailable  # noqa: F401
+from maestro.coordination.arbiter_errors import ArbiterUnavailable
 from maestro.models import (
     AgentType,
     ArbiterConfig,
@@ -207,8 +207,27 @@ class ArbiterRouting:
         return decision
 
     async def report_outcome(self, task: Task, outcome: TaskOutcome) -> None:
-        # Implemented fully in Task 21.
-        raise NotImplementedError("implemented in Task 21")
+        if task.arbiter_decision_id is None:
+            return  # static-routed task; no correlation to report
+
+        timeout_s = self._cfg.timeout_ms / 1000.0
+        try:
+            await asyncio.wait_for(
+                self._client.report_outcome(
+                    task_id=task.id,
+                    agent_id=outcome.agent_used,
+                    status=outcome.status.value,
+                    decision_id=task.arbiter_decision_id,
+                    duration_min=outcome.duration_min,
+                    tokens_used=outcome.tokens_used,
+                    cost_usd=outcome.cost_usd,
+                    error_code=outcome.error_code,
+                ),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError as exc:
+            raise ArbiterUnavailable("report_outcome timeout", cause=exc) from exc
+        # ArbiterUnavailable from the client propagates as-is
 
     async def aclose(self) -> None:
         await self._client.stop()
