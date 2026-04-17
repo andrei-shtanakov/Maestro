@@ -22,7 +22,11 @@ from subprocess import Popen
 from typing import Protocol
 
 from maestro.coordination.arbiter_errors import ArbiterUnavailable
-from maestro.coordination.routing import RoutingStrategy, StaticRouting
+from maestro.coordination.routing import (
+    RoutingStrategy,
+    StaticRouting,
+    task_status_to_outcome_status,
+)
 from maestro.dag import DAG
 from maestro.database import Database
 from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
@@ -43,6 +47,8 @@ from maestro.validator import ValidationResult, Validator
 
 
 logger = logging.getLogger(__name__)
+
+MAX_REATTEMPTS_PER_TICK = 5
 
 StatusChangeCallback = Callable[[str, str, str], None]
 
@@ -219,6 +225,7 @@ class Scheduler:
         )
         self._arbiter_mode: ArbiterMode = arbiter_mode
         self._hold_throttle: HoldThrottle = HoldThrottle()
+        self._abandon_outcome_after_s: int = 300
 
         self._running_tasks: dict[str, RunningTask] = {}
         self._retry_ready_times: dict[str, datetime] = {}
@@ -356,6 +363,90 @@ class Scheduler:
             )
         return True
 
+    async def _outcome_reattempt_pass(self) -> None:
+        """R-03: Deliver deferred outcomes (bounded per tick).
+
+        Called once per main-loop iteration. In AUTHORITATIVE mode, also
+        force-unblocks FAILED tasks whose decision is older than
+        `_abandon_outcome_after_s` — their outcome is abandoned, the task
+        transitions to READY for retry, and an ARBITER_OUTCOME_ABANDONED
+        event is emitted.
+        """
+        pending = await self._db.get_tasks_with_pending_outcome()
+        now = datetime.now(UTC)
+        delivered_count = 0
+
+        for task in pending:
+            if delivered_count >= MAX_REATTEMPTS_PER_TICK:
+                break
+
+            outcome_status = task_status_to_outcome_status(task.status)
+            if outcome_status is None:
+                logger.error(
+                    "task %s has decision_id but unexpected status %s — skipping",
+                    task.id,
+                    task.status,
+                )
+                continue
+            if task.arbiter_decision_id is None:
+                # DB filter should prevent this, but narrow for the type checker.
+                continue
+
+            outcome = await self._build_outcome(task, exit_code=0)
+            outcome = outcome.model_copy(update={"status": outcome_status})
+            try:
+                await self._routing.report_outcome(task, outcome)
+            except ArbiterUnavailable:
+                # Arbiter is down this tick. For AUTHORITATIVE stuck-FAILED
+                # tasks past the abandon window, force-release.
+                if (
+                    self._arbiter_mode is ArbiterMode.AUTHORITATIVE
+                    and task.completed_at is not None
+                    and (now - task.completed_at).total_seconds()
+                    >= self._abandon_outcome_after_s
+                ):
+                    age_s = (now - task.completed_at).total_seconds()
+                    await self._db.mark_outcome_reported(
+                        task.id, now, task.arbiter_decision_id
+                    )
+                    self._emit_event(
+                        EventType.ARBITER_OUTCOME_ABANDONED,
+                        {
+                            "task_id": task.id,
+                            "decision_id": task.arbiter_decision_id,
+                            "age_s": age_s,
+                        },
+                    )
+                    released = await self._db.abandon_pending_outcome_and_release(
+                        task.id
+                    )
+                    if released and task.status is TaskStatus.FAILED:
+                        self._report_status_change(task.id, "failed", "ready")
+                # Arbiter is clearly down — stop for this tick.
+                break
+            else:
+                await self._db.mark_outcome_reported(
+                    task.id, now, task.arbiter_decision_id
+                )
+                self._emit_event(
+                    EventType.ARBITER_OUTCOME_REPORTED,
+                    {
+                        "task_id": task.id,
+                        "decision_id": task.arbiter_decision_id,
+                        "status": outcome_status.value,
+                    },
+                )
+                if (
+                    self._arbiter_mode is ArbiterMode.AUTHORITATIVE
+                    and task.status is TaskStatus.FAILED
+                ):
+                    ok = await self._db.reset_for_retry_atomic(
+                        task.id, task.arbiter_decision_id
+                    )
+                    if ok:
+                        self._report_status_change(task.id, "failed", "ready")
+                delivered_count += 1
+
     def _auto_commit_task(self, task: Task) -> None:
         """Auto-commit changes for a completed task."""
         if not self._config.auto_commit:
@@ -446,6 +537,9 @@ class Scheduler:
 
             # Monitor running processes
             await self._monitor_running_tasks()
+
+            # R-03: re-deliver any outcomes that couldn't reach arbiter earlier
+            await self._outcome_reattempt_pass()
 
             # Wait before next iteration
             with contextlib.suppress(TimeoutError):

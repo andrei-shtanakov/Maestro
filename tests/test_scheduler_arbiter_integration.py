@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC
 from unittest.mock import MagicMock
 
 import pytest
@@ -311,5 +312,116 @@ async def test_authoritative_retry_blocked_on_arbiter_down(tmp_path) -> None:
         assert refetched.status is TaskStatus.FAILED
         assert refetched.arbiter_decision_id == "dec-AUTH"
         assert refetched.arbiter_outcome_reported_at is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.anyio
+async def test_reattempt_pass_delivers_bounded_five_per_tick(tmp_path) -> None:
+    """With 10 dangling outcomes, a single pass delivers at most 5."""
+    fake = FakeArbiterClient()
+    fake.outcome_handler = lambda **_kw: {"recorded": True}
+    await fake.start()
+    routing = ArbiterRouting(
+        client=fake,
+        cfg=ArbiterConfig(
+            enabled=True,
+            binary_path="/fake",
+            config_dir="/fake",
+            tree_path="/fake",
+        ),
+    )
+
+    db = Database(tmp_path / "r.db")
+    await db.connect()
+    try:
+        for i in range(10):
+            t = Task(
+                id=f"t{i}",
+                title="T",
+                prompt="P",
+                workdir=str(tmp_path),
+                status=TaskStatus.DONE,
+                arbiter_decision_id=f"dec-{i}",
+                started_at=None,
+                completed_at=None,
+            )
+            await db.create_task(t)
+
+        scheduler = Scheduler(
+            db=db,
+            dag=DAG([]),
+            spawners={},
+            routing=routing,
+            arbiter_mode=ArbiterMode.ADVISORY,
+        )
+        await scheduler._outcome_reattempt_pass()
+
+        pending_after = await db.get_tasks_with_pending_outcome()
+        assert len(pending_after) == 5
+
+        outcome_calls = [c for c in fake.calls if c.method == "report_outcome"]
+        assert len(outcome_calls) == 5
+    finally:
+        await db.close()
+
+
+@pytest.mark.anyio
+async def test_authoritative_abandon_after_timeout(tmp_path) -> None:
+    """Authoritative + arbiter down + completed_at older than abandon window
+    → task force-unblocked, ABANDONED event emitted, FAILED → READY, audit
+    trail preserved via arbiter_outcome_reported_at."""
+    from datetime import datetime as _dt
+    from datetime import timedelta
+
+    from maestro.coordination.arbiter_errors import ArbiterUnavailable
+
+    fake = FakeArbiterClient()
+    fake.outcome_raises = ArbiterUnavailable("dead")
+    await fake.start()
+    routing = ArbiterRouting(
+        client=fake,
+        cfg=ArbiterConfig(
+            enabled=True,
+            mode=ArbiterMode.AUTHORITATIVE,
+            binary_path="/fake",
+            config_dir="/fake",
+            tree_path="/fake",
+            abandon_outcome_after_s=1,
+        ),
+    )
+
+    db = Database(tmp_path / "a.db")
+    await db.connect()
+    try:
+        past = _dt.now(UTC) - timedelta(seconds=10)
+        t = Task(
+            id="t1",
+            title="T",
+            prompt="P",
+            workdir=str(tmp_path),
+            status=TaskStatus.FAILED,
+            arbiter_decision_id="dec-abandon",
+            created_at=past,
+            started_at=past,
+            completed_at=past,
+        )
+        await db.create_task(t)
+
+        scheduler = Scheduler(
+            db=db,
+            dag=DAG([]),
+            spawners={},
+            routing=routing,
+            arbiter_mode=ArbiterMode.AUTHORITATIVE,
+        )
+        scheduler._abandon_outcome_after_s = 1
+
+        await scheduler._outcome_reattempt_pass()
+
+        refetched = await db.get_task("t1")
+        assert refetched.status is TaskStatus.READY
+        assert refetched.arbiter_outcome_reported_at is not None
+        assert refetched.arbiter_decision_id is None
     finally:
         await db.close()

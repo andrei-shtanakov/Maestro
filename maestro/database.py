@@ -810,6 +810,32 @@ class Database:
         await self._connection.commit()
         return cursor.rowcount > 0
 
+    async def abandon_pending_outcome_and_release(self, task_id: str) -> bool:
+        """R-03: Drop a stuck arbiter decision without touching reported_at.
+
+        Paired with `mark_outcome_reported` — caller first stamps
+        `arbiter_outcome_reported_at` as the abandon moment, then calls this
+        to clear routing fields and release FAILED → READY while keeping the
+        audit trail on `arbiter_outcome_reported_at` intact.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            """
+            UPDATE tasks
+            SET status = CASE WHEN status = 'failed' THEN 'ready' ELSE status END,
+                routed_agent_type = NULL,
+                arbiter_decision_id = NULL,
+                arbiter_route_reason = NULL
+            WHERE id = ?
+            """,
+            (task_id,),
+        )
+        await self._connection.commit()
+        return cursor.rowcount > 0
+
     async def get_tasks_with_pending_outcome(self) -> list[Task]:
         """R-03: Tasks that have a routing decision but no outcome delivered yet.
 
