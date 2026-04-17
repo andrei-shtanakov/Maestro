@@ -145,7 +145,10 @@ class ArbiterRouting:
         self._last_reconnect_attempt: datetime | None = None
 
     async def route(self, task: Task) -> RouteDecision:
-        # Happy path only for this task; degraded path comes in Task 20.
+        # Degraded-mode short-circuit: don't hammer a known-dead subprocess.
+        if self._is_in_degraded_window():
+            return await self._fallback_route(task, reason_for_auto="arbiter_degraded")
+
         payload = _task_to_arbiter_payload(task)
         timeout_s = self._cfg.timeout_ms / 1000.0
         try:
@@ -160,6 +163,12 @@ class ArbiterRouting:
                 chosen_agent=None,
                 decision_id=None,
                 reason="timeout",
+            )
+        except ArbiterUnavailable as exc:
+            logger.warning("arbiter unavailable for task %s: %s", task.id, exc)
+            self._enter_degraded(exc)
+            return await self._fallback_route(
+                task, reason_for_auto="arbiter_unavailable_no_default_for_auto"
             )
         action_str = raw.get("action", "")
         try:
@@ -203,3 +212,26 @@ class ArbiterRouting:
 
     async def aclose(self) -> None:
         await self._client.stop()
+
+    def _is_in_degraded_window(self) -> bool:
+        if self._degraded_since is None:
+            return False
+        if self._last_reconnect_attempt is None:
+            return True
+        elapsed = (datetime.now(UTC) - self._last_reconnect_attempt).total_seconds()
+        return elapsed < self._cfg.reconnect_interval_s
+
+    def _enter_degraded(self, exc: ArbiterUnavailable) -> None:
+        if self._degraded_since is None:
+            self._degraded_since = datetime.now(UTC)
+        self._last_reconnect_attempt = datetime.now(UTC)
+
+    async def _fallback_route(self, task: Task, reason_for_auto: str) -> RouteDecision:
+        if task.agent_type is AgentType.AUTO:
+            return RouteDecision(
+                action=RouteAction.HOLD,
+                chosen_agent=None,
+                decision_id=None,
+                reason=reason_for_auto,
+            )
+        return await self._fallback.route(task)

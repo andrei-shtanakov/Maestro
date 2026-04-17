@@ -221,3 +221,64 @@ class TestTimeoutMapping:
         d = await routing.route(_task())
         assert d.action is RouteAction.HOLD
         assert d.reason == "timeout"
+
+
+class TestDegradedMode:
+    @pytest.mark.anyio
+    async def test_unavailable_falls_back_to_static_for_explicit_task(self) -> None:
+        from maestro.coordination.arbiter_errors import ArbiterUnavailable
+
+        fake = FakeArbiterClient()
+        fake.route_handler = lambda *a, **kw: (_ for _ in ()).throw(
+            ArbiterUnavailable("pipe closed")
+        )
+        await fake.start()
+        routing = ArbiterRouting(client=fake, cfg=_cfg())
+
+        d = await routing.route(_task(AgentType.CODEX))
+        assert d.action is RouteAction.ASSIGN
+        assert d.chosen_agent == "codex_cli"  # static fallback returns declared
+        assert d.decision_id is None
+        assert d.reason == "static"
+
+    @pytest.mark.anyio
+    async def test_unavailable_holds_auto_task(self) -> None:
+        """AUTO + arbiter down → HOLD with specific reason, not spawner misfire."""
+        from maestro.coordination.arbiter_errors import ArbiterUnavailable
+
+        fake = FakeArbiterClient()
+        fake.route_handler = lambda *a, **kw: (_ for _ in ()).throw(
+            ArbiterUnavailable("dead")
+        )
+        await fake.start()
+        routing = ArbiterRouting(client=fake, cfg=_cfg())
+
+        d = await routing.route(_task(AgentType.AUTO))
+        assert d.action is RouteAction.HOLD
+        assert d.reason == "arbiter_unavailable_no_default_for_auto"
+        assert d.chosen_agent is None
+
+    @pytest.mark.anyio
+    async def test_degraded_window_skips_call_for_reconnect_interval(self) -> None:
+        """Once degraded, we don't hammer the subprocess every tick."""
+        from maestro.coordination.arbiter_errors import ArbiterUnavailable
+
+        fake = FakeArbiterClient()
+        call_count = {"n": 0}
+
+        def handler(tid: str, t: dict, c: dict | None) -> dict:
+            call_count["n"] += 1
+            raise ArbiterUnavailable("dead")
+
+        fake.route_handler = handler
+        await fake.start()
+        cfg = _cfg()
+        # Big reconnect window; two calls back-to-back should only call once
+        cfg = cfg.model_copy(update={"reconnect_interval_s": 3600})
+        routing = ArbiterRouting(client=fake, cfg=cfg)
+
+        await routing.route(_task(AgentType.CODEX))
+        assert call_count["n"] == 1
+        await routing.route(_task(AgentType.CODEX))
+        # Within reconnect window — no second call
+        assert call_count["n"] == 1
