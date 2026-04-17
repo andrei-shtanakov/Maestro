@@ -4,23 +4,30 @@ Scheduler calls `route(task)` before spawning to get a chosen agent,
 and `report_outcome(task, outcome)` in terminal handlers to close the
 learning loop. StaticRouting is the zero-config OSS default and the
 fallback delegate inside ArbiterRouting.
-
-ArbiterRouting is added in a later task; this file currently exposes
-only the protocol and StaticRouting so lower-level tests can run.
 """
 
 from __future__ import annotations
 
-from typing import Protocol
+import asyncio
+import logging
+from datetime import UTC, datetime
+from typing import Any, Protocol
 
+from maestro.coordination.arbiter_errors import ArbiterUnavailable  # noqa: F401
 from maestro.models import (
+    ArbiterConfig,
+    ArbiterMode,  # noqa: F401
+    Priority,
     RouteAction,
     RouteDecision,
     Task,
     TaskOutcome,
     TaskOutcomeStatus,
     TaskStatus,
+    priority_int_to_enum,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class RoutingStrategy(Protocol):
@@ -97,3 +104,79 @@ def task_status_to_outcome_status(
     invariant violations.
     """
     return _STATUS_MAP.get(status)
+
+
+def _task_to_arbiter_payload(task: Task) -> dict[str, Any]:
+    """Build the `task` dict that route_task expects.
+
+    Uses the R-02 arbiter fields already present on Task (task_type,
+    language, complexity, priority-as-int → enum).
+    """
+    priority_enum: Priority = priority_int_to_enum(task.priority)
+    return {
+        "type": task.task_type.value,
+        "language": task.language.value,
+        "complexity": task.complexity.value,
+        "priority": priority_enum.value,
+    }
+
+
+def _extract_decision_id(raw: dict[str, Any]) -> str | None:
+    """Arbiter returns decision_id in metadata per its DTO spec."""
+    meta = raw.get("metadata") or {}
+    return meta.get("decision_id") if isinstance(meta, dict) else None
+
+
+class ArbiterRouting:
+    """Routing strategy backed by a running arbiter subprocess.
+
+    Owns one long-lived client for the scheduler's lifetime. Falls back to
+    StaticRouting on ArbiterUnavailable (except for AUTO tasks, which HOLD).
+    Advisory-vs-authoritative semantics are applied inside `route()` so
+    scheduler code stays mode-agnostic.
+    """
+
+    def __init__(self, client: Any, cfg: ArbiterConfig) -> None:
+        self._client = client
+        self._cfg = cfg
+        self._fallback: StaticRouting = StaticRouting()
+        self._degraded_since: datetime | None = None
+        self._last_reconnect_attempt: datetime | None = None
+
+    async def route(self, task: Task) -> RouteDecision:
+        # Happy path only for this task; degraded path comes in Task 20.
+        payload = _task_to_arbiter_payload(task)
+        timeout_s = self._cfg.timeout_ms / 1000.0
+        raw = await asyncio.wait_for(
+            self._client.route_task(task.id, payload),
+            timeout=timeout_s,
+        )
+        action_str = raw.get("action", "")
+        try:
+            action = RouteAction(action_str)
+        except ValueError:
+            logger.warning("unknown arbiter action %r, treating as HOLD", action_str)
+            return RouteDecision(
+                action=RouteAction.HOLD,
+                chosen_agent=None,
+                decision_id=_extract_decision_id(raw),
+                reason=f"unknown_action:{action_str}",
+            )
+
+        chosen = raw.get("chosen_agent") or None
+        reason = raw.get("reasoning") or ""
+        decision_id = _extract_decision_id(raw)
+
+        return RouteDecision(
+            action=action,
+            chosen_agent=chosen,
+            decision_id=decision_id,
+            reason=reason or "dt_inference",
+        )
+
+    async def report_outcome(self, task: Task, outcome: TaskOutcome) -> None:
+        # Implemented fully in Task 21.
+        raise NotImplementedError("implemented in Task 21")
+
+    async def aclose(self) -> None:
+        await self._client.stop()
