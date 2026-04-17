@@ -210,6 +210,8 @@ class ArbiterConfig(BaseModel):
     zero-config StaticRouting path; no arbiter subprocess ever started.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     enabled: bool = False
     mode: ArbiterMode = ArbiterMode.ADVISORY
     optional: bool = False
@@ -1270,6 +1272,10 @@ class OrchestratorConfig(BaseModel):
     )
     notifications: NotificationConfig | None = Field(
         default=None, description="Notification configuration"
+    )
+    arbiter: ArbiterConfig | None = Field(
+        default=None,
+        description="Arbiter MCP integration config; None keeps static routing.",
     )
 
     @field_validator("repo_path")
