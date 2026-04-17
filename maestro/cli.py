@@ -37,7 +37,7 @@ from maestro import (
     load_config,
 )
 from maestro.config import load_orchestrator_config
-from maestro.coordination.routing import make_routing_strategy
+from maestro.coordination.routing import RoutingStrategy, make_routing_strategy
 from maestro.dag import DAG
 from maestro.decomposer import ProjectDecomposer
 from maestro.git import GitManager
@@ -326,11 +326,14 @@ async def _run_scheduler(
 
     # R-03: pick routing strategy. StaticRouting if cfg.arbiter is None or
     # disabled; ArbiterRouting (with its subprocess) when enabled.
+    # Build inside try/finally so db.close() and lock release always run even
+    # if arbiter startup raises (e.g. ArbiterStartupError with optional=false).
     arbiter_cfg = config.arbiter
-    routing = await make_routing_strategy(arbiter_cfg)
     arbiter_mode = arbiter_cfg.mode if arbiter_cfg is not None else ArbiterMode.ADVISORY
+    routing: RoutingStrategy | None = None
 
     try:
+        routing = await make_routing_strategy(arbiter_cfg)
         # Check if resuming
         if resume:
             existing_tasks = await db.get_all_tasks()
@@ -487,7 +490,8 @@ async def _run_scheduler(
         console.print("\n[green]All tasks completed successfully![/green]")
 
     finally:
-        await routing.aclose()
+        if routing is not None:
+            await routing.aclose()
         await db.close()
         if lock_fd is not None:
             _release_pid_lock(lock_fd)

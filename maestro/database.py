@@ -1841,6 +1841,6 @@ async def create_database(db_path: str | Path) -> Database:
         Connected and initialized Database instance.
     """
     db = Database(db_path)
+    # Database.connect() auto-runs initialize_schema(); no separate call needed.
     await db.connect()
-    await db.initialize_schema()
     return db

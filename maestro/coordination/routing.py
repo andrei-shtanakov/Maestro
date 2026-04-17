@@ -287,11 +287,23 @@ async def make_routing_strategy(
     client = ArbiterClient(client_cfg)
     try:
         await client.start()
-    except ArbiterStartupError:
+    except (ArbiterStartupError, ArbiterUnavailable):
+        # ArbiterClient.start() can raise either: ArbiterStartupError for
+        # spawn/version-check failures, ArbiterUnavailable for handshake
+        # transport errors. Both should honor optional=true.
         if cfg.optional:
             logger.warning(
                 "arbiter startup failed and optional=true — falling back to static"
             )
+            # Best-effort shutdown: a partially-started subprocess would
+            # otherwise leak into the caller's process tree.
+            try:
+                await client.stop()
+            except Exception:
+                logger.warning(
+                    "failed to stop arbiter client after startup failure",
+                    exc_info=True,
+                )
             return StaticRouting()
         raise
     return ArbiterRouting(client=client, cfg=cfg)

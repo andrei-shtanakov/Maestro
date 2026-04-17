@@ -295,8 +295,21 @@ class Scheduler:
             Event(event_type=event_type, task_id=task_id_str, details=details)
         )
 
-    async def _build_outcome(self, task: Task, exit_code: int) -> TaskOutcome:
-        """Build a TaskOutcome from a terminal Task for arbiter report_outcome."""
+    async def _build_outcome(
+        self,
+        task: Task,
+        exit_code: int,
+        attempt: int | None = None,
+    ) -> TaskOutcome:
+        """Build a TaskOutcome from a terminal Task for arbiter report_outcome.
+
+        `attempt` is the 1-based attempt number for the run being reported. It
+        must be passed explicitly when the caller already mutated
+        `task.retry_count` (e.g. the failure path increments the counter
+        before building the outcome). When omitted it falls back to
+        `task.retry_count + 1`, which is correct for the success path where
+        `retry_count` has not been touched on the final attempt.
+        """
         duration_min: float | None = None
         if task.started_at and task.completed_at:
             duration_min = (task.completed_at - task.started_at).total_seconds() / 60.0
@@ -304,7 +317,8 @@ class Scheduler:
         tokens_used: int | None = None
         cost_usd: float | None = None
         rows = await self._db.get_task_costs(task.id)
-        attempt = task.retry_count + 1
+        if attempt is None:
+            attempt = task.retry_count + 1
         matching = [r for r in rows if r.attempt == attempt]
         if matching:
             tokens_used = sum(r.input_tokens + r.output_tokens for r in matching)
@@ -336,9 +350,14 @@ class Scheduler:
     async def _try_report_outcome(self, task: Task, outcome: TaskOutcome) -> bool:
         """Deliver an outcome via the routing strategy.
 
-        Returns True if delivery succeeded or the task is static-routed
-        (no decision_id to report). Returns False when the arbiter is
-        unavailable, which is the signal callers use for retry gating.
+        Returns True when the full round-trip succeeds: the routing strategy
+        accepted the outcome AND `mark_outcome_reported` committed the
+        `reported_at` stamp under its decision_id guard. Returns False on
+        `ArbiterUnavailable` (arbiter is down) OR on a decision_id guard
+        miss — in that case the local state no longer matches the decision
+        the caller intended to report, so callers must treat the attempt as
+        non-delivered and skip the decision_id guard on any subsequent
+        `reset_for_retry_atomic`.
         """
         if task.arbiter_decision_id is None:
             return True
@@ -352,15 +371,22 @@ class Scheduler:
         ok = await self._db.mark_outcome_reported(
             task.id, datetime.now(UTC), task.arbiter_decision_id
         )
-        if ok:
-            self._emit_event(
-                EventType.ARBITER_OUTCOME_REPORTED,
-                {
-                    "task_id": task.id,
-                    "decision_id": task.arbiter_decision_id,
-                    "status": outcome.status.value,
-                },
+        if not ok:
+            logger.warning(
+                "mark_outcome_reported guard miss for task %s (decision_id=%s) — "
+                "treating as non-delivery",
+                task.id,
+                task.arbiter_decision_id,
             )
+            return False
+        self._emit_event(
+            EventType.ARBITER_OUTCOME_REPORTED,
+            {
+                "task_id": task.id,
+                "decision_id": task.arbiter_decision_id,
+                "status": outcome.status.value,
+            },
+        )
         return True
 
     async def _outcome_reattempt_pass(self) -> None:
@@ -392,7 +418,14 @@ class Scheduler:
                 # DB filter should prevent this, but narrow for the type checker.
                 continue
 
-            outcome = await self._build_outcome(task, exit_code=0)
+            # FAILED rows already had retry_count bumped at failure; the
+            # attempt being reported is `retry_count`, not `retry_count + 1`.
+            attempt = (
+                task.retry_count
+                if task.status is TaskStatus.FAILED
+                else task.retry_count + 1
+            )
+            outcome = await self._build_outcome(task, exit_code=0, attempt=attempt)
             outcome = outcome.model_copy(update={"status": outcome_status})
             try:
                 await self._routing.report_outcome(task, outcome)
@@ -1066,7 +1099,11 @@ class Scheduler:
             self._report_status_change(task_id, "running", "failed")
 
             # R-03: deliver outcome (best-effort). Mode decides retry gating.
-            outcome = await self._build_outcome(failed_task, exit_code=1)
+            # `attempt` is the run that just finished, before the counter bump
+            # above would have made it off-by-one for cost lookup.
+            outcome = await self._build_outcome(
+                failed_task, exit_code=1, attempt=current_task.retry_count + 1
+            )
             delivered = await self._try_report_outcome(failed_task, outcome)
 
             if self._arbiter_mode is ArbiterMode.ADVISORY or delivered:
