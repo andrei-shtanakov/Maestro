@@ -28,6 +28,7 @@ from maestro.models import (
     priority_int_to_enum,
 )
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -156,7 +157,7 @@ class ArbiterRouting:
                 self._client.route_task(task.id, payload),
                 timeout=timeout_s,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("arbiter route_task timeout for task %s", task.id)
             return RouteDecision(
                 action=RouteAction.HOLD,
@@ -225,7 +226,7 @@ class ArbiterRouting:
                 ),
                 timeout=timeout_s,
             )
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise ArbiterUnavailable("report_outcome timeout", cause=exc) from exc
         # ArbiterUnavailable from the client propagates as-is
 
@@ -240,7 +241,7 @@ class ArbiterRouting:
         elapsed = (datetime.now(UTC) - self._last_reconnect_attempt).total_seconds()
         return elapsed < self._cfg.reconnect_interval_s
 
-    def _enter_degraded(self, exc: ArbiterUnavailable) -> None:
+    def _enter_degraded(self, exc: ArbiterUnavailable) -> None:  # noqa: ARG002
         if self._degraded_since is None:
             self._degraded_since = datetime.now(UTC)
         self._last_reconnect_attempt = datetime.now(UTC)
@@ -254,3 +255,43 @@ class ArbiterRouting:
                 reason=reason_for_auto,
             )
         return await self._fallback.route(task)
+
+
+async def make_routing_strategy(
+    cfg: ArbiterConfig | None,
+) -> RoutingStrategy:
+    """Factory used by CLI / scheduler to pick a RoutingStrategy.
+
+    Enforces fail-fast semantics of ArbiterConfig.optional:
+    - enabled=false or cfg=None → StaticRouting.
+    - enabled=true: start arbiter subprocess, handshake, version-check.
+      Any failure → ArbiterStartupError unless cfg.optional=true (then warn
+      and degrade to StaticRouting).
+    """
+    if cfg is None or not cfg.enabled:
+        return StaticRouting()
+
+    from maestro.coordination.arbiter_client import (
+        ArbiterClient,
+        ArbiterClientConfig,
+    )
+    from maestro.coordination.arbiter_errors import ArbiterStartupError
+
+    client_cfg = ArbiterClientConfig(
+        binary_path=cfg.binary_path or "",
+        tree_path=cfg.tree_path or "",
+        config_dir=cfg.config_dir or "",
+        db_path=cfg.db_path,
+        log_level=cfg.log_level,
+    )
+    client = ArbiterClient(client_cfg)
+    try:
+        await client.start()
+    except ArbiterStartupError:
+        if cfg.optional:
+            logger.warning(
+                "arbiter startup failed and optional=true — falling back to static"
+            )
+            return StaticRouting()
+        raise
+    return ArbiterRouting(client=client, cfg=cfg)
