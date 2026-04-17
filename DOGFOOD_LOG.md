@@ -183,3 +183,24 @@ Each entry:
 - **Expected**: This is the target state; log it so a regression is noticed.
 - **Workaround**: n/a.
 - **Reflection**: Pyrefly still reports 31 pre-existing suppressed warnings; consider surfacing a small `pyrefly diff` as a CI informational step so the number is visible, not just absent.
+
+### 18. CLI hardcodes only `claude_code` spawner; `announce`/`codex_cli`/`aider` configs broke at spawn time
+- **Date**: 2026-04-17
+- **Severity**: HIGH
+- **Mode**: Mode 1 (Scheduler)
+- **Backlog ref**: discovered by real-arbiter smoke (issue #9 in andrei-shtanakov/arbiter)
+- **Description**: `_run_scheduler` in `maestro/cli.py` built `spawners = {"claude_code": ClaudeCodeSpawner()}` only. `AnnounceSpawner`, `CodexSpawner`, `AiderSpawner` classes exist and are re-exported from `maestro.spawners`, but nothing imported or registered them in the CLI path. Any YAML with `agent_type: announce` (including `examples/hello.yaml` and the just-shipped `examples/with-arbiter.yaml`) or any arbiter policy that picked one of the four built-ins blew up at `_spawn_task` with `SchedulerError: No spawner available for agent type '<x>'` after the arbiter had already persisted a valid routing decision.
+- **Expected**: All four built-in spawners registered by default so published examples work. Any non-built-in is a follow-up plugin problem.
+- **Workaround**: None — ran into it on the very first real smoke.
+- **FIXED**: 2026-04-17 — commit `3e7444b`. CLI imports + registers `AnnounceSpawner`, `CodexSpawner`, `AiderSpawner` alongside `ClaudeCodeSpawner`.
+- **Reflection**: README table listed `announce` as a supported agent since v0.1.0. Config parsing accepted it. Spawner lookup failed at runtime. v0.3.0 candidate: smoke test per example YAML that runs end-to-end (at least through `_spawn_task`) — catches this class of "documented but broken" immediately.
+
+### 19. Real-arbiter smoke uncovered missing `metadata.decision_id` in `route_task` response
+- **Date**: 2026-04-17
+- **Severity**: HIGH
+- **Mode**: Mode 1 (Scheduler) + R-03 integration
+- **Backlog ref**: andrei-shtanakov/arbiter#9, blocks R-05 and Maestro PR #13 Task 32 acceptance scenarios 1-3
+- **Description**: First real run of R-03 against the arbiter-mcp macos-arm64 binary (commit `7e6de56`). Arbiter ASSIGN'd the task and persisted `decisions.id = 1` in its own SQLite, but Maestro stored `arbiter_decision_id = NULL`. Root cause: the vendored `arbiter_client.py` and `routing._extract_decision_id` expect `metadata.decision_id` in the response; real arbiter doesn't populate it. `FakeArbiterClient` always does, which is why 1118 tests pass. Without the id, `_try_report_outcome` treats the decision as static-routed, the decision-id guard on `reset_for_retry_atomic` never fires, and the whole authoritative retry / abandon flow becomes unobservable in real runs.
+- **Expected**: Every ASSIGN / REJECT / FALLBACK response from arbiter carries `metadata.decision_id` matching the row id in its `decisions` table, and `report_outcome` accepts that id back for correlation.
+- **Workaround**: None on Maestro's side — it's an upstream protocol gap. Tracked as andrei-shtanakov/arbiter#9.
+- **Reflection**: FakeArbiterClient mirrored a *contract assumption*, not a *real binary observation*. v0.3.0 prep should add a small contract test that loads a real arbiter subprocess (or a golden JSON capture from one) and validates the response shape Maestro's client expects. R-05 blocked on arbiter#9 + arbiter#8 (release-attached binaries).
