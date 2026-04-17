@@ -44,6 +44,8 @@ from maestro.git import GitManager
 from maestro.models import ArbiterMode, OrchestratorConfig, TaskStatus, ZadachaStatus
 from maestro.orchestrator import Orchestrator
 from maestro.pr_manager import PRManager
+from maestro.spawners import AiderSpawner, AnnounceSpawner, CodexSpawner
+from maestro.spawners.base import AgentSpawner  # noqa: TC001 — runtime use
 from maestro.workspace import WorkspaceManager
 
 
@@ -364,9 +366,15 @@ async def _run_scheduler(
                     "[yellow]No existing tasks found, starting fresh[/yellow]"
                 )
 
-        # Setup spawners
-        spawners: dict[str, ClaudeCodeSpawner] = {
+        # Setup spawners — all four built-ins so YAML configs with
+        # agent_type: codex_cli / aider / announce work out of the box,
+        # matching what examples/hello.yaml, examples/tasks.yaml, and
+        # the arbiter policy tree's agent set expect.
+        spawners: dict[str, AgentSpawner] = {
             "claude_code": ClaudeCodeSpawner(),
+            "codex_cli": CodexSpawner(),
+            "aider": AiderSpawner(),
+            "announce": AnnounceSpawner(),
         }
 
         # Determine log directory
@@ -428,7 +436,7 @@ async def _run_scheduler(
         scheduler = await create_scheduler_from_config(
             db=db,
             tasks=config.tasks,
-            spawners=spawners,  # type: ignore[arg-type]
+            spawners=spawners,  # type: ignore[arg-type]  # variance of invariant dict
             max_concurrent=config.max_concurrent,
             workdir=workdir,
             log_dir=log_dir,
