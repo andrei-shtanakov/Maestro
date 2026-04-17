@@ -21,6 +21,7 @@ from pathlib import Path
 from subprocess import Popen
 from typing import Protocol
 
+from maestro.coordination.arbiter_errors import ArbiterUnavailable
 from maestro.coordination.routing import RoutingStrategy, StaticRouting
 from maestro.dag import DAG
 from maestro.database import Database
@@ -31,6 +32,8 @@ from maestro.models import (
     RouteAction,
     Task,
     TaskConfig,
+    TaskOutcome,
+    TaskOutcomeStatus,
     TaskStatus,
 )
 from maestro.notifications.base import Notification, NotificationEvent
@@ -284,6 +287,74 @@ class Scheduler:
         event_logger.log(
             Event(event_type=event_type, task_id=task_id_str, details=details)
         )
+
+    async def _build_outcome(self, task: Task, exit_code: int) -> TaskOutcome:
+        """Build a TaskOutcome from a terminal Task for arbiter report_outcome."""
+        duration_min: float | None = None
+        if task.started_at and task.completed_at:
+            duration_min = (task.completed_at - task.started_at).total_seconds() / 60.0
+
+        tokens_used: int | None = None
+        cost_usd: float | None = None
+        rows = await self._db.get_task_costs(task.id)
+        attempt = task.retry_count + 1
+        matching = [r for r in rows if r.attempt == attempt]
+        if matching:
+            tokens_used = sum(r.input_tokens + r.output_tokens for r in matching)
+            cost_usd = sum(r.estimated_cost_usd for r in matching)
+
+        error_code: str | None = None
+        if task.error_message:
+            lines = task.error_message.splitlines()
+            first_line = lines[0] if lines else task.error_message
+            error_code = first_line[:200]
+
+        msg_lower = (task.error_message or "").lower()
+        if exit_code == 0:
+            status = TaskOutcomeStatus.SUCCESS
+        elif "timeout" in msg_lower or "timed out" in msg_lower:
+            status = TaskOutcomeStatus.TIMEOUT
+        else:
+            status = TaskOutcomeStatus.FAILURE
+
+        return TaskOutcome(
+            status=status,
+            agent_used=task.routed_agent_type or task.agent_type.value,
+            duration_min=duration_min,
+            tokens_used=tokens_used,
+            cost_usd=cost_usd,
+            error_code=error_code,
+        )
+
+    async def _try_report_outcome(self, task: Task, outcome: TaskOutcome) -> bool:
+        """Deliver an outcome via the routing strategy.
+
+        Returns True if delivery succeeded or the task is static-routed
+        (no decision_id to report). Returns False when the arbiter is
+        unavailable, which is the signal callers use for retry gating.
+        """
+        if task.arbiter_decision_id is None:
+            return True
+        try:
+            await self._routing.report_outcome(task, outcome)
+        except ArbiterUnavailable:
+            logger.info(
+                "outcome delivery deferred (arbiter unavailable) for %s", task.id
+            )
+            return False
+        ok = await self._db.mark_outcome_reported(
+            task.id, datetime.now(UTC), task.arbiter_decision_id
+        )
+        if ok:
+            self._emit_event(
+                EventType.ARBITER_OUTCOME_REPORTED,
+                {
+                    "task_id": task.id,
+                    "decision_id": task.arbiter_decision_id,
+                    "status": outcome.status.value,
+                },
+            )
+        return True
 
     def _auto_commit_task(self, task: Task) -> None:
         """Auto-commit changes for a completed task."""
@@ -743,7 +814,7 @@ class Scheduler:
                 # Run validation with the Validator class
                 validation_result = await self._run_validation(task)
                 if validation_result.success:
-                    await self._db.update_task_status(
+                    done_task = await self._db.update_task_status(
                         task_id,
                         TaskStatus.DONE,
                         expected_status=TaskStatus.VALIDATING,
@@ -752,6 +823,8 @@ class Scheduler:
                     self._report_status_change(task_id, "validating", "done")
                     await self._notify(task, NotificationEvent.TASK_COMPLETED)
                     self._auto_commit_task(task)
+                    outcome = await self._build_outcome(done_task, exit_code=0)
+                    await self._try_report_outcome(done_task, outcome)
                 else:
                     # Include validation output in error for retry context
                     error_msg = self._format_validation_error(validation_result)
@@ -760,7 +833,7 @@ class Scheduler:
                     )
             else:
                 # No validation - mark as done
-                await self._db.update_task_status(
+                done_task = await self._db.update_task_status(
                     task_id,
                     TaskStatus.DONE,
                     expected_status=TaskStatus.RUNNING,
@@ -769,6 +842,8 @@ class Scheduler:
                 self._report_status_change(task_id, "running", "done")
                 await self._notify(task, NotificationEvent.TASK_COMPLETED)
                 self._auto_commit_task(task)
+                outcome = await self._build_outcome(done_task, exit_code=0)
+                await self._try_report_outcome(done_task, outcome)
         else:
             # Process failed
             error_msg = f"Process exited with code {return_code}"
@@ -880,7 +955,7 @@ class Scheduler:
         current_task = await self._db.get_task(task_id)
 
         if self._retry_manager.should_retry(current_task):
-            # Increment retry count and set back to READY
+            # Increment retry count and transition to FAILED.
             new_retry_count = current_task.retry_count + 1
             logging.info(
                 "Scheduling retry %d/%d for task %s",
@@ -888,20 +963,36 @@ class Scheduler:
                 current_task.max_retries,
                 task_id,
             )
-            await self._db.update_task_status(
+            failed_task = await self._db.update_task_status(
                 task_id,
                 TaskStatus.FAILED,
                 error_message=error_message,
                 retry_count=new_retry_count,
             )
             self._report_status_change(task_id, "running", "failed")
-            # Transition back to READY for retry
-            await self._db.update_task_status(
-                task_id,
-                TaskStatus.READY,
-                expected_status=TaskStatus.FAILED,
-            )
-            self._report_status_change(task_id, "failed", "ready")
+
+            # R-03: deliver outcome (best-effort). Mode decides retry gating.
+            outcome = await self._build_outcome(failed_task, exit_code=1)
+            delivered = await self._try_report_outcome(failed_task, outcome)
+
+            if self._arbiter_mode is ArbiterMode.ADVISORY or delivered:
+                guard_id = failed_task.arbiter_decision_id if delivered else None
+                ok = await self._db.reset_for_retry_atomic(
+                    task_id, decision_id=guard_id
+                )
+                if ok:
+                    self._report_status_change(task_id, "failed", "ready")
+                else:
+                    self._emit_event(
+                        EventType.ARBITER_RETRY_RESET_SKIPPED,
+                        {
+                            "task_id": task_id,
+                            "expected_decision_id": (failed_task.arbiter_decision_id),
+                        },
+                    )
+            # else: authoritative + not delivered — stay FAILED; the
+            # re-attempt pass (Task 28) will drive the outcome through
+            # before retrying.
         else:
             # No more retries - needs review
             logging.warning(
@@ -909,12 +1000,14 @@ class Scheduler:
                 task_id,
                 current_task.max_retries,
             )
-            await self._db.update_task_status(
+            failed_task = await self._db.update_task_status(
                 task_id,
                 TaskStatus.FAILED,
                 error_message=error_message,
             )
             self._report_status_change(task_id, "running", "failed")
+            outcome = await self._build_outcome(failed_task, exit_code=1)
+            await self._try_report_outcome(failed_task, outcome)
             await self._db.update_task_status(
                 task_id,
                 TaskStatus.NEEDS_REVIEW,
