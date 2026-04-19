@@ -102,6 +102,9 @@ filterwarnings = [
     "ignore:Exception ignored in.*socket.socket:pytest.PytestUnraisableExceptionWarning",
     # Ignore unclosed event loop warnings that occur during pytest cleanup
     "ignore:Exception ignored in.*BaseEventLoop:pytest.PytestUnraisableExceptionWarning",
+    # Ignore unclosed file warnings from structlog WriteLoggerFactory (obs init_logging)
+    "ignore:Exception ignored in.*maestro.*\\.jsonl:pytest.PytestUnraisableExceptionWarning",
+    "ignore:Exception ignored in.*logs.*\\.jsonl:pytest.PytestUnraisableExceptionWarning",
 ]
 
 # Coverage configuration

@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from maestro._vendor.obs import child_env, span
 from maestro.database import Database
 from maestro.decomposer import ProjectDecomposer
 from maestro.models import (
@@ -357,12 +358,14 @@ class Orchestrator:
 
         log_fd = os.open(str(log_file), os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
         try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=workspace,
-                stdout=log_fd,
-                stderr=asyncio.subprocess.STDOUT,
-            )
+            with span("task.execute", task_id=zadacha_id):
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    cwd=workspace,
+                    env={**os.environ, **child_env()},
+                    stdout=log_fd,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
         except Exception:
             os.close(log_fd)
             raise
@@ -404,18 +407,21 @@ class Orchestrator:
         This ensures spec-runner subtask branches inherit
         the generated tasks.md when they branch off.
         """
-        subprocess.run(
-            ["git", "add", "spec/", "spec-runner.config.yaml"],
-            cwd=workspace,
-            capture_output=True,
-            check=False,
-        )
-        subprocess.run(
-            ["git", "commit", "-m", f"maestro: add spec for {zadacha_id}"],
-            cwd=workspace,
-            capture_output=True,
-            check=False,
-        )
+        with span("task.execute", task_id=zadacha_id):
+            subprocess.run(
+                ["git", "add", "spec/", "spec-runner.config.yaml"],
+                cwd=workspace,
+                env={**os.environ, **child_env()},
+                capture_output=True,
+                check=False,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", f"maestro: add spec for {zadacha_id}"],
+                cwd=workspace,
+                env={**os.environ, **child_env()},
+                capture_output=True,
+                check=False,
+            )
 
     def _merge_into_base(self, feature_branch: str) -> None:
         """Merge feature branch into base branch in the main repo.
@@ -427,13 +433,15 @@ class Orchestrator:
         repo = Path(self._config.repo_path).expanduser()
         base = self._config.base_branch
 
-        result = subprocess.run(
-            ["git", "merge", feature_branch, "--no-edit"],
-            cwd=repo,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        with span("task.execute", task_id=feature_branch):
+            result = subprocess.run(
+                ["git", "merge", feature_branch, "--no-edit"],
+                cwd=repo,
+                env={**os.environ, **child_env()},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
 
         if result.returncode == 0:
             self._logger.info(

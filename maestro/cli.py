@@ -36,6 +36,7 @@ from maestro import (
     create_scheduler_from_config,
     load_config,
 )
+from maestro._vendor.obs import init_logging
 from maestro.config import load_orchestrator_config
 from maestro.coordination.routing import RoutingStrategy, make_routing_strategy
 from maestro.dag import DAG
@@ -697,6 +698,7 @@ def run_command(
         maestro run tasks.yaml --clean
         maestro run tasks.yaml --db /path/to/state.db
     """
+    init_logging("maestro")
     db_path = db or DEFAULT_DB_PATH
 
     try:
@@ -1053,6 +1055,7 @@ def orchestrate_command(
         maestro orchestrate project.yaml
         maestro orchestrate project.yaml --resume
     """
+    init_logging("maestro")
     db_path = db or DEFAULT_DB_PATH
 
     try:
