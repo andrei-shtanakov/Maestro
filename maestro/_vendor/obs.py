@@ -164,10 +164,14 @@ def init_logging(
     pipeline_id = os.environ.get("ORCHESTRA_PIPELINE_ID") or str(ulid.new())
     trace_id, parent_span_id = _parse_traceparent()
 
+    # When TRACEPARENT carries an external parent span, use it as the initial
+    # _span_id so the first obs.span() child correctly sets parent_span_id to
+    # the remote caller's span — preserving cross-process OTel trace linkage.
+    initial_span_id = parent_span_id if parent_span_id is not None else secrets.token_hex(8)
     bind_kwargs: dict[str, Any] = {
         "pipeline_id": pipeline_id,
         "_trace_id": trace_id,
-        "_span_id": secrets.token_hex(8),
+        "_span_id": initial_span_id,
     }
     if parent_span_id is not None:
         bind_kwargs["parent_span_id"] = parent_span_id
