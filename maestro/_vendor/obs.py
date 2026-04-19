@@ -1,4 +1,4 @@
-# Vendored from spec-runner@641b9b8357e11f7e7e8b259259f6e90aebca89d5 — observability contract v1
+# Vendored from spec-runner@fa6b106be96eef2d9a4e3e0d9a970ce0e7092384 — observability contract v1
 # Do not edit locally. To update: re-copy from spec-runner and bump marker.
 """Orchestra observability emitter — reference implementation.
 
@@ -167,7 +167,9 @@ def init_logging(
     # When TRACEPARENT carries an external parent span, use it as the initial
     # _span_id so the first obs.span() child correctly sets parent_span_id to
     # the remote caller's span — preserving cross-process OTel trace linkage.
-    initial_span_id = parent_span_id if parent_span_id is not None else secrets.token_hex(8)
+    initial_span_id = (
+        parent_span_id if parent_span_id is not None else secrets.token_hex(8)
+    )
     bind_kwargs: dict[str, Any] = {
         "pipeline_id": pipeline_id,
         "_trace_id": trace_id,
