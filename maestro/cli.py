@@ -36,6 +36,7 @@ from maestro import (
     create_scheduler_from_config,
     load_config,
 )
+from maestro import merge_logs as _merge_logs
 from maestro._vendor.obs import init_logging
 from maestro.config import load_orchestrator_config
 from maestro.coordination.routing import RoutingStrategy, make_routing_strategy
@@ -1129,6 +1130,17 @@ def workspaces_command(
         table.add_row(d.name, str(d))
 
     console.print(table)
+
+
+@app.command("merge-logs")
+def merge_logs_cmd(
+    target: Annotated[
+        str,
+        typer.Argument(help="Pipeline dir or pipeline_id"),
+    ],
+) -> None:
+    """Time-sort per-pid JSONL under a pipeline directory into merged.jsonl."""
+    raise SystemExit(_merge_logs.main([target]))
 
 
 @app.callback()
