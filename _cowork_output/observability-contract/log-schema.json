@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://all_ai_orchestrators/observability-contract/v1",
+  "title": "Orchestra Observability Log Record v1",
+  "type": "object",
+  "required": [
+    "Timestamp", "ts_iso", "SeverityText", "SeverityNumber",
+    "TraceId", "SpanId", "TraceFlags", "Body", "Resource", "Attributes"
+  ],
+  "properties": {
+    "Timestamp": {"type": "string", "pattern": "^[0-9]+$"},
+    "ObservedTimestamp": {"type": "string", "pattern": "^[0-9]+$"},
+    "ts_iso": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{6}Z$"
+    },
+    "SeverityText": {"enum": ["DEBUG", "INFO", "WARN", "ERROR", "FATAL"]},
+    "SeverityNumber": {"type": "integer", "minimum": 1, "maximum": 24},
+    "TraceId": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "SpanId": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
+    "TraceFlags": {"type": "string", "pattern": "^[0-9a-f]{2}$"},
+    "Body": {"type": "string"},
+    "Resource": {
+      "type": "object",
+      "required": ["service.name"],
+      "properties": {
+        "service.name": {
+          "enum": ["maestro", "spec-runner", "arbiter", "atp", "proctor-a"]
+        }
+      }
+    },
+    "InstrumentationScope": {
+      "type": "object",
+      "properties": {"name": {"type": "string"}}
+    },
+    "Attributes": {
+      "type": "object",
+      "required": ["event", "pipeline_id"],
+      "properties": {
+        "event": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+        },
+        "pipeline_id": {"type": "string", "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"},
+        "parent_span_id": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
+        "task_id": {"type": "string"},
+        "module": {"type": "string"},
+        "error": {"$ref": "#/$defs/error"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "error": {
+      "type": "object",
+      "required": ["type", "message"],
+      "properties": {
+        "type": {"type": "string"},
+        "message": {"type": "string"},
+        "stack": {"type": "string"},
+        "caused_by": {"$ref": "#/$defs/error"}
+      }
+    }
+  }
+}
