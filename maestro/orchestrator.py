@@ -16,9 +16,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from maestro._vendor.obs import child_env, span
+from maestro._vendor.obs import child_env, current_pipeline_id, span
 from maestro.database import Database
 from maestro.decomposer import ProjectDecomposer
+from maestro.merge_logs import merge_logs_dir
 from maestro.models import (
     OrchestratorConfig,
     Zadacha,
@@ -131,6 +132,14 @@ class Orchestrator:
             await self._main_loop()
         finally:
             await self._cleanup()
+            _pipeline_id = current_pipeline_id()
+            if _pipeline_id:
+                _log_dir = Path(
+                    os.environ.get("ORCHESTRA_LOG_DIR") or f"logs/{_pipeline_id}"
+                )
+                if _log_dir.exists():  # noqa: ASYNC240
+                    with contextlib.suppress(Exception):
+                        merge_logs_dir(_log_dir)
 
         return self._stats
 
