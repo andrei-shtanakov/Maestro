@@ -5,11 +5,23 @@ New agent types can be added by subclassing AgentSpawner and implementing
 the required methods.
 """
 
+import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from subprocess import Popen
 
+from maestro._vendor.obs import child_env
 from maestro.models import Task
+
+
+def spawn_env() -> dict[str, str]:
+    """Environment for a spawned agent subprocess.
+
+    Merges the current process environment with observability propagation
+    (`TRACEPARENT`, `ORCHESTRA_PIPELINE_ID`, `ORCHESTRA_LOG_DIR`) so the
+    child joins the pipeline trace if it initialises obs.
+    """
+    return {**os.environ, **child_env()}
 
 
 class AgentSpawner(ABC):

@@ -9,9 +9,12 @@ post-task validation commands. It handles:
 
 import asyncio
 import logging
+import os
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
+
+from maestro._vendor.obs import child_env
 
 
 logger = logging.getLogger(__name__)
@@ -183,6 +186,7 @@ class Validator:
             proc = await asyncio.create_subprocess_exec(
                 *args,
                 cwd=workdir_path,
+                env={**os.environ, **child_env()},
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

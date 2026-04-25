@@ -21,6 +21,7 @@ from pathlib import Path
 from subprocess import Popen
 from typing import Protocol
 
+from maestro._vendor import obs
 from maestro.coordination.arbiter_errors import ArbiterUnavailable
 from maestro.coordination.routing import (
     RoutingStrategy,
@@ -48,6 +49,7 @@ from maestro.validator import ValidationResult, Validator
 
 
 logger = logging.getLogger(__name__)
+_obs_log = obs.get_logger("maestro.scheduler")
 
 MAX_REATTEMPTS_PER_TICK = 5
 
@@ -587,7 +589,12 @@ class Scheduler:
         self._config.log_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            await self._main_loop()
+            with obs.span(
+                "scheduler.session",
+                max_concurrent=self._config.max_concurrent,
+                arbiter_mode=self._arbiter_mode.value,
+            ):
+                await self._main_loop()
         finally:
             await self._cleanup()
 
@@ -834,28 +841,39 @@ class Scheduler:
                 task, task.error_message
             )
 
-        # Transition to RUNNING
-        task = await self._db.update_task_status(
-            task_id,
-            TaskStatus.RUNNING,
-            expected_status=TaskStatus.READY,
-        )
-        self._report_status_change(task_id, "ready", "running")
-        self._retry_ready_times.pop(task_id, None)
+        # Span scope covers the actual spawn so the spawner subprocess
+        # inherits this span as TRACEPARENT (via spawner.child_env()),
+        # giving cross-process trace continuity per the observability
+        # contract. Earlier returns (HOLD/REJECT/etc.) intentionally
+        # stay outside the span — they don't launch a subprocess.
+        with obs.span(
+            "task.spawn",
+            task_id=task_id,
+            agent=spawner_key,
+            retry_count=task.retry_count,
+        ):
+            # Transition to RUNNING
+            task = await self._db.update_task_status(
+                task_id,
+                TaskStatus.RUNNING,
+                expected_status=TaskStatus.READY,
+            )
+            self._report_status_change(task_id, "ready", "running")
+            self._retry_ready_times.pop(task_id, None)
 
-        # Spawn the process with retry context
-        process = spawner.spawn(task, context, workdir, log_file, retry_context)
+            # Spawn the process with retry context
+            process = spawner.spawn(task, context, workdir, log_file, retry_context)
 
-        # Track running task
-        self._running_tasks[task_id] = RunningTask(
-            task=task,
-            process=process,
-            started_at=datetime.now(UTC),
-            log_file=log_file,
-        )
+            # Track running task
+            self._running_tasks[task_id] = RunningTask(
+                task=task,
+                process=process,
+                started_at=datetime.now(UTC),
+                log_file=log_file,
+            )
 
-        await self._notify(task, NotificationEvent.TASK_STARTED)
-        return True
+            await self._notify(task, NotificationEvent.TASK_STARTED)
+            return True
 
     async def _build_dependency_context(self, task: Task) -> str:
         """Build context string from completed dependency tasks.
@@ -996,6 +1014,12 @@ class Scheduler:
                     self._auto_commit_task(task)
                     outcome = await self._build_outcome(done_task, exit_code=0)
                     await self._try_report_outcome(done_task, outcome)
+                    _obs_log.info(
+                        "task.completed",
+                        task_id=task_id,
+                        agent=task.routed_agent_type or task.agent_type.value,
+                        validation_passed=True,
+                    )
                 else:
                     # Include validation output in error for retry context
                     error_msg = self._format_validation_error(validation_result)
@@ -1015,6 +1039,12 @@ class Scheduler:
                 self._auto_commit_task(task)
                 outcome = await self._build_outcome(done_task, exit_code=0)
                 await self._try_report_outcome(done_task, outcome)
+                _obs_log.info(
+                    "task.completed",
+                    task_id=task_id,
+                    agent=task.routed_agent_type or task.agent_type.value,
+                    validation_passed=None,
+                )
         else:
             # Process failed
             error_msg = f"Process exited with code {return_code}"
@@ -1071,6 +1101,14 @@ class Scheduler:
                 current_task.max_retries,
                 task_id,
             )
+            _obs_log.warning(
+                "task.validation_failed",
+                task_id=task_id,
+                retry_count=new_retry_count,
+                max_retries=current_task.max_retries,
+                will_retry=True,
+                timed_out=validation_result.timed_out,
+            )
             await self._db.update_task_status(
                 task_id,
                 TaskStatus.FAILED,
@@ -1092,6 +1130,14 @@ class Scheduler:
                 "Task %s exhausted all %d retries, moving to NEEDS_REVIEW",
                 task_id,
                 current_task.max_retries,
+            )
+            _obs_log.warning(
+                "task.validation_failed",
+                task_id=task_id,
+                retry_count=current_task.retry_count,
+                max_retries=current_task.max_retries,
+                will_retry=False,
+                timed_out=validation_result.timed_out,
             )
             await self._db.update_task_status(
                 task_id,
@@ -1134,6 +1180,14 @@ class Scheduler:
                 current_task.max_retries,
                 task_id,
             )
+            _obs_log.warning(
+                "task.failed",
+                task_id=task_id,
+                retry_count=new_retry_count,
+                max_retries=current_task.max_retries,
+                will_retry=True,
+                error=error_message,
+            )
             failed_task = await self._db.update_task_status(
                 task_id,
                 TaskStatus.FAILED,
@@ -1174,6 +1228,14 @@ class Scheduler:
                 "Task %s exhausted all %d retries, moving to NEEDS_REVIEW",
                 task_id,
                 current_task.max_retries,
+            )
+            _obs_log.warning(
+                "task.failed",
+                task_id=task_id,
+                retry_count=current_task.retry_count,
+                max_retries=current_task.max_retries,
+                will_retry=False,
+                error=error_message,
             )
             failed_task = await self._db.update_task_status(
                 task_id,
@@ -1224,6 +1286,13 @@ class Scheduler:
 
         # Notify timeout
         error_msg = f"Task timed out after {running_task.task.timeout_minutes} minutes"
+        _obs_log.warning(
+            "task.timeout",
+            task_id=task_id,
+            agent=running_task.task.routed_agent_type
+            or running_task.task.agent_type.value,
+            timeout_minutes=running_task.task.timeout_minutes,
+        )
         await self._notify(
             running_task.task,
             NotificationEvent.TASK_TIMEOUT,

@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 
 from maestro.models import Task
-from maestro.spawners.base import AgentSpawner
+from maestro.spawners.base import AgentSpawner, spawn_env
 
 
 class ClaudeCodeSpawner(AgentSpawner):
@@ -70,6 +70,7 @@ class ClaudeCodeSpawner(AgentSpawner):
             process = subprocess.Popen(
                 ["claude", "--print", "--output-format", "json", "-p", prompt],
                 cwd=workdir,
+                env=spawn_env(),
                 stdout=fd,
                 stderr=subprocess.STDOUT,
             )
