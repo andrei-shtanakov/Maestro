@@ -124,9 +124,26 @@ def _task_to_arbiter_payload(task: Task) -> dict[str, Any]:
 
 
 def _extract_decision_id(raw: dict[str, Any]) -> str | None:
-    """Arbiter returns decision_id in metadata per its DTO spec."""
+    """Arbiter returns decision_id in metadata per its DTO spec.
+
+    Real arbiter emits the SQLite rowid as a JSON integer; older fixtures
+    and FakeArbiterClient use opaque strings. Coerce to str so callers
+    (Maestro's `arbiter_decision_id TEXT` column, stale-guard logic) see
+    a uniform type. Reject empty strings and explicit nulls.
+    """
     meta = raw.get("metadata") or {}
-    return meta.get("decision_id") if isinstance(meta, dict) else None
+    if not isinstance(meta, dict):
+        return None
+    raw_id = meta.get("decision_id")
+    if raw_id is None:
+        return None
+    if isinstance(raw_id, bool):
+        # bool is a subclass of int — never a valid decision_id.
+        return None
+    if isinstance(raw_id, (int, str)):
+        coerced = str(raw_id)
+        return coerced or None
+    return None
 
 
 class ArbiterRouting:

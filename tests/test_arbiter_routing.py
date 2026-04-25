@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from maestro.coordination.routing import ArbiterRouting
+from maestro.coordination.routing import ArbiterRouting, _extract_decision_id
 from maestro.models import (
     AgentType,
     ArbiterConfig,
@@ -343,3 +343,44 @@ class TestReportOutcome:
         outcome = TaskOutcome(status=TaskOutcomeStatus.FAILURE, agent_used="codex_cli")
         with pytest.raises(ArbiterUnavailable):
             await routing.report_outcome(task, outcome)
+
+
+class TestExtractDecisionId:
+    """Real arbiter emits decision_id as a JSON int (SQLite rowid); the
+    Fake and older fixtures use opaque strings. Both must coerce to str
+    so Maestro's `arbiter_decision_id TEXT` column and stale-guard logic
+    see a uniform type."""
+
+    def test_int_from_real_arbiter_coerces_to_str(self) -> None:
+        raw = {"metadata": {"decision_id": 42}}
+        assert _extract_decision_id(raw) == "42"
+
+    def test_str_from_fake_passes_through(self) -> None:
+        raw = {"metadata": {"decision_id": "dec-7"}}
+        assert _extract_decision_id(raw) == "dec-7"
+
+    def test_missing_metadata_returns_none(self) -> None:
+        assert _extract_decision_id({}) is None
+
+    def test_explicit_null_decision_id_returns_none(self) -> None:
+        raw = {"metadata": {"decision_id": None}}
+        assert _extract_decision_id(raw) is None
+
+    def test_empty_string_decision_id_returns_none(self) -> None:
+        raw = {"metadata": {"decision_id": ""}}
+        assert _extract_decision_id(raw) is None
+
+    def test_zero_int_coerces_to_zero_string(self) -> None:
+        # SQLite rowids start at 1, but the contract should not silently
+        # drop a numerically-zero id — that would be a data-corruption hide.
+        raw = {"metadata": {"decision_id": 0}}
+        assert _extract_decision_id(raw) == "0"
+
+    def test_bool_decision_id_rejected(self) -> None:
+        # bool is a subclass of int in Python; never a valid decision_id.
+        raw = {"metadata": {"decision_id": True}}
+        assert _extract_decision_id(raw) is None
+
+    def test_metadata_not_a_dict_returns_none(self) -> None:
+        raw = {"metadata": "not a dict"}
+        assert _extract_decision_id(raw) is None
