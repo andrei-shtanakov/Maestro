@@ -1,8 +1,8 @@
-# TODO — Maestro (план от 2026-04-16)
+# TODO — Maestro (план от 2026-04-16, snapshot 2026-04-25)
 
 > Стратегический контекст: `../_cowork_output/roadmap/ecosystem-roadmap.md`
-> Последний недельный отчёт: `../_cowork_output/status/2026-04-10-status.md`
-> Критический путь: R-01 → R-02 → R-03 (Maestro ↔ Arbiter интеграция)
+> Последние недельные отчёты: `../_cowork_output/status/2026-04-24-status.md`, `2026-04-18-status.md`, `2026-04-10-status.md`
+> Критический путь: ✅ закрыт (R-01..R-04 shipped в v0.2.0, observability M1+M2 закрыты, arbiter#9 фикс 2026-04-25)
 
 ## Правила ведения
 - После каждой выполненной задачи проставь `[x]` и добавь хеш коммита
@@ -81,8 +81,9 @@
 Дальнейший трек ведётся в Linear (Maestro / Arbiter проекты, team Labs). Ниже — snapshot на 2026-04-17.
 
 - [ ] **R-03b** (LABS-TBD): Mode 2 (`maestro orchestrate`) zadacha-level routing. Gate: ≥1 неделя стабильного Mode-1 dogfood после v0.2.0
-- [ ] **R-05** (LABS-93, blocked on LABS-92): Maestro↔Arbiter e2e тесты с реальным `arbiter-mcp` subprocess. Mock-side уже shipped под LABS-79 (~50 тестов). Реальный subprocess ждёт upstream `metadata.decision_id` fix
-- [ ] **R-10** (LABS-91 / arbiter#8, partially done `7e6de56`): Arbiter CI release-binary. Готово: linux-x64 + macos-arm64 30-day artifacts. Открыто: tag-triggered GitHub Release upload, `pyrefly check` в Python job
+- [x] **R-05 contract-level** (commit `f1f7d26`, 2026-04-25): 4 e2e теста против реального `arbiter-mcp` бинарника в `tests/test_arbiter_real_subprocess.py`. Auto-skip без бинарника; `MAESTRO_ARBITER_BIN` override. Покрывает: decision_id i64, int→str coercion, route→report_outcome round-trip, distinct rowids. **Pending follow-up:** scheduler-driven e2e (с моk spawner), CI-задача с предсобранным бинарём
+- [x] **arbiter#9 client-side fix** (commit `e5915f2`, 2026-04-25): `_extract_decision_id` коэрсит `int → str` для `arbiter_decision_id TEXT` колонки и stale-guard. Парная с arbiter `d1a8ecd`. 8 unit-тестов в `TestExtractDecisionId`
+- [x] **R-10** (LABS-91 / arbiter#8, `7e6de56`): Arbiter CI release-binary. Готово: linux-x64 + macos-arm64 30-day artifacts. Открыто: tag-triggered GitHub Release upload, `pyrefly check` в Python job
 - [x] **R-NN** (LABS-84, commit `ab279f2`): wire `cost_tracker` в `Scheduler._record_cost`. `TaskOutcome.tokens_used` / `cost_usd` теперь несут реальные значения. Model variants / structured usage — отдельно под LABS-49
 - [x] **Mini-R** (LABS-85, commit `627c12d`): `schema_migrations` journal + линейный migration runner. Добавление миграции #3+ = одна строка в `ordered` + метод
 - [ ] **R-14**: Вынести vendored `arbiter_client.py` в отдельный PyPI-пакет `arbiter-py` (upstream arbiter work, не в Linear пока)
@@ -93,6 +94,12 @@
 - [ ] **LABS-88** (Low): CI guard для unreferenced public modules
 - [ ] **LABS-89** (Medium): release automation (version-vs-tag guard + release-drafter)
 - [ ] **LABS-90** (Medium): per-example YAML smoke test в CI
+
+### Observability (cross-project) — M1 closed, M2 closed 2026-04-25
+
+- [x] **M1** (commits `e3feefd`, `4688633`, `279193e`): cross-process trace continuity. Vendored `obs.py` от spec-runner@`fa6b106`, contract в `_cowork_output/observability-contract/` (log-schema, propagation, 4 fixtures), CLI `init_logging("maestro")`, child_env() пропагация в orchestrator
+- [x] **M2** (commit `d474120`, 2026-04-25): scheduler instrumentation. `obs.span("scheduler.session")` + `obs.span("task.spawn")` (subprocess inheritance через TRACEPARENT), 4 структурированных emit'а (`task.completed`/`task.validation_failed`/`task.failed`/`task.timeout`), `spawn_env()` helper в `spawners/base.py` пропагирует трасу в claude_code/codex/aider/validator subprocesses. 3 теста в `test_scheduler_observability.py`
+- [ ] **M3** (pending): scheduler-tick instrumentation (per-poll-cycle metrics), arbiter routing decision span, observability dashboards
 
 ---
 
