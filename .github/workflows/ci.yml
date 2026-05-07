@@ -4,6 +4,14 @@ on:
   push:
     branches: [master]
   pull_request:
+  schedule:
+    # Weekly drift-check against arbiter master (Monday 06:00 UTC)
+    - cron: "0 6 * * 1"
+
+env:
+  # Pin arbiter to the commit that closed arbiter#9 + shipped obs v1.
+  # Bump when the Maestro↔arbiter contract evolves.
+  ARBITER_PINNED_SHA: d1a8ecd
 
 jobs:
   lint:
@@ -44,3 +52,67 @@ jobs:
           git config --global user.name "Maestro CI"
       - run: uv sync
       - run: uv run python -m pytest -m "not slow"
+
+  arbiter-e2e:
+    name: R-05 real-subprocess (arbiter ${{ github.event_name == 'schedule' && 'master' || 'pinned' }})
+    runs-on: ubuntu-latest
+    needs: [test]
+    env:
+      NO_COLOR: "1"
+      TERM: "dumb"
+    steps:
+      - name: Checkout Maestro into sibling layout
+        uses: actions/checkout@v4
+        with:
+          path: Maestro
+
+      - name: Resolve arbiter ref
+        id: arbiter_ref
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "ref=master" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${ARBITER_PINNED_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout arbiter (${{ steps.arbiter_ref.outputs.ref }})
+        uses: actions/checkout@v4
+        with:
+          repository: andrei-shtanakov/arbiter
+          ref: ${{ steps.arbiter_ref.outputs.ref }}
+          path: arbiter
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: arbiter
+          shared-key: arbiter-mcp-${{ steps.arbiter_ref.outputs.ref }}
+
+      - name: Build arbiter-mcp release binary
+        working-directory: arbiter
+        run: cargo build --release --bin arbiter-mcp
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v4
+
+      - name: Configure git identity and default branch
+        run: |
+          git config --global init.defaultBranch main
+          git config --global user.email "ci@maestro.test"
+          git config --global user.name "Maestro CI"
+
+      - name: Install Maestro deps
+        working-directory: Maestro
+        run: uv sync
+
+      - name: Run R-05 real-subprocess tests
+        working-directory: Maestro
+        env:
+          MAESTRO_ARBITER_BIN: ${{ github.workspace }}/arbiter/target/release/arbiter-mcp
+        run: uv run python -m pytest tests/test_arbiter_real_subprocess.py -v
