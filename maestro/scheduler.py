@@ -1093,7 +1093,7 @@ class Scheduler:
             full_error = f"{error_message}\n\nValidation output:\n{output}"
 
         if self._retry_manager.should_retry(current_task):
-            # Increment retry count and set back to READY
+            # Increment retry count and transition to FAILED.
             new_retry_count = current_task.retry_count + 1
             logging.info(
                 "Scheduling retry %d/%d for task %s",
@@ -1109,7 +1109,7 @@ class Scheduler:
                 will_retry=True,
                 timed_out=validation_result.timed_out,
             )
-            await self._db.update_task_status(
+            failed_task = await self._db.update_task_status(
                 task_id,
                 TaskStatus.FAILED,
                 expected_status=TaskStatus.VALIDATING,
@@ -1117,13 +1117,32 @@ class Scheduler:
                 retry_count=new_retry_count,
             )
             self._report_status_change(task_id, "validating", "failed")
-            # Transition back to READY for retry
-            await self._db.update_task_status(
-                task_id,
-                TaskStatus.READY,
-                expected_status=TaskStatus.FAILED,
+
+            # LABS-87: deliver outcome + mode-aware retry gating, mirroring
+            # the process-failure path in _handle_task_failure. `attempt` is
+            # the run that just finished, before the counter bump above.
+            outcome = await self._build_outcome(
+                failed_task, exit_code=1, attempt=current_task.retry_count + 1
             )
-            self._report_status_change(task_id, "failed", "ready")
+            delivered = await self._try_report_outcome(failed_task, outcome)
+
+            if self._arbiter_mode is ArbiterMode.ADVISORY or delivered:
+                guard_id = failed_task.arbiter_decision_id if delivered else None
+                ok = await self._db.reset_for_retry_atomic(
+                    task_id, decision_id=guard_id
+                )
+                if ok:
+                    self._report_status_change(task_id, "failed", "ready")
+                else:
+                    self._emit_event(
+                        EventType.ARBITER_RETRY_RESET_SKIPPED,
+                        {
+                            "task_id": task_id,
+                            "expected_decision_id": (failed_task.arbiter_decision_id),
+                        },
+                    )
+            # else: authoritative + not delivered — stay FAILED; the
+            # re-attempt pass will drive the outcome through before retrying.
         else:
             # No more retries - needs review
             logging.warning(
@@ -1139,13 +1158,17 @@ class Scheduler:
                 will_retry=False,
                 timed_out=validation_result.timed_out,
             )
-            await self._db.update_task_status(
+            failed_task = await self._db.update_task_status(
                 task_id,
                 TaskStatus.FAILED,
                 expected_status=TaskStatus.VALIDATING,
                 error_message=full_error,
             )
             self._report_status_change(task_id, "validating", "failed")
+            # LABS-87: report outcome before the terminal NEEDS_REVIEW
+            # transition (mirror of _handle_task_failure exhausted path).
+            outcome = await self._build_outcome(failed_task, exit_code=1)
+            await self._try_report_outcome(failed_task, outcome)
             await self._db.update_task_status(
                 task_id,
                 TaskStatus.NEEDS_REVIEW,

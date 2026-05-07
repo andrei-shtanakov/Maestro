@@ -425,3 +425,202 @@ async def test_authoritative_abandon_after_timeout(tmp_path) -> None:
         assert refetched.arbiter_decision_id is None
     finally:
         await db.close()
+
+
+# ---------------------------------------------------------------------------
+# LABS-87: validation-failure path delivers outcome with retry-gating.
+#
+# Mirrors the four `_handle_task_failure` cases above. We bypass _spawn_task
+# and seed the task directly in VALIDATING with arbiter_decision_id set —
+# this keeps the test surface tight on _handle_validation_failure and avoids
+# the retry-backoff branch in _spawn_task that fights with retry_count
+# manipulation needed for the exhausted case.
+# ---------------------------------------------------------------------------
+
+
+def _validation_failure_result():
+    from maestro.validator import ValidationResult
+
+    return ValidationResult(
+        success=False,
+        exit_code=1,
+        stdout="",
+        stderr="assertion failed",
+        error_message="validation failed",
+        timed_out=False,
+    )
+
+
+async def _setup_validating_task(
+    tmp_path,
+    fake: FakeArbiterClient,
+    mode: ArbiterMode,
+    decision_id: str,
+    retry_count: int = 0,
+    max_retries: int = 2,
+) -> tuple[Database, Scheduler, Task]:
+    """Build db + scheduler with the task already in VALIDATING and a
+    decision_id pre-populated, simulating the state right before validation
+    runs."""
+    await fake.start()
+    routing = ArbiterRouting(
+        client=fake,
+        cfg=ArbiterConfig(
+            enabled=True,
+            mode=mode,
+            binary_path="/fake",
+            config_dir="/fake",
+            tree_path="/fake",
+        ),
+    )
+
+    db = Database(tmp_path / "s.db")
+    await db.connect()
+
+    task = Task(
+        id="t1",
+        title="T",
+        prompt="P",
+        workdir=str(tmp_path),
+        agent_type=AgentType.AUTO,
+        status=TaskStatus.VALIDATING,
+        max_retries=max_retries,
+        retry_count=retry_count,
+        routed_agent_type="codex_cli",
+        arbiter_decision_id=decision_id,
+    )
+    await db.create_task(task)
+
+    (tmp_path / "logs").mkdir(exist_ok=True)
+    scheduler = Scheduler(
+        db=db,
+        dag=DAG([]),
+        spawners={"codex_cli": MagicMock()},
+        routing=routing,
+        arbiter_mode=mode,
+        config=SchedulerConfig(workdir=tmp_path, log_dir=tmp_path / "logs"),
+    )
+    return db, scheduler, task
+
+
+@pytest.mark.anyio
+async def test_validation_fail_advisory_reports_outcome_and_resets(tmp_path) -> None:
+    """ADVISORY + retry available: outcome reported, decision_id cleared
+    via guarded reset, status READY."""
+    fake = FakeArbiterClient()
+    db, scheduler, task = await _setup_validating_task(
+        tmp_path, fake, ArbiterMode.ADVISORY, decision_id="dec-V1"
+    )
+    try:
+        await scheduler._handle_validation_failure(
+            task.id,
+            task,
+            "Validation failed: assertion failed",
+            _validation_failure_result(),
+        )
+
+        refetched = await db.get_task("t1")
+        assert refetched.status is TaskStatus.READY
+        assert refetched.arbiter_decision_id is None
+        assert refetched.routed_agent_type is None
+        # reset_for_retry_atomic clears reported_at along with other arbiter
+        # fields; delivery is verified via fake.calls below.
+
+        outcome_calls = [c for c in fake.calls if c.method == "report_outcome"]
+        assert len(outcome_calls) == 1
+        assert outcome_calls[0].arguments["status"] == "failure"
+        assert outcome_calls[0].arguments["decision_id"] == "dec-V1"
+    finally:
+        await db.close()
+
+
+@pytest.mark.anyio
+async def test_validation_fail_exhausted_reports_outcome_then_needs_review(
+    tmp_path,
+) -> None:
+    """No retries left: outcome reported before terminal NEEDS_REVIEW
+    transition (mirror of `_handle_task_failure` exhausted path)."""
+    fake = FakeArbiterClient()
+    db, scheduler, task = await _setup_validating_task(
+        tmp_path,
+        fake,
+        ArbiterMode.ADVISORY,
+        decision_id="dec-V2",
+        retry_count=2,
+        max_retries=2,
+    )
+    try:
+        await scheduler._handle_validation_failure(
+            task.id,
+            task,
+            "Validation failed: assertion failed",
+            _validation_failure_result(),
+        )
+
+        refetched = await db.get_task("t1")
+        assert refetched.status is TaskStatus.NEEDS_REVIEW
+        assert refetched.arbiter_outcome_reported_at is not None
+
+        outcome_calls = [c for c in fake.calls if c.method == "report_outcome"]
+        assert len(outcome_calls) == 1
+        assert outcome_calls[0].arguments["status"] == "failure"
+    finally:
+        await db.close()
+
+
+@pytest.mark.anyio
+async def test_validation_fail_advisory_arbiter_down_still_resets(tmp_path) -> None:
+    """ADVISORY + arbiter delivery fails: reset still proceeds (guard=None),
+    decision_id cleared, status READY."""
+    from maestro.coordination.arbiter_errors import ArbiterUnavailable
+
+    fake = FakeArbiterClient()
+    fake.outcome_raises = ArbiterUnavailable("dead")
+    db, scheduler, task = await _setup_validating_task(
+        tmp_path, fake, ArbiterMode.ADVISORY, decision_id="dec-V3"
+    )
+    try:
+        await scheduler._handle_validation_failure(
+            task.id,
+            task,
+            "Validation failed: assertion failed",
+            _validation_failure_result(),
+        )
+
+        refetched = await db.get_task("t1")
+        assert refetched.status is TaskStatus.READY
+        assert refetched.arbiter_decision_id is None
+        assert refetched.routed_agent_type is None
+        # Outcome NOT reported — delivery failed.
+        assert refetched.arbiter_outcome_reported_at is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.anyio
+async def test_validation_fail_authoritative_arbiter_down_stays_failed(
+    tmp_path,
+) -> None:
+    """AUTHORITATIVE + arbiter down: stay FAILED, decision_id preserved,
+    awaiting outcome delivery in next reattempt pass."""
+    from maestro.coordination.arbiter_errors import ArbiterUnavailable
+
+    fake = FakeArbiterClient()
+    fake.outcome_raises = ArbiterUnavailable("dead")
+    db, scheduler, task = await _setup_validating_task(
+        tmp_path, fake, ArbiterMode.AUTHORITATIVE, decision_id="dec-V4"
+    )
+    try:
+        await scheduler._handle_validation_failure(
+            task.id,
+            task,
+            "Validation failed: assertion failed",
+            _validation_failure_result(),
+        )
+
+        refetched = await db.get_task("t1")
+        assert refetched.status is TaskStatus.FAILED
+        assert refetched.arbiter_decision_id == "dec-V4"
+        assert refetched.arbiter_outcome_reported_at is None
+    finally:
+        await db.close()
