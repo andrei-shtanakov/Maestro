@@ -96,7 +96,7 @@
 > M0 (design) approved by virtue of M1 landing.
 
 - [x] **R-06b M1 thin slice** (2026-05-07): новый `maestro/benchmark/` модуль — `BenchmarkRunner` + Protocols (`ATPClientLike`, `BenchmarkRun`, `AgentResponder`), Pydantic-модели (`BenchmarkResult`, `BenchmarkTaskResult`, `AgentResponse`). Async API (Maestro async-first; M2 spawner и M3 ATP HTTP-клиент будут async). Mock-only тесты в `tests/test_benchmark_runner.py` — 2 кейса: happy path с агрегацией tokens/cost и agent-error path (None ≠ 0 для отсутствия измерений). Цель M1 достигнута: API shape залочен, M2..M5 могут идти параллельно
-- [ ] **R-06b M2 spawner integration**: реальный `claude_code`/`codex_cli` adapter за `AgentResponder` (subprocess + timeout + token parsing)
+- [x] **R-06b M2 spawner integration** (2026-05-08): `maestro/benchmark/spawner_responder.py` — `SpawnerResponder` обёртывает любой `AgentSpawner` (claude_code/codex_cli/aider) и реализует `AgentResponder`. Синтез минимального `Task` под benchmark prompt, `asyncio.to_thread(process.wait)` под `asyncio.wait_for(timeout)`, парсинг tokens/cost через существующий `cost_tracker.{parse_log,calculate_cost}` (без db side-effects). `response.text` = full log content (M2 punt; M3 уточнит per-benchmark extraction). +4 теста в `tests/test_spawner_responder.py`: happy path, timeout (kill + unblock), non-zero exit, unknown agent_type short-circuit
 - [ ] **R-06b M3 auth + live ATP**: GitHub Device Flow, token persistence, env-var override, real `ATPClient` (httpx)
 - [ ] **R-06b M4 Arbiter feedback wiring**: `BenchmarkResult` → arbiter (выбрать: новый MCP tool `report_benchmark` или channel в `report_outcome`)
 - [ ] **R-06b M5 CLI**: `maestro benchmark <benchmark-id> --agent claude_code`

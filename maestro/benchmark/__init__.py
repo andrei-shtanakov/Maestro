@@ -16,6 +16,7 @@ from maestro.benchmark.runner import (
     BenchmarkRunner,
     BenchmarkTask,
 )
+from maestro.benchmark.spawner_responder import SpawnerResponder
 
 
 __all__ = [
@@ -27,4 +28,5 @@ __all__ = [
     "BenchmarkRunner",
     "BenchmarkTask",
     "BenchmarkTaskResult",
+    "SpawnerResponder",
 ]
