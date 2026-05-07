@@ -90,6 +90,17 @@
 - [x] **Mini-R** (LABS-85, commit `627c12d`): `schema_migrations` journal + линейный migration runner. Добавление миграции #3+ = одна строка в `ordered` + метод
 - [ ] **R-14**: Вынести vendored `arbiter_client.py` в отдельный PyPI-пакет `arbiter-py` (upstream arbiter work, не в Linear пока)
 
+### R-06b — Agent benchmarking via ATP
+
+> Дизайн: `../_cowork_output/decisions/2026-04-25-r06b-design.md`
+> M0 (design) approved by virtue of M1 landing.
+
+- [x] **R-06b M1 thin slice** (2026-05-07): новый `maestro/benchmark/` модуль — `BenchmarkRunner` + Protocols (`ATPClientLike`, `BenchmarkRun`, `AgentResponder`), Pydantic-модели (`BenchmarkResult`, `BenchmarkTaskResult`, `AgentResponse`). Async API (Maestro async-first; M2 spawner и M3 ATP HTTP-клиент будут async). Mock-only тесты в `tests/test_benchmark_runner.py` — 2 кейса: happy path с агрегацией tokens/cost и agent-error path (None ≠ 0 для отсутствия измерений). Цель M1 достигнута: API shape залочен, M2..M5 могут идти параллельно
+- [ ] **R-06b M2 spawner integration**: реальный `claude_code`/`codex_cli` adapter за `AgentResponder` (subprocess + timeout + token parsing)
+- [ ] **R-06b M3 auth + live ATP**: GitHub Device Flow, token persistence, env-var override, real `ATPClient` (httpx)
+- [ ] **R-06b M4 Arbiter feedback wiring**: `BenchmarkResult` → arbiter (выбрать: новый MCP tool `report_benchmark` или channel в `report_outcome`)
+- [ ] **R-06b M5 CLI**: `maestro benchmark <benchmark-id> --agent claude_code`
+
 ### Новое из v0.2.0 dogfood (LABS-87..90)
 
 - [x] **LABS-87** (2026-05-07): validation-failure path теперь репортит outcome в arbiter с retry-gating. `_handle_validation_failure` отзеркалил `_handle_task_failure`: build outcome (status FAILURE) → `_try_report_outcome` → ADVISORY/AUTHORITATIVE-aware reset. Both paths (retry-available + exhausted-NEEDS_REVIEW) шлют outcome. +4 теста в `test_scheduler_arbiter_integration.py` (advisory+retry, exhausted, advisory+arbiter-down, authoritative+arbiter-down). Routing API не расширен — `validation_passed` остаётся out-of-scope
