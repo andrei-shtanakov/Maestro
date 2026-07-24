@@ -534,8 +534,8 @@ class TestTaskCRUD:
         """Test backend column round-trips both None and non-None values.
 
         Regression guard: Task.backend was silently lost in round-trip before
-        the fix (dd0e5b5) wired it into create_task/update_task/_row_to_task.
-        Ensures backend column survives persistence and retrieval.
+        the column was wired into create_task/update_task/_row_to_task.
+        Ensures the backend column survives persistence and retrieval.
         """
         # Test with backend="remote"
         task_remote = Task(

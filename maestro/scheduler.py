@@ -1176,11 +1176,18 @@ class Scheduler:
             )
             raise SchedulerError(msg)
 
+        # Reservation gate BEFORE the span: an overlapping active reservation
+        # on an armed workdir launches nothing, so — like the HOLD/REJECT early
+        # returns above — it must not emit a task.spawn span. Retry a later
+        # tick; consume no slot, make no state transition.
+        if not self._try_reserve(task):
+            return False
+
         # Span scope covers the actual spawn so the backend subprocess
         # inherits this span as TRACEPARENT (via the execution backend's
         # build_local_env()/child_env()), giving cross-process trace
         # continuity per the observability
-        # contract. Earlier returns (HOLD/REJECT/etc.) intentionally
+        # contract. Earlier returns (HOLD/REJECT/reservation) intentionally
         # stay outside the span — they don't launch a subprocess.
         with obs.span(
             "task.spawn",
@@ -1188,11 +1195,6 @@ class Scheduler:
             agent=spawner_key,
             retry_count=task.retry_count,
         ):
-            if not self._try_reserve(task):
-                # Overlapping active reservation on an armed workdir — retry a
-                # later tick; consume no slot, make no state transition.
-                return False
-
             # Transition to RUNNING — fires the TASK_STARTED event and
             # notification here (§0: the notification now means "status is
             # running", not "process launched"; it fires even if the
