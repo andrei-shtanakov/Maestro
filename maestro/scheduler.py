@@ -35,7 +35,7 @@ from maestro.coordination.routing import (
 )
 from maestro.cost_tracker import effective_cost, parse_and_create_cost
 from maestro.dag import DAG
-from maestro.database import ConcurrentModificationError, Database
+from maestro.database import ConcurrentModificationError, Database, TaskNotFoundError
 from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
 from maestro.execution.backend import TaskHandle
 from maestro.execution.exec_config import ExecutionConfig
@@ -719,6 +719,7 @@ class Scheduler:
             raise SchedulerError("Database must be connected before running scheduler")
 
         await self._arm_workdirs()
+        await self._reconstruct_reservations()
 
         self._loop = asyncio.get_running_loop()
         self._setup_signal_handlers()
@@ -742,6 +743,33 @@ class Scheduler:
         except UnboundedRemoteScopeError as exc:
             raise SchedulerError(str(exc)) from exc
         self._armed = compute_armed_workdirs(tasks, self._execution)
+
+    async def _reconstruct_reservations(self) -> None:
+        """Rebuild held reservations from durable open SSH handles (recovery).
+
+        On a scheduler restart the in-memory `self._reservations` registry is
+        empty. `prepared`/`running`/`terminal` handles may still correspond to
+        a live remote execution holding a (workdir, scope) lock, so each is
+        reconstructed as held. `collected`/`cleaned` handles are not
+        scope-blocking (the scope was already released) and are left to the
+        existing cleanup-recovery path.
+        """
+        hold_states = {"prepared", "running", "terminal"}
+        for row in await self._db.get_open_execution_handles():
+            if row.get("state") not in hold_states:
+                continue
+            if row.get("entity_kind") != "task":
+                continue
+            try:
+                task = await self._db.get_task(row["entity_id"])
+            except TaskNotFoundError:
+                continue
+            if not is_ssh_task(task, self._execution):
+                continue
+            if self._is_armed(task):
+                self._reservations.reconstruct(
+                    task.id, scope_to_reservation(task.workdir, task.scope)
+                )
 
     def _is_armed(self, task: Task) -> bool:
         """Check whether `task.workdir` hosts >=1 SSH task (armed by `_arm_workdirs`)."""

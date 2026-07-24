@@ -116,3 +116,57 @@ async def test_non_armed_task_reserve_is_noop(tmp_path):
     assert sched._try_reserve(t1) is True
     assert sched._reservations.holds("t1") is False  # nothing recorded
     await db.close()
+
+
+async def test_recovery_reconstructs_held_reservation(tmp_path):
+    db = await _db(tmp_path)
+    wd = str(tmp_path / "wd")
+    await _add(db, "t1", wd, "remote", ["src/**"])
+    # Simulate a crash mid-run: task RUNNING + an open handle in state 'running'.
+    await db.start_execution(
+        entity_kind="task",
+        entity_id="t1",
+        expected_status=TaskStatus.PENDING.value,  # match the row we inserted
+        running_status=TaskStatus.RUNNING.value,
+        execution_id="e1",
+        backend_id="remote",
+        transport_ref="remote:maestro-e1",
+        attempt=1,
+    )
+    await db.mark_execution_state("e1", "running", allowed_from=["prepared"])
+
+    sched = _sched(db, tmp_path, _ssh_exec())
+    await sched._arm_workdirs()
+    await sched._reconstruct_reservations()
+
+    # A fresh overlapping task cannot reserve — the recovered reservation holds.
+    await _add(db, "t2", wd, "remote", ["src/api/x.py"])
+    t2 = await db.get_task("t2")
+    assert sched._try_reserve(t2) is False
+    await db.close()
+
+
+async def test_recovery_skips_collected_handle(tmp_path):
+    db = await _db(tmp_path)
+    wd = str(tmp_path / "wd")
+    await _add(db, "t1", wd, "remote", ["src/**"])
+    await db.start_execution(
+        entity_kind="task",
+        entity_id="t1",
+        expected_status=TaskStatus.PENDING.value,
+        running_status=TaskStatus.RUNNING.value,
+        execution_id="e1",
+        backend_id="remote",
+        transport_ref="remote:maestro-e1",
+        attempt=1,
+    )
+    await db.mark_execution_state("e1", "running", allowed_from=["prepared"])
+    await db.mark_execution_state("e1", "terminal", allowed_from=["running"])
+    await db.mark_execution_state("e1", "collected", allowed_from=["terminal"])
+
+    sched = _sched(db, tmp_path, _ssh_exec())
+    await sched._arm_workdirs()
+    await sched._reconstruct_reservations()
+
+    assert sched._reservations.holds("t1") is False  # collected → scope free
+    await db.close()
