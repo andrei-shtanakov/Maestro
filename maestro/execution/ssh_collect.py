@@ -33,6 +33,24 @@ def _excluded(rel: str, excludes: list[str]) -> bool:
     return False
 
 
+def path_in_scope(rel: str, scope: list[str]) -> bool:
+    """True if `rel` is covered by any scope entry (self, subtree, or glob).
+
+    Scope patterns are normalized by dropping `.` path segments so a
+    `./src/**` entry matches `src/a.py` exactly as `src/**` would (mirrors
+    `reservations.anchor_of`, which strips the same segments). Without this
+    a dot-prefixed scope would arm/lock the workdir yet reject its own
+    in-scope changes at collect.
+    """
+    for pat in scope:
+        norm = "/".join(s for s in pat.strip("/").split("/") if s != ".")
+        if rel == norm or rel.startswith(norm + "/"):
+            return True
+        if fnmatch.fnmatch(rel, norm) or fnmatch.fnmatch(rel, norm + "/*"):
+            return True
+    return False
+
+
 def _sha(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -72,8 +90,18 @@ def plan_collect(
     baseline: dict[str, str],
     *,
     forbidden: list[str],
+    scope: list[str] | None = None,
 ) -> CollectPlan:
-    """Preflight; raises CollectConflict on any violation. No side effects."""
+    """Preflight; raises CollectConflict on any violation. No side effects.
+
+    When `scope` is a list (Mode-1 remote), any modified/deleted path
+    outside the scope is a CollectConflict and the returned plan is bounded
+    to in-scope paths. An empty list (`scope=[]`) is a valid, fully-closed
+    scope: every changed path is out-of-scope, so any change raises
+    CollectConflict (a no-change collect still returns an empty plan).
+    `scope=None` keeps the whole-worktree behavior (Mode-2) — this is the
+    only value that skips the gate.
+    """
     remote = _walk(staging, forbidden)
     # Symlink / traversal guard over the raw staging tree.
     for dirpath, _dirs, files in os.walk(staging):
@@ -87,6 +115,11 @@ def plan_collect(
 
     modified = sorted(r for r, sha in remote.items() if baseline.get(r) != sha)
     deleted = sorted(r for r in baseline if r not in remote)
+
+    if scope is not None:
+        for rel in [*modified, *deleted]:
+            if not path_in_scope(rel, scope):
+                raise CollectConflict(f"out-of-scope change rejected: {rel}")
 
     for rel in [*modified, *deleted]:
         if _excluded(rel, forbidden):

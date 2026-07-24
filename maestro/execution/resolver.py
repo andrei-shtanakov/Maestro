@@ -50,11 +50,6 @@ class BackendResolver:
         if transport.type == "local":
             return self._build_local(name, spec)
         if isinstance(transport, SshTransport):
-            if self._mode == "scheduler":
-                raise ExecutionConfigError(
-                    f"backend {name!r} uses ssh transport: SSH backends are "
-                    "Mode-2 (orchestrator) only until Phase 2b"
-                )
             return self._build_ssh(name, spec, transport)
         raise ExecutionConfigError(f"backend {name!r}: unsupported transport")
 

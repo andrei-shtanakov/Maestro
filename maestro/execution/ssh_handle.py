@@ -36,6 +36,7 @@ class CollectSpec:
     staging_dir: Path
     journal_dir: Path
     baseline: dict[str, str]
+    scope: list[str] | None = None
 
 
 @dataclass
@@ -226,6 +227,7 @@ class SshTaskHandle:
             staging,
             self._collect.baseline,
             forbidden=[".git", ".maestro"],
+            scope=self._collect.scope,
         )
         apply_collect(
             self._collect.worktree,

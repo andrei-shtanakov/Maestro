@@ -529,6 +529,44 @@ class TestTaskCRUD:
         deps = await db.get_all_dependencies()
         assert len(deps) == 0
 
+    @pytest.mark.anyio
+    async def test_backend_column_round_trip(self, db) -> None:
+        """Test backend column round-trips both None and non-None values.
+
+        Regression guard: Task.backend was silently lost in round-trip before
+        the column was wired into create_task/update_task/_row_to_task.
+        Ensures the backend column survives persistence and retrieval.
+        """
+        # Test with backend="remote"
+        task_remote = Task(
+            id="backend-remote-task",
+            title="Remote Backend Task",
+            prompt="Task with remote backend",
+            workdir="/tmp/remote",
+            backend="remote",
+        )
+        await db.create_task(task_remote)
+        fetched_remote = await db.get_task(task_remote.id)
+        assert fetched_remote.backend == "remote"
+
+        # Test with backend=None (default)
+        task_none = Task(
+            id="backend-none-task",
+            title="None Backend Task",
+            prompt="Task with None backend",
+            workdir="/tmp/none",
+            backend=None,
+        )
+        await db.create_task(task_none)
+        fetched_none = await db.get_task(task_none.id)
+        assert fetched_none.backend is None
+
+        # Test update: change from None to "docker"
+        updated_task = task_none.model_copy(update={"backend": "docker"})
+        await db.update_task(updated_task)
+        refetched = await db.get_task(task_none.id)
+        assert refetched.backend == "docker"
+
 
 # =============================================================================
 # Atomic Status Update Tests

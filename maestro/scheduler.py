@@ -35,13 +35,23 @@ from maestro.coordination.routing import (
 )
 from maestro.cost_tracker import effective_cost, parse_and_create_cost
 from maestro.dag import DAG
-from maestro.database import Database
+from maestro.database import ConcurrentModificationError, Database, TaskNotFoundError
 from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
 from maestro.execution.backend import TaskHandle
 from maestro.execution.exec_config import ExecutionConfig
-from maestro.execution.finalize import ensure_finalize_task
-from maestro.execution.models import ExecutionRequest
+from maestro.execution.finalize import FinalizationResult, ensure_finalize_task
+from maestro.execution.models import CollectPolicy, ExecutionRequest
+from maestro.execution.reservations import (
+    ReservationRegistry,
+    UnboundedRemoteScopeError,
+    canonical_workdir,
+    compute_armed_workdirs,
+    is_ssh_task,
+    scope_to_reservation,
+    validate_ssh_scopes,
+)
 from maestro.execution.resolver import BackendResolver
+from maestro.execution.ssh_backend import LaunchNotStarted
 from maestro.models import (
     AgentType,
     ArbiterMode,
@@ -277,7 +287,10 @@ class Scheduler:
         self._arbiter_mode: ArbiterMode = arbiter_mode
         self._hold_throttle: HoldThrottle = HoldThrottle()
         self._abandon_outcome_after_s: int = 300
-        self._backends = BackendResolver(execution, mode="scheduler")
+        self._execution = execution or ExecutionConfig()
+        self._backends = BackendResolver(self._execution, mode="scheduler")
+        self._armed: set[Path] = set()
+        self._reservations = ReservationRegistry()
 
         self._running_tasks: dict[str, RunningTask] = {}
         self._last_tick: tuple[int, int, int] | None = None
@@ -705,6 +718,9 @@ class Scheduler:
         if not self._db.is_connected:
             raise SchedulerError("Database must be connected before running scheduler")
 
+        await self._arm_workdirs()
+        await self._reconstruct_reservations()
+
         self._loop = asyncio.get_running_loop()
         self._setup_signal_handlers()
         self._config.log_dir.mkdir(parents=True, exist_ok=True)
@@ -718,6 +734,53 @@ class Scheduler:
                 await self._main_loop()
         finally:
             await self._cleanup()
+
+    async def _arm_workdirs(self) -> None:
+        """Static per-workdir arming + start-time unbounded-scope fail-fast."""
+        tasks = await self._db.get_all_tasks()
+        try:
+            validate_ssh_scopes(tasks, self._execution)
+        except UnboundedRemoteScopeError as exc:
+            raise SchedulerError(str(exc)) from exc
+        self._armed = compute_armed_workdirs(tasks, self._execution)
+
+    async def _reconstruct_reservations(self) -> None:
+        """Rebuild held reservations from durable open SSH handles (recovery).
+
+        On a scheduler restart the in-memory `self._reservations` registry is
+        empty. `prepared`/`running`/`terminal` handles may still correspond to
+        a live remote execution holding a (workdir, scope) lock, so each is
+        reconstructed as held. `collected`/`cleaned` handles are not
+        scope-blocking (the scope was already released) and are left to the
+        existing cleanup-recovery path.
+        """
+        hold_states = {"prepared", "running", "terminal"}
+        for row in await self._db.get_open_execution_handles():
+            if row.get("state") not in hold_states:
+                continue
+            if row.get("entity_kind") != "task":
+                continue
+            try:
+                task = await self._db.get_task(row["entity_id"])
+            except TaskNotFoundError:
+                continue
+            if not is_ssh_task(task, self._execution):
+                continue
+            if self._is_armed(task):
+                self._reservations.reconstruct(
+                    task.id, scope_to_reservation(task.workdir, task.scope)
+                )
+
+    def _is_armed(self, task: Task) -> bool:
+        """Check whether `task.workdir` hosts >=1 SSH task (armed by `_arm_workdirs`)."""
+        return canonical_workdir(task.workdir) in self._armed
+
+    def _try_reserve(self, task: Task) -> bool:
+        """Acquire the (workdir, scope) reservation; no-op off armed workdirs."""
+        if not self._is_armed(task):
+            return True
+        r = scope_to_reservation(task.workdir, task.scope)
+        return self._reservations.try_acquire(task.id, r)
 
     def _emit_tick(self, ready: int, running: int, completed: int) -> None:
         """Emit a per-poll-cycle queue snapshot, but only when it changed.
@@ -1065,6 +1128,19 @@ class Scheduler:
             model=routed_model,
         )
 
+        # Armed SSH tasks always execute inside their declared scope — the
+        # spawner's default `none` collect policy would otherwise pull
+        # nothing (or everything) back; bound it to exactly `task.scope` so
+        # `ssh_collect` only ever touches the paths the reservation covers.
+        if self._is_armed(task) and is_ssh_task(task, self._execution):
+            request = request.model_copy(
+                update={
+                    "collect": CollectPolicy(
+                        mode="scope_paths", include=list(task.scope)
+                    )
+                }
+            )
+
         # Resolve the execution backend for this task (per-entity, falling
         # back to the configured/default backend — see BackendResolver).
         # Stamped onto the request before any capability check/spawn.
@@ -1100,11 +1176,18 @@ class Scheduler:
             )
             raise SchedulerError(msg)
 
+        # Reservation gate BEFORE the span: an overlapping active reservation
+        # on an armed workdir launches nothing, so — like the HOLD/REJECT early
+        # returns above — it must not emit a task.spawn span. Retry a later
+        # tick; consume no slot, make no state transition.
+        if not self._try_reserve(task):
+            return False
+
         # Span scope covers the actual spawn so the backend subprocess
         # inherits this span as TRACEPARENT (via the execution backend's
         # build_local_env()/child_env()), giving cross-process trace
         # continuity per the observability
-        # contract. Earlier returns (HOLD/REJECT/etc.) intentionally
+        # contract. Earlier returns (HOLD/REJECT/reservation) intentionally
         # stay outside the span — they don't launch a subprocess.
         with obs.span(
             "task.spawn",
@@ -1125,38 +1208,60 @@ class Scheduler:
             # _transition helper (mirrors the reset_for_retry_atomic idiom
             # used elsewhere for atomically-committed writes). The local path
             # is unchanged — still the plain _transition call.
-            if backend.id != "local":
-                execution_id = str(uuid.uuid4())
-                attempt = task.retry_count + 1
-                request = request.model_copy(
-                    update={
-                        "execution_id": execution_id,
-                        "entity_kind": "task",
-                        "attempt": attempt,
-                    }
-                )
-                await self._db.start_execution(
-                    entity_kind="task",
-                    entity_id=task_id,
-                    expected_status=TaskStatus.READY.value,
-                    running_status=TaskStatus.RUNNING.value,
-                    execution_id=execution_id,
-                    backend_id=backend.id,
-                    transport_ref=f"{backend.id}:maestro-{execution_id}",
-                    attempt=attempt,
-                )
-                task = await self._db.get_task(task_id)
-                await self._dispatch_committed_transition(task, frm=TaskStatus.READY)
-            else:
-                execution_id = None
-                task = await self._transition(
-                    task_id,
-                    TaskStatus.RUNNING,
-                    expected_status=TaskStatus.READY,
-                )
-            self._retry_ready_times.pop(task_id, None)
+            #
+            # The reservation acquired above is rolled back only for a
+            # *proven-not-started* failure (lost CAS / SSH materialize never
+            # launched). Any other exception here is uncertain — the launch
+            # may have actually happened remotely even if this coroutine
+            # never observed success — so the reservation is HELD; the open
+            # execution handle drives its eventual release via
+            # recovery/collect, never a guess made here.
+            try:
+                if backend.id != "local":
+                    execution_id = str(uuid.uuid4())
+                    attempt = task.retry_count + 1
+                    request = request.model_copy(
+                        update={
+                            "execution_id": execution_id,
+                            "entity_kind": "task",
+                            "attempt": attempt,
+                        }
+                    )
+                    await self._db.start_execution(
+                        entity_kind="task",
+                        entity_id=task_id,
+                        expected_status=TaskStatus.READY.value,
+                        running_status=TaskStatus.RUNNING.value,
+                        execution_id=execution_id,
+                        backend_id=backend.id,
+                        transport_ref=f"{backend.id}:maestro-{execution_id}",
+                        attempt=attempt,
+                    )
+                    task = await self._db.get_task(task_id)
+                    await self._dispatch_committed_transition(
+                        task, frm=TaskStatus.READY
+                    )
+                else:
+                    execution_id = None
+                    task = await self._transition(
+                        task_id,
+                        TaskStatus.RUNNING,
+                        expected_status=TaskStatus.READY,
+                    )
+                self._retry_ready_times.pop(task_id, None)
 
-            handle = await backend.run(request)
+                handle = await backend.run(request)
+            except ConcurrentModificationError:
+                self._reservations.release(task.id)  # CAS lost: nothing launched
+                raise
+            except LaunchNotStarted:
+                self._reservations.release(task.id)  # proven not started
+                raise
+            except Exception:
+                # Uncertain (SSH may have launched, handshake lost): HOLD the
+                # reservation; the open handle drives release via
+                # recovery/collect.
+                raise
 
             # Track running task
             self._running_tasks[task_id] = RunningTask(
@@ -1264,9 +1369,37 @@ class Scheduler:
             error_message=str(error),
         )
 
+    async def _finalize_running(self, running_task: RunningTask) -> FinalizationResult:
+        """Finalize a handle, persisting `terminal`/`collected` BETWEEN
+        phases (not all-at-once after the fact). Mirrors orchestrator's
+        `_mark_terminal`/`_mark_collected` closures so a crash mid-finalize
+        can never leave durable state that lies. `exec_id is None` (LOCAL)
+        makes both callbacks no-ops.
+        """
+        exec_id = running_task.execution_id
+
+        async def on_terminal() -> None:
+            if exec_id is not None:
+                await self._db.mark_execution_state(
+                    exec_id, "terminal", allowed_from=["prepared", "running"]
+                )
+
+        async def on_collected() -> None:
+            if exec_id is not None:
+                await self._db.mark_execution_state(
+                    exec_id, "collected", allowed_from=["terminal"]
+                )
+
+        return await asyncio.shield(
+            ensure_finalize_task(
+                running_task, on_terminal=on_terminal, on_collected=on_collected
+            )
+        )
+
     async def _monitor_running_tasks(self) -> None:
         """Monitor all running tasks for completion or timeout."""
         completed: list[str] = []
+        to_release: list[str] = []
 
         for task_id, running_task in self._running_tasks.items():
             # Check if process has finished
@@ -1275,16 +1408,12 @@ class Scheduler:
             if return_code is not None:
                 # Process finished — finalize (reap/collect/cleanup) exactly
                 # once before dispatching on the outcome.
-                fin = await asyncio.shield(ensure_finalize_task(running_task))
+                fin = await self._finalize_running(running_task)
                 exec_id = running_task.execution_id
-                if exec_id is not None:
+                if exec_id is not None and fin.cleaned:
                     await self._db.mark_execution_state(
-                        exec_id, "terminal", allowed_from=["prepared", "running"]
+                        exec_id, "cleaned", allowed_from=["collected"]
                     )
-                    if fin.cleaned:
-                        await self._db.mark_execution_state(
-                            exec_id, "cleaned", allowed_from=["terminal"]
-                        )
                 if fin.collect_error or fin.cleanup_error:
                     _obs_log.warning(
                         "execution.finalize.resource_fault",
@@ -1292,10 +1421,27 @@ class Scheduler:
                         collect_error=fin.collect_error,
                         cleanup_error=fin.cleanup_error,
                     )
-                await self._handle_task_completion(
-                    task_id, running_task, fin.execution.exit_code
-                )
+                if fin.collect_error:
+                    # A REJECTED collect (e.g. an out-of-scope change) is not
+                    # a success even when the remote command exited 0 —
+                    # `finalize_handle` deliberately left the workdir/remote
+                    # artifacts untouched. Route to NEEDS_REVIEW instead of
+                    # taking the normal completion path.
+                    await self._handle_collect_conflict(
+                        task_id, running_task, fin.collect_error
+                    )
+                else:
+                    await self._handle_task_completion(
+                        task_id, running_task, fin.execution.exit_code
+                    )
                 completed.append(task_id)
+                # Release only once the scope is durably free: LOCAL tasks
+                # (no handle) free it in-place at completion; SSH/Docker
+                # tasks free it once `collected` landed. A collect-conflict
+                # (terminal-only, no `collected`) HOLDS the reservation —
+                # matches recovery's re-hold of `terminal` handles.
+                if exec_id is None or fin.collect_succeeded:
+                    to_release.append(task_id)
             else:
                 # Check for timeout
                 elapsed = datetime.now(UTC) - running_task.started_at
@@ -1303,26 +1449,51 @@ class Scheduler:
 
                 if elapsed.total_seconds() > timeout_seconds:
                     await running_task.handle.terminate(grace_seconds=10.0)
-                    timeout_fin = await asyncio.shield(
-                        ensure_finalize_task(running_task)
-                    )
+                    timeout_fin = await self._finalize_running(running_task)
                     timeout_exec_id = running_task.execution_id
-                    if timeout_exec_id is not None:
+                    if timeout_exec_id is not None and timeout_fin.cleaned:
                         await self._db.mark_execution_state(
-                            timeout_exec_id,
-                            "terminal",
-                            allowed_from=["prepared", "running"],
+                            timeout_exec_id, "cleaned", allowed_from=["collected"]
                         )
-                        if timeout_fin.cleaned:
-                            await self._db.mark_execution_state(
-                                timeout_exec_id, "cleaned", allowed_from=["terminal"]
-                            )
                     await self._handle_task_timeout(task_id, running_task)
                     completed.append(task_id)
+                    if timeout_exec_id is None or timeout_fin.collect_succeeded:
+                        to_release.append(task_id)
 
-        # Remove completed tasks from tracking
+        # Remove completed tasks from tracking. The single reap chokepoint.
         for task_id in completed:
             del self._running_tasks[task_id]
+        # Release is outcome-driven (see per-branch comments above), not
+        # unconditional on reap — a held SSH reservation (collect conflict)
+        # is freed later by a retry or by recovery once the handle reaches
+        # `collected`/`cleaned`.
+        for task_id in to_release:
+            self._reservations.release(task_id)
+
+    async def _handle_collect_conflict(
+        self,
+        task_id: str,
+        running_task: RunningTask,
+        collect_error: str,
+    ) -> None:
+        """Route a REJECTED collect to NEEDS_REVIEW, never DONE.
+
+        The remote command may have exited 0, but `finalize_handle` caught a
+        `CollectConflict` (out-of-scope change) and left the shared workdir
+        untouched — applying no changes and reporting no success. Cost is
+        still recorded (mirrors the unconditional `_record_cost` call at the
+        top of `_handle_task_completion`) so the cost row exists for this
+        attempt. No success outcome is reported.
+        """
+        await self._record_cost(running_task)
+        message = f"collect rejected: {collect_error}"
+        await self._transition(
+            task_id,
+            TaskStatus.NEEDS_REVIEW,
+            expected_status=TaskStatus.RUNNING,
+            message=message,
+            error_message=message,
+        )
 
     async def _handle_task_completion(
         self,
