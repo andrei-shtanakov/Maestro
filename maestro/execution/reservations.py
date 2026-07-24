@@ -87,3 +87,26 @@ def validate_ssh_scopes(tasks: list[Task], execution: ExecutionConfig) -> None:
                 f"SSH task {t.id!r} has no scope: remote Mode-1 execution "
                 "requires a bounding scope (parent design §2/§7)"
             )
+
+
+class ReservationRegistry:
+    """In-memory owner->Reservation map with a conservative overlap gate."""
+
+    def __init__(self) -> None:
+        self._held: dict[str, Reservation] = {}
+
+    def try_acquire(self, owner: str, r: Reservation) -> bool:
+        for other, held in self._held.items():
+            if other != owner and overlaps(held, r):
+                return False
+        self._held[owner] = r
+        return True
+
+    def reconstruct(self, owner: str, r: Reservation) -> None:
+        self._held[owner] = r
+
+    def release(self, owner: str) -> None:
+        self._held.pop(owner, None)
+
+    def holds(self, owner: str) -> bool:
+        return owner in self._held

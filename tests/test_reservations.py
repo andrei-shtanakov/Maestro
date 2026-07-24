@@ -9,6 +9,7 @@ from maestro.execution.exec_config import (
     SshTransport,
 )
 from maestro.execution.reservations import (
+    ReservationRegistry,
     UnboundedRemoteScopeError,
     _covers,
     anchor_of,
@@ -141,3 +142,37 @@ def test_validate_ssh_scopes_rejects_unbounded():
 def test_validate_ssh_scopes_accepts_bounded():
     ex = _exec_with_ssh()
     validate_ssh_scopes([_task("t1", "/r", "remote", ["src/**"])], ex)  # no raise
+
+
+def test_acquire_disjoint_both_succeed():
+    reg = ReservationRegistry()
+    assert reg.try_acquire("a", scope_to_reservation("/r", ["src/**"])) is True
+    assert reg.try_acquire("b", scope_to_reservation("/r", ["docs/**"])) is True
+
+
+def test_acquire_overlap_second_fails_and_is_not_recorded():
+    reg = ReservationRegistry()
+    assert reg.try_acquire("a", scope_to_reservation("/r", ["src/**"])) is True
+    assert reg.try_acquire("b", scope_to_reservation("/r", ["src/api/x"])) is False
+    assert reg.holds("b") is False
+
+
+def test_release_frees_the_scope():
+    reg = ReservationRegistry()
+    reg.try_acquire("a", scope_to_reservation("/r", ["src/**"]))
+    reg.release("a")
+    assert reg.try_acquire("b", scope_to_reservation("/r", ["src/api/x"])) is True
+
+
+def test_acquire_same_owner_is_idempotent():
+    reg = ReservationRegistry()
+    r = scope_to_reservation("/r", ["src/**"])
+    assert reg.try_acquire("a", r) is True
+    assert reg.try_acquire("a", r) is True  # re-acquire own reservation
+
+
+def test_reconstruct_records_unconditionally():
+    reg = ReservationRegistry()
+    reg.reconstruct("a", scope_to_reservation("/r", ["src/**"]))
+    assert reg.holds("a") is True
+    assert reg.try_acquire("b", scope_to_reservation("/r", ["src/x"])) is False
