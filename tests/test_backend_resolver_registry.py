@@ -2,6 +2,7 @@ import pytest
 
 from maestro.execution.exec_config import BackendSpec, ExecutionConfig, SshTransport
 from maestro.execution.resolver import BackendResolver, ExecutionConfigError
+from maestro.execution.ssh_backend import SshBackend
 
 
 def _ssh_cfg() -> ExecutionConfig:
@@ -26,7 +27,9 @@ def test_unknown_backend_raises():
         BackendResolver(_ssh_cfg()).resolve("nope")
 
 
-def test_ssh_backend_rejected_in_scheduler_mode():
+def test_ssh_backend_resolves_in_scheduler_mode():
+    """SSH backends resolve in scheduler mode after Phase 2b guard removal."""
     r = BackendResolver(_ssh_cfg(), mode="scheduler")
-    with pytest.raises(ExecutionConfigError, match="Mode-2"):
-        r.resolve("gpu")
+    backend = r.resolve("gpu")
+    assert isinstance(backend, SshBackend)
+    assert backend.id == "gpu"

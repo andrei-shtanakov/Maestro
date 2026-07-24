@@ -1,36 +1,28 @@
-"""Scheduler must resolve backends in Mode-1 (`scheduler`) mode.
+"""Phase 2b lifts the Mode-1 SSH guard: an ssh backend now resolves in
+scheduler mode (safety moved to the scheduler's reservation lock)."""
 
-SSH-transport backends are Mode-2 (orchestrator) only until Phase 2b, so the
-scheduler's `BackendResolver` must be constructed with `mode="scheduler"` and
-fail fast when asked to resolve an ssh-transport backend.
-"""
-
-from pathlib import Path
-
-import pytest
-
-from maestro.dag import DAG
-from maestro.database import create_database
-from maestro.execution.exec_config import BackendSpec, ExecutionConfig, SshTransport
-from maestro.execution.resolver import ExecutionConfigError
-from maestro.scheduler import Scheduler
+from maestro.execution.exec_config import (
+    BackendSpec,
+    BareIsolation,
+    ExecutionConfig,
+    SshTransport,
+)
+from maestro.execution.resolver import BackendResolver
+from maestro.execution.ssh_backend import SshBackend
 
 
-@pytest.mark.anyio
-async def test_scheduler_rejects_ssh_backend(tmp_path: Path) -> None:
-    """Scheduler's resolver rejects ssh backends with a Mode-2 error."""
-    cfg = ExecutionConfig(
+def test_ssh_resolves_in_scheduler_mode() -> None:
+    """SSH backend resolves in scheduler mode after Phase 2b guard removal."""
+    ex = ExecutionConfig(
+        default_backend="local",
         backends={
-            "gpu": BackendSpec(
-                transport=SshTransport(type="ssh", host="gpu", workdir_root="/w"),
-                isolation={"type": "bare"},
+            "remote": BackendSpec(
+                transport=SshTransport(type="ssh", host="h", workdir_root="/remote"),
+                isolation=BareIsolation(),
             )
-        }
+        },
     )
-    db = await create_database(tmp_path / "s.db")
-    try:
-        scheduler = Scheduler(db=db, dag=DAG([]), spawners={}, execution=cfg)
-        with pytest.raises(ExecutionConfigError, match="Mode-2"):
-            scheduler._backends.resolve("gpu")
-    finally:
-        await db.close()
+    resolver = BackendResolver(ex, mode="scheduler")
+    backend = resolver.resolve("remote")
+    assert isinstance(backend, SshBackend)
+    assert backend.id == "remote"
