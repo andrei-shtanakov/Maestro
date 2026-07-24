@@ -14,6 +14,7 @@ container cleanup confirmation is missing), it performs an ownership-checked
 status — callers are responsible for updating the handle's persisted state.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -32,6 +33,22 @@ class DockerProbe(Protocol):
     async def inspect(self, name: str) -> dict[str, Any] | None: ...
 
     async def rm(self, name: str) -> None: ...
+
+
+def labels_match(
+    actual: Mapping[str, str | None], expected: Mapping[str, str | None]
+) -> bool:
+    """True iff every expected label is present on `actual` with an equal,
+    non-None value. Used for full-set ownership verification (Phase 2c).
+
+    Defined here (rather than in `ssh_docker_probe.py`) so this module never
+    needs to import the ssh-specific module; `ssh_docker_probe` re-exports
+    this function instead.
+    """
+    for key, value in expected.items():
+        if value is None or actual.get(key) != value:
+            return False
+    return True
 
 
 @dataclass

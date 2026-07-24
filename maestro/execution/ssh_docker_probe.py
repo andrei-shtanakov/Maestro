@@ -8,10 +8,13 @@ DockerCli's probe/inspect paths fail closed on a hung remote daemon.
 
 import asyncio
 import contextlib
-from collections.abc import Mapping
 
 from maestro.execution.docker_cli import DockerCli, RunCmd
+from maestro.execution.docker_recovery import labels_match
 from maestro.execution.ssh_cli import SshCli
+
+
+__all__ = ["ContainerOps", "labels_match", "ssh_docker_run_cmd"]
 
 
 def ssh_docker_run_cmd(ssh: SshCli) -> RunCmd:
@@ -26,17 +29,6 @@ def ssh_docker_run_cmd(ssh: SshCli) -> RunCmd:
         return res.returncode, res.stdout, res.stderr
 
     return run_cmd
-
-
-def labels_match(
-    actual: Mapping[str, str | None], expected: Mapping[str, str | None]
-) -> bool:
-    """True iff every expected label is present on `actual` with an equal,
-    non-None value. Used for full-set ownership verification (Phase 2c)."""
-    for key, value in expected.items():
-        if value is None or actual.get(key) != value:
-            return False
-    return True
 
 
 class ContainerOps:
