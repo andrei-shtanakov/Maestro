@@ -45,3 +45,26 @@ def test_plan_collect_bounds_plan_to_scope(tmp_path):
         worktree, staging, baseline, forbidden=[".git"], scope=["src/**"]
     )
     assert plan.modified == ["src/a.py"]
+
+
+def test_plan_collect_rejects_out_of_scope_deletion(tmp_path):
+    worktree = tmp_path / "wt"
+    staging = tmp_path / "st"
+    _write(worktree / "src" / "a.py", "orig")
+    _write(worktree / "docs" / "r.md", "orig")
+    baseline = capture_baseline(worktree, excludes=[])
+    # Remote deleted the out-of-scope file (omitted from staging) and left
+    # the in-scope file untouched.
+    _write(staging / "src" / "a.py", "orig")
+    with pytest.raises(CollectConflict):
+        plan_collect(worktree, staging, baseline, forbidden=[".git"], scope=["src/**"])
+
+
+def test_plan_collect_empty_scope_rejects_any_change(tmp_path):
+    worktree = tmp_path / "wt"
+    staging = tmp_path / "st"
+    _write(worktree / "src" / "a.py", "orig")
+    baseline = capture_baseline(worktree, excludes=[])
+    _write(staging / "src" / "a.py", "changed")
+    with pytest.raises(CollectConflict):
+        plan_collect(worktree, staging, baseline, forbidden=[".git"], scope=[])

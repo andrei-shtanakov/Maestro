@@ -87,10 +87,13 @@ def plan_collect(
 ) -> CollectPlan:
     """Preflight; raises CollectConflict on any violation. No side effects.
 
-    When `scope` is a non-empty list (Mode-1 remote), any modified/deleted
-    path outside the scope is a CollectConflict and the returned plan is
-    bounded to in-scope paths. `scope=None` (or empty) keeps the
-    whole-worktree behavior (Mode-2).
+    When `scope` is a list (Mode-1 remote), any modified/deleted path
+    outside the scope is a CollectConflict and the returned plan is bounded
+    to in-scope paths. An empty list (`scope=[]`) is a valid, fully-closed
+    scope: every changed path is out-of-scope, so any change raises
+    CollectConflict (a no-change collect still returns an empty plan).
+    `scope=None` keeps the whole-worktree behavior (Mode-2) — this is the
+    only value that skips the gate.
     """
     remote = _walk(staging, forbidden)
     # Symlink / traversal guard over the raw staging tree.
@@ -106,7 +109,7 @@ def plan_collect(
     modified = sorted(r for r, sha in remote.items() if baseline.get(r) != sha)
     deleted = sorted(r for r in baseline if r not in remote)
 
-    if scope:
+    if scope is not None:
         for rel in [*modified, *deleted]:
             if not path_in_scope(rel, scope):
                 raise CollectConflict(f"out-of-scope change rejected: {rel}")
