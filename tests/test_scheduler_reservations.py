@@ -5,6 +5,9 @@ all tasks, fail-fasts on an SSH task with an unbounded (empty) scope, and
 otherwise records which workdirs host >=1 SSH task in `self._armed`.
 """
 
+from datetime import UTC, datetime
+from pathlib import Path
+
 import pytest
 
 from maestro.dag import DAG
@@ -15,8 +18,10 @@ from maestro.execution.exec_config import (
     ExecutionConfig,
     SshTransport,
 )
+from maestro.execution.models import ExecutionHandleRef, ExecutionResult
+from maestro.execution.ssh_collect import CollectConflict
 from maestro.models import AgentType, Task, TaskStatus
-from maestro.scheduler import Scheduler, SchedulerConfig, SchedulerError
+from maestro.scheduler import RunningTask, Scheduler, SchedulerConfig, SchedulerError
 
 
 pytestmark = pytest.mark.anyio
@@ -169,4 +174,93 @@ async def test_recovery_skips_collected_handle(tmp_path):
     await sched._reconstruct_reservations()
 
     assert sched._reservations.holds("t1") is False  # collected → scope free
+    await db.close()
+
+
+class _FakeCollectConflictHandle:
+    """TaskHandle double: remote command "succeeds" (exit 0) but collect
+    raises CollectConflict (out-of-scope change) — the seam the e2e missed.
+    """
+
+    def __init__(self) -> None:
+        self.ref = ExecutionHandleRef(
+            backend_id="remote",
+            run_id="fake-conflict",
+            transport_ref="remote:maestro-fake-conflict",
+            started_at=datetime.now(UTC),
+        )
+        self.cleanup_calls = 0
+
+    @property
+    def os_pid(self) -> int | None:
+        return None
+
+    def poll(self) -> int | None:
+        return 0  # remote command exited 0
+
+    async def wait(self) -> ExecutionResult:
+        return ExecutionResult(exit_code=0, output_log_path=Path("/tmp/fake.log"))
+
+    async def terminate(self, grace_seconds: float) -> None:
+        del grace_seconds
+
+    async def kill(self) -> None:
+        pass
+
+    async def collect(self):
+        raise CollectConflict("out-of-scope change rejected: docs/x.md")
+
+    async def cleanup(self) -> None:
+        # Must never be reached: finalize_handle skips cleanup on a
+        # collect_error, preserving the workdir for inspection/retry.
+        self.cleanup_calls += 1
+
+
+async def test_collect_conflict_routes_to_needs_review_not_done(tmp_path):
+    """SCHEDULER-LEVEL: a task whose remote exits 0 but whose collect is
+    REJECTED (CollectConflict) must end in NEEDS_REVIEW, not DONE — the
+    workdir is left untouched and the reservation is released (the scope is
+    genuinely free since nothing was applied).
+    """
+    db = await _db(tmp_path)
+    wd = str(tmp_path / "wd")
+    await _add(db, "t1", wd, "remote", ["src/**"])
+    sched = _sched(db, tmp_path, _ssh_exec())
+    await sched._arm_workdirs()
+
+    t1 = await db.get_task("t1")
+    # Drive t1 into RUNNING with the reservation held, mirroring what
+    # _spawn_task does before tracking a RunningTask.
+    assert sched._try_reserve(t1) is True
+    t1 = await db.update_task_status(
+        "t1", TaskStatus.RUNNING, expected_status=TaskStatus.PENDING
+    )
+
+    handle = _FakeCollectConflictHandle()
+    running_task = RunningTask(
+        task=t1,
+        handle=handle,
+        started_at=datetime.now(UTC),
+        log_file=tmp_path / "t1.log",
+        execution_id=None,
+        backend_id="remote",
+    )
+    sched._running_tasks["t1"] = running_task
+
+    await sched._monitor_running_tasks()
+
+    final_task = await db.get_task("t1")
+    assert final_task.status is TaskStatus.NEEDS_REVIEW
+    assert final_task.error_message is not None
+    assert "collect rejected" in final_task.error_message
+    assert "out-of-scope change rejected" in final_task.error_message
+
+    # Reap chokepoint still ran: reservation released (workdir genuinely
+    # free — the collect conflict applied nothing) and tracking cleared.
+    assert sched._reservations.holds("t1") is False
+    assert "t1" not in sched._running_tasks
+
+    # Workdir/remote artifacts preserved for inspection: cleanup() never ran.
+    assert handle.cleanup_calls == 0
+
     await db.close()

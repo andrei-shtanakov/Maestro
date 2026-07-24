@@ -40,6 +40,22 @@ def test_anchor_of_pure_literal_is_itself():
     assert anchor_of("a/b/c.txt") == "a/b/c.txt"
 
 
+def test_anchor_of_drops_dot_segments():
+    assert anchor_of("./src/**") == "src"
+    assert anchor_of("a/./b/*.py") == "a/b"
+
+
+def test_anchor_of_dotdot_is_whole_workdir():
+    assert anchor_of("../etc/passwd") == ""
+    assert anchor_of("a/../b/*.py") == ""
+
+
+def test_overlaps_dot_prefixed_and_bare_scope():
+    a = scope_to_reservation("/r", ["./src/**"])
+    b = scope_to_reservation("/r", ["src/**"])
+    assert overlaps(a, b) is True
+
+
 def test_covers_prefix_and_root():
     assert _covers("", "anything/here") is True
     assert _covers("src", "src/api/x.py") is True

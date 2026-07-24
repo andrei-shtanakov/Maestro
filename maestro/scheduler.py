@@ -1395,9 +1395,19 @@ class Scheduler:
                         collect_error=fin.collect_error,
                         cleanup_error=fin.cleanup_error,
                     )
-                await self._handle_task_completion(
-                    task_id, running_task, fin.execution.exit_code
-                )
+                if fin.collect_error:
+                    # A REJECTED collect (e.g. an out-of-scope change) is not
+                    # a success even when the remote command exited 0 —
+                    # `finalize_handle` deliberately left the workdir/remote
+                    # artifacts untouched. Route to NEEDS_REVIEW instead of
+                    # taking the normal completion path.
+                    await self._handle_collect_conflict(
+                        task_id, running_task, fin.collect_error
+                    )
+                else:
+                    await self._handle_task_completion(
+                        task_id, running_task, fin.execution.exit_code
+                    )
                 completed.append(task_id)
             else:
                 # Check for timeout
@@ -1433,6 +1443,31 @@ class Scheduler:
         for task_id in completed:
             del self._running_tasks[task_id]
             self._reservations.release(task_id)
+
+    async def _handle_collect_conflict(
+        self,
+        task_id: str,
+        running_task: RunningTask,
+        collect_error: str,
+    ) -> None:
+        """Route a REJECTED collect to NEEDS_REVIEW, never DONE.
+
+        The remote command may have exited 0, but `finalize_handle` caught a
+        `CollectConflict` (out-of-scope change) and left the shared workdir
+        untouched — applying no changes and reporting no success. Cost is
+        still recorded (mirrors the unconditional `_record_cost` call at the
+        top of `_handle_task_completion`) so the cost row exists for this
+        attempt. No success outcome is reported.
+        """
+        await self._record_cost(running_task)
+        message = f"collect rejected: {collect_error}"
+        await self._transition(
+            task_id,
+            TaskStatus.NEEDS_REVIEW,
+            expected_status=TaskStatus.RUNNING,
+            message=message,
+            error_message=message,
+        )
 
     async def _handle_task_completion(
         self,

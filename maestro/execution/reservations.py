@@ -18,12 +18,24 @@ _WILDCARD = set("*?[")
 
 
 def anchor_of(glob: str) -> str:
-    """Longest leading wildcard-free path prefix; '' == workdir root."""
+    """Longest leading wildcard-free path prefix; '' == workdir root.
+
+    Literal `.` segments are dropped so `./src/**` and `src/**` normalize
+    to the same anchor (a bare `strip("/").split("/")` would otherwise
+    keep them as distinct anchors and falsely declare overlapping scopes
+    disjoint). A literal `..` segment means the scope may escape the
+    workdir root — return the whole-workdir anchor `""`, the conservative
+    over-approximation (reserves everything, never under-approximates).
+    """
     segments = glob.strip("/").split("/")
     literal: list[str] = []
     for seg in segments:
         if any(ch in _WILDCARD for ch in seg):
             break
+        if seg == ".":
+            continue
+        if seg == "..":
+            return ""
         literal.append(seg)
     return "/".join(literal)
 
