@@ -27,7 +27,7 @@ from maestro.execution.secret_file import write_env_file
 from maestro.execution.ssh_cli import Runner, RunResult, SshCli
 from maestro.execution.ssh_collect import capture_baseline
 from maestro.execution.ssh_docker import build_docker_run_argv, resolve_effective_user
-from maestro.execution.ssh_docker_probe import ssh_docker_run_cmd
+from maestro.execution.ssh_docker_probe import ContainerOps, ssh_docker_run_cmd
 from maestro.execution.ssh_handle import CollectSpec, MirrorSpec, SshTaskHandle
 from maestro.execution.ssh_launch import (
     RSYNC_EXCLUDES_OUT,
@@ -116,6 +116,21 @@ class SshBackend:
     def docker(self) -> DockerCli | None:
         """The over-SSH DockerCli for the docker path (None for bare)."""
         return self._docker
+
+    def _make_container_ops(self, expected_labels: dict[str, str]) -> ContainerOps:
+        """Build the `ContainerOps` for this run's `maestro-<execution_id>`
+        container, bound to `self._docker` and its full expected label set.
+
+        The container name matches `ssh_docker.build_docker_run_argv`'s
+        `--name maestro-<execution_id>`.
+        """
+        assert self._docker is not None  # only called on the docker path
+        execution_id = expected_labels["maestro.execution_id"]
+        return ContainerOps(
+            docker=self._docker,
+            container_name=f"maestro-{execution_id}",
+            expected_labels=expected_labels,
+        )
 
     async def healthcheck(self) -> BackendHealth:
         """Reachability check: `ssh host true`."""
@@ -218,6 +233,11 @@ class SshBackend:
             ),
             expected_owner=req.execution_id,
             mirror_spec=self._build_mirror_spec(req, layout),
+            container_ops=(
+                self._make_container_ops(expected_labels)
+                if self._isolation is not None
+                else None
+            ),
         )
         handle.start()
         return handle
