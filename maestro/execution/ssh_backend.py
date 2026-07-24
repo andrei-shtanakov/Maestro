@@ -143,9 +143,11 @@ class SshBackend:
 
         Bare: each `required_tool` on the remote PATH. Docker: the remote
         daemon is reachable, the image exists, each required tool resolves
-        INSIDE the image under the effective user, and a scratch file can be
-        written/read/deleted in a `/work`-style bind mount (catches a
-        UID/rootfs incompatibility before the real task).
+        INSIDE the image under the effective user, and a probe file can be
+        written/read/deleted under the effective user in a remote scratch
+        dir that is bind-mounted at `/work` (catches a UID/bind-mount-owner
+        incompatibility — e.g. a container UID that cannot write to a bind
+        mount owned by the remote SSH user — before the real task).
         """
         if self._isolation is None:
             missing = [
@@ -179,21 +181,34 @@ class SshBackend:
             )
             if probe.returncode != 0:
                 problems.append(f"tool missing in image: {tool}")
-        scratch = await self._ssh.run(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "--user",
-                user,
-                image,
-                "sh",
-                "-c",
-                't=$(mktemp) && echo ok > "$t" && cat "$t" && rm "$t"',
-            ]
-        )
-        if scratch.returncode != 0:
+        mkdir_res = await self._ssh.run(["mktemp", "-d"])
+        scratch = mkdir_res.stdout.strip()
+        if mkdir_res.returncode != 0 or not scratch:
             problems.append(f"scratch write/read/delete failed under user {user}")
+        else:
+            try:
+                probe_res = await self._ssh.run(
+                    [
+                        "docker",
+                        "run",
+                        "--rm",
+                        "--user",
+                        user,
+                        "-v",
+                        f"{scratch}:/work",
+                        image,
+                        "sh",
+                        "-c",
+                        't=/work/.maestro-probe && echo ok > "$t" '
+                        '&& cat "$t" && rm "$t"',
+                    ]
+                )
+                if probe_res.returncode != 0:
+                    problems.append(
+                        f"scratch write/read/delete failed under user {user}"
+                    )
+            finally:
+                await self._ssh.run(["rm", "-rf", scratch])
         return CapabilityResult(ok=not problems, missing_tools=problems)
 
     async def run(self, req: ExecutionRequest) -> SshTaskHandle:

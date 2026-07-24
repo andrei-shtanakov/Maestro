@@ -6,7 +6,6 @@ import pytest
 
 from maestro.execution.exec_config import DockerIsolation, SshTransport
 from maestro.execution.models import CollectPolicy, ExecutionRequest
-from maestro.execution.models import ExecutionRequest as _ER
 from maestro.execution.ssh_backend import SshBackend
 from maestro.execution.ssh_cli import RunResult
 from maestro.execution.ssh_launch import decode_transport_ref, remote_layout
@@ -174,7 +173,7 @@ def _docker_backend(runner):
 
 
 def _can_run_req():
-    return _ER(
+    return ExecutionRequest(
         run_id="w",
         execution_id="e",
         argv=["spec-runner"],
@@ -185,10 +184,23 @@ def _can_run_req():
     )
 
 
+def _is_scratch_probe(tail: str) -> bool:
+    """Identify the bind-mounted scratch probe `docker run`, distinct from
+    the in-image `command -v` tool-resolution runs.
+
+    `tail` is the shell-joined command string `SshCli.run` hands the
+    runner (`argv[-1]`), so this matches on substrings of that string.
+    """
+    return "-v" in tail.split() and "/work" in tail and ".maestro-probe" in tail
+
+
 @pytest.mark.anyio
 async def test_can_run_docker_ok(tmp_path):
     async def runner(argv, stdin):
-        return RunResult(0, "ok", "")  # every docker/id/scratch check succeeds
+        tail = argv[-1]
+        if tail == "mktemp -d":
+            return RunResult(0, "/tmp/maestro-scratch-xyz\n", "")
+        return RunResult(0, "ok", "")  # every docker/id/tool/scratch check succeeds
 
     res = await _docker_backend(runner).can_run(_can_run_req())
     assert res.ok
@@ -213,8 +225,38 @@ async def test_can_run_docker_tool_missing():
         tail = argv[-1]
         if "command -v" in tail:
             return RunResult(1, "", "")
+        if tail == "mktemp -d":
+            return RunResult(0, "/tmp/maestro-scratch-xyz\n", "")
         return RunResult(0, "ok", "")
 
     res = await _docker_backend(runner).can_run(_can_run_req())
     assert not res.ok
     assert any("spec-runner" in m for m in res.missing_tools)
+
+
+@pytest.mark.anyio
+async def test_can_run_docker_daemon_unreachable():
+    async def runner(argv, stdin):
+        tail = argv[-1]
+        if tail == "docker version":
+            return RunResult(1, "", "cannot connect to the Docker daemon")
+        return RunResult(0, "ok", "")
+
+    res = await _docker_backend(runner).can_run(_can_run_req())
+    assert not res.ok
+    assert any("daemon" in m for m in res.missing_tools)
+
+
+@pytest.mark.anyio
+async def test_can_run_docker_scratch_fails():
+    async def runner(argv, stdin):
+        tail = argv[-1]
+        if tail == "mktemp -d":
+            return RunResult(0, "/tmp/maestro-scratch-xyz\n", "")
+        if _is_scratch_probe(tail):
+            return RunResult(1, "", "permission denied")
+        return RunResult(0, "ok", "")  # docker version/image/command -v all succeed
+
+    res = await _docker_backend(runner).can_run(_can_run_req())
+    assert not res.ok
+    assert any("scratch" in m for m in res.missing_tools)
