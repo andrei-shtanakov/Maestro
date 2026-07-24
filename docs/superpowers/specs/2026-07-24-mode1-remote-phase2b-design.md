@@ -65,10 +65,13 @@ one invariant:
 > Remote (ssh) Mode-1 execution is permitted only with **scope-bounded collect**
 > and **no overlap** between the active `(workdir, scope)` reservations.
 
-Local (`bare`) and local-Docker Mode-1 execution are unchanged — they mutate the
-shared workdir in place, with no snapshot→rsync round-trip, so the collect
-clobber hazard does not apply to them and they are out of the reservation
-protocol.
+Local (`bare`) and local-Docker Mode-1 execution never snapshot→rsync round-trip
+— they mutate the shared workdir in place, so the collect clobber hazard does
+not apply to them *directly*. They are outside the reservation protocol **only on
+a non-armed workdir**. On an **armed** workdir (§1) local tasks still
+participate: they reserve their scope (or `**` if scopeless, §3), because a local
+in-place write into an SSH task's scope during that task's run would diverge its
+baseline and break its collect.
 
 ### Hard requirements
 
@@ -166,10 +169,26 @@ possible-path space; its exact-file-set tier is not reused for the lock.
   tick**: it consumes no concurrency slot and is retried on a later tick when the
   conflicting reservation releases. One reservation per task (its whole scope
   set at once) ⇒ no multi-lock ordering, no deadlock.
-- **Rollback.** If `start_execution` raises `ConcurrentModificationError`
-  (lost CAS), or the spawn/`backend.run()` fails after the CAS, the reservation
-  is released as part of the same failure unwind — a reservation is never left
-  behind by a failed start.
+- **Rollback / hold-on-failure — launch-stage aware.** A start failure after
+  acquire is **not** unconditionally released: for SSH the remote supervisor may
+  have launched successfully while the center lost the handshake/connection and
+  saw an exception. Releasing then would let another task mutate the same scope
+  while the first is still live. `SshBackend` therefore exposes a **launch-stage
+  exception contract** — only a dedicated `LaunchNotStarted` (proven nothing
+  launched) permits immediate release; any other exception is **uncertain**.
+  Cases:
+  - `start_execution` raised `ConcurrentModificationError` (CAS lost) → **release
+    immediately** (no handle row, nothing launched).
+  - Failure **before** remote launch, proven nothing started
+    (`LaunchNotStarted`) → **release**.
+  - `backend.run()` errored **after** a possible launch (any other exception) →
+    **hold**; the durable handle stays open; fail-closed probe runs (§6).
+  - Probe **unreachable / ambiguous** → task to `NEEDS_REVIEW`, reservation
+    **held**.
+  - Release only after a **proven not-found / no-process** with cleanup or waive,
+    **or** after `collected` + completed finalization.
+  A reservation is never left behind by a *proven-not-started* failure, and never
+  released under uncertainty.
 - **Hold** spans the full handle lifecycle: run → wait → collect → cleanup.
 - **Release** happens **after finalization and the durable state transition**
   (`mark_execution_state("collected"/"cleaned")`), not merely when a terminal
@@ -214,21 +233,28 @@ not from task status. A restart is **not** evidence that no remote execution is
 live; the existing fail-closed probe (`ssh_recovery` / `probe_execution`) runs
 first.
 
-Reconstruction matrix (per SSH `execution_handle`):
+Reconstruction is driven by durable **handle state**, keyed off the non-cleaned
+non-local handle query (`database.py:1539`), independent of task status:
 
-| Handle condition | Reservation |
+| Handle state | Reservation |
 |---|---|
-| Any **non-cleaned** SSH handle (`database.py:1539` query), any task status | **reconstructed** |
-| Probe: running / unreachable / ambiguous | **held** |
-| Confirmed terminal, **collect not yet done**, subsequent manual/recovery collect permitted | **held** |
-| `collected` / `cleaned` | **released** |
-| Explicitly abandoned with proven no-process **and** collect waived | **released** |
+| `prepared` / `running` / `terminal` | **reconstruct + hold** (blocks the workdir scope) |
+| `collected` | does **not** block the workdir scope, but stays a recovery candidate for remote **cleanup** (remote tmp not yet GC'd) |
+| `cleaned` | absent from the open set — no reservation |
 
-Release is gated on the durable transition (`collected`/`cleaned`) plus
-finalization — never on merely observing a terminal task row. A task that the
+For a `prepared`/`running`/`terminal` handle the fail-closed probe
+(`ssh_recovery` / `probe_execution`) decides task disposition — running /
+unreachable / ambiguous → `NEEDS_REVIEW` — but the reservation is **held**
+throughout, released only when the handle durably reaches `collected` (scope
+unblocked) via completed finalization, or is explicitly abandoned with a proven
+no-process and collect waived.
+
+The scope-blocking reservation is released on the durable `collected` transition
+plus finalization — never on merely observing a terminal task row. A task the
 fail-closed probe has already sent to `NEEDS_REVIEW` can still have a live remote
-process; its reservation is held until the handle is durably `collected`/
-`cleaned` or explicitly abandoned.
+process; its reservation is held until the handle is durably `collected` (or
+explicitly abandoned with a proven no-process and collect waived). The remaining
+`collected → cleaned` step is remote-tmp GC only and no longer blocks the scope.
 
 ## Behavior-compatibility statement
 
@@ -250,6 +276,10 @@ execution.
   reconstruction call (§6).
 - `maestro/execution/ssh_collect.py` — scope reject filter + scope-bounded apply
   over the full-worktree baseline/diff (§4).
+- `maestro/execution/ssh_backend.py` — expose the launch-stage exception
+  contract: a dedicated `LaunchNotStarted` raised only when nothing launched, so
+  the scheduler can distinguish proven-not-started (release) from uncertain
+  (hold) after `run()` (§3).
 - `maestro/preflight.py` — extract/reuse the path-space overlap helper only if
   sound (§3); otherwise leave untouched.
 
@@ -264,14 +294,17 @@ execution.
 - **Reservation contention**: two overlapping-scope tasks on an armed workdir
   serialize (second not dispatched until first releases); two disjoint-scope
   tasks run concurrently.
-- **Acquire rollback**: lost CAS / spawn failure releases the reservation.
+- **Launch-stage release**: lost CAS → immediate release; `LaunchNotStarted` →
+  release; any other `run()` exception → reservation **held**, handle stays open,
+  probe runs; unreachable/ambiguous → `NEEDS_REVIEW` + held.
 - **Scope collect**: out-of-scope modify/delete/new-file → `CollectConflict`;
   in-scope changes apply; baseline-divergence within scope → conflict.
 - **Guard removal e2e**: localhost-SSH Mode-1 task runs end-to-end (arm →
   reserve → run → scope-collect → release).
-- **Recovery reconstruction**: non-cleaned SSH handle rebuilds a held
-  reservation across restart; `collected`/`cleaned` releases; NEEDS_REVIEW with
-  a live handle stays held.
+- **Recovery reconstruction**: `prepared`/`running`/`terminal` handle rebuilds a
+  held (scope-blocking) reservation across restart; `collected` unblocks the
+  scope but stays a cleanup candidate; `cleaned` absent from the open set;
+  `NEEDS_REVIEW` with a live handle stays held.
 
 ## Known limitations (ship with these documented)
 
