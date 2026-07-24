@@ -39,7 +39,7 @@ from maestro.database import ConcurrentModificationError, Database, TaskNotFound
 from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
 from maestro.execution.backend import TaskHandle
 from maestro.execution.exec_config import ExecutionConfig
-from maestro.execution.finalize import ensure_finalize_task
+from maestro.execution.finalize import FinalizationResult, ensure_finalize_task
 from maestro.execution.models import CollectPolicy, ExecutionRequest
 from maestro.execution.reservations import (
     ReservationRegistry,
@@ -1367,9 +1367,37 @@ class Scheduler:
             error_message=str(error),
         )
 
+    async def _finalize_running(self, running_task: RunningTask) -> FinalizationResult:
+        """Finalize a handle, persisting `terminal`/`collected` BETWEEN
+        phases (not all-at-once after the fact). Mirrors orchestrator's
+        `_mark_terminal`/`_mark_collected` closures so a crash mid-finalize
+        can never leave durable state that lies. `exec_id is None` (LOCAL)
+        makes both callbacks no-ops.
+        """
+        exec_id = running_task.execution_id
+
+        async def on_terminal() -> None:
+            if exec_id is not None:
+                await self._db.mark_execution_state(
+                    exec_id, "terminal", allowed_from=["prepared", "running"]
+                )
+
+        async def on_collected() -> None:
+            if exec_id is not None:
+                await self._db.mark_execution_state(
+                    exec_id, "collected", allowed_from=["terminal"]
+                )
+
+        return await asyncio.shield(
+            ensure_finalize_task(
+                running_task, on_terminal=on_terminal, on_collected=on_collected
+            )
+        )
+
     async def _monitor_running_tasks(self) -> None:
         """Monitor all running tasks for completion or timeout."""
         completed: list[str] = []
+        to_release: list[str] = []
 
         for task_id, running_task in self._running_tasks.items():
             # Check if process has finished
@@ -1378,16 +1406,12 @@ class Scheduler:
             if return_code is not None:
                 # Process finished — finalize (reap/collect/cleanup) exactly
                 # once before dispatching on the outcome.
-                fin = await asyncio.shield(ensure_finalize_task(running_task))
+                fin = await self._finalize_running(running_task)
                 exec_id = running_task.execution_id
-                if exec_id is not None:
+                if exec_id is not None and fin.cleaned:
                     await self._db.mark_execution_state(
-                        exec_id, "terminal", allowed_from=["prepared", "running"]
+                        exec_id, "cleaned", allowed_from=["collected"]
                     )
-                    if fin.cleaned:
-                        await self._db.mark_execution_state(
-                            exec_id, "cleaned", allowed_from=["terminal"]
-                        )
                 if fin.collect_error or fin.cleanup_error:
                     _obs_log.warning(
                         "execution.finalize.resource_fault",
@@ -1409,6 +1433,13 @@ class Scheduler:
                         task_id, running_task, fin.execution.exit_code
                     )
                 completed.append(task_id)
+                # Release only once the scope is durably free: LOCAL tasks
+                # (no handle) free it in-place at completion; SSH/Docker
+                # tasks free it once `collected` landed. A collect-conflict
+                # (terminal-only, no `collected`) HOLDS the reservation —
+                # matches recovery's re-hold of `terminal` handles.
+                if exec_id is None or fin.collect_succeeded:
+                    to_release.append(task_id)
             else:
                 # Check for timeout
                 elapsed = datetime.now(UTC) - running_task.started_at
@@ -1416,32 +1447,25 @@ class Scheduler:
 
                 if elapsed.total_seconds() > timeout_seconds:
                     await running_task.handle.terminate(grace_seconds=10.0)
-                    timeout_fin = await asyncio.shield(
-                        ensure_finalize_task(running_task)
-                    )
+                    timeout_fin = await self._finalize_running(running_task)
                     timeout_exec_id = running_task.execution_id
-                    if timeout_exec_id is not None:
+                    if timeout_exec_id is not None and timeout_fin.cleaned:
                         await self._db.mark_execution_state(
-                            timeout_exec_id,
-                            "terminal",
-                            allowed_from=["prepared", "running"],
+                            timeout_exec_id, "cleaned", allowed_from=["collected"]
                         )
-                        if timeout_fin.cleaned:
-                            await self._db.mark_execution_state(
-                                timeout_exec_id, "cleaned", allowed_from=["terminal"]
-                            )
                     await self._handle_task_timeout(task_id, running_task)
                     completed.append(task_id)
+                    if timeout_exec_id is None or timeout_fin.collect_succeeded:
+                        to_release.append(task_id)
 
-        # Remove completed tasks from tracking. The single reap chokepoint:
-        # release the (workdir, scope) reservation here regardless of owner
-        # kind. Local armed tasks have no execution-handle "collected" state
-        # to hook a release on, so this is their only release point; SSH
-        # tasks may already be released (a no-op `.pop` below) if they had
-        # an earlier collect-time release, but this is the leak-proof
-        # backstop either way.
+        # Remove completed tasks from tracking. The single reap chokepoint.
         for task_id in completed:
             del self._running_tasks[task_id]
+        # Release is outcome-driven (see per-branch comments above), not
+        # unconditional on reap — a held SSH reservation (collect conflict)
+        # is freed later by a retry or by recovery once the handle reaches
+        # `collected`/`cleaned`.
+        for task_id in to_release:
             self._reservations.release(task_id)
 
     async def _handle_collect_conflict(
