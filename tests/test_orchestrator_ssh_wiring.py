@@ -987,6 +987,171 @@ class TestDualEntityRecovery:
         finally:
             await db.close()
 
+    @pytest.mark.anyio
+    async def test_probe_open_handle_passes_expected_labels_to_container_probe(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Final-review fix: the persisted `expected_labels` (full label
+        set from the v2 transport_ref) must reach the SSH+Docker
+        container probe, not just the bare `maestro.execution_id`.
+
+        `needs_review` alone can't prove this: it is already True for ANY
+        found container regardless of whether the match was full-set or
+        single-id (a found container is always ambiguous-or-owned). So
+        this test captures the actual kwargs `probe_execution` is called
+        with and asserts the full persisted `expected_labels` reached it.
+        """
+        from maestro import orchestrator as orch_mod
+
+        async def _clean_ssh(ssh, ref):
+            del ssh, ref
+            return RecoveryVerdict(False, "ssh clean")
+
+        monkeypatch.setattr(orch_mod, "probe_ssh", _clean_ssh)
+
+        captured: dict[str, object] = {}
+        real_probe_execution = orch_mod.probe_execution
+
+        async def _capturing_probe_execution(
+            execution_id, docker, expected_labels=None
+        ):
+            captured["execution_id"] = execution_id
+            captured["expected_labels"] = expected_labels
+            return await real_probe_execution(
+                execution_id, docker, expected_labels=expected_labels
+            )
+
+        monkeypatch.setattr(orch_mod, "probe_execution", _capturing_probe_execution)
+
+        orch, db = await _orch_with_db(tmp_path)
+        try:
+            backend = _ssh_backend(
+                isolation=DockerIsolation(type="docker", image="busybox")
+            )
+            # Matches execution_id but has the WRONG backend_id label.
+            fake_docker = _FakeDockerProbe(
+                ps_ids=["cid1"],
+                labels={"maestro.execution_id": "e1", "maestro.backend_id": "wrong"},
+            )
+            backend._docker = fake_docker  # type: ignore[assignment]
+            orch._backends.resolve = MagicMock(return_value=backend)
+
+            await db.create_workstream(
+                _seed("w", WorkstreamStatus.READY, backend="gpu")
+            )
+            layout = remote_layout("/var/tmp/m", "e1")
+            expected_labels = {
+                "maestro.execution_id": "e1",
+                "maestro.backend_id": "gpu",
+            }
+            transport_ref = encode_transport_ref(
+                "gpu",
+                None,
+                layout.root,
+                layout.status,
+                isolation="docker",
+                expected_labels=expected_labels,
+            )
+            await db.start_execution(
+                entity_kind="workstream",
+                entity_id="w",
+                expected_status=WorkstreamStatus.READY.value,
+                running_status=WorkstreamStatus.RUNNING.value,
+                execution_id="e1",
+                backend_id="gpu",
+                transport_ref=transport_ref,
+                attempt=1,
+                status_marker=layout.status,
+            )
+
+            count = await orch._recover_stranded_workstreams()
+
+            assert count == 1
+            w = await db.get_workstream("w")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            assert captured["execution_id"] == "e1"
+            assert captured["expected_labels"] == expected_labels
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_gc_terminal_handles_passes_expected_labels_to_container_gc(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Final-review fix: `_gc_terminal_handles`'s container-first GC
+        step for the SSH+Docker path must pass the persisted
+        `expected_labels` through to `gc_terminal_handle`, mirroring the
+        probe-side wiring."""
+        from maestro import orchestrator as orch_mod
+
+        captured_calls: list[dict[str, object]] = []
+        real_gc = orch_mod.gc_terminal_handle
+
+        async def _capturing_gc(row, docker, expected_labels=None):
+            captured_calls.append(
+                {
+                    "execution_id": row["execution_id"],
+                    "expected_labels": expected_labels,
+                }
+            )
+            return await real_gc(row, docker, expected_labels=expected_labels)
+
+        monkeypatch.setattr(orch_mod, "gc_terminal_handle", _capturing_gc)
+
+        async def _clean_ssh_gc(ssh, ref):
+            del ssh, ref
+            return "removed"
+
+        monkeypatch.setattr(orch_mod, "gc_ssh_terminal", _clean_ssh_gc)
+
+        orch, db = await _orch_with_db(tmp_path)
+        try:
+            backend = _ssh_backend(
+                isolation=DockerIsolation(type="docker", image="busybox")
+            )
+            expected_labels = {
+                "maestro.execution_id": "e1",
+                "maestro.backend_id": "gpu",
+            }
+            fake_docker = _FakeDockerProbe(
+                ps_ids=["cid1"], labels=dict(expected_labels)
+            )
+            backend._docker = fake_docker  # type: ignore[assignment]
+            orch._backends.resolve = MagicMock(return_value=backend)
+
+            await db.create_workstream(_seed("w", WorkstreamStatus.READY))
+            layout = remote_layout("/var/tmp/m", "e1")
+            transport_ref = encode_transport_ref(
+                "gpu",
+                None,
+                layout.root,
+                layout.status,
+                isolation="docker",
+                expected_labels=expected_labels,
+            )
+            await db.start_execution(
+                entity_kind="workstream",
+                entity_id="w",
+                expected_status=WorkstreamStatus.READY.value,
+                running_status=WorkstreamStatus.RUNNING.value,
+                execution_id="e1",
+                backend_id="gpu",
+                transport_ref=transport_ref,
+                attempt=1,
+                status_marker=layout.status,
+            )
+            await db.mark_execution_state("e1", "collected", allowed_from=["prepared"])
+
+            handles = await db.get_open_execution_handles()
+            swept = await orch._gc_terminal_handles(handles)
+
+            assert swept == 1
+            assert captured_calls
+            assert captured_calls[0]["execution_id"] == "e1"
+            assert captured_calls[0]["expected_labels"] == expected_labels
+        finally:
+            await db.close()
+
 
 # =============================================================================
 # I2: ssh can_run() capability gate in `_spawn_workstream`

@@ -166,47 +166,61 @@ class SshBackend:
             return CapabilityResult(ok=False, missing_tools=[f"image absent: {image}"])
         user = await resolve_effective_user(self._ssh, self._isolation.user)
         for tool in req.required_tools:
-            probe = await self._ssh.run(
-                [
-                    "docker",
-                    "run",
-                    "--rm",
-                    "--user",
-                    user,
-                    image,
-                    "sh",
-                    "-c",
-                    f"command -v {tool}",
-                ]
-            )
+            try:
+                async with asyncio.timeout(60.0):
+                    probe = await self._ssh.run(
+                        [
+                            "docker",
+                            "run",
+                            "--rm",
+                            "--user",
+                            user,
+                            image,
+                            "sh",
+                            "-c",
+                            f"command -v {tool}",
+                        ]
+                    )
+            except TimeoutError:
+                problems.append(f"tool missing in image: {tool}")
+                continue
             if probe.returncode != 0:
                 problems.append(f"tool missing in image: {tool}")
         mkdir_res = await self._ssh.run(["mktemp", "-d"])
         scratch = mkdir_res.stdout.strip()
         if mkdir_res.returncode != 0 or not scratch:
-            problems.append(f"scratch write/read/delete failed under user {user}")
+            problems.append(
+                f"could not create remote scratch dir (rc={mkdir_res.returncode})"
+            )
         else:
             try:
-                probe_res = await self._ssh.run(
-                    [
-                        "docker",
-                        "run",
-                        "--rm",
-                        "--user",
-                        user,
-                        "-v",
-                        f"{scratch}:/work",
-                        image,
-                        "sh",
-                        "-c",
-                        't=/work/.maestro-probe && echo ok > "$t" '
-                        '&& cat "$t" && rm "$t"',
-                    ]
-                )
-                if probe_res.returncode != 0:
+                try:
+                    async with asyncio.timeout(60.0):
+                        probe_res = await self._ssh.run(
+                            [
+                                "docker",
+                                "run",
+                                "--rm",
+                                "--user",
+                                user,
+                                "-v",
+                                f"{scratch}:/work",
+                                image,
+                                "sh",
+                                "-c",
+                                't=/work/.maestro-probe && echo ok > "$t" '
+                                '&& cat "$t" && rm "$t"',
+                            ]
+                        )
+                except TimeoutError:
                     problems.append(
                         f"scratch write/read/delete failed under user {user}"
                     )
+                else:
+                    if probe_res.returncode != 0:
+                        problems.append(
+                            f"scratch write/read/delete failed under user {user}"
+                        )
             finally:
                 await self._ssh.run(["rm", "-rf", scratch])
         return CapabilityResult(ok=not problems, missing_tools=problems)

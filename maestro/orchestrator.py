@@ -688,7 +688,9 @@ class Orchestrator:
                         )
                     else:
                         cont = await probe_execution(
-                            row["execution_id"], backend.docker
+                            row["execution_id"],
+                            backend.docker,
+                            expected_labels=decoded["expected_labels"],
                         )
                         verdict = RecoveryVerdict(
                             ssh_verdict.needs_review or cont.needs_review,
@@ -772,7 +774,9 @@ class Orchestrator:
                     if backend.docker is None:
                         continue  # config no longer docker; leave for a human
                     dk_outcome = await gc_terminal_handle(
-                        {"execution_id": row["execution_id"]}, backend.docker
+                        {"execution_id": row["execution_id"]},
+                        backend.docker,
+                        expected_labels=decoded["expected_labels"],
                     )
                     if dk_outcome not in GC_CLEAN_OUTCOMES:
                         self._logger.warning(

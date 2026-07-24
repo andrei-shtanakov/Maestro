@@ -99,6 +99,39 @@ async def test_inspect_error_fails_closed() -> None:
     assert "inspect failed" in v.reason
 
 
+@pytest.mark.anyio
+async def test_full_label_mismatch_with_expected_labels() -> None:
+    """Phase 2c: found container matches `maestro.execution_id` but has the
+    wrong `maestro.backend_id` — with a full `expected_labels` set passed,
+    this must fail closed on the full-set mismatch, not just the id."""
+    v = await probe_execution(
+        "e1",
+        _FakeDocker(
+            ids=["c1"],
+            labels={"maestro.execution_id": "e1", "maestro.backend_id": "wrong"},
+        ),
+        expected_labels={"maestro.execution_id": "e1", "maestro.backend_id": "ssh1"},
+    )
+    assert v.needs_review is True
+    assert "mismatch" in v.reason
+
+
+@pytest.mark.anyio
+async def test_local_path_unaffected_without_expected_labels() -> None:
+    """Without `expected_labels` (the local-docker path), a container
+    matching only `maestro.execution_id` is still treated as a match — the
+    single-id check is preserved exactly."""
+    v = await probe_execution(
+        "e1",
+        _FakeDocker(
+            ids=["c1"],
+            labels={"maestro.execution_id": "e1", "maestro.backend_id": "whatever"},
+        ),
+    )
+    assert v.needs_review is True
+    assert v.reason == "live/leftover container found"
+
+
 # =============================================================================
 # gc_terminal_handle
 # =============================================================================
@@ -156,3 +189,37 @@ async def test_gc_rm_error_never_raises() -> None:
     outcome = await gc_terminal_handle({"execution_id": "e1"}, docker)
     assert outcome.startswith("gc failed")
     assert outcome not in GC_CLEAN_OUTCOMES
+
+
+@pytest.mark.anyio
+async def test_gc_full_label_mismatch_skips_with_expected_labels() -> None:
+    """Phase 2c: found container matches `maestro.execution_id` but has the
+    wrong `maestro.backend_id` — with `expected_labels` passed, GC must
+    skip (not rm) on the full-set mismatch."""
+    docker = _FakeDocker(
+        ids=["c1"],
+        labels={"maestro.execution_id": "e1", "maestro.backend_id": "wrong"},
+    )
+    outcome = await gc_terminal_handle(
+        {"execution_id": "e1"},
+        docker,
+        expected_labels={"maestro.execution_id": "e1", "maestro.backend_id": "ssh1"},
+    )
+    assert outcome == "label mismatch, skipped"
+    assert outcome not in GC_CLEAN_OUTCOMES
+    assert docker.rm_calls == []
+
+
+@pytest.mark.anyio
+async def test_gc_local_path_unaffected_without_expected_labels() -> None:
+    """Without `expected_labels` (the local-docker path), a container
+    matching only `maestro.execution_id` is still removed — the single-id
+    behavior is preserved exactly."""
+    docker = _FakeDocker(
+        ids=["c1"],
+        labels={"maestro.execution_id": "e1", "maestro.backend_id": "whatever"},
+    )
+    outcome = await gc_terminal_handle({"execution_id": "e1"}, docker)
+    assert outcome == "removed"
+    assert outcome in GC_CLEAN_OUTCOMES
+    assert docker.rm_calls == ["c1"]

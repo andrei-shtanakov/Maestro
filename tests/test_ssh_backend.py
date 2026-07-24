@@ -260,3 +260,60 @@ async def test_can_run_docker_scratch_fails():
     res = await _docker_backend(runner).can_run(_can_run_req())
     assert not res.ok
     assert any("scratch" in m for m in res.missing_tools)
+
+
+@pytest.mark.anyio
+async def test_can_run_docker_mktemp_fails_has_distinct_reason():
+    """A failing `mktemp -d` (rc!=0/empty) must report a reason distinct
+    from the in-container scratch write/read/delete failure — it never
+    even reached the container."""
+
+    async def runner(argv, stdin):
+        tail = argv[-1]
+        if tail == "mktemp -d":
+            return RunResult(1, "", "no space left on device")
+        return RunResult(0, "ok", "")
+
+    res = await _docker_backend(runner).can_run(_can_run_req())
+    assert not res.ok
+    assert any("could not create remote scratch dir" in m for m in res.missing_tools)
+    assert not any("write/read/delete" in m for m in res.missing_tools)
+
+
+@pytest.mark.anyio
+async def test_can_run_docker_tool_probe_timeout_reported_as_missing():
+    """A hung in-image `command -v` probe must not hang the scheduler —
+    a `TimeoutError` from the runner (simulating a wedged `docker run`)
+    must be caught and reported as the tool being missing, not
+    propagate."""
+
+    async def runner(argv, stdin):
+        tail = argv[-1]
+        if "command -v" in tail:
+            raise TimeoutError("simulated hang")
+        if tail == "mktemp -d":
+            return RunResult(0, "/tmp/maestro-scratch-xyz\n", "")
+        return RunResult(0, "ok", "")
+
+    res = await _docker_backend(runner).can_run(_can_run_req())
+    assert not res.ok
+    assert any("spec-runner" in m for m in res.missing_tools)
+
+
+@pytest.mark.anyio
+async def test_can_run_docker_scratch_probe_timeout_reported_as_missing():
+    """A hung bind-mounted scratch probe must not hang the scheduler —
+    a `TimeoutError` from the runner must be caught and reported with the
+    same reason as an in-container scratch failure, not propagate."""
+
+    async def runner(argv, stdin):
+        tail = argv[-1]
+        if tail == "mktemp -d":
+            return RunResult(0, "/tmp/maestro-scratch-xyz\n", "")
+        if _is_scratch_probe(tail):
+            raise TimeoutError("simulated hang")
+        return RunResult(0, "ok", "")
+
+    res = await _docker_backend(runner).can_run(_can_run_req())
+    assert not res.ok
+    assert any("scratch" in m for m in res.missing_tools)

@@ -94,3 +94,15 @@ async def test_container_ops_remove_refuses_on_mismatch():
     with pytest.raises(RuntimeError, match="label mismatch"):
         await ops.remove()
     assert dk.removed == []
+
+
+@pytest.mark.anyio
+async def test_container_ops_empty_expected_labels_refuses_not_vacuous_match():
+    """An empty `expected_labels` must never vacuously match — `_verify`
+    should refuse outright rather than let `labels_match({}, {})` short-
+    circuit True for any container found."""
+    dk = _FakeDocker({"maestro.execution_id": "e1"})
+    ops = _ops(dk, "maestro-e1", {})
+    with pytest.raises(RuntimeError, match="non-empty expected label set"):
+        await ops.remove()
+    assert dk.removed == []

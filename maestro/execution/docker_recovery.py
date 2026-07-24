@@ -65,7 +65,11 @@ class RecoveryVerdict:
     reason: str
 
 
-async def probe_execution(execution_id: str, docker: DockerProbe) -> RecoveryVerdict:
+async def probe_execution(
+    execution_id: str,
+    docker: DockerProbe,
+    expected_labels: Mapping[str, str] | None = None,
+) -> RecoveryVerdict:
     """Classify whether an execution is safe to silently re-queue.
 
     Fails closed: any confirmed container (in any state — running, exited,
@@ -75,8 +79,14 @@ async def probe_execution(execution_id: str, docker: DockerProbe) -> RecoveryVer
     proceeds.
 
     Args:
-        execution_id: The `maestro.execution_id` label value to probe for.
+        execution_id: The `maestro.execution_id` label value to probe for
+            (also the unique key used to find the container).
         docker: Docker CLI wrapper (injectable for tests).
+        expected_labels: When provided and non-empty, the full label set
+            (Phase 2c, SSH+Docker path) the found container must match via
+            `labels_match` — not just `maestro.execution_id`. When
+            None/empty (the local-docker path, which has no persisted full
+            set), the check falls back to single-`execution_id` equality.
 
     Returns:
         RecoveryVerdict describing whether review is required and why.
@@ -94,12 +104,19 @@ async def probe_execution(execution_id: str, docker: DockerProbe) -> RecoveryVer
     except Exception as e:
         return RecoveryVerdict(True, f"inspect failed: {e}")
     labels = (info or {}).get("Config", {}).get("Labels") or {}
-    if labels.get("maestro.execution_id") != execution_id:
+    if expected_labels:
+        if not labels_match(labels, expected_labels):
+            return RecoveryVerdict(True, "label mismatch on found container")
+    elif labels.get("maestro.execution_id") != execution_id:
         return RecoveryVerdict(True, "label mismatch on found container")
     return RecoveryVerdict(True, "live/leftover container found")
 
 
-async def gc_terminal_handle(row: dict[str, Any], docker: DockerProbe) -> str:
+async def gc_terminal_handle(
+    row: dict[str, Any],
+    docker: DockerProbe,
+    expected_labels: Mapping[str, str] | None = None,
+) -> str:
     """Best-effort, ownership-checked GC for a `terminal` execution handle.
 
     The entity behind `row` has already reached a terminal status (finalize
@@ -117,6 +134,10 @@ async def gc_terminal_handle(row: dict[str, Any], docker: DockerProbe) -> str:
             `Database.get_open_execution_handles()`) with at least
             `execution_id`.
         docker: Docker CLI wrapper (injectable for tests).
+        expected_labels: When provided and non-empty, the full label set
+            the found container must match via `labels_match` (Phase 2c,
+            SSH+Docker path) instead of the single-`execution_id` check
+            used on the local-docker path.
 
     Returns:
         One of: `"no container found"`, `"removed"`,
@@ -137,7 +158,10 @@ async def gc_terminal_handle(row: dict[str, Any], docker: DockerProbe) -> str:
     except Exception as e:
         return f"gc failed: {e}"
     labels = (info or {}).get("Config", {}).get("Labels") or {}
-    if labels.get("maestro.execution_id") != execution_id:
+    if expected_labels:
+        if not labels_match(labels, expected_labels):
+            return "label mismatch, skipped"
+    elif labels.get("maestro.execution_id") != execution_id:
         return "label mismatch, skipped"
     try:
         await docker.rm(ids[0])

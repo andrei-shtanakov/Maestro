@@ -48,6 +48,8 @@ class ContainerOps:
 
     async def _verify(self) -> bool:
         """Inspect by name; True iff present AND full labels match. None → absent."""
+        if not self._expected:
+            raise RuntimeError("ContainerOps requires a non-empty expected label set")
         info = await self._docker.inspect(self._name)
         if info is None:
             return False
