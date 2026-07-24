@@ -1,12 +1,25 @@
 from pathlib import Path
 
+import pytest
+
+from maestro.execution.exec_config import (
+    BackendSpec,
+    BareIsolation,
+    ExecutionConfig,
+    SshTransport,
+)
 from maestro.execution.reservations import (
+    UnboundedRemoteScopeError,
     _covers,
     anchor_of,
     canonical_workdir,
+    compute_armed_workdirs,
+    is_ssh_task,
     overlaps,
     scope_to_reservation,
+    validate_ssh_scopes,
 )
+from maestro.models import AgentType, Task, TaskStatus
 
 
 def test_anchor_of_literal_prefix():
@@ -70,3 +83,61 @@ def test_different_workdirs_never_overlap():
 
 def test_canonical_workdir_is_absolute(tmp_path: Path):
     assert canonical_workdir(tmp_path).is_absolute()
+
+
+def _task(tid: str, workdir: str, backend: str | None, scope: list[str]) -> Task:
+    return Task(
+        id=tid,
+        title=tid,
+        prompt="do x",
+        agent_type=AgentType.CLAUDE_CODE,
+        workdir=workdir,
+        status=TaskStatus.PENDING,
+        backend=backend,
+        scope=scope,
+    )
+
+
+def _exec_with_ssh() -> ExecutionConfig:
+    return ExecutionConfig(
+        default_backend="local",
+        backends={
+            "remote": BackendSpec(
+                transport=SshTransport(type="ssh", host="h", workdir_root="/remote"),
+                isolation=BareIsolation(),
+            )
+        },
+    )
+
+
+def test_is_ssh_task_by_transport_not_name():
+    ex = _exec_with_ssh()
+    assert is_ssh_task(_task("t1", "/r", "remote", ["src/**"]), ex) is True
+    assert is_ssh_task(_task("t2", "/r", "local", []), ex) is False
+    assert is_ssh_task(_task("t3", "/r", "unknown", []), ex) is False
+
+
+def test_compute_armed_workdirs(tmp_path):
+    ex = _exec_with_ssh()
+    wd_armed = str(tmp_path / "armed")
+    wd_plain = str(tmp_path / "plain")
+    tasks = [
+        _task("t1", wd_armed, "remote", ["src/**"]),
+        _task("t2", wd_armed, "local", []),
+        _task("t3", wd_plain, "local", []),
+    ]
+    armed = compute_armed_workdirs(tasks, ex)
+
+    assert canonical_workdir(wd_armed) in armed
+    assert canonical_workdir(wd_plain) not in armed
+
+
+def test_validate_ssh_scopes_rejects_unbounded():
+    ex = _exec_with_ssh()
+    with pytest.raises(UnboundedRemoteScopeError):
+        validate_ssh_scopes([_task("t1", "/r", "remote", [])], ex)
+
+
+def test_validate_ssh_scopes_accepts_bounded():
+    ex = _exec_with_ssh()
+    validate_ssh_scopes([_task("t1", "/r", "remote", ["src/**"])], ex)  # no raise

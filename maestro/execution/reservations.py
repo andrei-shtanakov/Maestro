@@ -10,6 +10,9 @@ real overlap through (no false negative). Exact-path matching lives in
 from dataclasses import dataclass
 from pathlib import Path
 
+from maestro.execution.exec_config import ExecutionConfig
+from maestro.models import Task
+
 
 _WILDCARD = set("*?[")
 
@@ -54,3 +57,33 @@ def overlaps(a: Reservation, b: Reservation) -> bool:
     if a.workdir != b.workdir:
         return False
     return any(_covers(x, y) or _covers(y, x) for x in a.anchors for y in b.anchors)
+
+
+class UnboundedRemoteScopeError(Exception):
+    """A Mode-1 SSH task declared no scope — remote collect would be unbounded."""
+
+
+def effective_backend_name(task: Task, execution: ExecutionConfig) -> str:
+    """Resolve a task's effective backend name (task override or execution default)."""
+    return task.backend or execution.default_backend
+
+
+def is_ssh_task(task: Task, execution: ExecutionConfig) -> bool:
+    """Check if task targets an SSH backend (by transport type, not name)."""
+    spec = execution.normalized().get(effective_backend_name(task, execution))
+    return spec is not None and spec.transport.type == "ssh"
+
+
+def compute_armed_workdirs(tasks: list[Task], execution: ExecutionConfig) -> set[Path]:
+    """Return canonical workdirs hosting ≥1 SSH task."""
+    return {canonical_workdir(t.workdir) for t in tasks if is_ssh_task(t, execution)}
+
+
+def validate_ssh_scopes(tasks: list[Task], execution: ExecutionConfig) -> None:
+    """Raise UnboundedRemoteScopeError if any SSH task has empty scope."""
+    for t in tasks:
+        if is_ssh_task(t, execution) and not t.scope:
+            raise UnboundedRemoteScopeError(
+                f"SSH task {t.id!r} has no scope: remote Mode-1 execution "
+                "requires a bounding scope (parent design §2/§7)"
+            )
