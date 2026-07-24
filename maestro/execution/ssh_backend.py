@@ -139,9 +139,62 @@ class SshBackend:
         return BackendHealth(reachable=False, detail=f"ssh {self._t.host} unreachable")
 
     async def can_run(self, req: ExecutionRequest) -> CapabilityResult:
-        """Probe each `req.required_tools` on the remote PATH."""
-        missing = [t for t in req.required_tools if not await self._ssh.probe_tool(t)]
-        return CapabilityResult(ok=not missing, missing_tools=missing)
+        """Probe capability on the executor.
+
+        Bare: each `required_tool` on the remote PATH. Docker: the remote
+        daemon is reachable, the image exists, each required tool resolves
+        INSIDE the image under the effective user, and a scratch file can be
+        written/read/deleted in a `/work`-style bind mount (catches a
+        UID/rootfs incompatibility before the real task).
+        """
+        if self._isolation is None:
+            missing = [
+                t for t in req.required_tools if not await self._ssh.probe_tool(t)
+            ]
+            return CapabilityResult(ok=not missing, missing_tools=missing)
+
+        assert self._docker is not None
+        problems: list[str] = []
+        if not await self._docker.version_ok():
+            return CapabilityResult(
+                ok=False, missing_tools=["docker daemon unreachable"]
+            )
+        image = self._isolation.image
+        if not await self._docker.image_exists(image):
+            return CapabilityResult(ok=False, missing_tools=[f"image absent: {image}"])
+        user = await resolve_effective_user(self._ssh, self._isolation.user)
+        for tool in req.required_tools:
+            probe = await self._ssh.run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--user",
+                    user,
+                    image,
+                    "sh",
+                    "-c",
+                    f"command -v {tool}",
+                ]
+            )
+            if probe.returncode != 0:
+                problems.append(f"tool missing in image: {tool}")
+        scratch = await self._ssh.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--user",
+                user,
+                image,
+                "sh",
+                "-c",
+                't=$(mktemp) && echo ok > "$t" && cat "$t" && rm "$t"',
+            ]
+        )
+        if scratch.returncode != 0:
+            problems.append(f"scratch write/read/delete failed under user {user}")
+        return CapabilityResult(ok=not problems, missing_tools=problems)
 
     async def run(self, req: ExecutionRequest) -> SshTaskHandle:
         """Materialize the worktree remotely and launch the supervisor.

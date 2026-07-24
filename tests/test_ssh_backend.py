@@ -1,10 +1,12 @@
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
 from maestro.execution.exec_config import DockerIsolation, SshTransport
 from maestro.execution.models import CollectPolicy, ExecutionRequest
+from maestro.execution.models import ExecutionRequest as _ER
 from maestro.execution.ssh_backend import SshBackend
 from maestro.execution.ssh_cli import RunResult
 from maestro.execution.ssh_launch import decode_transport_ref, remote_layout
@@ -159,3 +161,60 @@ async def test_docker_run_rewrites_argv_and_ref(tmp_path):
     assert ref["isolation"] == "docker"
     assert ref["expected_labels"]["maestro.execution_id"] == "exec1"
     await handle.cleanup()
+
+
+def _docker_backend(runner):
+    return SshBackend(
+        "rs",
+        SshTransport(type="ssh", host="h", workdir_root="/r"),
+        secret_env=[],
+        isolation=DockerIsolation(type="docker", image="img:tag", network="none"),
+        runner=runner,
+    )
+
+
+def _can_run_req():
+    return _ER(
+        run_id="w",
+        execution_id="e",
+        argv=["spec-runner"],
+        workdir=Path("/tmp"),
+        log_path=Path("/tmp/l"),
+        collect=CollectPolicy(mode="none"),
+        required_tools=["spec-runner"],
+    )
+
+
+@pytest.mark.anyio
+async def test_can_run_docker_ok(tmp_path):
+    async def runner(argv, stdin):
+        return RunResult(0, "ok", "")  # every docker/id/scratch check succeeds
+
+    res = await _docker_backend(runner).can_run(_can_run_req())
+    assert res.ok
+
+
+@pytest.mark.anyio
+async def test_can_run_docker_image_absent():
+    async def runner(argv, stdin):
+        tail = argv[-1]
+        if "image inspect" in tail:
+            return RunResult(1, "", "No such image")
+        return RunResult(0, "ok", "")
+
+    res = await _docker_backend(runner).can_run(_can_run_req())
+    assert not res.ok
+    assert any("image" in m for m in res.missing_tools)
+
+
+@pytest.mark.anyio
+async def test_can_run_docker_tool_missing():
+    async def runner(argv, stdin):
+        tail = argv[-1]
+        if "command -v" in tail:
+            return RunResult(1, "", "")
+        return RunResult(0, "ok", "")
+
+    res = await _docker_backend(runner).can_run(_can_run_req())
+    assert not res.ok
+    assert any("spec-runner" in m for m in res.missing_tools)
