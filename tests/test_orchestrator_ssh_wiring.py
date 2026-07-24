@@ -18,7 +18,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from maestro.database import Database
-from maestro.execution.exec_config import SshTransport
+from maestro.execution.docker_recovery import RecoveryVerdict
+from maestro.execution.exec_config import DockerIsolation, SshTransport
 from maestro.execution.models import (
     BackendHealth,
     CollectPolicy,
@@ -111,15 +112,52 @@ def test_collect_policy_import_sanity():
 # =============================================================================
 
 
-def _ssh_backend(host: str = "gpu") -> SshBackend:
-    """A real SshBackend over a no-op fake Runner (no subprocess/network)."""
+def _ssh_backend(
+    host: str = "gpu", *, isolation: DockerIsolation | None = None
+) -> SshBackend:
+    """A real SshBackend over a no-op fake Runner (no subprocess/network).
+
+    Passing `isolation` mirrors a `backend: docker` ssh config (Task 5):
+    `isolation_kind` reads `"docker"` and `.docker` returns a (real, but
+    network-free at construction time) over-ssh `DockerCli` — tests that
+    need to control its behavior replace `backend._docker` afterward.
+    """
 
     async def runner(argv, stdin):
         del argv, stdin
         return RunResult(0, "", "")
 
     transport = SshTransport(type="ssh", host=host, workdir_root="/var/tmp/m")
-    return SshBackend(host, transport, secret_env=[], runner=runner)
+    return SshBackend(
+        host, transport, secret_env=[], isolation=isolation, runner=runner
+    )
+
+
+class _FakeDockerProbe:
+    """Fake satisfying `docker_recovery.DockerProbe` (ps_ids_by_label /
+    inspect / rm) without a real docker daemon — for Task 9's dual-entity
+    recovery, substituted in for `SshBackend.docker`."""
+
+    def __init__(
+        self,
+        ps_ids: list[str],
+        labels: dict[str, str] | None = None,
+    ) -> None:
+        self._ps_ids = ps_ids
+        self._labels = labels or {}
+        self.ps_calls: list[tuple[str, str]] = []
+        self.rm_calls: list[str] = []
+
+    async def ps_ids_by_label(self, key: str, value: str) -> list[str]:
+        self.ps_calls.append((key, value))
+        return list(self._ps_ids)
+
+    async def inspect(self, name: str) -> dict[str, object] | None:
+        del name
+        return {"Config": {"Labels": self._labels}}
+
+    async def rm(self, name: str) -> None:
+        self.rm_calls.append(name)
 
 
 async def _orch_with_db(tmp_path: Path) -> tuple[Orchestrator, Database]:
@@ -748,6 +786,204 @@ class TestSshRecoveryBranch:
             assert swept == 1
             remaining = await db.get_open_execution_handles()
             assert all(h["execution_id"] != "e1" for h in remaining)
+        finally:
+            await db.close()
+
+
+# =============================================================================
+# Task 9: dual-entity recovery (ssh process-group AND container)
+# =============================================================================
+
+
+class TestDualEntityRecovery:
+    @pytest.mark.anyio
+    async def test_recovery_docker_leftover_container_needs_review(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A docker-isolated ssh handle: probe_ssh itself reports clean, but
+        a leftover container with matching labels is found -> NEEDS_REVIEW.
+
+        probe_ssh is monkeypatched to a clean verdict specifically so this
+        test isolates the container probe's contribution: real `probe_ssh`
+        is unconditionally fail-closed (always needs_review=True), which
+        would make the assertion true even without Task 9's code — so
+        without this monkeypatch the test could pass against the old,
+        container-blind branch too. With ssh forced clean, the workstream
+        can only land in NEEDS_REVIEW if the new container probe ran and
+        found the leftover container.
+        """
+        from maestro import orchestrator as orch_mod
+
+        async def _clean_ssh(ssh, ref):
+            del ssh, ref
+            return RecoveryVerdict(False, "ssh clean")
+
+        monkeypatch.setattr(orch_mod, "probe_ssh", _clean_ssh)
+
+        orch, db = await _orch_with_db(tmp_path)
+        try:
+            backend = _ssh_backend(
+                isolation=DockerIsolation(type="docker", image="busybox")
+            )
+            fake_docker = _FakeDockerProbe(
+                ps_ids=["cid1"], labels={"maestro.execution_id": "e1"}
+            )
+            backend._docker = fake_docker  # type: ignore[assignment]
+            orch._backends.resolve = MagicMock(return_value=backend)
+
+            await db.create_workstream(
+                _seed("w", WorkstreamStatus.READY, backend="gpu")
+            )
+            layout = remote_layout("/var/tmp/m", "e1")
+            transport_ref = encode_transport_ref(
+                "gpu",
+                None,
+                layout.root,
+                layout.status,
+                isolation="docker",
+                expected_labels={"maestro.execution_id": "e1"},
+            )
+            await db.start_execution(
+                entity_kind="workstream",
+                entity_id="w",
+                expected_status=WorkstreamStatus.READY.value,
+                running_status=WorkstreamStatus.RUNNING.value,
+                execution_id="e1",
+                backend_id="gpu",
+                transport_ref=transport_ref,
+                attempt=1,
+                status_marker=layout.status,
+            )
+
+            count = await orch._recover_stranded_workstreams()
+
+            assert count == 1
+            w = await db.get_workstream("w")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            # The container probe was actually consulted (not skipped).
+            assert fake_docker.ps_calls == [("maestro.execution_id", "e1")]
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_recovery_isolation_mismatch_needs_review(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Persisted isolation="docker" but the resolved backend is bare
+        (`isolation_kind == "bare"`, `.docker is None`) -> NEEDS_REVIEW
+        without guessing, and without even attempting a container probe.
+
+        probe_ssh is again forced clean so the assertion can only pass if
+        the mismatch check itself forces the verdict — proving the branch
+        fired rather than piggybacking on ssh's own fail-closed default.
+        """
+        from maestro import orchestrator as orch_mod
+
+        async def _clean_ssh(ssh, ref):
+            del ssh, ref
+            return RecoveryVerdict(False, "ssh clean")
+
+        monkeypatch.setattr(orch_mod, "probe_ssh", _clean_ssh)
+
+        orch, db = await _orch_with_db(tmp_path)
+        try:
+            backend = _ssh_backend(isolation=None)  # bare: isolation_kind == "bare"
+            assert backend.isolation_kind == "bare"
+            assert backend.docker is None
+            orch._backends.resolve = MagicMock(return_value=backend)
+
+            await db.create_workstream(
+                _seed("w", WorkstreamStatus.READY, backend="gpu")
+            )
+            layout = remote_layout("/var/tmp/m", "e1")
+            # Persisted ref claims docker isolation even though the backend
+            # config on this side has since reverted to bare.
+            transport_ref = encode_transport_ref(
+                "gpu",
+                None,
+                layout.root,
+                layout.status,
+                isolation="docker",
+                expected_labels={"maestro.execution_id": "e1"},
+            )
+            await db.start_execution(
+                entity_kind="workstream",
+                entity_id="w",
+                expected_status=WorkstreamStatus.READY.value,
+                running_status=WorkstreamStatus.RUNNING.value,
+                execution_id="e1",
+                backend_id="gpu",
+                transport_ref=transport_ref,
+                attempt=1,
+                status_marker=layout.status,
+            )
+
+            count = await orch._recover_stranded_workstreams()
+
+            assert count == 1
+            w = await db.get_workstream("w")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_gc_container_first_short_circuits(self, tmp_path) -> None:
+        """A `collected` docker-isolated ssh handle whose container GC comes
+        back non-clean (ambiguous: 2 containers) must never proceed to the
+        remote-root `rm -rf` — the row stays `collected` and no ssh command
+        is issued at all."""
+        orch, db = await _orch_with_db(tmp_path)
+        try:
+            backend = _ssh_backend(
+                isolation=DockerIsolation(type="docker", image="busybox")
+            )
+            ssh_calls: list[list[str]] = []
+
+            async def runner(argv, stdin):
+                del stdin
+                ssh_calls.append(argv)
+                return RunResult(0, "", "")
+
+            backend._ssh = SshCli(backend._t, runner=runner)
+            fake_docker = _FakeDockerProbe(ps_ids=["cid1", "cid2"])  # ambiguous
+            backend._docker = fake_docker  # type: ignore[assignment]
+            orch._backends.resolve = MagicMock(return_value=backend)
+
+            await db.create_workstream(_seed("w", WorkstreamStatus.READY))
+            layout = remote_layout("/var/tmp/m", "e1")
+            transport_ref = encode_transport_ref(
+                "gpu",
+                None,
+                layout.root,
+                layout.status,
+                isolation="docker",
+                expected_labels={"maestro.execution_id": "e1"},
+            )
+            await db.start_execution(
+                entity_kind="workstream",
+                entity_id="w",
+                expected_status=WorkstreamStatus.READY.value,
+                running_status=WorkstreamStatus.RUNNING.value,
+                execution_id="e1",
+                backend_id="gpu",
+                transport_ref=transport_ref,
+                attempt=1,
+                status_marker=layout.status,
+            )
+            await db.mark_execution_state("e1", "collected", allowed_from=["prepared"])
+
+            handles = await db.get_open_execution_handles()
+            swept = await orch._gc_terminal_handles(handles)
+
+            assert swept == 0
+            # The container probe ran (ambiguous outcome)...
+            assert fake_docker.ps_calls == [("maestro.execution_id", "e1")]
+            # ...but no rm -rf on the remote root was ever issued: the ssh
+            # side (owner-marker check + rm) was never even reached.
+            assert ssh_calls == []
+            remaining = await db.get_open_execution_handles()
+            row = next(h for h in remaining if h["execution_id"] == "e1")
+            assert row["state"] == "collected"
         finally:
             await db.close()
 
