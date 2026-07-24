@@ -35,19 +35,23 @@ from maestro.coordination.routing import (
 )
 from maestro.cost_tracker import effective_cost, parse_and_create_cost
 from maestro.dag import DAG
-from maestro.database import Database
+from maestro.database import ConcurrentModificationError, Database
 from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
 from maestro.execution.backend import TaskHandle
 from maestro.execution.exec_config import ExecutionConfig
 from maestro.execution.finalize import ensure_finalize_task
-from maestro.execution.models import ExecutionRequest
+from maestro.execution.models import CollectPolicy, ExecutionRequest
 from maestro.execution.reservations import (
     ReservationRegistry,
     UnboundedRemoteScopeError,
+    canonical_workdir,
     compute_armed_workdirs,
+    is_ssh_task,
+    scope_to_reservation,
     validate_ssh_scopes,
 )
 from maestro.execution.resolver import BackendResolver
+from maestro.execution.ssh_backend import LaunchNotStarted
 from maestro.models import (
     AgentType,
     ArbiterMode,
@@ -739,6 +743,17 @@ class Scheduler:
             raise SchedulerError(str(exc)) from exc
         self._armed = compute_armed_workdirs(tasks, self._execution)
 
+    def _is_armed(self, task: Task) -> bool:
+        """Check whether `task.workdir` hosts >=1 SSH task (armed by `_arm_workdirs`)."""
+        return canonical_workdir(task.workdir) in self._armed
+
+    def _try_reserve(self, task: Task) -> bool:
+        """Acquire the (workdir, scope) reservation; no-op off armed workdirs."""
+        if not self._is_armed(task):
+            return True
+        r = scope_to_reservation(task.workdir, task.scope)
+        return self._reservations.try_acquire(task.id, r)
+
     def _emit_tick(self, ready: int, running: int, completed: int) -> None:
         """Emit a per-poll-cycle queue snapshot, but only when it changed.
 
@@ -1085,6 +1100,19 @@ class Scheduler:
             model=routed_model,
         )
 
+        # Armed SSH tasks always execute inside their declared scope — the
+        # spawner's default `none` collect policy would otherwise pull
+        # nothing (or everything) back; bound it to exactly `task.scope` so
+        # `ssh_collect` only ever touches the paths the reservation covers.
+        if self._is_armed(task) and is_ssh_task(task, self._execution):
+            request = request.model_copy(
+                update={
+                    "collect": CollectPolicy(
+                        mode="scope_paths", include=list(task.scope)
+                    )
+                }
+            )
+
         # Resolve the execution backend for this task (per-entity, falling
         # back to the configured/default backend — see BackendResolver).
         # Stamped onto the request before any capability check/spawn.
@@ -1132,6 +1160,11 @@ class Scheduler:
             agent=spawner_key,
             retry_count=task.retry_count,
         ):
+            if not self._try_reserve(task):
+                # Overlapping active reservation on an armed workdir — retry a
+                # later tick; consume no slot, make no state transition.
+                return False
+
             # Transition to RUNNING — fires the TASK_STARTED event and
             # notification here (§0: the notification now means "status is
             # running", not "process launched"; it fires even if the
@@ -1145,38 +1178,60 @@ class Scheduler:
             # _transition helper (mirrors the reset_for_retry_atomic idiom
             # used elsewhere for atomically-committed writes). The local path
             # is unchanged — still the plain _transition call.
-            if backend.id != "local":
-                execution_id = str(uuid.uuid4())
-                attempt = task.retry_count + 1
-                request = request.model_copy(
-                    update={
-                        "execution_id": execution_id,
-                        "entity_kind": "task",
-                        "attempt": attempt,
-                    }
-                )
-                await self._db.start_execution(
-                    entity_kind="task",
-                    entity_id=task_id,
-                    expected_status=TaskStatus.READY.value,
-                    running_status=TaskStatus.RUNNING.value,
-                    execution_id=execution_id,
-                    backend_id=backend.id,
-                    transport_ref=f"{backend.id}:maestro-{execution_id}",
-                    attempt=attempt,
-                )
-                task = await self._db.get_task(task_id)
-                await self._dispatch_committed_transition(task, frm=TaskStatus.READY)
-            else:
-                execution_id = None
-                task = await self._transition(
-                    task_id,
-                    TaskStatus.RUNNING,
-                    expected_status=TaskStatus.READY,
-                )
-            self._retry_ready_times.pop(task_id, None)
+            #
+            # The reservation acquired above is rolled back only for a
+            # *proven-not-started* failure (lost CAS / SSH materialize never
+            # launched). Any other exception here is uncertain — the launch
+            # may have actually happened remotely even if this coroutine
+            # never observed success — so the reservation is HELD; the open
+            # execution handle drives its eventual release via
+            # recovery/collect, never a guess made here.
+            try:
+                if backend.id != "local":
+                    execution_id = str(uuid.uuid4())
+                    attempt = task.retry_count + 1
+                    request = request.model_copy(
+                        update={
+                            "execution_id": execution_id,
+                            "entity_kind": "task",
+                            "attempt": attempt,
+                        }
+                    )
+                    await self._db.start_execution(
+                        entity_kind="task",
+                        entity_id=task_id,
+                        expected_status=TaskStatus.READY.value,
+                        running_status=TaskStatus.RUNNING.value,
+                        execution_id=execution_id,
+                        backend_id=backend.id,
+                        transport_ref=f"{backend.id}:maestro-{execution_id}",
+                        attempt=attempt,
+                    )
+                    task = await self._db.get_task(task_id)
+                    await self._dispatch_committed_transition(
+                        task, frm=TaskStatus.READY
+                    )
+                else:
+                    execution_id = None
+                    task = await self._transition(
+                        task_id,
+                        TaskStatus.RUNNING,
+                        expected_status=TaskStatus.READY,
+                    )
+                self._retry_ready_times.pop(task_id, None)
 
-            handle = await backend.run(request)
+                handle = await backend.run(request)
+            except ConcurrentModificationError:
+                self._reservations.release(task.id)  # CAS lost: nothing launched
+                raise
+            except LaunchNotStarted:
+                self._reservations.release(task.id)  # proven not started
+                raise
+            except Exception:
+                # Uncertain (SSH may have launched, handshake lost): HOLD the
+                # reservation; the open handle drives release via
+                # recovery/collect.
+                raise
 
             # Track running task
             self._running_tasks[task_id] = RunningTask(
@@ -1340,9 +1395,16 @@ class Scheduler:
                     await self._handle_task_timeout(task_id, running_task)
                     completed.append(task_id)
 
-        # Remove completed tasks from tracking
+        # Remove completed tasks from tracking. The single reap chokepoint:
+        # release the (workdir, scope) reservation here regardless of owner
+        # kind. Local armed tasks have no execution-handle "collected" state
+        # to hook a release on, so this is their only release point; SSH
+        # tasks may already be released (a no-op `.pop` below) if they had
+        # an earlier collect-time release, but this is the leak-proof
+        # backstop either way.
         for task_id in completed:
             del self._running_tasks[task_id]
+            self._reservations.release(task_id)
 
     async def _handle_task_completion(
         self,

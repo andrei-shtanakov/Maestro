@@ -88,3 +88,31 @@ async def test_arm_workdirs_fail_fast_on_unbounded_scope(tmp_path):
     with pytest.raises(SchedulerError):
         await sched._arm_workdirs()
     await db.close()
+
+
+async def test_overlapping_reservation_blocks_second(tmp_path):
+    db = await _db(tmp_path)
+    wd = str(tmp_path / "wd")
+    await _add(db, "t1", wd, "remote", ["src/**"])
+    await _add(db, "t2", wd, "remote", ["src/api/x.py"])
+    sched = _sched(db, tmp_path, _ssh_exec())
+    await sched._arm_workdirs()
+    t1 = await db.get_task("t1")
+    t2 = await db.get_task("t2")
+    assert sched._try_reserve(t1) is True
+    assert sched._try_reserve(t2) is False  # overlap -> blocked
+    sched._reservations.release("t1")
+    assert sched._try_reserve(t2) is True  # freed
+    await db.close()
+
+
+async def test_non_armed_task_reserve_is_noop(tmp_path):
+    db = await _db(tmp_path)
+    wd = str(tmp_path / "plain")
+    await _add(db, "t1", wd, "local", [])
+    sched = _sched(db, tmp_path, _ssh_exec())
+    await sched._arm_workdirs()
+    t1 = await db.get_task("t1")
+    assert sched._try_reserve(t1) is True
+    assert sched._reservations.holds("t1") is False  # nothing recorded
+    await db.close()
