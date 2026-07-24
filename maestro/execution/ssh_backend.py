@@ -12,7 +12,9 @@ from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 
-from maestro.execution.exec_config import SshTransport
+from maestro._vendor.obs import child_env
+from maestro.execution.docker_cli import DockerCli
+from maestro.execution.exec_config import DockerIsolation, SshTransport
 from maestro.execution.models import (
     BackendHealth,
     CapabilityResult,
@@ -24,6 +26,8 @@ from maestro.execution.models import (
 from maestro.execution.secret_file import write_env_file
 from maestro.execution.ssh_cli import Runner, RunResult, SshCli
 from maestro.execution.ssh_collect import capture_baseline
+from maestro.execution.ssh_docker import build_docker_run_argv, resolve_effective_user
+from maestro.execution.ssh_docker_probe import ssh_docker_run_cmd
 from maestro.execution.ssh_handle import CollectSpec, MirrorSpec, SshTaskHandle
 from maestro.execution.ssh_launch import (
     RSYNC_EXCLUDES_OUT,
@@ -79,14 +83,21 @@ class SshBackend:
         transport: SshTransport,
         *,
         secret_env: list[str],
+        isolation: DockerIsolation | None = None,
         runner: Runner | None = None,
         local_staging_root: Path | None = None,
     ) -> None:
-        """Build the backend for a named ssh transport."""
+        """Build the backend for a named ssh transport (bare or docker)."""
         self._name = name
         self._t = transport
         self._secret_env = secret_env
+        self._isolation = isolation
         self._ssh = SshCli(transport, runner=runner)
+        self._docker = (
+            DockerCli(run_cmd=ssh_docker_run_cmd(self._ssh), op_timeout=60.0)
+            if isolation is not None
+            else None
+        )
         self._staging_root = local_staging_root or Path(
             os.environ.get("TMPDIR", "/tmp")
         )
@@ -95,6 +106,16 @@ class SshBackend:
     def id(self) -> str:
         """Backend identifier (the configured backend name)."""
         return self._name
+
+    @property
+    def isolation_kind(self) -> str:
+        """`"docker"` when a container isolation is configured, else `"bare"`."""
+        return "docker" if self._isolation is not None else "bare"
+
+    @property
+    def docker(self) -> DockerCli | None:
+        """The over-SSH DockerCli for the docker path (None for bare)."""
+        return self._docker
 
     async def healthcheck(self) -> BackendHealth:
         """Reachability check: `ssh host true`."""
@@ -127,6 +148,39 @@ class SshBackend:
         descriptor = build_descriptor(
             req.execution_id, layout, list(req.argv), self._t.workdir_root
         )
+        isolation = "bare"
+        expected_labels: dict[str, str] = {}
+        if self._isolation is not None:
+            effective_user = await resolve_effective_user(
+                self._ssh, self._isolation.user
+            )
+            trace_env = child_env()  # non-secret trace propagation
+            inline_env = {**req.env, **trace_env}
+            docker_argv, expected_labels = build_docker_run_argv(
+                execution_id=req.execution_id,
+                entity_kind=req.entity_kind or "workstream",
+                entity_id=req.run_id,
+                attempt=req.attempt,
+                backend_id=self._name,
+                image=self._isolation.image,
+                remote_repo=layout.repo,
+                remote_root=layout.root,
+                remote_env_file=layout.env_file,
+                effective_user=effective_user,
+                network=self._isolation.network,
+                memory=self._isolation.memory,
+                cpus=self._isolation.cpus,
+                inline_env=inline_env,
+                has_secret_env_file=bool(self._secret_env),
+                inner_argv=list(req.argv),
+            )
+            descriptor["argv"] = docker_argv
+            # secrets reach the container via docker --env-file; keep them OUT of
+            # the docker-run process env by pointing the supervisor's env_file at
+            # a non-existent path under root (passes _validate, _load_env skips it).
+            descriptor["env_file"] = f"{layout.root}/noenv"
+            isolation = "docker"
+
         # Launch the supervisor and block on its startup handshake, so a channel
         # drop after this point can never leave the run unobservable.
         result = await self._launch_supervisor(layout, descriptor)
@@ -137,7 +191,12 @@ class SshBackend:
             backend_id=self._name,
             run_id=req.run_id,
             transport_ref=encode_transport_ref(
-                self._t.host, self._t.port, layout.root, layout.status
+                self._t.host,
+                self._t.port,
+                layout.root,
+                layout.status,
+                isolation=isolation,
+                expected_labels=expected_labels,
             ),
             status_marker=layout.status,
             started_at=datetime.now(UTC),
