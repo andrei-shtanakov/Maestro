@@ -106,14 +106,28 @@ class DockerCli:
         return [line for line in out.splitlines() if line.strip()]
 
     async def stop(self, name: str, timeout: float) -> None:  # noqa: ASYNC109
-        """Stop a container by name with a timeout."""
+        """Stop a container by name with a timeout. Raises on non-zero rc."""
         secs = max(1, int(timeout))
-        await self._run([self._binary, "stop", "-t", str(secs), name], secs + 10.0)
+        rc, out, err = await self._run(
+            [self._binary, "stop", "-t", str(secs), name], secs + 10.0
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"docker stop {name} failed: {err.strip() or out.strip()}"
+            )
 
     async def kill(self, name: str) -> None:
-        """Kill a container by name."""
-        await self._run([self._binary, "kill", name], self._op_timeout)
+        """Kill a container by name. Raises on non-zero rc."""
+        rc, out, err = await self._run([self._binary, "kill", name], self._op_timeout)
+        if rc != 0:
+            raise RuntimeError(
+                f"docker kill {name} failed: {err.strip() or out.strip()}"
+            )
 
     async def rm(self, name: str) -> None:
-        """Remove a container by name with -f flag."""
-        await self._run([self._binary, "rm", "-f", name], self._op_timeout)
+        """Remove a container by name with -f. Raises on non-zero rc."""
+        rc, out, err = await self._run(
+            [self._binary, "rm", "-f", name], self._op_timeout
+        )
+        if rc != 0:
+            raise RuntimeError(f"docker rm {name} failed: {err.strip() or out.strip()}")
