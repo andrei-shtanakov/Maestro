@@ -7,6 +7,10 @@ real overlap through (no false negative). Exact-path matching lives in
 `ssh_collect` against actual changed paths.
 """
 
+from dataclasses import dataclass
+from pathlib import Path
+
+
 _WILDCARD = set("*?[")
 
 
@@ -26,3 +30,27 @@ def _covers(a: str, b: str) -> bool:
     if a == "":
         return True
     return b == a or b.startswith(a + "/")
+
+
+def canonical_workdir(path: str | Path) -> Path:
+    """Absolute, symlink-resolved workdir key (same policy everywhere)."""
+    return Path(path).expanduser().resolve()
+
+
+@dataclass(frozen=True)
+class Reservation:
+    workdir: Path
+    anchors: frozenset[str]
+
+
+def scope_to_reservation(workdir: str | Path, scope: list[str]) -> Reservation:
+    """Empty/undeclared scope reserves the whole workdir (anchor '')."""
+    anchors = frozenset(anchor_of(g) for g in scope) if scope else frozenset({""})
+    return Reservation(workdir=canonical_workdir(workdir), anchors=anchors)
+
+
+def overlaps(a: Reservation, b: Reservation) -> bool:
+    """Check if two reservations overlap."""
+    if a.workdir != b.workdir:
+        return False
+    return any(_covers(x, y) or _covers(y, x) for x in a.anchors for y in b.anchors)
