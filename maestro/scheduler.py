@@ -41,6 +41,12 @@ from maestro.execution.backend import TaskHandle
 from maestro.execution.exec_config import ExecutionConfig
 from maestro.execution.finalize import ensure_finalize_task
 from maestro.execution.models import ExecutionRequest
+from maestro.execution.reservations import (
+    ReservationRegistry,
+    UnboundedRemoteScopeError,
+    compute_armed_workdirs,
+    validate_ssh_scopes,
+)
 from maestro.execution.resolver import BackendResolver
 from maestro.models import (
     AgentType,
@@ -277,7 +283,10 @@ class Scheduler:
         self._arbiter_mode: ArbiterMode = arbiter_mode
         self._hold_throttle: HoldThrottle = HoldThrottle()
         self._abandon_outcome_after_s: int = 300
-        self._backends = BackendResolver(execution, mode="scheduler")
+        self._execution = execution or ExecutionConfig()
+        self._backends = BackendResolver(self._execution, mode="scheduler")
+        self._armed: set[Path] = set()
+        self._reservations = ReservationRegistry()
 
         self._running_tasks: dict[str, RunningTask] = {}
         self._last_tick: tuple[int, int, int] | None = None
@@ -705,6 +714,8 @@ class Scheduler:
         if not self._db.is_connected:
             raise SchedulerError("Database must be connected before running scheduler")
 
+        await self._arm_workdirs()
+
         self._loop = asyncio.get_running_loop()
         self._setup_signal_handlers()
         self._config.log_dir.mkdir(parents=True, exist_ok=True)
@@ -718,6 +729,15 @@ class Scheduler:
                 await self._main_loop()
         finally:
             await self._cleanup()
+
+    async def _arm_workdirs(self) -> None:
+        """Static per-workdir arming + start-time unbounded-scope fail-fast."""
+        tasks = await self._db.get_all_tasks()
+        try:
+            validate_ssh_scopes(tasks, self._execution)
+        except UnboundedRemoteScopeError as exc:
+            raise SchedulerError(str(exc)) from exc
+        self._armed = compute_armed_workdirs(tasks, self._execution)
 
     def _emit_tick(self, ready: int, running: int, completed: int) -> None:
         """Emit a per-poll-cycle queue snapshot, but only when it changed.

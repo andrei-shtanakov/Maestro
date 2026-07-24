@@ -290,6 +290,7 @@ def _row_to_task(row: aiosqlite.Row) -> Task:
         arbiter_decision_id=row["arbiter_decision_id"],
         arbiter_route_reason=row["arbiter_route_reason"],
         arbiter_outcome_reported_at=_parse_datetime(row["arbiter_outcome_reported_at"]),
+        backend=row["backend"],
     )
 
 
@@ -820,8 +821,8 @@ class Database:
                     task_type, language, complexity,
                     result_summary, error_message, created_at, started_at, completed_at,
                     routed_agent_type, arbiter_decision_id, arbiter_route_reason,
-                    arbiter_outcome_reported_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    arbiter_outcome_reported_at, backend
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.id,
@@ -851,6 +852,7 @@ class Database:
                     task.arbiter_decision_id,
                     task.arbiter_route_reason,
                     _format_datetime(task.arbiter_outcome_reported_at),
+                    task.backend,
                 ),
             )
         except sqlite3.IntegrityError as e:
@@ -987,7 +989,8 @@ class Database:
                 result_summary = ?, error_message = ?,
                 started_at = ?, completed_at = ?,
                 routed_agent_type = ?, arbiter_decision_id = ?,
-                arbiter_route_reason = ?, arbiter_outcome_reported_at = ?
+                arbiter_route_reason = ?, arbiter_outcome_reported_at = ?,
+                backend = ?
             WHERE id = ?
             """,
             (
@@ -1016,6 +1019,7 @@ class Database:
                 task.arbiter_decision_id,
                 task.arbiter_route_reason,
                 _format_datetime(task.arbiter_outcome_reported_at),
+                task.backend,
                 task.id,
             ),
         )
