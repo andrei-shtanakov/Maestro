@@ -36,6 +36,10 @@ from maestro.execution.ssh_launch import (
 _HANDSHAKE = "MAESTRO-SUPERVISOR-READY"
 
 
+class LaunchNotStarted(Exception):
+    """The remote run provably never launched — safe to release/rollback."""
+
+
 def _supervisor_src() -> str:
     """Read the shipped, versioned remote supervisor source."""
     return (
@@ -101,7 +105,10 @@ class SshBackend:
         layout = remote_layout(self._t.workdir_root, req.execution_id)
         baseline = capture_baseline(req.workdir, excludes=RSYNC_EXCLUDES_OUT)
 
-        await self._materialize_remote(req, layout)
+        try:
+            await self._materialize_remote(req, layout)
+        except Exception as exc:  # nothing launched remotely yet
+            raise LaunchNotStarted(str(exc)) from exc
 
         descriptor = build_descriptor(
             req.execution_id, layout, list(req.argv), self._t.workdir_root
@@ -129,7 +136,13 @@ class SshBackend:
             ref,
             log_path=req.log_path,
             timeout_seconds=req.timeout_seconds,
-            collect_spec=CollectSpec(req.workdir, staging, journal, baseline),
+            collect_spec=CollectSpec(
+                req.workdir,
+                staging,
+                journal,
+                baseline,
+                scope=req.collect.include or None,
+            ),
             expected_owner=req.execution_id,
             mirror_spec=self._build_mirror_spec(req, layout),
         )
