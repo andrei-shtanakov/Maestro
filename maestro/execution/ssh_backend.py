@@ -16,6 +16,7 @@ from maestro.execution.exec_config import SshTransport
 from maestro.execution.models import (
     BackendHealth,
     CapabilityResult,
+    CollectPolicy,
     ExecutionHandleRef,
     ExecutionRequest,
     ProbeResult,
@@ -38,6 +39,19 @@ _HANDSHAKE = "MAESTRO-SUPERVISOR-READY"
 
 class LaunchNotStarted(Exception):
     """The remote run provably never launched — safe to release/rollback."""
+
+
+def _collect_scope(policy: CollectPolicy) -> list[str] | None:
+    """Scope paths for a `scope_paths` collect; None for any other mode.
+
+    Keyed off ``mode``, not ``include`` — an empty ``include`` under
+    ``mode="scope_paths"`` must stay a fully-closed (reject-all) scope, not
+    collapse to a whole-worktree collect. Keying off ``include or None``
+    would silently disable ``plan_collect``'s fail-closed empty-scope
+    handling, and would also scope-bound a ``mode="none"``/``whole_worktree``
+    request that carried a stray ``include``.
+    """
+    return list(policy.include) if policy.mode == "scope_paths" else None
 
 
 def _supervisor_src() -> str:
@@ -141,7 +155,7 @@ class SshBackend:
                 staging,
                 journal,
                 baseline,
-                scope=req.collect.include or None,
+                scope=_collect_scope(req.collect),
             ),
             expected_owner=req.execution_id,
             mirror_spec=self._build_mirror_spec(req, layout),

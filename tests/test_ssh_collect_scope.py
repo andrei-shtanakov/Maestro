@@ -15,6 +15,17 @@ def test_path_in_scope_matches_subtree_and_glob():
     assert path_in_scope("docs/readme.md", ["src/**"]) is False
 
 
+def test_path_in_scope_normalizes_dot_segments():
+    # A `./`-prefixed scope must match its own in-scope paths (clean rels
+    # never carry `./`), mirroring reservations.anchor_of normalization —
+    # otherwise the scope would arm/lock the workdir yet reject its own
+    # changes at collect.
+    assert path_in_scope("src/a.py", ["./src/**"]) is True
+    assert path_in_scope("src/a.py", ["./src"]) is True
+    assert path_in_scope("a/b/x.py", ["a/./b/**"]) is True
+    assert path_in_scope("docs/r.md", ["./src/**"]) is False
+
+
 def _write(p, text):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(text)

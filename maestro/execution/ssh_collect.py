@@ -34,12 +34,19 @@ def _excluded(rel: str, excludes: list[str]) -> bool:
 
 
 def path_in_scope(rel: str, scope: list[str]) -> bool:
-    """True if `rel` is covered by any scope entry (self, subtree, or glob)."""
+    """True if `rel` is covered by any scope entry (self, subtree, or glob).
+
+    Scope patterns are normalized by dropping `.` path segments so a
+    `./src/**` entry matches `src/a.py` exactly as `src/**` would (mirrors
+    `reservations.anchor_of`, which strips the same segments). Without this
+    a dot-prefixed scope would arm/lock the workdir yet reject its own
+    in-scope changes at collect.
+    """
     for pat in scope:
-        norm = pat.strip("/")
+        norm = "/".join(s for s in pat.strip("/").split("/") if s != ".")
         if rel == norm or rel.startswith(norm + "/"):
             return True
-        if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(rel, norm + "/*"):
+        if fnmatch.fnmatch(rel, norm) or fnmatch.fnmatch(rel, norm + "/*"):
             return True
     return False
 
