@@ -33,6 +33,17 @@ def _excluded(rel: str, excludes: list[str]) -> bool:
     return False
 
 
+def path_in_scope(rel: str, scope: list[str]) -> bool:
+    """True if `rel` is covered by any scope entry (self, subtree, or glob)."""
+    for pat in scope:
+        norm = pat.strip("/")
+        if rel == norm or rel.startswith(norm + "/"):
+            return True
+        if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(rel, norm + "/*"):
+            return True
+    return False
+
+
 def _sha(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -72,8 +83,15 @@ def plan_collect(
     baseline: dict[str, str],
     *,
     forbidden: list[str],
+    scope: list[str] | None = None,
 ) -> CollectPlan:
-    """Preflight; raises CollectConflict on any violation. No side effects."""
+    """Preflight; raises CollectConflict on any violation. No side effects.
+
+    When `scope` is a non-empty list (Mode-1 remote), any modified/deleted
+    path outside the scope is a CollectConflict and the returned plan is
+    bounded to in-scope paths. `scope=None` (or empty) keeps the
+    whole-worktree behavior (Mode-2).
+    """
     remote = _walk(staging, forbidden)
     # Symlink / traversal guard over the raw staging tree.
     for dirpath, _dirs, files in os.walk(staging):
@@ -87,6 +105,11 @@ def plan_collect(
 
     modified = sorted(r for r, sha in remote.items() if baseline.get(r) != sha)
     deleted = sorted(r for r in baseline if r not in remote)
+
+    if scope:
+        for rel in [*modified, *deleted]:
+            if not path_in_scope(rel, scope):
+                raise CollectConflict(f"out-of-scope change rejected: {rel}")
 
     for rel in [*modified, *deleted]:
         if _excluded(rel, forbidden):
