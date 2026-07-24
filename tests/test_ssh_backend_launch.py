@@ -5,9 +5,9 @@ from maestro.execution.ssh_handle import CollectSpec
 
 def test_collect_scope_keyed_off_mode_not_include():
     # scope_paths with a real scope -> that scope
-    assert _collect_scope(
-        CollectPolicy(mode="scope_paths", include=["src/**"])
-    ) == ["src/**"]
+    assert _collect_scope(CollectPolicy(mode="scope_paths", include=["src/**"])) == [
+        "src/**"
+    ]
     # scope_paths with an EMPTY include -> stays [] (fail-closed), not None
     assert _collect_scope(CollectPolicy(mode="scope_paths", include=[])) == []
     # non-scope_paths modes -> None (Mode-2 whole-worktree), even with a stray include
