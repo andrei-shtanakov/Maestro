@@ -65,11 +65,29 @@ def ssh_docker_run_cmd(ssh: SshCli) -> RunCmd:
 ```
 
 `DockerCli(run_cmd=ssh_docker_run_cmd(ssh))` then drives the **remote** daemon
-with all of `DockerCli`'s existing structured-inspect / absent-vs-error /
-timeout logic reused verbatim. This is what makes container stop/kill/cleanup/
-probe on the remote host cost almost nothing new. (The `op_timeout` for remote
-ops should be widened from the 30 s local default to absorb SSH round-trips —
-made configurable, defaulting higher for the ssh runner.)
+with all of `DockerCli`'s existing structured-inspect / absent-vs-error logic
+reused verbatim. This is what makes container stop/kill/cleanup/probe on the
+remote host cost almost nothing new. (The `op_timeout` for remote ops should be
+widened from the 30 s local default to absorb SSH round-trips — made
+configurable, defaulting higher for the ssh runner.)
+
+**Shared hardening (blocking prerequisite).** The reuse claim above is only true
+after `DockerCli` is hardened — today `stop`/`kill`/`rm` discard the `_run(...)`
+tuple and treat **any** return code as success (`docker_cli.py:108-119`), and
+the sketched `ssh_docker_run_cmd` above ignores its `timeout` argument
+(`SshCli.run` takes no timeout). Phase 2c must, as a **shared** change (i.e. it
+also affects the **local** docker path):
+
+- `stop`/`kill`/`rm` check the return code and **raise** on non-zero (so an
+  ownership-verified cleanup that silently fails can never be mistaken for a
+  successful removal — the recovery/GC logic in §6/§7 depends on this).
+- The remote `run_cmd` **actually enforces** `timeout` — since `SshCli.run` has
+  no timeout parameter, the run_cmd wraps it (`asyncio.wait_for` / `asyncio.
+  timeout`) and maps expiry to a non-zero/`TimeoutError` result, mirroring the
+  local `_default_run_cmd` kill-on-timeout contract.
+- Tests cover the non-zero-rc and timeout branches for both the local and the
+  over-SSH runner, **including regression coverage** for the local docker path
+  that this hardening touches.
 
 ### 2. Pure remote-docker argv builder (new `ssh_docker.py`)
 
@@ -150,6 +168,12 @@ so the container receives secrets solely through the `docker run --env-file`
 flag, which references the real `layout.env_file`. GH credential denylisting is
 already enforced upstream in `exec_config`.
 
+Precise promise: **Maestro does not add allowlisted secrets to the `docker run`
+process env; it delivers them exclusively via `--env-file`.** Maestro cannot
+guarantee the absence of a same-named value already present in the remote SSH
+user's *ambient* environment — that is the operator's responsibility, not a
+guarantee this seam can make.
+
 ### 5. `can_run` for SSH+Docker (replaces bare-PATH probe)
 
 Today `SshBackend.can_run` probes `req.required_tools` on the **bare remote
@@ -202,10 +226,24 @@ succeed.)
 An SSH+Docker crash can strand **two** resources: the remote supervisor/process
 group **and** the container. Recovery for such a handle must check both:
 
-- Resolve the backend; if it is an `SshBackend` with **docker** isolation
-  (detected via an `isolation` field added to the versioned `transport_ref`
-  JSON, so recovery is independent of later config edits, and cross-checked
-  against the resolved backend):
+**`transport_ref` as the isolation SSOT (bump `v` 1 → 2).** The persisted
+`transport_ref` — not the current config — is the source of truth for a run's
+isolation type and expected identity; the resolved backend config is used
+**only** to connect (host, user, `ssh_opts`, connection policy) and to
+cross-check. Recovery is therefore *not* fully config-independent (SSH still
+needs live connection settings), only **isolation-identity**-independent.
+Concretely:
+
+- bump `transport_ref.v` from 1 to 2;
+- store `isolation: "bare" | "docker"`;
+- for docker, store the **full `expected_labels`** (for the ownership probe);
+- do **not** store `image`/`user` — the ownership probe does not need them;
+- treat a legacy `v:1` ref as `bare`;
+- a mismatch between persisted isolation and the resolved backend →
+  `NEEDS_REVIEW`, with **no** attempt to guess.
+
+Recovery flow: resolve the backend; if the persisted ref says `docker` and the
+resolved `SshBackend` agrees (cross-check):
   - Run `probe_ssh` (existing) **and** `docker_recovery.probe_execution` driven
     by the over-SSH `DockerCli`.
   - `NEEDS_REVIEW` if **either** says review is needed — a live/leftover
@@ -213,9 +251,19 @@ group **and** the container. Recovery for such a handle must check both:
     an alive process group, or a terminal-marker-without-confirmed-collect.
   - **probe deletes nothing.**
 - GC (`terminal`/`collected` → `cleaned`) proceeds only when the ssh side is
-  `collected` **and** the container is confirmed gone (both `gc_ssh_terminal`
-  and the remote `gc_terminal_handle` report a clean outcome). Any residue
-  leaves the row for the next sweep / a human.
+  `collected` **and** the container is confirmed gone. **Ordering is
+  load-bearing — the container is GC'd first:**
+
+  ```
+  docker gc_terminal_handle  →  only on a clean outcome:
+    gc_ssh_terminal (remote-root rm -rf)  →  mark handle cleaned
+  ```
+
+  If `gc_ssh_terminal` ran first it could delete the remote worktree **and the
+  secret evidence** and then fail to remove the container — leaving an orphaned
+  container that can no longer be correlated to its run. So a non-clean docker GC
+  outcome short-circuits: the remote root is **not** removed, and the row is left
+  `collected` for the next sweep / a human.
 
 ### 8. Config & resolver wiring
 
@@ -259,6 +307,15 @@ each workstream ran on already extends `DOGFOOD_LOG`.
 - **Over-SSH `DockerCli`**: inject a fake `Runner` into `SshCli`; assert each
   `docker …` argv is correctly shlex-joined through `ssh_base()`; reuse the
   `docker_recovery` fakes for probe/gc against it.
+- **`DockerCli` hardening (§1, shared)**: `stop`/`kill`/`rm` raise on non-zero
+  rc; the remote run_cmd enforces `timeout` (expiry → non-zero/`TimeoutError`);
+  **local-docker regression** — the existing local path still passes with the
+  rc-checked ops.
+- **`transport_ref` v2**: docker ref round-trips `isolation` + full
+  `expected_labels`; a legacy `v:1` ref decodes as `bare`; persisted-vs-resolved
+  isolation mismatch → `NEEDS_REVIEW`.
+- **Recovery-GC ordering (§7)**: a non-clean docker GC outcome leaves the remote
+  root intact (no `gc_ssh_terminal`) and the row `collected`.
 - **`can_run`**: fake ssh runner returning scripted results for `docker
   version` / `image inspect` / in-image `command -v` / scratch write-read-delete;
   assert each failure maps to a specific `CapabilityResult` reason.
@@ -283,6 +340,18 @@ each workstream ran on already extends `DOGFOOD_LOG`.
 
 ## Rollout guarantee
 
-No `execution` block, or `isolation: bare` → **byte-identical to today**. The
-docker path is reached only by an explicit `isolation: {type: docker}` under an
-`ssh` transport; the bare ssh path and the local docker path are untouched.
+The **remote supervisor source stays byte-identical** — no remote-protocol
+version bump (`transport_ref.v` is a center-side persisted field, not the
+supervisor wire format).
+
+For the runtime paths the promise is **behavior-compatible**, not byte-identical,
+because the shared `DockerCli` hardening (§1: rc-checked `stop`/`kill`/`rm`,
+enforced timeout) and the tightened full-label ownership check (§6) deliberately
+touch the **local** docker path too. Those are *fail-closed* changes — a
+previously-silent failure now raises / routes to review rather than being
+mistaken for success — and are covered by local-docker regression tests.
+
+The SSH+Docker path is reached only by an explicit `isolation: {type: docker}`
+under an `ssh` transport. No `execution` block, or `isolation: bare`, still
+selects the bare paths — unchanged apart from the shared fail-closed hardening
+noted above.
