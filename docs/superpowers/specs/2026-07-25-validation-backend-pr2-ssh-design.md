@@ -154,31 +154,69 @@ policy:
   `update_execution_handle_launch`, no real remote coords) → NEEDS_REVIEW**
   (fail-closed; never fall through to the local-docker branch).
 
-So `ProbeResult.needs_review` (transport-correct) drives the routing: `True` →
-NEEDS_REVIEW; `False` → safe to reclaim/re-READY. Automatic re-READY is permitted
-**only** on a durable proof (a backend `probe` that returns not-needs-review, a
-`LaunchNotStarted` outcome, or an already-`cleaned` handle) — **never** on a raw
-`kill -0` "process dead".
+#### 4a. `ProbeResult` gains an honest `needs_review` field
 
-**Phase routing** (extends PR1's phase-split) — and the map must now include
-`terminal`, which PR1 filtered out (`recovery.py:123`):
+The routing above needs a transport-correct "should this go to review?" signal, but
+`ProbeResult` today is only `alive: bool, exit_code, detail` (`models.py:118`) —
+"dead process, but collect unconfirmed" (alive=False yet review-required) cannot be
+expressed, and `SshBackend.probe` currently smuggles the verdict into `alive`, which
+is a lie about the field's meaning. PR2 makes the contract honest:
+
+```python
+class ProbeResult(BaseModel):
+    needs_review: bool
+    alive: bool | None = None      # diagnostic only
+    exit_code: int | None = None
+    detail: str = ""
+```
+
+Recovery routes **solely on `needs_review`**; `alive` is diagnostic. Each backend's
+`probe()` sets `needs_review` with its own transport-correct policy (local reclaims a
+dead PID / absent container → `needs_review=False`; SSH open handle → always `True`).
+This is the change that lets `ExecutionBackend.probe()` be the single decision
+boundary rather than a value recovery has to reinterpret.
+
+#### 4b. `ExecutionHandleRef` gains `execution_id`
+
+Docker's probe key is `execution_handles.execution_id`, but `ExecutionHandleRef`
+(`models.py:90`) carries only `backend_id`/`run_id`/`transport_ref`/coords — so
+`LocalBackend.probe(ref)` cannot call `probe_execution(execution_id, docker)` without
+parsing `maestro-<id>` back out of the opaque `transport_ref`. Do **not** make the
+container name a second identity source. Instead:
+
+- add `execution_id: str | None` to `ExecutionHandleRef`;
+- runtime handles fill it at mint from `ExecutionRequest.execution_id`
+  (`models.py:53`, already present);
+- the shared `handle_ref_from_row()` reads it from the row's `execution_id` column;
+- a Docker probe with a null `execution_id` is **fail-closed → NEEDS_REVIEW**, never a
+  best-effort name parse;
+- regression tests cover ref construction + round-trip (row → ref → probe key).
+
+#### 4c. Recovery state matrix (authoritative)
+
+Phase selection now includes `collected` (PR1 filtered to prepared/running,
+`recovery.py:123`), so a `collected` handle on a still-RUNNING/VALIDATING task can
+reach routing:
 
 ```
-RUNNING    task → probe the execution_phase='task'       handle  (states prepared/running/terminal)
-VALIDATING task → probe the execution_phase='validation' handle  (states prepared/running/terminal)
+RUNNING    task → the execution_phase='task'       handle, states {prepared,running,terminal,collected}
+VALIDATING task → the execution_phase='validation' handle, states {prepared,running,terminal,collected}
 ```
 
-**Task-status drives the outcome, handle-state modulates safety.** A task left in
-RUNNING/VALIDATING by a crash has an **unconfirmed execution outcome**. For any
-non-`cleaned` handle on such a task, recovery routes to NEEDS_REVIEW (there is no
-validation-only re-run in PR1/PR2 — a lost outcome cannot be safely reconstructed).
-`collected` only means the **scope reservation was released** and the handle is
-GC-eligible; it does **not** prove the task's outcome survived, so a
-RUNNING/VALIDATING task with a `collected` handle is still NEEDS_REVIEW. (The
-earlier "collected does not block the task" framing was too strong.)
+Outcome is **not** a blanket "any non-cleaned → NEEDS_REVIEW" (that would wrongly
+review a reclaimable local run). It is per (backend, handle-state):
 
-VALIDATING → NEEDS_REVIEW uses the `VALIDATING → FAILED → NEEDS_REVIEW` edge,
-matching PR1's `_route_validation_infra_review`.
+| Backend             | Handle state                    | RUNNING/VALIDATING recovery                          |
+|---------------------|---------------------------------|------------------------------------------------------|
+| local bare / Docker | prepared / running / terminal   | backend `probe()`: `needs_review` → review, else reclaim (re-READY) |
+| SSH bare / Docker   | prepared / running / terminal   | **always review** (collect unconfirmed; remote diff may be unsynced) |
+| any backend         | `collected` (outcome lost)      | **review** — scope reservation already freed, handle is GC-eligible, but the crashed task's outcome was never recorded and cannot be validation-only-replayed |
+| any backend         | `cleaned` / no open handle      | existing recovery path (no probe)                    |
+
+Automatic re-READY is permitted **only** on a durable proof — a backend `probe()`
+returning `needs_review=False`, a `LaunchNotStarted` outcome, or an already-`cleaned`
+handle — **never** on a raw `kill -0` "process dead". VALIDATING → review uses the
+`VALIDATING → FAILED → NEEDS_REVIEW` edge (PR1's `_route_validation_infra_review`).
 
 ### 5. State- and transport-aware GC
 
@@ -219,18 +257,23 @@ preflight and runs remotely.
 
 ## Components touched
 
+- `maestro/execution/models.py` — `ProbeResult` gains `needs_review: bool` (with
+  `alive` demoted to diagnostic, §4a); `ExecutionHandleRef` gains
+  `execution_id: str | None` (§4b).
 - `maestro/execution/ssh_handle.py` — populate `stdout_tail` (combined) on
   `capture_output` in `wait()` with a final `_tail_log()` (§1); `CollectSpec.mode`
   + `collect()` `none` short-circuit (§2).
 - `maestro/execution/ssh_backend.py` — set `CollectSpec.mode` from
   `req.collect.mode`; make `probe()` isolation-aware (dual probe for persisted
-  Docker isolation, §4).
+  Docker isolation) and return `ProbeResult(needs_review=…)` honestly (§4/§4a);
+  `SshTaskHandle` fills `ref.execution_id` at mint.
 - `maestro/execution/local.py` — make `LocalBackend.probe()` isolation-aware
-  (bare → PID, Docker → `probe_execution`), so it is a self-sufficient recovery
-  boundary (§4).
-- `maestro/execution/` (new shared helper) — `handle_ref_from_row(row)` reused by
-  both `StateRecovery` (Mode 1) and the orchestrator (Mode 2); replaces the private
-  `orchestrator._handle_ref_from_row`.
+  (bare → PID, Docker → `probe_execution` keyed on `ref.execution_id`), returning
+  `ProbeResult(needs_review=…)`; `LocalTaskHandle`/`DockerTaskHandle` fill
+  `ref.execution_id` at mint (§4a/§4b).
+- `maestro/execution/` (new shared helper) — `handle_ref_from_row(row)` (reads the
+  row's `execution_id`) reused by both `StateRecovery` (Mode 1) and the orchestrator
+  (Mode 2); replaces the private `orchestrator._handle_ref_from_row`.
 - `maestro/scheduler.py` — persist remote coords after both task-phase and
   validation-phase SSH `backend.run` (`update_execution_handle_launch`); remove the
   SSH validation preflight gate wiring.
@@ -247,6 +290,11 @@ preflight and runs remotely.
 
 ## Testing
 
+- **Probe contract unit:** `ExecutionHandleRef` round-trips `execution_id` (row → ref
+  → `probe_execution` key); a Docker probe on a ref with `execution_id=None` is
+  fail-closed (`needs_review=True`), never a `maestro-<id>` name parse; each backend
+  `probe()` sets `needs_review` per its transport policy (local dead → `False`, SSH
+  open → `True`).
 - **SSH capture unit:** an `SshTaskHandle` run with `capture_output=True` returns
   `stdout_tail` = the (bounded) combined remote-log tail and `stderr_tail == ""`;
   the final `_tail_log()` picks up bytes written after the last monitor tail; a
@@ -298,7 +346,10 @@ re-derive them:
 
 1. **`ExecutionBackend.probe(ref) -> ProbeResult` is the single recovery boundary.**
    Recovery never hand-assembles transport×isolation combinations. Each backend's
-   `probe()` owns its transport-correct, fail-closed policy.
+   `probe()` owns its transport-correct, fail-closed policy. This requires the two
+   model changes in §4a/§4b: `ProbeResult.needs_review` (recovery routes on it;
+   `alive` is diagnostic) and `ExecutionHandleRef.execution_id` (the Docker probe key
+   travels on the ref, not parsed from `transport_ref`).
 2. **`StateRecovery` gets a `BackendResolver`** (built from the execution config the
    CLI already loads) and classifies every open handle by its **persisted
    `backend_id`**, then calls the resolved backend's `probe()`. Never by
