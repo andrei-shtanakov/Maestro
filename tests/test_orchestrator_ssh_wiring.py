@@ -856,6 +856,61 @@ class TestSshRecoveryBranch:
             await db.close()
 
     @pytest.mark.anyio
+    async def test_probe_exception_recovers_to_needs_review_not_running(
+        self, tmp_path
+    ) -> None:
+        """Fix-13e / decision #1 symmetry: if backend.probe() RAISES during
+        Mode-2 recovery, the workstream must route to NEEDS_REVIEW — never
+        stay stranded in RUNNING (the pre-fix behavior: the raise propagated
+        to the outer recovery except, logged 'Failed to recover', left the
+        workstream RUNNING). Mirrors Mode-1 StateRecovery's probe guard.
+        MUST FAIL on pre-fix code (workstream stays RUNNING, count == 0)."""
+        orch, db = await _orch_with_db(tmp_path)
+        try:
+            backend = MagicMock()
+            backend.accepts_ref = MagicMock(return_value=True)
+            backend.probe = AsyncMock(side_effect=RuntimeError("transport down"))
+            orch._backends.resolve = MagicMock(return_value=backend)
+
+            await db.create_workstream(
+                _seed("w", WorkstreamStatus.READY, backend="gpu")
+            )
+            layout = remote_layout("/var/tmp/m", "e1")
+            transport_ref = encode_transport_ref(
+                "gpu", None, layout.root, layout.status
+            )
+            await db.start_execution(
+                entity_kind="workstream",
+                entity_id="w",
+                expected_status=WorkstreamStatus.READY.value,
+                running_status=WorkstreamStatus.RUNNING.value,
+                execution_id="e1",
+                backend_id="gpu",
+                transport_ref=transport_ref,
+                attempt=1,
+                status_marker=layout.status,
+            )
+            # NOTE: deliberately DO NOT mark the handle terminal — it stays an
+            # open handle so recovery routes it through _probe_open_handle.
+            w0 = await db.get_workstream("w")
+            assert w0.status == WorkstreamStatus.RUNNING
+            retry_before = w0.retry_count
+
+            count = await orch._recover_stranded_workstreams()
+
+            assert count == 1
+            backend.probe.assert_awaited_once()  # the raise actually happened
+            w = await db.get_workstream("w")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            assert w.status != WorkstreamStatus.RUNNING
+            assert w.retry_count == retry_before
+            # No GC/close after the exception: the open handle is left intact.
+            remaining = await db.get_open_execution_handles()
+            assert any(h["execution_id"] == "e1" for h in remaining)
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
     async def test_docker_terminal_handle_still_resets_to_ready(self, tmp_path) -> None:
         """Zero docker regression: a docker `terminal` handle in the same
         stranded-RUNNING situation still resets to READY (docker collect is a

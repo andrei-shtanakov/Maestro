@@ -696,8 +696,23 @@ class Orchestrator:
             if not backend.accepts_ref(ref):
                 needs_review = True
             else:
-                result = await backend.probe(ref)
-                needs_review = result.needs_review
+                try:
+                    result = await backend.probe(ref)
+                except Exception as exc:
+                    # A probe raise (e.g. transient transport I/O) must not
+                    # abort recovery and strand the workstream in RUNNING:
+                    # fail closed to NEEDS_REVIEW, never a silent reclaim.
+                    # Mirrors StateRecovery's Mode-1 probe guard (recovery.py).
+                    self._logger.warning(
+                        "Workstream '%s' execution probe failed during "
+                        "recovery (%s) — sending to NEEDS_REVIEW; verify "
+                        "and clean it up before resume",
+                        workstream_id,
+                        exc,
+                    )
+                    needs_review = True
+                else:
+                    needs_review = result.needs_review
         if not needs_review:
             await self._db.mark_execution_state(
                 row["execution_id"], "terminal", allowed_from=["prepared", "running"]
