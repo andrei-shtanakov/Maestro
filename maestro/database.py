@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     timeout_minutes INTEGER DEFAULT 30,
     requires_approval BOOLEAN DEFAULT FALSE,
     validation_cmd TEXT,
+    validation_backend TEXT NOT NULL DEFAULT 'local',
     task_type TEXT NOT NULL DEFAULT 'feature',
     language TEXT NOT NULL DEFAULT 'other',
     complexity TEXT NOT NULL DEFAULT 'moderate',
@@ -292,6 +293,7 @@ def _row_to_task(row: aiosqlite.Row) -> Task:
         arbiter_route_reason=row["arbiter_route_reason"],
         arbiter_outcome_reported_at=_parse_datetime(row["arbiter_outcome_reported_at"]),
         backend=row["backend"],
+        validation_backend=row["validation_backend"],
     )
 
 
@@ -438,6 +440,7 @@ class Database:
             (8, "entity_backend_columns", self._migrate_entity_backend_columns),
             (9, "ssh_handle_columns", self._migrate_ssh_handle_columns),
             (10, "execution_phase", self._migrate_execution_phase),
+            (11, "tasks_validation_backend", self._migrate_tasks_validation_backend),
         ]
 
         for version, name, fn in ordered:
@@ -783,6 +786,21 @@ class Database:
                 "CHECK (execution_phase IN ('task','validation'))"
             )
 
+    async def _migrate_tasks_validation_backend(self) -> None:
+        """Migration 11: add `validation_backend` to `tasks` (DEFAULT 'local').
+
+        Pre-existing rows keep today's local-validation behavior. Idempotent
+        via PRAGMA table_info, same shape as `_migrate_entity_backend_columns`.
+        """
+        assert self._connection is not None
+        cursor = await self._connection.execute("PRAGMA table_info(tasks)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "validation_backend" not in columns:
+            await self._connection.execute(
+                "ALTER TABLE tasks ADD COLUMN validation_backend "
+                "TEXT NOT NULL DEFAULT 'local'"
+            )
+
     @asynccontextmanager
     async def transaction(self) -> AsyncGenerator[aiosqlite.Connection, None]:
         """Context manager for database transactions.
@@ -840,11 +858,12 @@ class Database:
                     id, title, prompt, branch, workdir, agent_type, status,
                     assigned_to, scope, priority, max_retries, retry_count,
                     timeout_minutes, requires_approval, validation_cmd,
+                    validation_backend,
                     task_type, language, complexity,
                     result_summary, error_message, created_at, started_at, completed_at,
                     routed_agent_type, arbiter_decision_id, arbiter_route_reason,
                     arbiter_outcome_reported_at, backend
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.id,
@@ -862,6 +881,7 @@ class Database:
                     task.timeout_minutes,
                     task.requires_approval,
                     task.validation_cmd,
+                    task.validation_backend,
                     task.task_type.value,
                     task.language.value,
                     task.complexity.value,
@@ -1007,6 +1027,7 @@ class Database:
                 status = ?, assigned_to = ?, scope = ?, priority = ?,
                 max_retries = ?, retry_count = ?, timeout_minutes = ?,
                 requires_approval = ?, validation_cmd = ?,
+                validation_backend = ?,
                 task_type = ?, language = ?, complexity = ?,
                 result_summary = ?, error_message = ?,
                 started_at = ?, completed_at = ?,
@@ -1030,6 +1051,7 @@ class Database:
                 task.timeout_minutes,
                 task.requires_approval,
                 task.validation_cmd,
+                task.validation_backend,
                 task.task_type.value,
                 task.language.value,
                 task.complexity.value,

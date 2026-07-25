@@ -472,6 +472,14 @@ class TaskConfig(BaseModel):
         default=None,
         description=("Execution backend name (local|docker); None -> default_backend"),
     )
+    validation_backend: str = Field(
+        default="local",
+        description=(
+            "Backend for the post-task validation run: 'local' | 'same' "
+            "(the task's backend) | a named backend. Non-local targets must "
+            "resolve to transport.type == local; SSH targets fail preflight."
+        ),
+    )
 
     @field_validator("id")
     @classmethod
@@ -550,6 +558,13 @@ class Task(BaseModel):
     backend: str | None = Field(
         default=None,
         description=("Execution backend name (local|docker); None -> default_backend"),
+    )
+    validation_backend: str = Field(
+        default="local",
+        description=(
+            "Validation backend: 'local' | 'same' | a named backend "
+            "(non-local must be transport.type == local; SSH fails preflight)"
+        ),
     )
     task_type: TaskType = Field(
         default=TaskType.FEATURE,
@@ -718,6 +733,7 @@ class Task(BaseModel):
             requires_approval=config.requires_approval,
             validation_cmd=config.validation_cmd,
             backend=config.backend,
+            validation_backend=config.validation_backend,
             task_type=config.task_type or infer_task_type(config.prompt),
             language=config.language or infer_language(config.scope),
             complexity=config.complexity or infer_complexity(config.scope),
