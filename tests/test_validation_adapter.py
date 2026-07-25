@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from maestro.execution.models import ExecutionResult
 from maestro.models import Task, TaskStatus
 from maestro.validator import (
@@ -30,6 +32,15 @@ def test_build_request_shape():
     assert req.inherit_env is True
     assert req.backend_id == "local"
     assert req.timeout_seconds == 300
+
+
+def test_build_request_rejects_unparseable_cmd():
+    # A truthy-but-empty-argv cmd (all whitespace) must raise ValueError so
+    # both validation paths can turn it into a validation failure, not a crash.
+    task = _task()
+    task.validation_cmd = "   "
+    with pytest.raises(ValueError):
+        build_validation_request(task, backend_id="local", run_id="r", attempt=1)
 
 
 def test_map_success():

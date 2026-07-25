@@ -1555,19 +1555,37 @@ class Scheduler:
                     )
                     validation_result = await self._run_validation(task)
                 else:
-                    validation_result = await self._run_durable_validation(
-                        task,
-                        backend,
-                        build_validation_request(
+                    try:
+                        request = build_validation_request(
                             task,
                             backend_id=backend.id,
                             run_id=f"val-{task_id}-{task.retry_count + 1}",
                             attempt=task.retry_count + 1,
-                        ),
-                    )
-                    if validation_result is None:
-                        # Infra failure already routed to NEEDS_REVIEW.
-                        return
+                        )
+                    except ValueError as e:
+                        # Unparseable/empty validation_cmd: a plain transition
+                        # then a failed result (a code-level validation failure,
+                        # not an infra failure) — mirrors the local path's
+                        # ValueError handling in _run_validation.
+                        await self._transition(
+                            task_id,
+                            TaskStatus.VALIDATING,
+                            expected_status=TaskStatus.RUNNING,
+                        )
+                        validation_result = ValidationResult(
+                            success=False,
+                            exit_code=None,
+                            stdout="",
+                            stderr="",
+                            error_message=str(e),
+                        )
+                    else:
+                        validation_result = await self._run_durable_validation(
+                            task, backend, request
+                        )
+                        if validation_result is None:
+                            # Infra failure already routed to NEEDS_REVIEW.
+                            return
                 if validation_result.success:
                     done_task = await self._transition(
                         task_id,
