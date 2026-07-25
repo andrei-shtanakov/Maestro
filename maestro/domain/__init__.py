@@ -24,12 +24,18 @@ from maestro.domain.verdict import (
     VerdictValue,
     evaluate_handshake,
 )
+from maestro.domain.verifier import (
+    CommandVerifier,
+    VerificationContext,
+    VerificationProvider,
+)
 
 
 __all__ = [
     "ALLOWED_PLACEHOLDERS",
     "RESUME_REVERIFY",
     "RESUME_REWORK",
+    "CommandVerifier",
     "CriteriaConfig",
     "DeliveryPolicy",
     "DomainProfile",
@@ -44,6 +50,8 @@ __all__ = [
     "VerdictDocument",
     "VerdictIdentity",
     "VerdictValue",
+    "VerificationContext",
+    "VerificationProvider",
     "VerificationSection",
     "VerifierSpec",
     "WorkspacePolicy",
