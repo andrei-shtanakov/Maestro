@@ -1,5 +1,6 @@
 """Domain contracts and verification runtime (Stage B, design v1.1)."""
 
+from maestro.domain.ledger import EvidenceLedger, IngestedAttempt, LedgerCollisionError
 from maestro.domain.profile import (
     ALLOWED_PLACEHOLDERS,
     CriteriaConfig,
@@ -33,8 +34,11 @@ __all__ = [
     "DeliveryPolicy",
     "DomainProfile",
     "EchoExpectations",
+    "EvidenceLedger",
     "Finding",
     "HandshakeResult",
+    "IngestedAttempt",
+    "LedgerCollisionError",
     "RoleScopes",
     "SpecGenSection",
     "VerdictDocument",
