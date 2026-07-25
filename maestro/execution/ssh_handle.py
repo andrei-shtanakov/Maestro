@@ -11,6 +11,7 @@ import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from maestro.execution.models import (
     CollectResult,
@@ -21,6 +22,10 @@ from maestro.execution.ssh_cli import SshCli
 from maestro.execution.ssh_collect import apply_collect, plan_collect
 from maestro.execution.ssh_launch import RSYNC_EXCLUDES_COLLECT, RemoteLayout
 from maestro.execution.ssh_mirror import mirror_once
+
+
+if TYPE_CHECKING:
+    from maestro.execution.ssh_docker_probe import ContainerOps
 
 
 logger = logging.getLogger(__name__)
@@ -75,8 +80,15 @@ class SshTaskHandle:
         poll_interval: float = 1.0,
         expected_owner: str | None = None,
         mirror_spec: MirrorSpec | None = None,
+        container_ops: "ContainerOps | None" = None,
     ) -> None:
-        """Initialize the handle; call `start()` to spawn the monitor."""
+        """Initialize the handle; call `start()` to spawn the monitor.
+
+        `container_ops`, when set, is the docker-path lifecycle companion:
+        `terminate`/`kill` also stop the container (killing the remote
+        `docker run` client alone does not stop the container), and
+        `cleanup` removes it before the remote `rm -rf`.
+        """
         self._ssh = ssh
         self._layout = layout
         self.ref = ref
@@ -86,6 +98,7 @@ class SshTaskHandle:
         self._interval = poll_interval
         self._expected_owner = expected_owner
         self._mirror = mirror_spec
+        self._container_ops = container_ops
         self._exit_code: int | None = None
         self._terminal = asyncio.Event()
         self._timed_out = False
@@ -194,15 +207,23 @@ class SshTaskHandle:
         )
 
     async def terminate(self, grace_seconds: float) -> None:
-        """Send TERM to the process group; escalate to KILL after grace."""
+        """Send TERM to the process group; escalate to KILL after grace.
+
+        For a docker run, also targeted-stop the container — killing the
+        remote `docker run` client does not stop the container itself.
+        """
         await self._signal_group("TERM")
+        if self._container_ops is not None:
+            await self._container_ops.stop(grace_seconds)
         await asyncio.sleep(grace_seconds)
         if not self._terminal.is_set():
             await self._signal_group("KILL")
 
     async def kill(self) -> None:
-        """Force-kill the process group."""
+        """Force-kill the process group and, for docker, the container."""
         await self._signal_group("KILL")
+        if self._container_ops is not None:
+            await self._container_ops.stop(0.0)
 
     async def collect(self) -> CollectResult:
         """Rsync the remote repo to staging, then plan + apply the collect.
@@ -240,8 +261,11 @@ class SshTaskHandle:
         )
 
     async def cleanup(self) -> None:
-        """Ownership-checked remote `rm -rf` + local staging/journal removal."""
+        """Ownership-checked container removal (docker), then remote `rm -rf`
+        + local staging/journal removal."""
         await self._verify_ownership()
+        if self._container_ops is not None:
+            await self._container_ops.remove()
         await self._ssh.run(["rm", "-rf", self._layout.root])
         for p in (self._collect.staging_dir, self._collect.journal_dir):
             shutil.rmtree(p, ignore_errors=True)

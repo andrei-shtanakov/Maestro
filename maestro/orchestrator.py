@@ -674,7 +674,30 @@ class Orchestrator:
             backend = self._backends.resolve(backend_id)
             if isinstance(backend, SshBackend):
                 ref = _handle_ref_from_row(row)
-                verdict = await probe_ssh(backend._ssh, ref)
+                decoded = decode_transport_ref(ref.transport_ref)
+                ssh_verdict = await probe_ssh(backend._ssh, ref)
+                if decoded["isolation"] == "docker":
+                    # Phase 2c: an ssh-launched execution that itself runs the
+                    # harness inside a container can strand TWO resources — the
+                    # remote supervisor/process-group AND the container. Probe
+                    # both and route to NEEDS_REVIEW if either says so; never
+                    # trust ssh_verdict alone to rule out a leftover container.
+                    if backend.isolation_kind != "docker" or backend.docker is None:
+                        verdict = RecoveryVerdict(
+                            True, "persisted docker isolation but backend is bare"
+                        )
+                    else:
+                        cont = await probe_execution(
+                            row["execution_id"],
+                            backend.docker,
+                            expected_labels=decoded["expected_labels"],
+                        )
+                        verdict = RecoveryVerdict(
+                            ssh_verdict.needs_review or cont.needs_review,
+                            f"ssh={ssh_verdict.reason}; container={cont.reason}",
+                        )
+                else:
+                    verdict = ssh_verdict
             else:
                 verdict = RecoveryVerdict(
                     True, f"unsupported backend {backend_id!r} for recovery probe"
@@ -743,6 +766,26 @@ class Orchestrator:
                 if not isinstance(backend, SshBackend):
                     continue
                 ref = _handle_ref_from_row(row)
+                decoded = decode_transport_ref(ref.transport_ref)
+                if decoded["isolation"] == "docker":
+                    # Container-first ordering: never delete the remote root
+                    # (which may hold the only evidence of what the container
+                    # touched) before the container itself is confirmed gone.
+                    if backend.docker is None:
+                        continue  # config no longer docker; leave for a human
+                    dk_outcome = await gc_terminal_handle(
+                        {"execution_id": row["execution_id"]},
+                        backend.docker,
+                        expected_labels=decoded["expected_labels"],
+                    )
+                    if dk_outcome not in GC_CLEAN_OUTCOMES:
+                        self._logger.warning(
+                            "recovery: container GC not clean for %s: %s — "
+                            "leaving remote root intact",
+                            row["execution_id"],
+                            dk_outcome,
+                        )
+                        continue
                 outcome = await gc_ssh_terminal(backend._ssh, ref)
             except Exception as e:
                 self._logger.warning(

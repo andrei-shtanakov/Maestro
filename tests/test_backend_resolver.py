@@ -1,11 +1,19 @@
 import pytest
 
 from maestro.execution.docker_cli import DockerCli
-from maestro.execution.exec_config import DockerConfig, ExecutionConfig
+from maestro.execution.exec_config import (
+    BackendSpec,
+    BareIsolation,
+    DockerConfig,
+    DockerIsolation,
+    ExecutionConfig,
+    SshTransport,
+)
 from maestro.execution.isolators import DockerIsolator
 from maestro.execution.local import LocalBackend
 from maestro.execution.models import CollectPolicy, ExecutionRequest
 from maestro.execution.resolver import BackendResolver, ExecutionConfigError
+from maestro.execution.ssh_backend import SshBackend
 
 
 class FakeDockerCli(DockerCli):
@@ -181,3 +189,34 @@ async def test_docker_can_run_image_present(tmp_path):
     )
     cap = await backend.can_run(_minimal_request(tmp_path))
     assert cap.ok is True
+
+
+def test_resolve_ssh_docker_backend():
+    cfg = ExecutionConfig(
+        default_backend="local",
+        backends={
+            "rs": BackendSpec(
+                transport=SshTransport(type="ssh", host="h", workdir_root="/r"),
+                isolation=DockerIsolation(type="docker", image="img:tag"),
+                secret_env=["ANTHROPIC_API_KEY"],
+            )
+        },
+    )
+    backend = BackendResolver(cfg).resolve("rs")
+    assert isinstance(backend, SshBackend)
+    assert backend.isolation_kind == "docker"
+
+
+def test_resolve_ssh_bare_backend():
+    cfg = ExecutionConfig(
+        default_backend="local",
+        backends={
+            "rb": BackendSpec(
+                transport=SshTransport(type="ssh", host="h", workdir_root="/r"),
+                isolation=BareIsolation(),
+            )
+        },
+    )
+    backend = BackendResolver(cfg).resolve("rb")
+    assert isinstance(backend, SshBackend)
+    assert backend.isolation_kind == "bare"

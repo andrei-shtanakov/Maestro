@@ -73,10 +73,16 @@ class BackendResolver:
         return LocalBackend(backend_id=name)
 
     def _build_ssh(
-        self, name: str, _spec: BackendSpec, transport: SshTransport
+        self, name: str, spec: BackendSpec, transport: SshTransport
     ) -> ExecutionBackend:
         from maestro.execution.ssh_backend import SshBackend
 
+        isolation = None
+        if isinstance(spec.isolation, DockerIsolation):
+            isolation = spec.isolation
         return SshBackend(
-            name, transport, secret_env=self._execution.effective_secret_env(name)
+            name,
+            transport,
+            secret_env=self._execution.effective_secret_env(name),
+            isolation=isolation,
         )

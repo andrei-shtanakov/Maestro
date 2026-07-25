@@ -128,3 +128,33 @@ async def test_kill_container():
     cli = DockerCli(run_cmd=fake)
     await cli.kill("maestro-e1")
     assert fake.calls[0] == ["docker", "kill", "maestro-e1"]
+
+
+def _cli(rc: int, err: str = "boom"):
+    async def run_cmd(argv, timeout):  # noqa: ASYNC109
+        return rc, "", err
+
+    return DockerCli(run_cmd=run_cmd)
+
+
+@pytest.mark.anyio
+async def test_rm_raises_on_nonzero_rc():
+    with pytest.raises(RuntimeError, match="docker rm"):
+        await _cli(1).rm("maestro-abc")
+
+
+@pytest.mark.anyio
+async def test_stop_raises_on_nonzero_rc():
+    with pytest.raises(RuntimeError, match="docker stop"):
+        await _cli(1).stop("maestro-abc", 10.0)
+
+
+@pytest.mark.anyio
+async def test_kill_raises_on_nonzero_rc():
+    with pytest.raises(RuntimeError, match="docker kill"):
+        await _cli(1).kill("maestro-abc")
+
+
+@pytest.mark.anyio
+async def test_rm_ok_on_zero_rc():
+    await _cli(0).rm("maestro-abc")  # no raise

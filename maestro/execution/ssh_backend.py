@@ -12,7 +12,9 @@ from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 
-from maestro.execution.exec_config import SshTransport
+from maestro._vendor.obs import child_env
+from maestro.execution.docker_cli import DockerCli
+from maestro.execution.exec_config import DockerIsolation, SshTransport
 from maestro.execution.models import (
     BackendHealth,
     CapabilityResult,
@@ -24,6 +26,8 @@ from maestro.execution.models import (
 from maestro.execution.secret_file import write_env_file
 from maestro.execution.ssh_cli import Runner, RunResult, SshCli
 from maestro.execution.ssh_collect import capture_baseline
+from maestro.execution.ssh_docker import build_docker_run_argv, resolve_effective_user
+from maestro.execution.ssh_docker_probe import ContainerOps, ssh_docker_run_cmd
 from maestro.execution.ssh_handle import CollectSpec, MirrorSpec, SshTaskHandle
 from maestro.execution.ssh_launch import (
     RSYNC_EXCLUDES_OUT,
@@ -79,14 +83,21 @@ class SshBackend:
         transport: SshTransport,
         *,
         secret_env: list[str],
+        isolation: DockerIsolation | None = None,
         runner: Runner | None = None,
         local_staging_root: Path | None = None,
     ) -> None:
-        """Build the backend for a named ssh transport."""
+        """Build the backend for a named ssh transport (bare or docker)."""
         self._name = name
         self._t = transport
         self._secret_env = secret_env
+        self._isolation = isolation
         self._ssh = SshCli(transport, runner=runner)
+        self._docker = (
+            DockerCli(run_cmd=ssh_docker_run_cmd(self._ssh), op_timeout=60.0)
+            if isolation is not None
+            else None
+        )
         self._staging_root = local_staging_root or Path(
             os.environ.get("TMPDIR", "/tmp")
         )
@@ -96,6 +107,31 @@ class SshBackend:
         """Backend identifier (the configured backend name)."""
         return self._name
 
+    @property
+    def isolation_kind(self) -> str:
+        """`"docker"` when a container isolation is configured, else `"bare"`."""
+        return "docker" if self._isolation is not None else "bare"
+
+    @property
+    def docker(self) -> DockerCli | None:
+        """The over-SSH DockerCli for the docker path (None for bare)."""
+        return self._docker
+
+    def _make_container_ops(self, expected_labels: dict[str, str]) -> ContainerOps:
+        """Build the `ContainerOps` for this run's `maestro-<execution_id>`
+        container, bound to `self._docker` and its full expected label set.
+
+        The container name matches `ssh_docker.build_docker_run_argv`'s
+        `--name maestro-<execution_id>`.
+        """
+        assert self._docker is not None  # only called on the docker path
+        execution_id = expected_labels["maestro.execution_id"]
+        return ContainerOps(
+            docker=self._docker,
+            container_name=f"maestro-{execution_id}",
+            expected_labels=expected_labels,
+        )
+
     async def healthcheck(self) -> BackendHealth:
         """Reachability check: `ssh host true`."""
         if await self._ssh.check(["true"]):
@@ -103,9 +139,96 @@ class SshBackend:
         return BackendHealth(reachable=False, detail=f"ssh {self._t.host} unreachable")
 
     async def can_run(self, req: ExecutionRequest) -> CapabilityResult:
-        """Probe each `req.required_tools` on the remote PATH."""
-        missing = [t for t in req.required_tools if not await self._ssh.probe_tool(t)]
-        return CapabilityResult(ok=not missing, missing_tools=missing)
+        """Probe capability on the executor.
+
+        Bare: each `required_tool` on the remote PATH. Docker: the remote
+        daemon is reachable, the image exists, each required tool resolves
+        INSIDE the image under the effective user, and a probe file can be
+        written/read/deleted under the effective user in a remote scratch
+        dir that is bind-mounted at `/work` (catches a UID/bind-mount-owner
+        incompatibility — e.g. a container UID that cannot write to a bind
+        mount owned by the remote SSH user — before the real task).
+        """
+        if self._isolation is None:
+            missing = [
+                t for t in req.required_tools if not await self._ssh.probe_tool(t)
+            ]
+            return CapabilityResult(ok=not missing, missing_tools=missing)
+
+        assert self._docker is not None
+        problems: list[str] = []
+        if not await self._docker.version_ok():
+            return CapabilityResult(
+                ok=False, missing_tools=["docker daemon unreachable"]
+            )
+        image = self._isolation.image
+        if not await self._docker.image_exists(image):
+            return CapabilityResult(ok=False, missing_tools=[f"image absent: {image}"])
+        user = await resolve_effective_user(self._ssh, self._isolation.user)
+        for tool in req.required_tools:
+            try:
+                async with asyncio.timeout(60.0):
+                    probe = await self._ssh.run(
+                        [
+                            "docker",
+                            "run",
+                            "--rm",
+                            "--user",
+                            user,
+                            image,
+                            "sh",
+                            "-c",
+                            # tool as a positional ($1), never interpolated into
+                            # the shell string, so a config-supplied tool name
+                            # cannot inject shell syntax.
+                            'command -v -- "$1"',
+                            "sh",
+                            tool,
+                        ]
+                    )
+            except TimeoutError:
+                problems.append(f"tool missing in image: {tool}")
+                continue
+            if probe.returncode != 0:
+                problems.append(f"tool missing in image: {tool}")
+        mkdir_res = await self._ssh.run(["mktemp", "-d"])
+        scratch = mkdir_res.stdout.strip()
+        if mkdir_res.returncode != 0 or not scratch:
+            problems.append(
+                f"could not create remote scratch dir (rc={mkdir_res.returncode})"
+            )
+        else:
+            try:
+                try:
+                    async with asyncio.timeout(60.0):
+                        probe_res = await self._ssh.run(
+                            [
+                                "docker",
+                                "run",
+                                "--rm",
+                                "--user",
+                                user,
+                                "-v",
+                                f"{scratch}:/work",
+                                image,
+                                "sh",
+                                "-c",
+                                't=/work/.maestro-probe && echo ok > "$t" '
+                                '&& cat "$t" && rm "$t"',
+                            ]
+                        )
+                except TimeoutError:
+                    problems.append(
+                        f"scratch write/read/delete failed under user {user}"
+                    )
+                else:
+                    if probe_res.returncode != 0:
+                        problems.append(
+                            f"scratch write/read/delete failed under user {user}"
+                        )
+            finally:
+                await self._ssh.run(["rm", "-rf", scratch])
+        return CapabilityResult(ok=not problems, missing_tools=problems)
 
     async def run(self, req: ExecutionRequest) -> SshTaskHandle:
         """Materialize the worktree remotely and launch the supervisor.
@@ -127,6 +250,39 @@ class SshBackend:
         descriptor = build_descriptor(
             req.execution_id, layout, list(req.argv), self._t.workdir_root
         )
+        isolation = "bare"
+        expected_labels: dict[str, str] = {}
+        if self._isolation is not None:
+            effective_user = await resolve_effective_user(
+                self._ssh, self._isolation.user
+            )
+            trace_env = child_env()  # non-secret trace propagation
+            inline_env = {**req.env, **trace_env}
+            docker_argv, expected_labels = build_docker_run_argv(
+                execution_id=req.execution_id,
+                entity_kind=req.entity_kind or "workstream",
+                entity_id=req.run_id,
+                attempt=req.attempt,
+                backend_id=self._name,
+                image=self._isolation.image,
+                remote_repo=layout.repo,
+                remote_root=layout.root,
+                remote_env_file=layout.env_file,
+                effective_user=effective_user,
+                network=self._isolation.network,
+                memory=self._isolation.memory,
+                cpus=self._isolation.cpus,
+                inline_env=inline_env,
+                has_secret_env_file=bool(self._secret_env),
+                inner_argv=list(req.argv),
+            )
+            descriptor["argv"] = docker_argv
+            # secrets reach the container via docker --env-file; keep them OUT of
+            # the docker-run process env by pointing the supervisor's env_file at
+            # a non-existent path under root (passes _validate, _load_env skips it).
+            descriptor["env_file"] = f"{layout.root}/noenv"
+            isolation = "docker"
+
         # Launch the supervisor and block on its startup handshake, so a channel
         # drop after this point can never leave the run unobservable.
         result = await self._launch_supervisor(layout, descriptor)
@@ -137,7 +293,12 @@ class SshBackend:
             backend_id=self._name,
             run_id=req.run_id,
             transport_ref=encode_transport_ref(
-                self._t.host, self._t.port, layout.root, layout.status
+                self._t.host,
+                self._t.port,
+                layout.root,
+                layout.status,
+                isolation=isolation,
+                expected_labels=expected_labels,
             ),
             status_marker=layout.status,
             started_at=datetime.now(UTC),
@@ -159,6 +320,11 @@ class SshBackend:
             ),
             expected_owner=req.execution_id,
             mirror_spec=self._build_mirror_spec(req, layout),
+            container_ops=(
+                self._make_container_ops(expected_labels)
+                if self._isolation is not None
+                else None
+            ),
         )
         handle.start()
         return handle

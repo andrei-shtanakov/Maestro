@@ -12,6 +12,7 @@ import shutil
 from pathlib import Path
 
 from maestro.execution.docker_cli import DockerCli
+from maestro.execution.docker_recovery import labels_match
 from maestro.execution.local import LocalTaskHandle
 from maestro.execution.models import (
     CollectResult,
@@ -27,8 +28,8 @@ class DockerTaskHandle:
     `wait`/`terminate`/`kill` additionally target the container by name so
     that a killed/exited CLI process can never leave an orphaned container
     behind. `cleanup` is ownership-checked: it verifies the container's
-    `maestro.execution_id` label before removing it, so a name collision
-    with a foreign container is never silently rm'd.
+    full expected label set before removing it, so a name collision with a
+    foreign (or partially-matching) container is never silently rm'd.
     """
 
     def __init__(
@@ -85,26 +86,25 @@ class DockerTaskHandle:
         """Ownership-checked `docker rm -f`, then unlink local artifacts.
 
         Raises RuntimeError if a container with this name exists but its
-        `maestro.execution_id` label doesn't match what this handle expects
-        — a foreign container is never removed. Local cleanup_paths (the
-        env-file/cidfile/tmp dir) are always unlinked, whether or not the
-        container is present, so this is idempotent and safe to call more
-        than once (a second call sees an absent container and no files).
+        labels don't fully match this handle's `expected_labels` — a
+        foreign (or partially-matching) container is never removed. Local
+        cleanup_paths (the env-file/cidfile/tmp dir) are always unlinked,
+        whether or not the container is present, so this is idempotent and
+        safe to call more than once (a second call sees an absent container
+        and no files).
         """
         info = await self._docker.inspect(self._name)
         if info is not None:
             labels = (info.get("Config") or {}).get("Labels") or {}
             expected_id = self._expected.get("maestro.execution_id")
-            actual_id = labels.get("maestro.execution_id")
             # expected_id is None (handle built without the label) must
             # also fail the check — otherwise a foreign, unlabeled
-            # container with a matching name (actual_id None too) would
-            # satisfy `actual_id == expected_id` and get rm'd.
-            if expected_id is None or actual_id != expected_id:
+            # container (whose labels vacuously satisfy an empty/id-less
+            # expected set) would get rm'd.
+            if expected_id is None or not labels_match(labels, self._expected):
                 raise RuntimeError(
                     f"refusing to rm {self._name}: label mismatch "
-                    f"(expected maestro.execution_id={expected_id!r}, "
-                    f"got {actual_id!r})"
+                    f"(expected {self._expected}, got {labels})"
                 )
             await self._docker.rm(self._name)
         # Always unlink local secret/cid/tmp artifacts, even if the

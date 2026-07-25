@@ -168,6 +168,23 @@ async def test_cleanup_raises_when_no_expected_label_but_present() -> None:
 
 
 @pytest.mark.anyio
+async def test_cleanup_refuses_on_full_label_mismatch() -> None:
+    # id matches but backend_id differs -> full-set check must refuse.
+    expected = {"maestro.execution_id": "e1", "maestro.backend_id": "rs"}
+    docker = _FakeDockerCli(
+        inspect_labels={"maestro.execution_id": "e1", "maestro.backend_id": "OTHER"}
+    )
+    h = _handle(
+        _FakeLocal(ExecutionResult(exit_code=0, output_log_path=Path("/l"))),
+        docker,
+        expected_labels=expected,
+    )
+    with pytest.raises(RuntimeError, match="label mismatch"):
+        await h.cleanup()
+    assert docker.removed == []
+
+
+@pytest.mark.anyio
 async def test_terminate_targets_this_container_by_name() -> None:
     local = _FakeLocal(ExecutionResult(exit_code=0, output_log_path=Path("/l")))
     docker = _FakeDockerCli()

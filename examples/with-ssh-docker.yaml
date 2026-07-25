@@ -1,0 +1,38 @@
+# Mode-2 orchestrator: run a workstream inside a Docker container on a remote
+# host over SSH (Phase 2c). The harness lives in the image; the remote host
+# only needs docker + rsync + git + python3.
+project: ssh-docker-demo
+description: |
+  Run a workstream inside a Docker container on a remote host over SSH.
+repo_url: https://github.com/user/ssh-docker-demo
+repo_path: ~/projects/ssh-docker-demo
+workspace_base: /tmp/maestro-ws/ssh-docker-demo
+
+base_branch: main
+
+execution:
+  default_backend: local
+  secret_env_defaults: [ANTHROPIC_API_KEY]
+  backends:
+    remote-sandbox:
+      transport:
+        type: ssh
+        host: gpu-box                # ssh config alias or bare host (no user@ / :port)
+        workdir_root: /var/tmp/maestro
+        connect_timeout_s: 10
+      isolation:
+        type: docker
+        image: ghcr.io/andrei-shtanakov/maestro-runner:2026-07-21
+        network: none
+        memory: 8g
+        # user omitted -> container runs as the remote SSH user's uid:gid.
+        # Set user: "0:0" only as a deliberate root opt-in.
+      secret_env: [ANTHROPIC_API_KEY]
+      inherit_secret_defaults: true
+
+workstreams:
+  - id: api
+    title: "API Layer"
+    backend: remote-sandbox
+    description: Implement the API layer
+    scope: ["src/api/**"]

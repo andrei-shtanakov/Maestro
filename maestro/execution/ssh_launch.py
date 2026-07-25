@@ -75,26 +75,47 @@ def build_descriptor(
 
 
 def encode_transport_ref(
-    host: str, port: int | None, remote_dir: str, status_marker: str
+    host: str,
+    port: int | None,
+    remote_dir: str,
+    status_marker: str,
+    *,
+    isolation: str = "bare",
+    expected_labels: dict[str, str] | None = None,
 ) -> str:
-    """Encode an opaque, versioned transport_ref string for an SSH execution."""
+    """Encode an opaque, versioned (v2) transport_ref for an SSH execution.
+
+    `isolation` (`"bare"|"docker"`) and `expected_labels` are the recovery
+    SSOT for a run's isolation identity — persisted so a config edit after
+    launch cannot change how the run is probed/GC'd.
+
+    Fails closed on an ambiguous ref: `isolation` must be exactly `"bare"` or
+    `"docker"` (a typo must never silently decode as bare), and a `"docker"`
+    ref must carry a non-empty `expected_labels` (else recovery/GC would
+    silently downgrade to a single-id ownership check).
+    """
+    if isolation not in ("bare", "docker"):
+        raise ValueError(f"isolation must be 'bare' or 'docker', got {isolation!r}")
+    if isolation == "docker" and not expected_labels:
+        raise ValueError("docker isolation requires a non-empty expected_labels")
     return json.dumps(
         {
-            "v": 1,
+            "v": 2,
             "transport": "ssh",
             "host": host,
             "port": port,
             "remote_dir": remote_dir,
             "status_marker": status_marker,
+            "isolation": isolation,
+            "expected_labels": expected_labels or {},
         }
     )
 
 
 def decode_transport_ref(s: str) -> dict:
-    """Decode an opaque `transport_ref` string produced by `encode_transport_ref`.
-
-    Pure inverse of `encode_transport_ref` — keeps callers (e.g. the
-    orchestrator, persisting the minted handle coordinates after
-    `SshBackend.run()`) decoupled from the JSON shape.
-    """
-    return json.loads(s)
+    """Decode a `transport_ref`. A legacy `v:1` ref (no `isolation`) reads as
+    a `bare` run with an empty expected-label set."""
+    data = json.loads(s)
+    data.setdefault("isolation", "bare")
+    data.setdefault("expected_labels", {})
+    return data
