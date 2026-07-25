@@ -34,9 +34,9 @@ from maestro.execution.docker_recovery import (
     probe_execution,
 )
 from maestro.execution.finalize import ensure_finalize_task
+from maestro.execution.handle_ref import handle_ref_from_row
 from maestro.execution.models import (
     CollectPolicy,
-    ExecutionHandleRef,
     ExecutionRequest,
     ProgressMirrorPolicy,
 )
@@ -168,19 +168,6 @@ def build_ssh_execution_request(
         entity_kind="workstream",
         attempt=attempt,
         backend_id="",  # set by the caller via model_copy (existing pattern)
-    )
-
-
-def _handle_ref_from_row(row: dict[str, Any]) -> ExecutionHandleRef:
-    """Rebuild an ExecutionHandleRef from an execution_handles DB row."""
-    return ExecutionHandleRef(
-        backend_id=row["backend_id"],
-        run_id=row["entity_id"],
-        transport_ref=row["transport_ref"],
-        status_marker=row.get("status_marker"),
-        started_at=datetime.fromisoformat(row["created_at"]),
-        workdir_mirror_path=None,
-        state_mirror_path=None,
     )
 
 
@@ -673,7 +660,7 @@ class Orchestrator:
         else:
             backend = self._backends.resolve(backend_id)
             if isinstance(backend, SshBackend):
-                ref = _handle_ref_from_row(row)
+                ref = handle_ref_from_row(row)
                 decoded = decode_transport_ref(ref.transport_ref)
                 ssh_verdict = await probe_ssh(backend._ssh, ref)
                 if decoded["isolation"] == "docker":
@@ -765,7 +752,7 @@ class Orchestrator:
                 backend = self._backends.resolve(backend_id)
                 if not isinstance(backend, SshBackend):
                     continue
-                ref = _handle_ref_from_row(row)
+                ref = handle_ref_from_row(row)
                 decoded = decode_transport_ref(ref.transport_ref)
                 if decoded["isolation"] == "docker":
                     # Container-first ordering: never delete the remote root
