@@ -213,6 +213,34 @@ def _evidence_commits(worktree: Path, run_id: str) -> list[str]:
     return [line for line in out.splitlines() if line]
 
 
+def _write_verdict_doc(
+    out_json: Path, *, run_id: str, attempt: int, verified_source_commit: str
+) -> None:
+    """Write a real verdict-v2 PASS document (a PASS row is never synthetic)."""
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_json.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "identity": {
+                    "verification_run_id": run_id,
+                    "verification_attempt": attempt,
+                    "rework_attempt": 0,
+                    "workstream_id": WORKSTREAM_ID,
+                    "artifact": "artifact.txt",
+                    "artifact_sha256": "a" * 64,
+                    "criteria_sha256": CRITERIA_SHA,
+                    "profile_sha256": "p" * 64,
+                    "verified_source_commit": verified_source_commit,
+                    "verified_source_tree": "t" * 40,
+                },
+                "verdict": "PASS",
+                "findings": [],
+            }
+        )
+    )
+
+
 # =============================================================================
 # Rule 1: alive handle -> leave in VERIFYING, no duplicate spawn
 # =============================================================================
@@ -415,7 +443,8 @@ async def test_unmaterialized_pass_reenters_finalization_only(
     run_id = "run-pass"
     staging = ledger.staging_dir(WORKSTREAM_ID, run_id, 1)
     out_json = staging / "attempt-001.json"
-    out_json.write_text(json.dumps({"outcome": "PASS"}))
+    head = _run_git(["rev-parse", "HEAD"], worktree).strip()
+    _write_verdict_doc(out_json, run_id=run_id, attempt=1, verified_source_commit=head)
     result = HandshakeResult(
         outcome=VerdictValue.PASS, protocol_error=None, document=None
     )
@@ -443,6 +472,58 @@ async def test_unmaterialized_pass_reenters_finalization_only(
     assert [r.verdict for r in rows] == ["PASS"]
     assert rows[0].materialized is True
     assert len(_evidence_commits(worktree, run_id)) == 1
+
+
+async def test_stale_unmaterialized_pass_routes_needs_review(
+    tmp_path: Path, worktree: Path, db: Database
+) -> None:
+    """F1: recovery must finalize from the verdict-recorded source commit, not
+    a re-read of HEAD. A PASS recorded commit A, then HEAD advanced to B before
+    finalization -> the stale-PASS guard must fire (NEEDS_REVIEW), never a
+    vacuous HEAD==HEAD comparison that commits stale evidence."""
+    script = _write_script(tmp_path, [{"verdict": "FAIL"}])  # must NOT be run
+    config = _config(worktree, _profile(script))
+    orch = _make_orch(db, worktree, config)
+    assert orch._ledger is not None
+    ledger = orch._ledger
+
+    run_id = "run-stale"
+    commit_a = _run_git(["rev-parse", "HEAD"], worktree).strip()
+    staging = ledger.staging_dir(WORKSTREAM_ID, run_id, 1)
+    out_json = staging / "attempt-001.json"
+    _write_verdict_doc(
+        out_json, run_id=run_id, attempt=1, verified_source_commit=commit_a
+    )
+    result = HandshakeResult(
+        outcome=VerdictValue.PASS, protocol_error=None, document=None
+    )
+    await ledger.ingest_attempt(
+        workstream_id=WORKSTREAM_ID,
+        run_id=run_id,
+        attempt=1,
+        result=result,
+        staging=staging,
+    )
+    await _create_workstream(db, verification_run_id=run_id, verification_attempt=1)
+
+    # A manual commit after the PASS advances HEAD past the verified commit.
+    (worktree / "extra.txt").write_text("post-pass change\n")
+    _run_git(["add", "-A"], worktree)
+    _run_git(["commit", "-m", "manual post-pass commit"], worktree)
+    commit_b = _run_git(["rev-parse", "HEAD"], worktree).strip()
+    assert commit_a != commit_b
+
+    count = await orch._recover_stranded_workstreams()
+
+    ws = await db.get_workstream(WORKSTREAM_ID)
+    assert ws.status is WorkstreamStatus.NEEDS_REVIEW
+    assert ws.resume_reason == "verification_reverify"
+    assert count == 1
+    assert orch._stats.failed == 1
+    # No stale evidence commit landed, and the attempt stays unmaterialized.
+    assert _evidence_commits(worktree, run_id) == []
+    rows = await db.list_verification_attempts(run_id)
+    assert rows[0].materialized is False
 
 
 # =============================================================================

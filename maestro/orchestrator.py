@@ -29,6 +29,7 @@ from maestro.domain import (
     RESUME_REWORK,
     CommandVerifier,
     EvidenceLedger,
+    IngestedAttempt,
     LedgerCollisionError,
     VerdictDocument,
     VerdictValue,
@@ -99,6 +100,22 @@ class _EvidenceContainmentError(Exception):
 
 
 StatusChangeCallback = Callable[[str, str, str], None]
+
+
+def _read_verified_source_commit(pass_row: IngestedAttempt) -> str | None:
+    """Parse the verified source commit from a PASS attempt's verdict JSON.
+
+    A PASS row is always backed by a real `VerdictDocument` (synthetic JSONs
+    exist only for protocol-ERROR outcomes), so its identity records the exact
+    commit that was verified — never re-derived from a possibly-advanced HEAD.
+    Returns None when the JSON is missing or fails validation, so the caller
+    can fail closed to NEEDS_REVIEW.
+    """
+    try:
+        document = VerdictDocument.model_validate_json(pass_row.json_path.read_text())
+    except (OSError, ValueError):
+        return None
+    return document.identity.verified_source_commit
 
 
 def _subject(workstream: Workstream) -> TransitionSubject:
@@ -726,11 +743,16 @@ class Orchestrator:
             )
             if pass_row is not None and not pass_row.materialized:
                 workspace = self._workspace_mgr.get_workspace_path(w.id)
-                commit = await self._workspace_head(workspace)
-                if commit is None:
+                # The commit that PASSed is recorded in the verdict JSON — read
+                # it from there, never from the current worktree HEAD (a manual
+                # commit after the crash would make the stale-PASS guard in
+                # `_commit_evidence` compare HEAD to itself, vacuously).
+                verified_commit = _read_verified_source_commit(pass_row)
+                if verified_commit is None:
                     reason = (
-                        "verification recovery: cannot read worktree HEAD "
-                        "for stranded finalization"
+                        "verification recovery: PASS verdict JSON is "
+                        "unreadable/invalid — cannot confirm the verified "
+                        "source commit for stranded finalization"
                     )
                     self._logger.warning("%s for '%s'", reason, w.id)
                     await self._route_verifying_needs_review(w.id, reason)
@@ -743,7 +765,10 @@ class Orchestrator:
                     pass_row.attempt,
                 )
                 await self._finalize_verification(
-                    w.id, workspace, run_id=run_id, verified_source_commit=commit
+                    w.id,
+                    workspace,
+                    run_id=run_id,
+                    verified_source_commit=verified_commit,
                 )
                 return 1
 
@@ -790,11 +815,17 @@ class Orchestrator:
     ) -> None:
         """Fail-closed VERIFYING -> NEEDS_REVIEW (direct edge — VERIFYING's
         transition table allows it, unlike RUNNING which must go via
-        FAILED). Same accounting as the existing live-orphan rule."""
+        FAILED). Same accounting as the existing live-orphan rule.
+
+        Tagged `RESUME_REVERIFY` so an operator re-queue (NEEDS_REVIEW ->
+        READY) re-enters the verification loop over the untouched worktree
+        rather than respawning the author — author respawn fires ONLY on a
+        genuine FAIL with rework budget left (§4 invariant)."""
         await self._transition(
             workstream_id,
             WorkstreamStatus.NEEDS_REVIEW,
             expected_status=WorkstreamStatus.VERIFYING,
+            resume_reason=RESUME_REVERIFY,
             message=reason,
             error_message=reason,
         )
@@ -2280,14 +2311,7 @@ class Orchestrator:
         if commit is None or tree is None:
             reason = "verification: cannot read worktree HEAD/tree"
             self._logger.warning("%s for '%s'", reason, workstream_id)
-            await self._transition(
-                workstream_id,
-                WorkstreamStatus.NEEDS_REVIEW,
-                expected_status=WorkstreamStatus.VERIFYING,
-                message=reason,
-                error_message=reason,
-            )
-            self._stats.failed += 1
+            await self._route_verifying_needs_review(workstream_id, reason)
             return
 
         backend = self._backends.resolve(workstream.backend)
@@ -2408,14 +2432,10 @@ class Orchestrator:
             f"({verification.rework_budget}) is exhausted"
         )
         self._logger.warning("%s for '%s'", reason, workstream_id)
-        await self._transition(
-            workstream_id,
-            WorkstreamStatus.NEEDS_REVIEW,
-            expected_status=WorkstreamStatus.VERIFYING,
-            message=reason,
-            error_message=reason,
-        )
-        self._stats.failed += 1
+        # Deliberate (§4): a re-queue re-verifies rather than respawning the
+        # author — a further FAIL with the budget still exhausted parks it
+        # again unless the operator raised rework_budget in the config.
+        await self._route_verifying_needs_review(workstream_id, reason)
 
     async def _finalize_verification(
         self,
@@ -2457,14 +2477,7 @@ class Orchestrator:
                 workstream_id,
                 exc,
             )
-            await self._transition(
-                workstream_id,
-                WorkstreamStatus.NEEDS_REVIEW,
-                expected_status=WorkstreamStatus.VERIFYING,
-                message=str(exc),
-                error_message=str(exc),
-            )
-            self._stats.failed += 1
+            await self._route_verifying_needs_review(workstream_id, str(exc))
             return
         except (OSError, RuntimeError, LedgerCollisionError) as exc:
             # Delivery-preparation error: STAY in VERIFYING, recovery re-enters.

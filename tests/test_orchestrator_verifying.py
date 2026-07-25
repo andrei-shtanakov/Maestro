@@ -591,3 +591,160 @@ async def test_finalization_failure_stays_verifying_then_reenters(
         materialized=materialized,
     )
     assert len(_evidence_commits(worktree, run_id)) == 1
+
+
+# =============================================================================
+# F2: fail-closed branches of `_commit_evidence`
+# =============================================================================
+
+
+async def _ingest_pass_attempt(orch: Orchestrator, run_id: str) -> None:
+    """Seed one unmaterialized PASS attempt so `materialize` has content."""
+    assert orch._ledger is not None
+    ledger = orch._ledger
+    staging = ledger.staging_dir(WORKSTREAM_ID, run_id, 1)
+    out_json = staging / "attempt-001.json"
+    out_json.write_text(json.dumps({"outcome": "PASS"}))
+    from maestro.domain import HandshakeResult
+
+    result = HandshakeResult(
+        outcome=VerdictValue.PASS, protocol_error=None, document=None
+    )
+    await ledger.ingest_attempt(
+        workstream_id=WORKSTREAM_ID,
+        run_id=run_id,
+        attempt=1,
+        result=result,
+        staging=staging,
+    )
+
+
+async def test_stale_pass_finalization_routes_needs_review(
+    tmp_path: Path, worktree: Path, db: Database
+) -> None:
+    """F2(a): HEAD moved after PASS but before finalization -> the stale-PASS
+    guard fires, routing NEEDS_REVIEW (tagged reverify) with no evidence
+    commit."""
+    script = _write_script(tmp_path, [{"verdict": "FAIL"}])  # must NOT run
+    config = _config(worktree, _profile(script))
+    orch, _ws_mgr, _dec = _make_orch(db, worktree, config)
+    run_id = "run-stale"
+    commit_a = _run_git(["rev-parse", "HEAD"], worktree).strip()
+    await _ingest_pass_attempt(orch, run_id)
+    await _create_workstream(
+        db,
+        WorkstreamStatus.VERIFYING,
+        verification_run_id=run_id,
+        verification_attempt=1,
+    )
+
+    # Advance HEAD past the verified commit.
+    (worktree / "extra.txt").write_text("post-pass change\n")
+    _run_git(["add", "-A"], worktree)
+    _run_git(["commit", "-m", "manual post-pass commit"], worktree)
+    commit_b = _run_git(["rev-parse", "HEAD"], worktree).strip()
+    assert commit_a != commit_b
+
+    await orch._finalize_verification(
+        WORKSTREAM_ID, worktree, run_id=run_id, verified_source_commit=commit_a
+    )
+
+    ws = await db.get_workstream(WORKSTREAM_ID)
+    assert ws.status is WorkstreamStatus.NEEDS_REVIEW
+    assert ws.resume_reason == "verification_reverify"
+    assert _evidence_commits(worktree, run_id) == []
+
+
+async def test_evidence_containment_escape_routes_needs_review(
+    tmp_path: Path, worktree: Path, db: Database
+) -> None:
+    """F2(b): a materialized path outside verifier.write raises the containment
+    error -> NEEDS_REVIEW (tagged reverify), no evidence commit lands."""
+    script = _write_script(tmp_path, [{"verdict": "FAIL"}])  # must NOT run
+    # evidence_root ("evidence") is deliberately NOT under verifier.write
+    # ("allowed/**") — a config that only preflight would reject, constructed
+    # directly here to exercise the runtime containment guard.
+    profile = DomainProfile(
+        verification=VerificationSection(
+            verifier=_verifier_spec(script),
+            artifact="artifact.txt",
+            rework_budget=1,
+            verdict_schema_version=2,
+            criteria=CriteriaConfig(
+                visibility="shared", source="criteria.yaml", sha256=CRITERIA_SHA
+            ),
+        ),
+        workspace=WorkspacePolicy(
+            roles={"verifier": RoleScopes(write=["allowed/**"])},
+            evidence_root="evidence",
+        ),
+        delivery=DeliveryPolicy(
+            local_merge="before_remote_pr", remote="github_pr", evidence="all"
+        ),
+    )
+    config = _config(worktree, profile)
+    orch, _ws_mgr, _dec = _make_orch(db, worktree, config)
+    run_id = "run-escape"
+    commit = _run_git(["rev-parse", "HEAD"], worktree).strip()
+    await _ingest_pass_attempt(orch, run_id)
+    await _create_workstream(
+        db,
+        WorkstreamStatus.VERIFYING,
+        verification_run_id=run_id,
+        verification_attempt=1,
+    )
+
+    await orch._finalize_verification(
+        WORKSTREAM_ID, worktree, run_id=run_id, verified_source_commit=commit
+    )
+
+    ws = await db.get_workstream(WORKSTREAM_ID)
+    assert ws.status is WorkstreamStatus.NEEDS_REVIEW
+    assert ws.resume_reason == "verification_reverify"
+    assert "escapes verifier.write" in (ws.error_message or "")
+    # Worktree intact: no evidence commit landed, HEAD unchanged.
+    assert _evidence_commits(worktree, run_id) == []
+    assert _run_git(["rev-parse", "HEAD"], worktree).strip() == commit
+
+
+# =============================================================================
+# F3: verification-origin NEEDS_REVIEW re-queues as reverify (not respawn)
+# =============================================================================
+
+
+async def test_rework_exhausted_needs_review_requeues_as_reverify(
+    tmp_path: Path, worktree: Path, db: Database
+) -> None:
+    """F3: a rework-budget-exhausted FAIL parks the workstream NEEDS_REVIEW
+    tagged reverify; an operator re-queue (NEEDS_REVIEW -> READY) re-enters
+    VERIFYING (re-verify), never respawning the author."""
+    script = _write_script(tmp_path, [{"verdict": "FAIL"}, {"verdict": "PASS"}])
+    config = _config(worktree, _profile(script, rework_budget=0))
+    orch, _ws_mgr, decomposer = _make_orch(db, worktree, config)
+    await _create_workstream(db, WorkstreamStatus.RUNNING)
+
+    await orch._handle_success(WORKSTREAM_ID, worktree)
+    ws = await db.get_workstream(WORKSTREAM_ID)
+    assert ws.status is WorkstreamStatus.NEEDS_REVIEW
+    assert ws.resume_reason == "verification_reverify"
+    run_id = ws.verification_run_id
+    assert run_id is not None
+
+    # Operator re-queue: NEEDS_REVIEW -> READY (no gate marker, plain requeue);
+    # the reverify tag survives the flip.
+    await db.approve_workstream_with_gate_record(WORKSTREAM_ID, None, None)
+    ws = await db.get_workstream(WORKSTREAM_ID)
+    assert ws.status is WorkstreamStatus.READY
+    assert ws.resume_reason == "verification_reverify"
+
+    # Pickup routes straight back into VERIFYING (never an author respawn).
+    await orch._spawn_workstream(WORKSTREAM_ID)
+    ws = await db.get_workstream(WORKSTREAM_ID)
+    assert ws.status is WorkstreamStatus.DONE
+    assert ws.verification_run_id == run_id
+    # §4 invariant: reverify never respawns the author, never touches rework.
+    assert decomposer.generate_spec_calls == []
+    assert ws.rework_attempt == 0
+
+    rows = await db.list_verification_attempts(run_id)
+    assert [r.verdict for r in rows] == ["FAIL", "PASS"]
