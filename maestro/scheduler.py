@@ -1267,6 +1267,10 @@ class Scheduler:
                         expected_status=TaskStatus.READY,
                     )
                 self._retry_ready_times.pop(task_id, None)
+                # A fresh dispatch supersedes any stale validation hold from a
+                # prior uncertain-launch attempt of this task; otherwise the
+                # stale entry would block this attempt's reservation release.
+                self._validation_hold.discard(task_id)
 
                 handle = await backend.run(request)
             except ConcurrentModificationError:
