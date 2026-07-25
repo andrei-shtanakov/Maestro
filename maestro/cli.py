@@ -53,6 +53,7 @@ from maestro.config import load_orchestrator_config
 from maestro.coordination.arbiter_client import ArbiterClient, ArbiterClientConfig
 from maestro.coordination.routing import RoutingStrategy, make_routing_strategy
 from maestro.dag import DAG
+from maestro.database import verifier_requeue_block_reason
 from maestro.decomposer import ProjectDecomposer, resolve_spec_gen_settings
 from maestro.event_log import create_event_logger
 from maestro.git import GitManager
@@ -718,25 +719,21 @@ async def _retry_task(db_path: Path, task_id: str) -> None:
             )
             raise typer.Exit(1)
 
-        # Requeue handle-fence (Task 11, spec §8): a verifier-originated
-        # NEEDS_REVIEW must not be re-queued while its
+        # Requeue handle-fence (Task 11, spec §8): the shared
+        # `verifier_requeue_block_reason` fence (also used by the
+        # dashboard's `POST /api/tasks/{task_id}/retry`) fails this closed
+        # while a verifier-originated NEEDS_REVIEW's
         # `execution_phase='verification'` handle is still open (not yet
         # reconciled to `cleaned` by recovery/GC) — the judge subprocess it
-        # represents may still be alive. Fail closed with a clear error
-        # rather than silently re-running the task over it.
-        if task.status == TaskStatus.NEEDS_REVIEW:
-            open_handle = await db.get_open_verification_handle(task_id)
-            if open_handle is not None:
-                err_console.print(
-                    "[red]Cannot retry task:[/red] its verification handle "
-                    f"({open_handle['execution_id']!r}, state "
-                    f"{open_handle['state']!r}) has not been reconciled yet."
-                )
-                err_console.print(
-                    "Wait for recovery/GC to close it (or investigate the "
-                    "judge process) before retrying."
-                )
-                raise typer.Exit(1)
+        # represents may still be alive.
+        block_reason = await verifier_requeue_block_reason(db, task)
+        if block_reason is not None:
+            err_console.print(f"[red]Cannot retry task:[/red] {block_reason}.")
+            err_console.print(
+                "Wait for recovery/GC to close it (or investigate the "
+                "judge process) before retrying."
+            )
+            raise typer.Exit(1)
 
         # Reset retry count and status
         await db.update_task_status(

@@ -3187,6 +3187,45 @@ async def create_database(db_path: str | Path) -> Database:
     return db
 
 
+async def verifier_requeue_block_reason(db: Database, task: Task) -> str | None:
+    """Return why re-queuing `task` from NEEDS_REVIEW must be rejected, or
+    `None` if the re-queue is allowed.
+
+    The ONE shared fail-closed fence (Task 11 fix) for every
+    `NEEDS_REVIEW -> READY` re-queue path — `maestro retry` (the CLI's
+    `_retry_task`) and the dashboard's `POST /api/tasks/{task_id}/retry`
+    both call this instead of each re-implementing the check, so a future
+    third re-queue path cannot forget it either. A no-op (returns `None`)
+    for any status other than NEEDS_REVIEW — this fence only concerns a
+    verifier-originated review.
+
+    A verifier-originated NEEDS_REVIEW must not be re-queued while its
+    `execution_phase='verification'` handle is still open (not yet
+    reconciled to `cleaned` by recovery/GC): the judge subprocess it
+    represents may still be alive, and silently re-running the task over
+    it would defeat the gate's fail-closed guarantee. A task with no
+    verification handle at all (the ordinary non-verifier NEEDS_REVIEW
+    path) is unaffected.
+
+    Args:
+        db: Database to query.
+        task: The task being considered for re-queue (already fetched by
+            the caller).
+
+    Returns:
+        A human-readable rejection reason, or `None` if re-queuing is safe.
+    """
+    if task.status != TaskStatus.NEEDS_REVIEW:
+        return None
+    handle = await db.get_open_verification_handle(task.id)
+    if handle is None:
+        return None
+    return (
+        f"its verification handle ({handle['execution_id']!r}, state "
+        f"{handle['state']!r}) has not been reconciled yet"
+    )
+
+
 _REQUIRED_TASK_COST_COLUMNS = frozenset(
     {
         "id",  # _row_to_task_cost reads row["id"]; require it so a table missing

@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 from maestro.database import (
     Database,
     TaskNotFoundError,
+    verifier_requeue_block_reason,
 )
 from maestro.models import TaskStatus
 
@@ -241,6 +242,18 @@ class DashboardServer:
                 return RetryResponse(
                     success=False,
                     message=(f"Cannot retry task in status: {task.status.value}"),
+                )
+
+            # Requeue handle-fence (Task 11 fix): the same shared fence the
+            # CLI's `maestro retry` (`_retry_task`) uses — a
+            # verifier-originated NEEDS_REVIEW must not be re-queued while
+            # its `execution_phase='verification'` handle is still open
+            # (the judge subprocess it represents may still be alive).
+            block_reason = await verifier_requeue_block_reason(self.db, task)
+            if block_reason is not None:
+                return RetryResponse(
+                    success=False,
+                    message=f"Cannot retry task: {block_reason}.",
                 )
 
             await self.db.update_task_status(

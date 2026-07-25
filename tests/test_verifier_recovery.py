@@ -17,9 +17,11 @@ import asyncio
 import os
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 from typer.testing import CliRunner
 
 from maestro.cli import app
+from maestro.dashboard.app import create_dashboard_app
 from maestro.database import Database, create_database
 from maestro.models import Task, TaskStatus
 from maestro.recovery import StateRecovery
@@ -242,3 +244,68 @@ def test_requeue_unaffected_for_non_verifier_needs_review(tmp_path):
 
     assert result.exit_code == 0
     assert "ready" in result.output.lower()
+
+
+# =============================================================================
+# Dashboard `POST /api/tasks/{task_id}/retry` — same requeue handle-fence
+#
+# The dashboard endpoint is a SECOND real, shipped NEEDS_REVIEW -> READY
+# re-queue path (maestro/dashboard/app.py) that must apply the exact same
+# fence as `maestro retry` — both now call the shared
+# `verifier_requeue_block_reason` helper. These tests fail on the pre-fix
+# dashboard code, which re-queued unconditionally.
+# =============================================================================
+
+
+async def test_dashboard_retry_rejected_while_verification_handle_open(db):
+    """The dashboard retry endpoint must fail closed while a
+    verifier-originated NEEDS_REVIEW task's verification handle is open."""
+    await _seed_verifying_task(db)
+    await db.update_task_status(
+        "t1",
+        TaskStatus.NEEDS_REVIEW,
+        expected_status=TaskStatus.VERIFYING,
+        error_message="verifier gate ERROR",
+    )
+
+    server = create_dashboard_app(db)
+    transport = ASGITransport(app=server.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/tasks/t1/retry")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success"] is False
+    assert "verif" in data["message"].lower()
+
+    # Task must remain NEEDS_REVIEW — the fence blocked the transition.
+    task = await db.get_task("t1")
+    assert task.status == TaskStatus.NEEDS_REVIEW
+
+
+async def test_dashboard_retry_allowed_after_handle_reconciled(db):
+    """Once the verification handle is reconciled to `cleaned`, the
+    dashboard retry endpoint succeeds — the fence only blocks while open."""
+    execution_id = await _seed_verifying_task(db)
+    await db.update_task_status(
+        "t1",
+        TaskStatus.NEEDS_REVIEW,
+        expected_status=TaskStatus.VERIFYING,
+        error_message="verifier gate ERROR",
+    )
+    await db.mark_execution_state(
+        execution_id, "terminal", allowed_from=["prepared", "running"]
+    )
+    await db.mark_execution_state(execution_id, "cleaned", allowed_from=["terminal"])
+
+    server = create_dashboard_app(db)
+    transport = ASGITransport(app=server.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/tasks/t1/retry")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success"] is True
+
+    task = await db.get_task("t1")
+    assert task.status == TaskStatus.READY
