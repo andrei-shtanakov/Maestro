@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from maestro.dag import find_cycle
 from maestro.decomposer import ProjectDecomposer
-from maestro.execution.exec_config import ExecutionConfig, SshTransport
+from maestro.execution.exec_config import ExecutionConfig
 from maestro.models import GatesConfig, OrchestratorConfig, Task, WorkstreamConfig
 
 
@@ -26,19 +26,18 @@ Severity = Literal["error", "warning"]
 
 
 class ValidationBackendError(Exception):
-    """A task's validation_backend resolves to an unsupported (SSH) backend."""
+    """A task's validation_backend resolves to no known backend."""
 
 
 def check_validation_backends(
     tasks: list[Task], execution: ExecutionConfig | None
 ) -> None:
-    """Fail loud if any task's validation runs on a non-local-transport backend.
+    """Fail loud if any task's validation_backend names an unknown backend.
 
-    PR1 supports validation only on ``transport.type == local`` (bare or
-    Docker). ``same`` resolves to the task's own backend; a named value
-    resolves directly; ``local`` is always the local backend. An SSH target
-    raises — never a silent fallback to local. Tasks without a validation_cmd
-    are skipped.
+    SSH validation backends are supported (PR2) and no longer rejected here.
+    ``same`` resolves to the task's own backend, or the config default when
+    the task pins no backend; a named value resolves directly; ``local`` is
+    always the local backend. Tasks without a validation_cmd are skipped.
     """
     exec_cfg = execution or ExecutionConfig()
     registry = exec_cfg.normalized()
@@ -51,16 +50,16 @@ def check_validation_backends(
             continue
         # `same` follows the runtime resolver exactly: task.backend, or the
         # config default when the task pins no backend (BackendResolver.resolve
-        # maps None -> default_backend). Resolving `same` to None here would let
-        # an SSH *default* backend slip through this gate.
+        # maps None -> default_backend).
         resolved = (task.backend or default_backend) if name == "same" else name
         spec = registry.get(resolved) if resolved is not None else None
-        transport = spec.transport if spec is not None else None
-        if isinstance(transport, SshTransport):
+        # SSH is now supported (PR2) — no transport rejection. Keep the
+        # fast-fail on an explicitly named validation_backend that resolves
+        # to nothing: a late ExecutionConfigError inside the validation run
+        # is worse than a preflight failure.
+        if name not in ("local", "same") and resolved is not None and spec is None:
             raise ValidationBackendError(
-                f"task '{task.id}': validation_backend '{name}' resolves to "
-                f"backend '{resolved}' (transport ssh:{transport.host}); SSH "
-                f"validation is a PR2 follow-up. Use validation_backend: local."
+                f"task '{task.id}': validation_backend '{name}' is not a known backend"
             )
 
 

@@ -120,6 +120,9 @@ class FakeBackend:
     async def probe(self, ref: ExecutionHandleRef) -> ProbeResult:
         raise NotImplementedError("not exercised by responder tests")
 
+    def accepts_ref(self, ref: ExecutionHandleRef) -> bool:
+        raise NotImplementedError("not exercised by responder tests")
+
 
 class FakeSpawner(AgentSpawner):
     """Real subclass of the ABC so we don't need to mock isinstance checks.

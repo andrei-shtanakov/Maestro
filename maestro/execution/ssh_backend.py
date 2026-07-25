@@ -14,6 +14,7 @@ from pathlib import Path
 
 from maestro._vendor.obs import child_env
 from maestro.execution.docker_cli import DockerCli
+from maestro.execution.docker_recovery import probe_execution
 from maestro.execution.exec_config import DockerIsolation, SshTransport
 from maestro.execution.models import (
     BackendHealth,
@@ -23,6 +24,7 @@ from maestro.execution.models import (
     ExecutionRequest,
     ProbeResult,
 )
+from maestro.execution.ref_identity import RefIdentity, ref_identity
 from maestro.execution.secret_file import write_env_file
 from maestro.execution.ssh_cli import Runner, RunResult, SshCli
 from maestro.execution.ssh_collect import capture_baseline
@@ -33,6 +35,7 @@ from maestro.execution.ssh_launch import (
     RSYNC_EXCLUDES_OUT,
     RemoteLayout,
     build_descriptor,
+    decode_transport_ref,
     encode_transport_ref,
     remote_layout,
 )
@@ -292,6 +295,7 @@ class SshBackend:
         ref = ExecutionHandleRef(
             backend_id=self._name,
             run_id=req.run_id,
+            execution_id=req.execution_id,
             transport_ref=encode_transport_ref(
                 self._t.host,
                 self._t.port,
@@ -316,6 +320,7 @@ class SshBackend:
                 staging,
                 journal,
                 baseline,
+                mode=req.collect.mode,
                 scope=_collect_scope(req.collect),
             ),
             expected_owner=req.execution_id,
@@ -325,6 +330,7 @@ class SshBackend:
                 if self._isolation is not None
                 else None
             ),
+            capture_output=req.capture_output,
         )
         handle.start()
         return handle
@@ -406,15 +412,54 @@ class SshBackend:
             local_env.unlink(missing_ok=True)
 
     async def probe(self, ref: ExecutionHandleRef) -> ProbeResult:
-        """Delegate liveness recovery to `ssh_recovery.probe_ssh` (Task E3).
+        """Isolation-aware recovery probe (ported from the orchestrator's
+        former `_probe_open_handle` SSH branch, Phase 2c).
 
-        Imported lazily so this module has no hard import-time dependency on
-        a sibling that lands in a later task.
+        Bare (persisted `isolation != "docker"`): delegates to
+        `ssh_recovery.probe_ssh`, which is unconditionally fail-closed for
+        an open handle (a terminal marker cannot prove collect already
+        applied). Docker (persisted `isolation == "docker"`): a run that
+        itself launches the harness inside a container over ssh can strand
+        TWO resources — the remote process group AND the container — so
+        both are probed and either saying "review" wins. A persisted
+        docker isolation on a backend that has since reconfigured to bare
+        (or has no docker client), or a ref with no `execution_id` to key
+        the container probe on, both fail closed rather than guess.
+
+        `probe_ssh` is imported lazily so this module has no hard
+        import-time dependency on a sibling that lands in a later task.
         """
         from maestro.execution.ssh_recovery import probe_ssh
 
-        verdict = await probe_ssh(self._ssh, ref)
-        return ProbeResult(alive=verdict.needs_review, detail=verdict.reason)
+        decoded = decode_transport_ref(ref.transport_ref)
+        ssh_verdict = await probe_ssh(self._ssh, ref)
+        needs = ssh_verdict.needs_review
+        detail = ssh_verdict.reason
+        if decoded.get("isolation") == "docker":
+            if self.isolation_kind != "docker" or self.docker is None:
+                return ProbeResult(
+                    needs_review=True,
+                    detail="persisted docker isolation but backend is bare",
+                )
+            if ref.execution_id is None:
+                return ProbeResult(
+                    needs_review=True, detail="docker probe: no execution_id"
+                )
+            cont = await probe_execution(
+                ref.execution_id,
+                self.docker,
+                expected_labels=decoded.get("expected_labels"),
+            )
+            needs = needs or cont.needs_review
+            detail = f"{detail}; container: {cont.reason}"
+        return ProbeResult(needs_review=needs, detail=detail)
+
+    def accepts_ref(self, ref: ExecutionHandleRef) -> bool:
+        """Own identity is `("ssh", self.isolation_kind)`; a mismatched or
+        unclassifiable (`("unknown","unknown")`) ref never matches ->
+        caller fails closed rather than probing."""
+        own = RefIdentity("ssh", self.isolation_kind)
+        return ref_identity(ref.transport_ref) == own
 
 
 async def _run_local(argv: list[str]) -> None:
