@@ -245,6 +245,7 @@ class LocalBackend:
         ref = ExecutionHandleRef(
             backend_id=req.backend_id,
             run_id=req.run_id,
+            execution_id=req.execution_id,
             transport_ref=self._isolator.transport_ref(prepared, proc.pid),
             started_at=datetime.now(UTC),
         )

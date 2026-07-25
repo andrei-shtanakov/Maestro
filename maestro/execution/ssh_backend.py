@@ -292,6 +292,7 @@ class SshBackend:
         ref = ExecutionHandleRef(
             backend_id=self._name,
             run_id=req.run_id,
+            execution_id=req.execution_id,
             transport_ref=encode_transport_ref(
                 self._t.host,
                 self._t.port,
