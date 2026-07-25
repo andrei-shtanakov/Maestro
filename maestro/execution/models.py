@@ -93,6 +93,7 @@ class ExecutionHandleRef(BaseModel):
     backend_id: str
     run_id: str
     transport_ref: str
+    execution_id: str | None = None
     status_marker: str | None = None
     started_at: datetime
     workdir_mirror_path: Path | None = None
@@ -116,6 +117,13 @@ class CapabilityResult(BaseModel):
 
 
 class ProbeResult(BaseModel):
-    alive: bool
+    """Recovery decision signal for a possibly-orphaned execution.
+
+    `needs_review` is the decision boundary (True -> route to NEEDS_REVIEW);
+    `alive`/`exit_code` are diagnostic only and must not be used to decide.
+    """
+
+    needs_review: bool
+    alive: bool | None = None
     exit_code: int | None = None
     detail: str = ""

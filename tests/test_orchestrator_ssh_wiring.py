@@ -20,6 +20,7 @@ import pytest
 from maestro.database import Database
 from maestro.execution.docker_recovery import RecoveryVerdict
 from maestro.execution.exec_config import DockerIsolation, SshTransport
+from maestro.execution.local import LocalBackend
 from maestro.execution.models import (
     BackendHealth,
     CollectPolicy,
@@ -572,22 +573,85 @@ class TestMonitorRunningFinalize:
 
 class TestSshRecoveryBranch:
     @pytest.mark.anyio
-    async def test_probe_open_handle_uses_probe_ssh_directly_not_backend_probe(
+    async def test_probe_open_handle_routes_through_backend_probe(
         self, tmp_path, monkeypatch
     ) -> None:
+        """Task 7: `_probe_open_handle` no longer hand-composes `probe_ssh`
+        itself — it resolves the backend and calls `backend.probe(ref)`
+        directly. A bare-ssh open handle still lands in NEEDS_REVIEW
+        (`SshBackend.probe` is fail-closed for a bare handle), but now via
+        the single `backend.probe` boundary — a spy on `backend.probe`
+        confirms it was actually consulted, not bypassed."""
         from maestro import orchestrator as orch_mod
 
         monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: False)
         orch, db = await _orch_with_db(tmp_path)
         try:
             backend = _ssh_backend()
+            real_probe = backend.probe
+            calls: list[object] = []
 
-            async def _refuse_probe(ref):
-                raise AssertionError(
-                    "backend.probe() must not be called; probe_ssh directly"
-                )
+            async def _spy_probe(ref):
+                calls.append(ref)
+                return await real_probe(ref)
 
-            backend.probe = _refuse_probe  # type: ignore[method-assign]
+            backend.probe = _spy_probe  # type: ignore[method-assign]
+            orch._backends.resolve = MagicMock(return_value=backend)
+
+            await db.create_workstream(_seed("w", WorkstreamStatus.READY))
+            layout = remote_layout("/var/tmp/m", "e1")
+            transport_ref = encode_transport_ref(
+                "gpu", None, layout.root, layout.status
+            )
+            await db.start_execution(
+                entity_kind="workstream",
+                entity_id="w",
+                expected_status=WorkstreamStatus.READY.value,
+                running_status=WorkstreamStatus.RUNNING.value,
+                execution_id="e1",
+                backend_id="gpu",
+                transport_ref=transport_ref,
+                attempt=1,
+                status_marker=layout.status,
+            )
+
+            count = await orch._recover_stranded_workstreams()
+
+            assert count == 1
+            # backend.probe() was actually consulted — the single boundary.
+            assert len(calls) == 1
+            w = await db.get_workstream("w")
+            # probe_ssh (called from inside backend.probe) is fail-closed:
+            # always needs_review=True.
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_probe_open_handle_ssh_reconfigured_to_local_docker_needs_review(
+        self, tmp_path
+    ) -> None:
+        """Fix-13b Mode-2 regression guard (mirrors the Mode-1 guard in
+        tests/test_recovery_backend_classify.py): a workstream's open
+        handle was minted by an SSH backend (real JSON `transport_ref`),
+        but the backend name has since been reconfigured to local+docker.
+        `_probe_open_handle` must route to NEEDS_REVIEW WITHOUT ever
+        calling `backend.probe()` — a local-docker probe of an SSH run's
+        `execution_id` would (pre-13b) find no matching container and
+        silently clear the review, letting the workstream re-run over an
+        unconfirmed remote diff. This test MUST FAIL on pre-13b code (no
+        `accepts_ref` gate): the workstream would end up READY and the fake
+        docker's `ps_ids_by_label` would have been called."""
+        from maestro.execution.local import LocalBackend
+
+        orch, db = await _orch_with_db(tmp_path)
+        try:
+            docker = _FakeDockerProbe(ps_ids=[])  # "no container" -> would clear
+            # Reconfigured: 'gpu' now resolves to a local-docker backend.
+            backend = LocalBackend(
+                backend_id="gpu",
+                docker=docker,  # type: ignore[arg-type]
+            )
             orch._backends.resolve = MagicMock(return_value=backend)
 
             await db.create_workstream(_seed("w", WorkstreamStatus.READY))
@@ -611,8 +675,8 @@ class TestSshRecoveryBranch:
 
             assert count == 1
             w = await db.get_workstream("w")
-            # probe_ssh is fail-closed: always needs_review=True.
             assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            assert docker.ps_calls == []  # never probed across identities
         finally:
             await db.close()
 
@@ -726,15 +790,147 @@ class TestSshRecoveryBranch:
             await db.close()
 
     @pytest.mark.anyio
+    async def test_ssh_terminal_handle_reconfigured_to_local_docker_needs_review(
+        self, tmp_path
+    ) -> None:
+        """Task 13d fix / spec decision #5: a workstream's execution handle
+        was minted by an SSH backend and is stranded in the terminal window
+        (real JSON `transport_ref`, `state == "terminal"`), but the backend
+        NAME has since been reconfigured to local+docker. Recovery must
+        still route to NEEDS_REVIEW — never fall through to the generic
+        pid/reset branch and silently re-READY the workstream over a
+        possibly-uncollected remote diff. `_is_ssh_terminal_strand` used to
+        classify by `isinstance(backend, SshBackend)` on the *resolved*
+        backend only, so this reconfigured-name case resolved to a
+        `LocalBackend` and returned False — fail-OPEN. This test MUST FAIL
+        on pre-fix code (workstream ends up READY)."""
+        from maestro.execution.local import LocalBackend
+
+        orch, db = await _orch_with_db(tmp_path)
+        try:
+            docker = MagicMock()
+            docker.ps_ids_by_label = AsyncMock(return_value=[])
+            # Reconfigured: 'gpu' now resolves to a local-docker backend.
+            backend = LocalBackend(backend_id="gpu", docker=docker)
+            orch._backends.resolve = MagicMock(return_value=backend)
+
+            await db.create_workstream(
+                _seed("w", WorkstreamStatus.READY, backend="gpu")
+            )
+            layout = remote_layout("/var/tmp/m", "e1")
+            transport_ref = encode_transport_ref(
+                "gpu", None, layout.root, layout.status
+            )
+            await db.start_execution(
+                entity_kind="workstream",
+                entity_id="w",
+                expected_status=WorkstreamStatus.READY.value,
+                running_status=WorkstreamStatus.RUNNING.value,
+                execution_id="e1",
+                backend_id="gpu",
+                transport_ref=transport_ref,
+                attempt=1,
+                status_marker=layout.status,
+            )
+            await db.update_execution_handle_launch(
+                "e1",
+                transport_ref=transport_ref,
+                remote_host="gpu",
+                remote_dir=layout.root,
+                status_marker=layout.status,
+            )
+            await db.mark_execution_state(
+                "e1", "terminal", allowed_from=["prepared", "running"]
+            )
+            w0 = await db.get_workstream("w")
+            assert w0.status == WorkstreamStatus.RUNNING
+            retry_before = w0.retry_count
+
+            count = await orch._recover_stranded_workstreams()
+
+            assert count == 1
+            w = await db.get_workstream("w")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            assert w.retry_count == retry_before
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_probe_exception_recovers_to_needs_review_not_running(
+        self, tmp_path
+    ) -> None:
+        """Fix-13e / decision #1 symmetry: if backend.probe() RAISES during
+        Mode-2 recovery, the workstream must route to NEEDS_REVIEW — never
+        stay stranded in RUNNING (the pre-fix behavior: the raise propagated
+        to the outer recovery except, logged 'Failed to recover', left the
+        workstream RUNNING). Mirrors Mode-1 StateRecovery's probe guard.
+        MUST FAIL on pre-fix code (workstream stays RUNNING, count == 0)."""
+        orch, db = await _orch_with_db(tmp_path)
+        try:
+            backend = MagicMock()
+            backend.accepts_ref = MagicMock(return_value=True)
+            backend.probe = AsyncMock(side_effect=RuntimeError("transport down"))
+            orch._backends.resolve = MagicMock(return_value=backend)
+
+            await db.create_workstream(
+                _seed("w", WorkstreamStatus.READY, backend="gpu")
+            )
+            layout = remote_layout("/var/tmp/m", "e1")
+            transport_ref = encode_transport_ref(
+                "gpu", None, layout.root, layout.status
+            )
+            await db.start_execution(
+                entity_kind="workstream",
+                entity_id="w",
+                expected_status=WorkstreamStatus.READY.value,
+                running_status=WorkstreamStatus.RUNNING.value,
+                execution_id="e1",
+                backend_id="gpu",
+                transport_ref=transport_ref,
+                attempt=1,
+                status_marker=layout.status,
+            )
+            # NOTE: deliberately DO NOT mark the handle terminal — it stays an
+            # open handle so recovery routes it through _probe_open_handle.
+            w0 = await db.get_workstream("w")
+            assert w0.status == WorkstreamStatus.RUNNING
+            retry_before = w0.retry_count
+
+            count = await orch._recover_stranded_workstreams()
+
+            assert count == 1
+            backend.probe.assert_awaited_once()  # the raise actually happened
+            w = await db.get_workstream("w")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            assert w.status != WorkstreamStatus.RUNNING
+            assert w.retry_count == retry_before
+            # No GC/close after the exception: the open handle is left intact.
+            remaining = await db.get_open_execution_handles()
+            assert any(h["execution_id"] == "e1" for h in remaining)
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
     async def test_docker_terminal_handle_still_resets_to_ready(self, tmp_path) -> None:
         """Zero docker regression: a docker `terminal` handle in the same
         stranded-RUNNING situation still resets to READY (docker collect is a
         no-op, so reset-and-rerun stays safe) — the new ssh-terminal routing
-        must never touch docker."""
+        must never touch docker.
+
+        The backend name is seeded into the resolver's cache the way
+        production wires it (`BackendResolver(local_docker=self._docker)` in
+        `__init__`, mirrored by `test_gc_terminal_handles_docker_unaffected_
+        by_ssh_branch` below) so `backend_id="docker"` actually resolves —
+        a genuinely-matching local-docker identity, not an unresolvable
+        name (which Task 13d's fail-closed `_is_ssh_terminal_strand` now
+        correctly routes to NEEDS_REVIEW instead of silently resetting)."""
         orch, db = await _orch_with_db(tmp_path)
         docker = MagicMock()
         docker.ps_ids_by_label = AsyncMock(return_value=[])
         orch._docker = docker
+        orch._backends._cache["docker"] = LocalBackend(
+            backend_id="docker", docker=docker
+        )
         try:
             await db.create_workstream(_seed("w", WorkstreamStatus.READY))
             await db.start_execution(
@@ -760,12 +956,23 @@ class TestSshRecoveryBranch:
     async def test_gc_terminal_handles_docker_unaffected_by_ssh_branch(
         self, tmp_path
     ) -> None:
-        """CRITICAL — zero regression: a docker `terminal` row is still
-        swept exactly as before (unaffected by the new ssh branch)."""
+        """CRITICAL — zero regression: a REAL local-docker "docker" backend
+        (resolved via `self._backends.resolve("docker")`, exactly as
+        production wires it — `LocalBackend` bound to `self._docker`) still
+        GCs its `terminal` row exactly as before (Task 13c: classification
+        now goes through `resolve()` + `accepts_ref()` instead of a literal
+        `backend_id == "docker"` check, but a genuine local-docker backend
+        must behave identically)."""
         orch, db = await _orch_with_db(tmp_path)
         docker = MagicMock()
         docker.ps_ids_by_label = AsyncMock(return_value=[])
         orch._docker = docker
+        # Seed the resolver's "docker" cache slot the way production wires it
+        # (`BackendResolver(local_docker=self._docker)` in `__init__`) —
+        # mirrors `test_orchestrator.py`'s `_set_fake_docker_backend`.
+        orch._backends._cache["docker"] = LocalBackend(
+            backend_id="docker", docker=docker
+        )
         try:
             await db.create_workstream(_seed("w", WorkstreamStatus.READY))
             await db.start_execution(
@@ -786,6 +993,64 @@ class TestSshRecoveryBranch:
             assert swept == 1
             remaining = await db.get_open_execution_handles()
             assert all(h["execution_id"] != "e1" for h in remaining)
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_gc_terminal_handles_ssh_named_docker_leaves_row_uncleaned(
+        self, tmp_path
+    ) -> None:
+        """Task 13c: the LAST residual of the fail-OPEN recovery defect
+        class. A backend named "docker" in config (`backends: {docker:
+        {transport: ssh, ...}}` — config validation allows this; only the
+        legacy `execution.docker` shorthand co-existing with a canonical
+        `backends.docker` is rejected) resolves to an `SshBackend`. Its
+        `terminal` handle row must be left alone — a terminal marker does
+        not prove `collect` ran, so GC-ing it would destroy the record of
+        an uncollected remote run.
+
+        Pre-13c, `_gc_terminal_handles` special-cased `backend_id ==
+        "docker"` as a literal, never calling `resolve()`/`accepts_ref()`,
+        so it always ran LOCAL docker GC (`self._docker.ps_ids_by_label`)
+        against this row — found no matching local container ("no
+        container found", a clean outcome) — and wrongly marked the row
+        `cleaned`. This test MUST FAIL on pre-13c code (row wrongly
+        cleaned, local docker GC called) and pass post-fix (row left
+        intact, local docker GC never consulted)."""
+        orch, db = await _orch_with_db(tmp_path)
+        docker = MagicMock()
+        docker.ps_ids_by_label = AsyncMock(return_value=[])
+        orch._docker = docker
+        backend = _ssh_backend()  # a real SshBackend, resolved for name "docker"
+        orch._backends.resolve = MagicMock(return_value=backend)
+        try:
+            await db.create_workstream(_seed("w", WorkstreamStatus.READY))
+            layout = remote_layout("/var/tmp/m", "e1")
+            transport_ref = encode_transport_ref(
+                "gpu", None, layout.root, layout.status
+            )
+            await db.start_execution(
+                entity_kind="workstream",
+                entity_id="w",
+                expected_status=WorkstreamStatus.READY.value,
+                running_status=WorkstreamStatus.RUNNING.value,
+                execution_id="e1",
+                backend_id="docker",
+                transport_ref=transport_ref,
+                attempt=1,
+                status_marker=layout.status,
+            )
+            await db.mark_execution_state(
+                "e1", "terminal", allowed_from=["prepared", "running"]
+            )
+
+            handles = await db.get_open_execution_handles()
+            swept = await orch._gc_terminal_handles(handles)
+
+            assert swept == 0
+            remaining = await db.get_open_execution_handles()
+            assert any(h["execution_id"] == "e1" for h in remaining)
+            docker.ps_ids_by_label.assert_not_called()
         finally:
             await db.close()
 
@@ -811,14 +1076,19 @@ class TestDualEntityRecovery:
         container-blind branch too. With ssh forced clean, the workstream
         can only land in NEEDS_REVIEW if the new container probe ran and
         found the leftover container.
+
+        Task 7: the dual-entity composition now lives inside
+        `SshBackend.probe`, which imports `probe_ssh` lazily from
+        `maestro.execution.ssh_recovery` at call time — so the patch target
+        is that module (not `orchestrator.probe_ssh`, which no longer
+        exists now that `_probe_open_handle` composes nothing itself).
         """
-        from maestro import orchestrator as orch_mod
 
         async def _clean_ssh(ssh, ref):
             del ssh, ref
             return RecoveryVerdict(False, "ssh clean")
 
-        monkeypatch.setattr(orch_mod, "probe_ssh", _clean_ssh)
+        monkeypatch.setattr("maestro.execution.ssh_recovery.probe_ssh", _clean_ssh)
 
         orch, db = await _orch_with_db(tmp_path)
         try:
@@ -876,14 +1146,17 @@ class TestDualEntityRecovery:
         probe_ssh is again forced clean so the assertion can only pass if
         the mismatch check itself forces the verdict — proving the branch
         fired rather than piggybacking on ssh's own fail-closed default.
+
+        Task 7: patched at `maestro.execution.ssh_recovery.probe_ssh` (the
+        source module) since `SshBackend.probe` — where the composition now
+        lives — imports it lazily from there at call time.
         """
-        from maestro import orchestrator as orch_mod
 
         async def _clean_ssh(ssh, ref):
             del ssh, ref
             return RecoveryVerdict(False, "ssh clean")
 
-        monkeypatch.setattr(orch_mod, "probe_ssh", _clean_ssh)
+        monkeypatch.setattr("maestro.execution.ssh_recovery.probe_ssh", _clean_ssh)
 
         orch, db = await _orch_with_db(tmp_path)
         try:
@@ -1000,17 +1273,24 @@ class TestDualEntityRecovery:
         single-id (a found container is always ambiguous-or-owned). So
         this test captures the actual kwargs `probe_execution` is called
         with and asserts the full persisted `expected_labels` reached it.
+
+        Task 7: both patches target `maestro.execution.ssh_backend` — that
+        module now owns the dual-entity composition (`SshBackend.probe`)
+        and holds its own module-level `probe_execution` binding (imported
+        at `ssh_backend` module load time), so patching
+        `orchestrator.probe_execution` would no longer have any effect on
+        this path.
         """
-        from maestro import orchestrator as orch_mod
+        from maestro.execution import ssh_backend as ssh_backend_mod
 
         async def _clean_ssh(ssh, ref):
             del ssh, ref
             return RecoveryVerdict(False, "ssh clean")
 
-        monkeypatch.setattr(orch_mod, "probe_ssh", _clean_ssh)
+        monkeypatch.setattr("maestro.execution.ssh_recovery.probe_ssh", _clean_ssh)
 
         captured: dict[str, object] = {}
-        real_probe_execution = orch_mod.probe_execution
+        real_probe_execution = ssh_backend_mod.probe_execution
 
         async def _capturing_probe_execution(
             execution_id, docker, expected_labels=None
@@ -1021,7 +1301,9 @@ class TestDualEntityRecovery:
                 execution_id, docker, expected_labels=expected_labels
             )
 
-        monkeypatch.setattr(orch_mod, "probe_execution", _capturing_probe_execution)
+        monkeypatch.setattr(
+            ssh_backend_mod, "probe_execution", _capturing_probe_execution
+        )
 
         orch, db = await _orch_with_db(tmp_path)
         try:

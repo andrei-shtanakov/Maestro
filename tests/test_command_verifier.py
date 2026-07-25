@@ -155,6 +155,9 @@ class _SpyBackend:
     async def probe(self, ref: ExecutionHandleRef) -> ProbeResult:
         return await self._inner.probe(ref)
 
+    def accepts_ref(self, ref: ExecutionHandleRef) -> bool:
+        return self._inner.accepts_ref(ref)
+
 
 async def test_pass_directive_returns_pass_and_persists_handle(
     tmp_path: Path, worktree: Path, db: Database

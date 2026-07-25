@@ -503,7 +503,7 @@ async def _run_scheduler(
                 )
 
                 # Perform state recovery for orphaned tasks
-                recovery = StateRecovery(db)
+                recovery = StateRecovery(db, execution=config.execution)
                 if await recovery.needs_recovery():
                     console.print(
                         "[yellow]Detected orphaned tasks, performing recovery...[/yellow]"

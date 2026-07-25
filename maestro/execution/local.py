@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 
 from maestro._vendor.obs import child_env
+from maestro.execution.docker_recovery import probe_execution
 from maestro.execution.env import build_local_env  # noqa: F401 (re-exported)
 from maestro.execution.models import (
     BackendHealth,
@@ -19,6 +20,7 @@ from maestro.execution.models import (
     PreparedRun,
     ProbeResult,
 )
+from maestro.execution.ref_identity import RefIdentity, ref_identity
 
 
 if TYPE_CHECKING:
@@ -245,6 +247,7 @@ class LocalBackend:
         ref = ExecutionHandleRef(
             backend_id=req.backend_id,
             run_id=req.run_id,
+            execution_id=req.execution_id,
             transport_ref=self._isolator.transport_ref(prepared, proc.pid),
             started_at=datetime.now(UTC),
         )
@@ -252,13 +255,33 @@ class LocalBackend:
         return self._isolator.wrap(local_handle, prepared, ref)
 
     async def probe(self, ref: ExecutionHandleRef) -> ProbeResult:
-        if not ref.transport_ref.startswith("local_pid:"):
-            return ProbeResult(alive=False, detail="not a local ref")
-        pid = int(ref.transport_ref.split(":", 1)[1])
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return ProbeResult(alive=False)
-        except PermissionError:
-            return ProbeResult(alive=True, detail="exists (EPERM)")
-        return ProbeResult(alive=True)
+        """Isolation-aware recovery probe: bare -> PID liveness; docker ->
+        container liveness by `execution_id` (fail-closed on either a
+        missing daemon or a missing `execution_id`, since there is then no
+        key to probe by)."""
+        if ref.transport_ref.startswith("local_pid:"):
+            pid = int(ref.transport_ref.split(":", 1)[1])
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return ProbeResult(needs_review=False, alive=False)
+            except PermissionError:
+                return ProbeResult(
+                    needs_review=True, alive=True, detail="exists (EPERM)"
+                )
+            return ProbeResult(needs_review=True, alive=True)
+        # Docker isolation: probe the container by execution_id (fail-closed
+        # on a missing daemon or a missing execution_id — no key to probe).
+        if self._docker is None or ref.execution_id is None:
+            return ProbeResult(
+                needs_review=True, detail="docker probe: no execution_id/daemon"
+            )
+        verdict = await probe_execution(ref.execution_id, self._docker)
+        return ProbeResult(needs_review=verdict.needs_review, detail=verdict.reason)
+
+    def accepts_ref(self, ref: ExecutionHandleRef) -> bool:
+        """Own identity is `("local", "docker" if self._docker else "bare")`;
+        a mismatched or unclassifiable (`("unknown","unknown")`) ref never
+        matches -> caller fails closed rather than probing."""
+        own = RefIdentity("local", "docker" if self._docker is not None else "bare")
+        return ref_identity(ref.transport_ref) == own

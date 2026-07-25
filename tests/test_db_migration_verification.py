@@ -1,15 +1,15 @@
-"""Tests for migrations 12-14 (Stage B verification persistence).
+"""Tests for migrations 13-15 (Stage B verification persistence).
 
-Migration 12 (`workstreams_verification_columns`): five additive columns on
+Migration 13 (`workstreams_verification_columns`): five additive columns on
 `workstreams` — `verification_run_id`, `verification_attempt`,
 `verification_error_attempt`, `rework_attempt`, `resume_reason`.
 
-Migration 13 (`verification_attempts_table`): the `verification_attempts`
+Migration 14 (`verification_attempts_table`): the `verification_attempts`
 index table (one row per `(run_id, attempt)`), plus the
 `insert_verification_attempt` / `list_verification_attempts` /
 `mark_attempts_materialized` DB methods.
 
-Migration 14 (`execution_phase_verification`): widens the
+Migration 15 (`execution_phase_verification`): widens the
 `execution_handles.execution_phase` CHECK constraint to also accept
 `'verification'`. SQLite cannot ALTER a CHECK constraint, so this rebuilds
 the table (mirrors migration 9, `_migrate_ssh_handle_columns`).
@@ -509,7 +509,7 @@ class TestExecutionPhaseVerificationMigration:
         try:
             assert db2._connection is not None
             cur = await db2._connection.execute(
-                "SELECT version FROM schema_migrations WHERE version = 14"
+                "SELECT version FROM schema_migrations WHERE version = 15"
             )
             assert await cur.fetchone() is not None
         finally:

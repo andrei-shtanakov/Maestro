@@ -41,6 +41,7 @@ from tests.fakes.fake_execution_backend import FakeTaskHandle
 
 if TYPE_CHECKING:
     from maestro.database import Database
+    from maestro.execution.docker_cli import DockerCli
     from maestro.execution.local import LocalBackend
 
 
@@ -145,6 +146,29 @@ def _set_fake_backend(orch: Orchestrator, backend: FakeOrchestratorBackend) -> N
     default.
     """
     orch._backends._cache["local"] = cast("LocalBackend", backend)
+
+
+def _set_fake_docker_backend(orch: Orchestrator, docker: object) -> None:
+    """Seed the resolver's "docker" cache slot with a real `LocalBackend`
+    bound to `docker`.
+
+    Task 7b routes `docker`-backed recovery through `self._backends.resolve
+    ("docker")` + `backend.probe()` like every other backend, instead of
+    hand-composing `probe_execution(row["execution_id"], self._docker)`.
+    `resolve()` returns a cache hit before ever consulting the registry or
+    building via `_build_local`, so seeding the cache directly here (mirrors
+    `_set_fake_backend`'s "local" seeding above) sidesteps two things this
+    module's tests don't configure: an `execution.docker` registry entry,
+    and this module's autouse `FakeOrchestratorBackend` patch of
+    `maestro.execution.resolver.LocalBackend` (whose `.probe()` raises
+    `NotImplementedError` — it's a spawn-path fake, not a probe-path one).
+    """
+    from maestro.execution.local import LocalBackend
+
+    orch._backends._cache["docker"] = LocalBackend(
+        backend_id="docker",
+        docker=cast("DockerCli", docker),
+    )
 
 
 # =============================================================================
@@ -1717,6 +1741,7 @@ class TestStartupRecovery:
             orch_config,
             docker=docker,
         )
+        _set_fake_docker_backend(orch, docker)
         try:
             await db.create_workstream(self._seed("w", WorkstreamStatus.READY))
             await db.start_execution(
@@ -1761,6 +1786,7 @@ class TestStartupRecovery:
             orch_config,
             docker=docker,
         )
+        _set_fake_docker_backend(orch, docker)
         try:
             await db.create_workstream(self._seed("w", WorkstreamStatus.READY))
             await db.start_execution(

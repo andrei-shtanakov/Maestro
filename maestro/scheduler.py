@@ -41,6 +41,7 @@ from maestro.execution.backend import ExecutionBackend, TaskHandle
 from maestro.execution.exec_config import ExecutionConfig
 from maestro.execution.finalize import FinalizationResult, ensure_finalize_task
 from maestro.execution.models import CollectPolicy, ExecutionRequest
+from maestro.execution.ref_identity import ref_identity
 from maestro.execution.reservations import (
     ReservationRegistry,
     UnboundedRemoteScopeError,
@@ -52,6 +53,7 @@ from maestro.execution.reservations import (
 )
 from maestro.execution.resolver import BackendResolver
 from maestro.execution.ssh_backend import LaunchNotStarted
+from maestro.execution.ssh_launch import decode_transport_ref
 from maestro.models import (
     AgentType,
     ArbiterMode,
@@ -1283,6 +1285,14 @@ class Scheduler:
                 # recovery/collect.
                 raise
 
+            if backend.id != "local":
+                # A durable (non-local) backend is never resolved for
+                # backend.id == "local", so the non-local branch above
+                # always ran and minted a real execution_id (never the
+                # local branch's None).
+                assert execution_id is not None
+                await self._persist_launch(execution_id, handle)
+
             # Track running task
             self._running_tasks[task_id] = RunningTask(
                 task=task,
@@ -1294,6 +1304,50 @@ class Scheduler:
             )
 
             return True
+
+    async def _persist_launch(self, execution_id: str, handle: TaskHandle) -> None:
+        """Write back the real ref `SshBackend`/`LocalBackend.run()` minted,
+        over the placeholder `start_execution` seeded, so recovery can
+        classify + probe it.
+
+        `start_execution` seeds only a plain-string placeholder
+        `transport_ref` (and NULL `remote_host`/`remote_dir`/
+        `status_marker`) before the backend actually launches, for ANY
+        durable (non-local) backend. Once `backend.run()` returns,
+        `handle.ref` carries the real ref the backend minted. SSH refs are
+        JSON (carry host/remote_dir, decoded here); local refs
+        (`local_pid:`/`docker:`) are opaque and stored as-is — the
+        scheduler does not decode them. Best-effort: a write-back failure
+        after a successful launch is an uncertain-launch condition — leave
+        the handle (placeholder ref -> recovery fail-closes to
+        NEEDS_REVIEW), never roll back.
+        """
+        transport_ref = handle.ref.transport_ref
+        try:
+            ident = ref_identity(transport_ref)
+            if ident.transport == "ssh":
+                info = decode_transport_ref(transport_ref)
+                await self._db.update_execution_handle_launch(
+                    execution_id,
+                    transport_ref=transport_ref,
+                    remote_host=info.get("host"),
+                    remote_dir=info.get("remote_dir"),
+                    status_marker=handle.ref.status_marker,
+                )
+            else:
+                await self._db.update_execution_handle_launch(
+                    execution_id,
+                    transport_ref=transport_ref,
+                    remote_host=None,
+                    remote_dir=None,
+                    status_marker=handle.ref.status_marker,
+                )
+        except Exception as exc:
+            _obs_log.warning(
+                "execution.persist_launch.failed",
+                execution_id=execution_id,
+                error=repr(exc),
+            )
 
     async def _build_dependency_context(self, task: Task) -> str:
         """Build context string from completed dependency tasks.
@@ -1905,9 +1959,10 @@ class Scheduler:
     def _resolve_validation_backend(self, task: Task) -> ExecutionBackend:
         """Resolve the backend for a task's validation run.
 
-        'local' -> the bare LocalBackend; 'same' -> the task's own backend;
-        a named value -> that backend. Preflight has already rejected any
-        SSH target, so this only yields local-transport backends.
+        'local' -> the bare LocalBackend; 'same' -> the task's own backend
+        (the default since PR3); a named value -> that backend. May yield a
+        non-local backend (docker or, since PR2, SSH), whose validation runs
+        durably; preflight only rejects an unknown named backend.
         """
         name = task.validation_backend
         if name == "local":
@@ -2005,6 +2060,9 @@ class Scheduler:
                 task.id, "validation launch result unknown"
             )
             return None
+
+        if backend.id != "local":
+            await self._persist_launch(execution_id, handle)
 
         running_val = RunningTask(
             task=validating,
