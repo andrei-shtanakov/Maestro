@@ -253,12 +253,12 @@ class LocalBackend:
 
     async def probe(self, ref: ExecutionHandleRef) -> ProbeResult:
         if not ref.transport_ref.startswith("local_pid:"):
-            return ProbeResult(alive=False, detail="not a local ref")
+            return ProbeResult(needs_review=True, detail="not a local ref")
         pid = int(ref.transport_ref.split(":", 1)[1])
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
-            return ProbeResult(alive=False)
+            return ProbeResult(needs_review=False, alive=False)
         except PermissionError:
-            return ProbeResult(alive=True, detail="exists (EPERM)")
-        return ProbeResult(alive=True)
+            return ProbeResult(needs_review=True, alive=True, detail="exists (EPERM)")
+        return ProbeResult(needs_review=True, alive=True)

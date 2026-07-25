@@ -81,7 +81,7 @@ class _FakeBackend:
         return _FakeHandle(self._result)
 
     async def probe(self, ref: ExecutionHandleRef) -> ProbeResult:
-        return ProbeResult(alive=False)
+        return ProbeResult(needs_review=False, alive=False)
 
 
 @pytest.fixture

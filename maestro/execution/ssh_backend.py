@@ -414,7 +414,9 @@ class SshBackend:
         from maestro.execution.ssh_recovery import probe_ssh
 
         verdict = await probe_ssh(self._ssh, ref)
-        return ProbeResult(alive=verdict.needs_review, detail=verdict.reason)
+        return ProbeResult(
+            needs_review=verdict.needs_review, alive=None, detail=verdict.reason
+        )
 
 
 async def _run_local(argv: list[str]) -> None:
