@@ -375,10 +375,20 @@ class Scheduler:
         unreliable under concurrent writes). `details`/`message` feed the
         event/notification only; `**fields` are DB columns (error_message,
         retry_count, result_summary, ...) and never leak into the effect.
+
+        A landing on a truly terminal status (DONE/ABANDONED) releases this
+        task's (workdir, scope) reservation, if any — the single point every
+        terminal transition passes through. This is the verifier lifecycle
+        hold's only release (design §5.3: hold from first dispatch through
+        every retry and NEEDS_REVIEW, release only at DONE/ABANDONED); for
+        non-verifier tasks the reservation was typically already released
+        earlier (post-collect), so this is a harmless no-op re-release.
         """
         task = await self._db.update_task_status(
             task_id, to_status, expected_status=expected_status, **fields
         )
+        if to_status in (TaskStatus.DONE, TaskStatus.ABANDONED):
+            self._reservations.release(task_id)
         await self._dispatcher.fire(
             _subject(task), frm=expected_status, details=details, message=message
         )
@@ -774,14 +784,24 @@ class Scheduler:
         self._armed = compute_armed_workdirs(tasks, self._execution)
 
     async def _reconstruct_reservations(self) -> None:
-        """Rebuild held reservations from durable open SSH handles (recovery).
+        """Rebuild held reservations after a restart (recovery).
 
         On a scheduler restart the in-memory `self._reservations` registry is
-        empty. `prepared`/`running`/`terminal` handles may still correspond to
-        a live remote execution holding a (workdir, scope) lock, so each is
-        reconstructed as held. `collected`/`cleaned` handles are not
-        scope-blocking (the scope was already released) and are left to the
-        existing cleanup-recovery path.
+        empty. Two independent sources feed it back:
+
+        1. Durable open SSH handles. `prepared`/`running`/`terminal` handles
+           may still correspond to a live remote execution holding a
+           (workdir, scope) lock, so each is reconstructed as held.
+           `collected`/`cleaned` handles are not scope-blocking (the scope
+           was already released) and are left to the existing
+           cleanup-recovery path.
+        2. Verifier-enabled tasks (design §5.3). Their reservation is held
+           for the task's WHOLE lifecycle (dispatch through DONE/ABANDONED),
+           independent of any single execution handle — so any task with a
+           recorded baseline and a non-terminal status (READY, FAILED,
+           NEEDS_REVIEW included, not just RUNNING/VALIDATING/VERIFYING)
+           re-holds its reservation here, whether or not it currently has an
+           open handle.
         """
         # Phase-agnostic: any open (workdir, scope)-holding handle re-holds the
         # reservation regardless of execution_phase — a still-open *validation*
@@ -804,13 +824,33 @@ class Scheduler:
                     task.id, scope_to_reservation(task.workdir, task.scope)
                 )
 
+        # Verifier lifecycle hold: not gated on `_is_armed` — the verifier
+        # gate needs unambiguous diff attribution regardless of backend, so
+        # its reservation applies on local workdirs too (see `_try_reserve`).
+        for task in await self._db.get_all_tasks():
+            if task.status.is_terminal():
+                continue
+            if task.verifier_baseline_sha is None:
+                continue
+            if not self._verifier_enabled(task):
+                continue
+            self._reservations.reconstruct(
+                task.id, scope_to_reservation(task.workdir, task.scope)
+            )
+
     def _is_armed(self, task: Task) -> bool:
         """Check whether `task.workdir` hosts >=1 SSH task (armed by `_arm_workdirs`)."""
         return canonical_workdir(task.workdir) in self._armed
 
     def _try_reserve(self, task: Task) -> bool:
-        """Acquire the (workdir, scope) reservation; no-op off armed workdirs."""
-        if not self._is_armed(task):
+        """Acquire the (workdir, scope) reservation.
+
+        No-op off armed workdirs, UNLESS `task` is verifier-enabled: the
+        verifier gate (design §5.3) needs unambiguous diff attribution for
+        its scope-bounded patch regardless of backend, so it engages the
+        reservation even on a local (non-SSH, non-armed) workdir.
+        """
+        if not self._is_armed(task) and not self._verifier_enabled(task):
             return True
         r = scope_to_reservation(task.workdir, task.scope)
         return self._reservations.try_acquire(task.id, r)
@@ -1569,9 +1609,15 @@ class Scheduler:
                 # A held validation (uncertain durable launch) keeps the
                 # (workdir, scope) reservation until cleanup/recovery frees it —
                 # the durable validation ran against the same workdir (detail 6).
+                # A verifier-enabled task (design §5.3) holds past this
+                # post-collect point too — its reservation is lifecycle-scoped
+                # and is released only by `_transition` landing on DONE/
+                # ABANDONED, never here.
                 if (
-                    exec_id is None or fin.collect_succeeded
-                ) and task_id not in self._validation_hold:
+                    (exec_id is None or fin.collect_succeeded)
+                    and task_id not in self._validation_hold
+                    and not self._verifier_enabled(running_task.task)
+                ):
                     to_release.append(task_id)
             else:
                 # Check for timeout
@@ -1588,7 +1634,9 @@ class Scheduler:
                         )
                     await self._handle_task_timeout(task_id, running_task)
                     completed.append(task_id)
-                    if timeout_exec_id is None or timeout_fin.collect_succeeded:
+                    if (
+                        timeout_exec_id is None or timeout_fin.collect_succeeded
+                    ) and not self._verifier_enabled(running_task.task):
                         to_release.append(task_id)
 
         # Remove completed tasks from tracking. The single reap chokepoint.
