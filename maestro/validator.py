@@ -15,6 +15,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from maestro._vendor.obs import child_env
+from maestro.execution.models import (
+    CollectPolicy,
+    ExecutionRequest,
+    ExecutionResult,
+)
+from maestro.models import Task
 
 
 logger = logging.getLogger(__name__)
@@ -300,3 +306,59 @@ class Validator:
             )
 
         return await self.validate(validation_cmd, workdir, timeout_override)
+
+
+def build_validation_request(
+    task: Task,
+    *,
+    backend_id: str,
+    run_id: str,
+    attempt: int,
+) -> ExecutionRequest:
+    """Build the validation ExecutionRequest for a task.
+
+    ``capture_output=True`` (retry context is read from the tails),
+    ``collect=none`` (validation applies no file changes), ``inherit_env=True``
+    so a bare LocalBackend reproduces today's ``{**os.environ, **child_env()}``
+    environment exactly. Timeout mirrors the pre-slice Validator default
+    (no per-task override existed).
+
+    Raises ValueError if ``validation_cmd`` is empty or unparseable.
+    """
+    if not task.validation_cmd:
+        raise ValueError("no validation_cmd")
+    argv = shlex.split(task.validation_cmd)
+    if not argv:
+        raise ValueError("empty validation command")
+    return ExecutionRequest(
+        run_id=run_id,
+        argv=argv,
+        workdir=Path(task.workdir),
+        log_path=Path(task.workdir) / f".maestro-validation-{run_id}.log",
+        capture_output=True,
+        inherit_env=True,
+        timeout_seconds=float(Validator.DEFAULT_TIMEOUT),
+        collect=CollectPolicy(mode="none"),
+        backend_id=backend_id,
+        entity_kind="task",
+        attempt=attempt,
+    )
+
+
+def execution_result_to_validation(res: ExecutionResult) -> ValidationResult:
+    """Map a captured ExecutionResult onto a ValidationResult."""
+    success = res.exit_code == 0 and not res.timed_out
+    if res.timed_out:
+        error_message: str | None = "Command timed out"
+    elif not success:
+        error_message = f"Exit code: {res.exit_code}"
+    else:
+        error_message = None
+    return ValidationResult(
+        success=success,
+        exit_code=res.exit_code,
+        stdout=res.stdout_tail,
+        stderr=res.stderr_tail,
+        timed_out=res.timed_out,
+        error_message=error_message,
+    )
