@@ -627,6 +627,59 @@ class TestSshRecoveryBranch:
             await db.close()
 
     @pytest.mark.anyio
+    async def test_probe_open_handle_ssh_reconfigured_to_local_docker_needs_review(
+        self, tmp_path
+    ) -> None:
+        """Fix-13b Mode-2 regression guard (mirrors the Mode-1 guard in
+        tests/test_recovery_backend_classify.py): a workstream's open
+        handle was minted by an SSH backend (real JSON `transport_ref`),
+        but the backend name has since been reconfigured to local+docker.
+        `_probe_open_handle` must route to NEEDS_REVIEW WITHOUT ever
+        calling `backend.probe()` — a local-docker probe of an SSH run's
+        `execution_id` would (pre-13b) find no matching container and
+        silently clear the review, letting the workstream re-run over an
+        unconfirmed remote diff. This test MUST FAIL on pre-13b code (no
+        `accepts_ref` gate): the workstream would end up READY and the fake
+        docker's `ps_ids_by_label` would have been called."""
+        from maestro.execution.local import LocalBackend
+
+        orch, db = await _orch_with_db(tmp_path)
+        try:
+            docker = _FakeDockerProbe(ps_ids=[])  # "no container" -> would clear
+            # Reconfigured: 'gpu' now resolves to a local-docker backend.
+            backend = LocalBackend(
+                backend_id="gpu",
+                docker=docker,  # type: ignore[arg-type]
+            )
+            orch._backends.resolve = MagicMock(return_value=backend)
+
+            await db.create_workstream(_seed("w", WorkstreamStatus.READY))
+            layout = remote_layout("/var/tmp/m", "e1")
+            transport_ref = encode_transport_ref(
+                "gpu", None, layout.root, layout.status
+            )
+            await db.start_execution(
+                entity_kind="workstream",
+                entity_id="w",
+                expected_status=WorkstreamStatus.READY.value,
+                running_status=WorkstreamStatus.RUNNING.value,
+                execution_id="e1",
+                backend_id="gpu",
+                transport_ref=transport_ref,
+                attempt=1,
+                status_marker=layout.status,
+            )
+
+            count = await orch._recover_stranded_workstreams()
+
+            assert count == 1
+            w = await db.get_workstream("w")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            assert docker.ps_calls == []  # never probed across identities
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
     async def test_gc_terminal_handles_sweeps_collected_ssh_row(self, tmp_path) -> None:
         orch, db = await _orch_with_db(tmp_path)
         try:

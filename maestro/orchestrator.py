@@ -652,7 +652,14 @@ class Orchestrator:
         same, test-injectable `DockerCli` startup recovery has always probed
         with (`Orchestrator(docker=...)`) — not a fresh, un-injectable one.
         An unresolvable `backend_id` is treated as needs_review (fail-closed)
-        rather than raising.
+        rather than raising. Likewise, a resolved backend whose
+        `accepts_ref()` rejects the persisted ref — the persisted
+        transport/isolation identity no longer matches the resolved backend
+        (config drift after the handle was minted), or the ref is a
+        placeholder/unknown — is treated as needs_review WITHOUT ever
+        calling `probe()`: probing across identities (e.g. a local-docker
+        probe of an SSH run's `execution_id`) would fail-OPEN. (spec
+        decision #5; kept consistent with `StateRecovery`'s Mode-1 gate.)
 
         SSH is fail-closed by design: `SshBackend.probe` always returns
         `needs_review=True` for a bare handle (a remote terminal marker
@@ -671,8 +678,12 @@ class Orchestrator:
         except ExecutionConfigError:
             needs_review = True
         else:
-            result = await backend.probe(handle_ref_from_row(row))
-            needs_review = result.needs_review
+            ref = handle_ref_from_row(row)
+            if not backend.accepts_ref(ref):
+                needs_review = True
+            else:
+                result = await backend.probe(ref)
+                needs_review = result.needs_review
         if not needs_review:
             await self._db.mark_execution_state(
                 row["execution_id"], "terminal", allowed_from=["prepared", "running"]
@@ -704,8 +715,10 @@ class Orchestrator:
         terminal -> cleaned GC sweep.
 
         A row whose outcome is ambiguous (multiple container matches /
-        label mismatch / probe error / no owner marker / resolve failure)
-        is left in place for the next sweep or a human to resolve.
+        label mismatch / probe error / no owner marker / resolve failure),
+        or whose resolved backend's `accepts_ref()` rejects the persisted
+        ref (config drift after the handle was minted), is left in place
+        for the next sweep or a human to resolve.
         """
         swept = 0
         for row in handles:
@@ -737,6 +750,11 @@ class Orchestrator:
                 if not isinstance(backend, SshBackend):
                     continue
                 ref = handle_ref_from_row(row)
+                if not backend.accepts_ref(ref):
+                    # Persisted identity no longer matches the resolved
+                    # backend (e.g. isolation reconfigured bare<->docker
+                    # under the same name) — never GC across identities.
+                    continue
                 decoded = decode_transport_ref(ref.transport_ref)
                 if decoded["isolation"] == "docker":
                     # Container-first ordering: never delete the remote root

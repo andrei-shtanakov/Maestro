@@ -30,6 +30,7 @@ from maestro.execution.exec_config import (
     LocalTransport,
     SshTransport,
 )
+from maestro.execution.local import LocalBackend
 from maestro.execution.ssh_launch import encode_transport_ref
 from maestro.models import Task, TaskStatus
 from maestro.recovery import StateRecovery
@@ -66,7 +67,18 @@ class _FakeDocker:
         pass
 
 
-async def _seed_running_task(db: Database, task_id: str = "t1") -> None:
+async def _seed_running_task(
+    db: Database, task_id: str = "t1", *, pid: int = 4242
+) -> None:
+    """Seed a RUNNING task with a named-local-bare open handle, mirroring
+    the real scheduler persistence path (`scheduler._persist_launch`):
+    `start_execution` seeds a plain-string placeholder `transport_ref`
+    (`"<backend_id>:maestro-<execution_id>"`) before the backend actually
+    launches, then `update_execution_handle_launch` overwrites it with the
+    backend-minted real ref (`local_pid:<pid>` for a bare local backend).
+    Seeding the real ref directly at `start_execution` time — as the old
+    version of this helper did — is a state the production code path never
+    produces and would make the identity gate's accepts_ref check vacuous."""
     await db.create_task(
         Task(
             id=task_id,
@@ -84,8 +96,15 @@ async def _seed_running_task(db: Database, task_id: str = "t1") -> None:
         running_status="running",
         execution_id="e1",
         backend_id="named-local",
-        transport_ref="local_pid:4242",
+        transport_ref="named-local:maestro-e1",
         attempt=1,
+    )
+    await db.update_execution_handle_launch(
+        "e1",
+        transport_ref=f"local_pid:{pid}",
+        remote_host=None,
+        remote_dir=None,
+        status_marker=None,
     )
 
 
@@ -308,6 +327,216 @@ async def test_placeholder_ssh_row_needs_review(db) -> None:
             "remote": BackendSpec(
                 transport=SshTransport(type="ssh", host="h", workdir_root="/r"),
                 isolation=BareIsolation(),
+            )
+        }
+    )
+    await StateRecovery(db, execution=execution).recover()
+
+    task = await db.get_task("t1")
+    assert task.status == TaskStatus.NEEDS_REVIEW
+
+
+# =============================================================================
+# Fix-13b: identity compatibility gate — never probe (or reclaim) across a
+# persisted-ref-vs-resolved-backend mismatch (config drift after the handle
+# was minted). Closes the whole-branch-review fail-OPEN defect (spec
+# decision #5).
+# =============================================================================
+
+
+async def test_ssh_reconfigured_to_local_docker_needs_review_no_probe(db) -> None:
+    """THE fail-OPEN regression guard. A task's open handle was minted by an
+    SSH backend (real JSON `transport_ref` persisted via
+    `update_execution_handle_launch`), but the backend named 'remote' has
+    since been reconfigured to local+docker (same name, different identity —
+    e.g. an operator edited `execution.backends.remote` between runs).
+
+    Recovery must route to NEEDS_REVIEW WITHOUT ever probing the
+    local-docker backend: a local-docker probe of an SSH run's
+    `execution_id` would (pre-13b) find no matching container and silently
+    re-READY the task, discarding an unconfirmed remote run.
+
+    This test MUST FAIL on pre-13b code (no `accepts_ref` gate): the task
+    would end up READY and the fake docker's `ps_ids_by_label` would have
+    been called."""
+    await db.create_task(
+        Task(
+            id="t1",
+            title="t",
+            prompt="p",
+            workdir="/tmp",
+            status=TaskStatus.READY,
+            backend="sandbox",
+        )
+    )
+    ssh_ref = encode_transport_ref(
+        "h", None, "/r/e1", "/r/e1/e1.status", isolation="bare"
+    )
+    await db.start_execution(
+        entity_kind="task",
+        entity_id="t1",
+        expected_status="ready",
+        running_status="running",
+        execution_id="e1",
+        backend_id="remote",
+        transport_ref="remote:maestro-e1",
+        attempt=1,
+    )
+    await db.update_execution_handle_launch(
+        "e1",
+        transport_ref=ssh_ref,
+        remote_host="h",
+        remote_dir="/r/e1",
+        status_marker="/r/e1/e1.status",
+    )
+
+    # Reconfigured: 'remote' now resolves to a local-docker backend, not SSH.
+    # An empty container list means a naive probe would answer "safe to
+    # reclaim" — the gate must never let that probe happen at all.
+    fake_docker = _FakeDocker(ids=[])
+    recovery = StateRecovery(db, docker=fake_docker)
+    mismatched_backend = LocalBackend(
+        backend_id="remote",
+        docker=fake_docker,  # type: ignore[arg-type]
+    )
+    recovery._backends.resolve = lambda _name: mismatched_backend  # type: ignore[method-assign]
+
+    await recovery.recover()
+
+    task = await db.get_task("t1")
+    assert task.status == TaskStatus.NEEDS_REVIEW
+    assert fake_docker.probed_execution_ids == []  # never probed across identities
+
+
+async def test_local_bare_ref_resolved_to_local_docker_needs_review(db) -> None:
+    """A bare-local ref (`local_pid:<pid>`) whose backend name now resolves
+    to local+docker is a mismatch too (not just SSH<->local) -> fail closed,
+    no probe."""
+    await _seed_running_task(db)  # persists backend_id='named-local', bare ref
+    fake_docker = _FakeDocker(ids=[])
+    recovery = StateRecovery(db, docker=fake_docker)
+    mismatched_backend = LocalBackend(
+        backend_id="named-local",
+        docker=fake_docker,  # type: ignore[arg-type]
+    )
+    recovery._backends.resolve = lambda _name: mismatched_backend  # type: ignore[method-assign]
+
+    await recovery.recover()
+
+    task = await db.get_task("t1")
+    assert task.status == TaskStatus.NEEDS_REVIEW
+    assert fake_docker.probed_execution_ids == []
+
+
+async def test_local_docker_ref_resolved_to_local_bare_needs_review(db) -> None:
+    """The inverse mismatch: a `docker:<name>` ref whose backend name now
+    resolves to bare local -> fail closed rather than probing a PID that
+    was never the real execution unit."""
+    await db.create_task(
+        Task(
+            id="t1",
+            title="t",
+            prompt="p",
+            workdir="/tmp",
+            status=TaskStatus.READY,
+            backend="sandbox",
+        )
+    )
+    await db.start_execution(
+        entity_kind="task",
+        entity_id="t1",
+        expected_status="ready",
+        running_status="running",
+        execution_id="e1",
+        backend_id="docker",
+        transport_ref="docker:maestro-e1",
+        attempt=1,
+    )
+
+    recovery = StateRecovery(db)
+    backend = LocalBackend(backend_id="docker")
+    recovery._backends.resolve = lambda _name: backend  # type: ignore[method-assign]
+
+    await recovery.recover()
+
+    task = await db.get_task("t1")
+    assert task.status == TaskStatus.NEEDS_REVIEW
+
+
+async def test_ssh_ref_resolved_to_local_bare_needs_review(db) -> None:
+    """local<->ssh mismatch, the other direction: a real SSH ref whose
+    backend name now resolves to plain local bare -> fail closed."""
+    await db.create_task(
+        Task(
+            id="t1",
+            title="t",
+            prompt="p",
+            workdir="/tmp",
+            status=TaskStatus.READY,
+            backend="sandbox",
+        )
+    )
+    ssh_ref = encode_transport_ref(
+        "h", None, "/r/e1", "/r/e1/e1.status", isolation="bare"
+    )
+    await db.start_execution(
+        entity_kind="task",
+        entity_id="t1",
+        expected_status="ready",
+        running_status="running",
+        execution_id="e1",
+        backend_id="remote",
+        transport_ref="remote:maestro-e1",
+        attempt=1,
+    )
+    await db.update_execution_handle_launch(
+        "e1",
+        transport_ref=ssh_ref,
+        remote_host="h",
+        remote_dir="/r/e1",
+        status_marker="/r/e1/e1.status",
+    )
+
+    recovery = StateRecovery(db)
+    backend = LocalBackend(backend_id="remote")
+    recovery._backends.resolve = lambda _name: backend  # type: ignore[method-assign]
+
+    await recovery.recover()
+
+    task = await db.get_task("t1")
+    assert task.status == TaskStatus.NEEDS_REVIEW
+
+
+async def test_unknown_placeholder_ref_needs_review(db) -> None:
+    """A ref that never classifies to any known identity (e.g. a stray
+    'pool:maestro-x' placeholder that was never overwritten by a real
+    launch, but for a backend whose resolve() itself succeeds) fails
+    closed via the identity gate, not just via a probe exception."""
+    await db.create_task(
+        Task(
+            id="t1",
+            title="t",
+            prompt="p",
+            workdir="/tmp",
+            status=TaskStatus.READY,
+            backend="sandbox",
+        )
+    )
+    await db.start_execution(
+        entity_kind="task",
+        entity_id="t1",
+        expected_status="ready",
+        running_status="running",
+        execution_id="e1",
+        backend_id="named-local",
+        transport_ref="pool:maestro-x",
+        attempt=1,
+    )
+
+    execution = ExecutionConfig(
+        backends={
+            "named-local": BackendSpec(
+                transport=LocalTransport(), isolation=BareIsolation()
             )
         }
     )

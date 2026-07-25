@@ -32,6 +32,7 @@ from maestro.execution.exec_config import (
     ExecutionConfig,
     SshTransport,
 )
+from maestro.execution.local import LocalBackend
 from maestro.execution.ssh_backend import SshBackend
 from maestro.execution.ssh_cli import RunResult
 from maestro.execution.ssh_launch import encode_transport_ref, remote_layout
@@ -404,3 +405,54 @@ async def test_local_docker_collected_gc_cleans(db) -> None:
 
     assert docker.rm_calls == ["c1"]  # container was removed
     assert not await _handle_present(db, "e1")  # handle marked cleaned
+
+
+# =============================================================================
+# 5. Fix-13b: identity-mismatch GC — never docker-GC an SSH run's
+#    execution_id (or vice versa) just because the backend *name* still
+#    resolves.
+# =============================================================================
+
+
+async def test_gc_ssh_ref_reconfigured_to_local_docker_leaves_row(db) -> None:
+    """A `collected` row minted by an SSH backend (real JSON transport_ref),
+    but whose backend name 'remote' has since been reconfigured to
+    local+docker, must be left alone by GC: no docker `rm` (not even a
+    `ps_ids_by_label` probe that finds nothing and marks it cleaned) and the
+    row must remain `collected` for the next sweep / a human. Pre-13b code
+    would resolve a `LocalBackend`, fail the (nonexistent) `isinstance(...,
+    SshBackend)` check, fall into the generic docker-GC branch, and — on an
+    empty container list — mark the row `cleaned`, destroying the record of
+    an uncollected remote run."""
+    await _seed_task(db, "t1")
+    layout = remote_layout("/var/tmp/m", "e1")
+    transport_ref = encode_transport_ref("gpu", None, layout.root, layout.status)
+    await db.start_execution(
+        entity_kind="task",
+        entity_id="t1",
+        expected_status="ready",
+        running_status="running",
+        execution_id="e1",
+        backend_id="remote",
+        transport_ref=transport_ref,
+        attempt=1,
+    )
+    await db.mark_execution_state("e1", "collected", allowed_from=["prepared"])
+    await db.update_task_status(
+        "t1", TaskStatus.DONE, expected_status=TaskStatus.RUNNING
+    )
+
+    # Reconfigured: 'remote' now resolves to local-docker, not SSH.
+    docker = _FakeDocker(ids=[])  # "no container" -> would wrongly clean pre-13b
+    recovery = StateRecovery(db, docker=docker)
+    mismatched_backend = LocalBackend(
+        backend_id="remote",
+        docker=docker,  # type: ignore[arg-type]
+    )
+    recovery._backends.resolve = lambda _name: mismatched_backend  # type: ignore[method-assign]
+
+    await recovery.recover()
+
+    assert docker.rm_calls == []
+    row = await _open_handle(db, "e1")
+    assert row["state"] == "collected"  # left in place, not cleaned

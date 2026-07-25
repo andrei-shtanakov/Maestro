@@ -305,6 +305,15 @@ class StateRecovery:
           probing (e.g. a placeholder SSH row with no real coordinates yet,
           crashed before `update_execution_handle_launch`), fails closed to
           NEEDS_REVIEW rather than falling through to a default backend.
+        - a resolved backend whose `accepts_ref()` rejects the persisted ref
+          — the persisted transport/isolation identity no longer matches
+          the resolved backend (config drift after the handle was minted),
+          or the ref is a placeholder/unknown — also fails closed to
+          NEEDS_REVIEW, WITHOUT ever calling `probe()`. Probing across
+          identities (e.g. a local-docker probe of an SSH run's
+          `execution_id`) would fail-OPEN: it could report "no such
+          container" and silently reclaim a task whose real remote run is
+          still unconfirmed. (spec decision #5)
 
         Args:
             task: The RUNNING or VALIDATING task being recovered.
@@ -336,8 +345,20 @@ class StateRecovery:
             )
             return True
 
+        ref = handle_ref_from_row(row)
+        if not backend.accepts_ref(ref):
+            # Persisted transport/isolation identity no longer matches the
+            # resolved backend (config drift), or the ref is a placeholder/
+            # unknown (crash before launch write-back). Never probe across
+            # identities — a local-docker probe of an SSH run's execution_id
+            # would fail-OPEN. Fail-closed. (spec decision #5)
+            await self._route_to_review(
+                task, "persisted execution identity does not match current config"
+            )
+            return True
+
         try:
-            result = await backend.probe(handle_ref_from_row(row))
+            result = await backend.probe(ref)
         except Exception as exc:
             # failure (e.g. a placeholder ref with no real coordinates yet)
             # means review, never a silent reclaim.
@@ -421,8 +442,12 @@ class StateRecovery:
           both `terminal` and `collected` states -> `cleaned` on a clean
           outcome (spec §5: local-docker rows left in `collected` state
           after a finalize crash have containers that must be removed).
-        - an unresolvable `backend_id` is left in place (fail-closed) for
-          the next sweep or a human to resolve.
+        - an unresolvable `backend_id`, or a resolved backend whose
+          `accepts_ref()` rejects the persisted ref (config drift after the
+          handle was minted, or an unknown/placeholder ref), is left in
+          place (fail-closed) for the next sweep or a human to resolve —
+          never docker-GC an SSH run's `execution_id` (or vice versa) just
+          because the backend *name* still resolves to something.
 
         A row whose outcome is ambiguous (multiple container matches /
         label mismatch / probe error / no owner marker / resolve failure)
@@ -452,6 +477,18 @@ class StateRecovery:
                     row["entity_id"],
                     row["backend_id"],
                     exc,
+                )
+                continue
+
+            if not backend.accepts_ref(handle_ref_from_row(row)):
+                logger.warning(
+                    "recovery: GC skipping handle %s (%s %s): persisted "
+                    "execution identity does not match resolved backend "
+                    "%r (config drift)",
+                    row["execution_id"],
+                    row["entity_kind"],
+                    row["entity_id"],
+                    row["backend_id"],
                 )
                 continue
 
