@@ -344,6 +344,14 @@ def _expand_scope(
     return matches, invalid
 
 
+_GLOB_MAGIC_CHARS = frozenset("*?[")
+
+
+def _has_glob_magic(pattern: str) -> bool:
+    """True if `pattern` itself contains glob metacharacters (`*`, `?`, `[`)."""
+    return any(c in _GLOB_MAGIC_CHARS for c in pattern)
+
+
 def _is_expected_output(
     pattern: str, expected_outputs: dict[str, list[str]] | None
 ) -> bool:
@@ -354,6 +362,14 @@ def _is_expected_output(
     exact future path as an expected output (of any phase — author,
     verification, delivery), the "no match yet" is expected, not noise
     (§6, friction #10): the pattern is exempt, silencing the warning.
+
+    `fnmatch(expected_norm, normalized_pattern)` only makes sense when
+    `expected_norm` is a concrete path — i.e. the *scope* pattern globs over
+    a known future file. When `expected_norm` itself carries glob
+    metacharacters, that call becomes glob-vs-glob, and a broad expected
+    pattern (e.g. `verdicts/topic-x/*/attempt-*.json`) can incorrectly
+    exempt an unrelated, genuinely-typo'd scope pattern. In that case only
+    exact string equality is a legitimate exemption.
     """
     if not expected_outputs:
         return False
@@ -361,7 +377,9 @@ def _is_expected_output(
     for patterns in expected_outputs.values():
         for expected in patterns:
             expected_norm = expected.removeprefix("./")
-            if expected_norm == normalized_pattern or fnmatch(
+            if expected_norm == normalized_pattern:
+                return True
+            if not _has_glob_magic(expected_norm) and fnmatch(
                 expected_norm, normalized_pattern
             ):
                 return True

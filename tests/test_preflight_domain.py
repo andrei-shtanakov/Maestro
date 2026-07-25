@@ -219,6 +219,38 @@ class TestExpectedOutputsExemption:
         assert len(no_match) == 1
         assert "unexpected/dir/**" in no_match[0].message
 
+    def test_globby_expected_output_does_not_exempt_unrelated_typo(
+        self, tmp_path: Path
+    ) -> None:
+        # expected_outputs["verification"] = ["verdicts/topic-x/*/attempt-*.json"]
+        # (globby) must NOT glob-vs-glob-match an unrelated typo'd scope
+        # pattern via fnmatch(expected, scope) — Copilot review regression.
+        repo = make_git_repo(tmp_path, ["briefs/topic-x/criteria.yaml"])
+        config = make_config(
+            domain=profile_dict(),
+            workstreams=[ws(scope=["reports/topic-y/**"])],
+            repo_path=str(repo),
+        )
+        report = validate_project(config, check_fs=True)
+        no_match = [i for i in report.issues if i.code == "scope-no-match"]
+        assert len(no_match) == 1
+        assert "reports/topic-y/**" in no_match[0].message
+
+    def test_identical_globby_pattern_is_still_exempt(self, tmp_path: Path) -> None:
+        # Exact string equality between scope pattern and an expected_outputs
+        # entry must still exempt, even when both are globby.
+        repo = make_git_repo(tmp_path, ["briefs/topic-x/criteria.yaml"])
+        config = make_config(
+            domain=profile_dict(),
+            workstreams=[
+                ws(scope=["reports/topic-x/**", "verdicts/topic-x/*/attempt-*.json"])
+            ],
+            repo_path=str(repo),
+        )
+        report = validate_project(config, check_fs=True)
+        no_match = [i for i in report.issues if i.code == "scope-no-match"]
+        assert no_match == []
+
 
 class TestSpecGenSsot:
     def test_domain_spec_gen_with_legacy_disabled_ok(self) -> None:
