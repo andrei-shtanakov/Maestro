@@ -1751,7 +1751,9 @@ def costs_command(
     NOTE: this aggregates the whole database, which may span several runs
     (one DB survives --resume); it is a database-wide summary, not a run total.
     Costs of unpriced harnesses with no self-reported cost are shown as
-    UNKNOWN, never as $0.
+    UNKNOWN, never as $0. Shows TOTAL plus breakdowns by harness, by task,
+    by execution phase (task/validation/verification), and by model (rows
+    with no recorded model group under "UNKNOWN").
 
     Examples:
         maestro costs --db run/maestro.db
@@ -1810,6 +1812,8 @@ def _render_cost_report(report: "CostReport") -> None:
     console.print(_table("Cost — database-wide TOTAL", "Scope", [report.total]))
     console.print(_table("By harness", "Harness", report.by_harness))
     console.print(_table("By task", "Task", report.by_task))
+    console.print(_table("By phase", "Phase", report.by_phase))
+    console.print(_table("By model", "Model", report.by_model))
 
 
 @app.callback()

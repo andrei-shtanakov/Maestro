@@ -306,15 +306,25 @@ class ClaudeDiffJudge:
                 f"exit_code={execution.exit_code} timed_out={execution.timed_out}"
             )
 
+        # Captured as soon as the transport succeeded — even if the envelope
+        # or payload later prove invalid, the CLI still ran and may carry a
+        # billable `usage`/`total_cost_usd`, which the scheduler wants for
+        # cost tracking regardless of the eventual verdict/ERROR outcome.
+        raw_envelope = execution.stdout_tail
+
         try:
             result_text = _extract_result_text(execution.stdout_tail)
         except _CliEnvelopeError as exc:
-            return _task_error(f"claude CLI envelope invalid: {exc}")
+            return _task_error(f"claude CLI envelope invalid: {exc}").model_copy(
+                update={"raw_result_envelope": raw_envelope}
+            )
 
         try:
             raw = parse_raw_payload(result_text)
         except RawPayloadError as exc:
-            return _task_error(f"raw verifier payload invalid: {exc}")
+            return _task_error(f"raw verifier payload invalid: {exc}").model_copy(
+                update={"raw_result_envelope": raw_envelope}
+            )
 
         # Provider binding (§6 step 4): identity is authored by Maestro from
         # `ctx`, never from the model's raw payload (which has no room for
@@ -357,4 +367,6 @@ class ClaudeDiffJudge:
             verified_source_commit=identity.verified_source_commit,
             verified_scope_sha256=identity.verified_scope_sha256,
         )
-        return evaluate_task_document(ctx.out_json, expected)
+        return evaluate_task_document(ctx.out_json, expected).model_copy(
+            update={"raw_result_envelope": raw_envelope}
+        )

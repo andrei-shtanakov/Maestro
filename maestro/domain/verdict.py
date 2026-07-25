@@ -223,6 +223,22 @@ class TaskHandshakeResult(BaseModel):
     outcome: VerdictValue
     protocol_error: str | None = None
     document: TaskVerdictDocument | None = None
+    raw_result_envelope: str | None = Field(
+        default=None,
+        description=(
+            "Raw stdout of the judge CLI process — the `claude -p "
+            "--output-format json` result envelope (`{'type': 'result', "
+            "'result': ..., 'usage': {...}, 'total_cost_usd': ...}`) — "
+            "captured whenever the judge process ran to completion on the "
+            "transport layer (regardless of PASS/FAIL/ERROR verdict). "
+            "`cost_tracker.parse_claude_code_log` already knows how to "
+            "read `usage`/`total_cost_usd` from this exact shape; the "
+            "scheduler uses it to write a verification-phase TaskCost "
+            "row. None on a transport failure (timeout or non-zero exit) "
+            "— any output captured in that case is untrusted and not "
+            "surfaced, so cost is UNKNOWN, never $0."
+        ),
+    )
 
 
 def _task_error(message: str) -> TaskHandshakeResult:

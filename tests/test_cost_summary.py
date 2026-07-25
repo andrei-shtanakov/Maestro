@@ -6,7 +6,18 @@ from maestro.cost_tracker import CostReport, summarize_costs
 from maestro.models import AgentType, TaskCost
 
 
-def _c(task_id, agent, *, inp=0, out=0, est=0.0, reported=None, attempt=1):
+def _c(
+    task_id,
+    agent,
+    *,
+    inp=0,
+    out=0,
+    est=0.0,
+    reported=None,
+    attempt=1,
+    execution_phase="task",
+    model=None,
+):
     return TaskCost(
         task_id=task_id,
         agent_type=agent,
@@ -15,6 +26,8 @@ def _c(task_id, agent, *, inp=0, out=0, est=0.0, reported=None, attempt=1):
         estimated_cost_usd=est,
         reported_cost_usd=reported,
         attempt=attempt,
+        execution_phase=execution_phase,
+        model=model,
         created_at=datetime.now(UTC),
     )
 
@@ -25,6 +38,7 @@ def test_empty():
     assert r.total.known_cost_usd == 0.0
     assert r.total.tasks == 0 and r.total.attempts == 0
     assert r.by_harness == [] and r.by_task == []
+    assert r.by_phase == [] and r.by_model == []
 
 
 def test_announce_is_known_zero_not_unknown():
@@ -92,3 +106,38 @@ def test_retry_with_different_harness_splits_by_group():
     # by task: t1 aggregates both attempts
     assert len(r.by_task) == 1 and r.by_task[0].attempts == 2
     assert r.by_task[0].known_cost_usd == pytest.approx(0.30)
+
+
+def test_by_phase_breakdown() -> None:
+    rows = [
+        _c("t1", AgentType.CLAUDE_CODE, est=0.20, attempt=1, execution_phase="task"),
+        _c(
+            "t1",
+            AgentType.CLAUDE_CODE,
+            est=0.05,
+            attempt=1,
+            execution_phase="verification",
+        ),
+    ]
+    r = summarize_costs(rows)
+    phases = {g.label: g for g in r.by_phase}
+    assert set(phases) == {"task", "verification"}
+    assert phases["task"].known_cost_usd == pytest.approx(0.20)
+    assert phases["verification"].known_cost_usd == pytest.approx(0.05)
+    # totals still sum ALL rows regardless of phase
+    assert r.total.known_cost_usd == pytest.approx(0.25)
+
+
+def test_by_model_breakdown() -> None:
+    rows = [
+        _c("t1", AgentType.CLAUDE_CODE, est=0.20, attempt=1, model="claude-opus"),
+        _c("t1", AgentType.CLAUDE_CODE, est=0.05, attempt=1, model="claude-haiku"),
+        _c("t2", AgentType.CLAUDE_CODE, est=0.01, attempt=1, model=None),
+    ]
+    r = summarize_costs(rows)
+    models = {g.label: g for g in r.by_model}
+    assert set(models) == {"claude-opus", "claude-haiku", "UNKNOWN"}
+    assert models["claude-opus"].known_cost_usd == pytest.approx(0.20)
+    assert models["claude-haiku"].known_cost_usd == pytest.approx(0.05)
+    assert models["UNKNOWN"].known_cost_usd == pytest.approx(0.01)
+    assert r.total.known_cost_usd == pytest.approx(0.26)

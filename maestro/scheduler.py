@@ -35,10 +35,16 @@ from maestro.coordination.routing import (
     interrupted_error_code,
     task_status_to_outcome_status,
 )
-from maestro.cost_tracker import effective_cost, parse_and_create_cost
+from maestro.cost_tracker import (
+    TokenUsage,
+    calculate_cost,
+    effective_cost,
+    parse_and_create_cost,
+    parse_claude_code_log,
+)
 from maestro.dag import DAG
 from maestro.database import ConcurrentModificationError, Database, TaskNotFoundError
-from maestro.domain.verdict import VerdictValue
+from maestro.domain.verdict import TaskHandshakeResult, VerdictValue
 from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
 from maestro.execution.backend import ExecutionBackend, TaskHandle
 from maestro.execution.exec_config import ExecutionConfig
@@ -64,6 +70,7 @@ from maestro.models import (
     RouteDecision,
     Task,
     TaskConfig,
+    TaskCost,
     TaskOutcome,
     TaskOutcomeStatus,
     TaskStatus,
@@ -466,6 +473,53 @@ class Scheduler:
             logger.debug(
                 "cost persist failed for task %s attempt %d",
                 task.id,
+                attempt,
+                exc_info=True,
+            )
+
+    async def _record_verifier_cost(
+        self,
+        task_id: str,
+        attempt: int,
+        verifier_model: str,
+        result: TaskHandshakeResult,
+    ) -> None:
+        """Persist a `execution_phase='verification'` TaskCost row (Task 10).
+
+        The judge IS Claude (`ClaudeDiffJudge` shells out to the `claude`
+        CLI), so `agent_type` is always `CLAUDE_CODE`; `model` is the
+        already-resolved verifier model (never argv-templated). Token/cost
+        figures come from `result.raw_result_envelope` — the same CLI
+        result-envelope shape `cost_tracker.parse_claude_code_log` already
+        parses for the main claude path — reused here rather than
+        re-derived. An envelope with no `usage`/`total_cost_usd` at all
+        parses to all-zero tokens and `cost_usd=None`; written through
+        unmodified so `reported_cost_usd` stays `None` (UNKNOWN), matching
+        the opencode/arbiter convention — never coerced to `$0`.
+
+        Best-effort, mirroring `_record_cost`: any failure here (parse or
+        DB) is logged and swallowed so cost accounting never blocks the
+        verifier's terminal routing.
+        """
+        try:
+            envelope = result.raw_result_envelope
+            usage = parse_claude_code_log(envelope) if envelope else TokenUsage()
+            cost = TaskCost(
+                task_id=task_id,
+                agent_type=AgentType.CLAUDE_CODE,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                estimated_cost_usd=calculate_cost(usage, AgentType.CLAUDE_CODE),
+                reported_cost_usd=usage.cost_usd,
+                attempt=attempt,
+                execution_phase="verification",
+                model=verifier_model,
+            )
+            await self._db.save_task_cost(cost)
+        except Exception:
+            logger.debug(
+                "verifier cost record failed for task %s attempt %d",
+                task_id,
                 attempt,
                 exc_info=True,
             )
@@ -2122,6 +2176,8 @@ class Scheduler:
             result = await judge.verify(ctx)
         finally:
             shutil.rmtree(out_dir, ignore_errors=True)
+
+        await self._record_verifier_cost(task_id, attempt, verifier_model, result)
 
         if result.outcome is VerdictValue.PASS:
             done_task = await self._transition(

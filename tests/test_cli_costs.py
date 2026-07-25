@@ -63,7 +63,9 @@ def test_costs_mixed_known_unknown_renders(tmp_path: Path, anyio_backend: str) -
     out = result.stdout
     assert "0.20" in out  # known subtotal shown
     assert "unknown" in out.lower()  # unknown attempts surfaced
-    # documented boundary: no by-model / by-run TABLE (check titles, not a bare
-    # substring — a task label could legitimately contain "run"/"model")
-    assert "by model" not in out.lower()
+    # by-phase / by-model breakdowns are rendered (Task 10)
+    assert "by phase" in out.lower()
+    assert "by model" in out.lower()
+    # documented boundary: still no by-run TABLE (check the title, not a bare
+    # substring — a task label could legitimately contain "run")
     assert "by run" not in out.lower()

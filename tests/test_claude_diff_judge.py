@@ -278,6 +278,22 @@ async def test_valid_pass_payload_returns_pass_with_provider_bound_identity(
     assert ctx.out_json.is_file()
 
 
+async def test_pass_payload_surfaces_raw_envelope_for_cost_tracking(
+    tmp_path: Path,
+) -> None:
+    """Task 10: the CLI result envelope (carrying `usage`/`total_cost_usd`)
+    is surfaced on the result so the scheduler can write a verifier cost
+    row, without changing the PASS/document behavior tested above."""
+    handle = FakeTaskHandle(stdout_tail=_pass_payload())
+    backend = FakeJudgeBackend(handle)
+    judge = ClaudeDiffJudge("claude-haiku-4-5", backend, timeout_seconds=30)
+    ctx = _ctx(tmp_path)
+
+    result = await judge.verify(ctx)
+
+    assert result.raw_result_envelope == _pass_payload()
+
+
 async def test_valid_fail_payload_returns_fail_not_error(tmp_path: Path) -> None:
     handle = FakeTaskHandle(stdout_tail=_fail_payload())
     backend = FakeJudgeBackend(handle)
@@ -334,6 +350,23 @@ async def test_timeout_is_error(tmp_path: Path) -> None:
 
     assert result.outcome is VerdictValue.ERROR
     assert result.protocol_error is not None
+    assert result.raw_result_envelope is None
+
+
+async def test_nonzero_exit_transport_failure_has_no_raw_envelope(
+    tmp_path: Path,
+) -> None:
+    """A transport failure's stdout is untrusted and not surfaced — cost
+    stays UNKNOWN rather than being parsed from an unreliable capture."""
+    handle = FakeTaskHandle(stdout_tail=_pass_payload(), exit_code=1)
+    backend = FakeJudgeBackend(handle)
+    judge = ClaudeDiffJudge("claude-haiku-4-5", backend, timeout_seconds=30)
+    ctx = _ctx(tmp_path)
+
+    result = await judge.verify(ctx)
+
+    assert result.outcome is VerdictValue.ERROR
+    assert result.raw_result_envelope is None
 
 
 async def test_malformed_cli_envelope_is_error(tmp_path: Path) -> None:
@@ -349,6 +382,10 @@ async def test_malformed_cli_envelope_is_error(tmp_path: Path) -> None:
 
     assert result.outcome is VerdictValue.ERROR
     assert result.protocol_error is not None
+    # Transport succeeded (exit 0) even though the envelope itself is junk —
+    # the raw stdout is still surfaced (parse_claude_code_log degrades to
+    # zero usage on invalid JSON; it never crashes on it).
+    assert result.raw_result_envelope == "not json at all"
 
 
 async def test_envelope_missing_result_field_is_error(tmp_path: Path) -> None:
