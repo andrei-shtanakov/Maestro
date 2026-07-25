@@ -51,7 +51,8 @@ from maestro.execution.reservations import (
     validate_ssh_scopes,
 )
 from maestro.execution.resolver import BackendResolver
-from maestro.execution.ssh_backend import LaunchNotStarted
+from maestro.execution.ssh_backend import LaunchNotStarted, SshBackend
+from maestro.execution.ssh_launch import decode_transport_ref
 from maestro.models import (
     AgentType,
     ArbiterMode,
@@ -1283,6 +1284,13 @@ class Scheduler:
                 # recovery/collect.
                 raise
 
+            if isinstance(backend, SshBackend):
+                # An SshBackend is never resolved for backend.id == "local",
+                # so the non-local branch above always ran and minted a real
+                # execution_id (never the local branch's None).
+                assert execution_id is not None
+                await self._persist_ssh_launch(execution_id, handle)
+
             # Track running task
             self._running_tasks[task_id] = RunningTask(
                 task=task,
@@ -1294,6 +1302,28 @@ class Scheduler:
             )
 
             return True
+
+    async def _persist_ssh_launch(self, execution_id: str, handle: TaskHandle) -> None:
+        """Persist the real remote coordinates `SshBackend.run()` minted.
+
+        `start_execution` seeds only a plain-string placeholder
+        `transport_ref` (and NULL `remote_host`/`remote_dir`/
+        `status_marker`) before the backend actually launches. Once
+        `backend.run()` returns, `handle.ref` carries the real JSON
+        `transport_ref` (via `encode_transport_ref`) plus the remote
+        directory and status marker — this overwrites the seeded
+        placeholders with those real values so crash recovery can decode
+        `transport_ref` and locate the remote workspace (mirrors
+        `orchestrator.py`'s equivalent write-back for Mode-2).
+        """
+        info = decode_transport_ref(handle.ref.transport_ref)
+        await self._db.update_execution_handle_launch(
+            execution_id,
+            transport_ref=handle.ref.transport_ref,
+            remote_host=info.get("host"),
+            remote_dir=info.get("remote_dir"),
+            status_marker=handle.ref.status_marker,
+        )
 
     async def _build_dependency_context(self, task: Task) -> str:
         """Build context string from completed dependency tasks.
@@ -2005,6 +2035,9 @@ class Scheduler:
                 task.id, "validation launch result unknown"
             )
             return None
+
+        if isinstance(backend, SshBackend):
+            await self._persist_ssh_launch(execution_id, handle)
 
         running_val = RunningTask(
             task=validating,
