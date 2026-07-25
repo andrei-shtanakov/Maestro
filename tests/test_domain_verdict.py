@@ -25,7 +25,7 @@ EXPECTED = EchoExpectations(
 
 
 def make_verdict(verdict: str = "PASS", **overrides: object) -> dict:
-    identity = {
+    identity: dict[str, object] = {
         "verification_run_id": EXPECTED.run_id,
         "verification_attempt": 1,
         "rework_attempt": 0,
