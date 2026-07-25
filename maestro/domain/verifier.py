@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     # execution_phase="verification" CAS target is passed as a plain string,
     # never the WorkstreamStatus enum, for the same reason.
     from maestro.database import Database
-    from maestro.execution.backend import ExecutionBackend, TaskHandle
+    from maestro.execution.backend import ExecutionBackend
 
 
 class VerificationContext(BaseModel):
@@ -156,11 +156,29 @@ class CommandVerifier:
             return _protocol_error(f"artifact unreadable: {exc}")
 
         staged_criteria = self._stage_criteria(ctx.out_json, criteria_bytes)
+        execution_id = str(uuid.uuid4())
         try:
-            request = self._build_request(ctx, staged_criteria)
+            # Gate BEFORE spawn (mirrors orchestrator.py's READY->RUNNING
+            # CAS-before-spawn pattern, e.g. its non-local branch around
+            # `start_execution`): if the workstream left VERIFYING between
+            # scheduling and here, this raises and NOTHING gets spawned —
+            # there is no window where a live subprocess exists untracked.
+            if self._db is not None:
+                await self._pre_spawn_persist(ctx, execution_id)
+            request = self._build_request(ctx, staged_criteria, execution_id)
             handle = await self._backend.run(request)
             if self._db is not None:
-                await self._persist_handle(ctx, request, handle)
+                # Patch in the transport_ref the backend actually minted
+                # (placeholder above was seeded pre-spawn) — same two-step
+                # `start_execution` + `update_execution_handle_launch` the
+                # SSH path uses to record real launch coordinates.
+                await self._db.update_execution_handle_launch(
+                    execution_id,
+                    transport_ref=handle.ref.transport_ref,
+                    remote_host=None,
+                    remote_dir=None,
+                    status_marker=None,
+                )
             result = await handle.wait()
         finally:
             staged_criteria.unlink(missing_ok=True)
@@ -217,7 +235,7 @@ class CommandVerifier:
         return path
 
     def _build_request(
-        self, ctx: VerificationContext, staged_criteria: Path
+        self, ctx: VerificationContext, staged_criteria: Path, execution_id: str
     ) -> ExecutionRequest:
         values = {
             "artifact": self._artifact,
@@ -249,33 +267,41 @@ class CommandVerifier:
             timeout_seconds=self._spec.timeout_seconds,
             collect=CollectPolicy(mode="none"),
             labels={"execution_phase": "verification"},
-            execution_id=str(uuid.uuid4()),
+            execution_id=execution_id,
             entity_kind="workstream",
             attempt=ctx.attempt,
             backend_id=self._backend.id,
         )
 
-    async def _persist_handle(
-        self, ctx: VerificationContext, request: ExecutionRequest, handle: TaskHandle
+    async def _pre_spawn_persist(
+        self, ctx: VerificationContext, execution_id: str
     ) -> None:
-        """Persist the spawned execution handle (`execution_phase="verification"`).
+        """CAS-gate + persist a placeholder handle BEFORE the process spawns.
 
         Every attempt inside a VERIFYING run happens while the workstream
         stays in `WorkstreamStatus.VERIFYING` — so this CAS is a same-status
         self-loop (`expected_status == running_status == "verifying"`),
         reusing `Database.start_execution` (Task 3's durable-handle path)
-        rather than inventing a second persistence mechanism.
+        rather than inventing a second persistence mechanism. If the CAS
+        fails (the workstream left `VERIFYING`, e.g. an operator action
+        raced this call), the raised exception propagates to the caller
+        BEFORE `backend.run()` is ever reached — a genuine orchestration
+        bug, not a verifier-contract violation, so this deliberately does
+        not degrade to a protocol-error `HandshakeResult`. The seeded
+        `transport_ref` is a placeholder (mirrors orchestrator.py's
+        pre-spawn seed for non-local backends); `verify()` overwrites it
+        with the backend-minted value via `update_execution_handle_launch`
+        once `backend.run()` returns.
         """
         assert self._db is not None
-        ref = handle.ref
         await self._db.start_execution(
             entity_kind="workstream",
             entity_id=ctx.workstream_id,
             expected_status="verifying",
             running_status="verifying",
-            execution_id=request.execution_id or ref.transport_ref,
-            backend_id=ref.backend_id,
-            transport_ref=ref.transport_ref,
+            execution_id=execution_id,
+            backend_id=self._backend.id,
+            transport_ref=f"{self._backend.id}:verify-{execution_id}",
             attempt=ctx.attempt,
             execution_phase="verification",
         )

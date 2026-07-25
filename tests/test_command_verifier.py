@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from maestro.database import Database
+from maestro.database import ConcurrentModificationError, Database
 from maestro.domain.profile import CriteriaConfig, VerifierSpec
 from maestro.domain.verdict import VerdictValue
 from maestro.domain.verifier import CommandVerifier, VerificationContext
@@ -280,6 +280,64 @@ async def test_staged_criteria_copy_is_deleted_after_attempt(
     assert result.outcome is VerdictValue.PASS
     staged_criteria = out_json.parent / f"{out_json.stem}.criteria"
     assert not staged_criteria.exists()
+    # Minor (review): the real staged copy is already gone by the time
+    # verify() returns (deleted in its own `finally`), so the 0600 contract
+    # is checked directly against the same staticmethod verify() uses
+    # internally rather than racing the subprocess to observe it in place.
+    probe = CommandVerifier._stage_criteria(out_json, CRITERIA_BYTES)
+    try:
+        assert probe.stat().st_mode & 0o777 == 0o600
+    finally:
+        probe.unlink()
+
+
+async def test_cas_failure_before_spawn_leaves_no_process(
+    tmp_path: Path, worktree: Path, db: Database
+) -> None:
+    """Important (review): the workstream left VERIFYING (e.g. an operator
+    action) races `verify()` — `start_execution`'s CAS must fail BEFORE the
+    verifier process is ever spawned, so no live subprocess is orphaned.
+    """
+    workstream_id = "topic-x"
+    await db.create_workstream(
+        Workstream(
+            id=workstream_id,
+            title="t",
+            description="d",
+            branch="feature/topic-x",
+            status=WorkstreamStatus.READY,  # not VERIFYING -> CAS must fail
+        )
+    )
+    script = _write_script(tmp_path, [{"mode": "hang"}])
+    out_json = _staging(tmp_path)
+    ctx = _ctx(worktree, out_json, workstream_id=workstream_id)
+    verifier = CommandVerifier(
+        _spec(script, workstream_id, timeout=1.0),
+        _criteria(),
+        "artifact.txt",
+        LocalBackend(),
+        db=db,
+    )
+
+    with pytest.raises(ConcurrentModificationError):
+        await verifier.verify(ctx)
+
+    # Never spawned: neither the verdict file nor the stub's cursor file
+    # (only ever written by the process itself) exist.
+    assert not out_json.exists()
+    assert not (script.parent / f"{script.name}.cursor").exists()
+    # The staged criteria copy was still cleaned up despite the failure.
+    assert not (out_json.parent / f"{out_json.stem}.criteria").exists()
+    # No execution_handles row was left behind either (start_execution is
+    # all-or-nothing: the failed CAS rolls back its own insert too).
+    assert db._connection is not None
+    cursor = await db._connection.execute(
+        "SELECT COUNT(*) AS n FROM execution_handles WHERE entity_id = ?",
+        (workstream_id,),
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    assert row["n"] == 0
 
 
 async def test_wrong_artifact_sha_is_protocol_error(
