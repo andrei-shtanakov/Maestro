@@ -391,9 +391,7 @@ async def test_local_docker_collected_gc_cleans(db) -> None:
         transport_ref="docker:maestro-e1",
         attempt=1,
     )
-    await db.mark_execution_state(
-        "e1", "collected", allowed_from=["prepared"]
-    )
+    await db.mark_execution_state("e1", "collected", allowed_from=["prepared"])
     await db.update_task_status(
         "t1", TaskStatus.DONE, expected_status=TaskStatus.RUNNING
     )

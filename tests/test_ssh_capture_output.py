@@ -120,9 +120,7 @@ async def test_final_tail_catch_up_populates_stdout_tail(tmp_path):
             return RunResult(0, "", "")
 
     fake = CountingFakeSsh()
-    ssh = SshCli(
-        SshTransport(type="ssh", host="gpu", workdir_root="/w"), runner=fake
-    )
+    ssh = SshCli(SshTransport(type="ssh", host="gpu", workdir_root="/w"), runner=fake)
     layout = remote_layout("/w", "e1")
     h = SshTaskHandle(
         ssh,
