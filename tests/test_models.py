@@ -37,6 +37,7 @@ class TestTaskStatus:
             "awaiting_approval",
             "running",
             "validating",
+            "verifying",
             "done",
             "failed",
             "needs_review",

@@ -51,6 +51,12 @@ class EventType(StrEnum):
     VALIDATION_PASSED = "validation_passed"
     VALIDATION_FAILED = "validation_failed"
 
+    # Verifier events
+    VERIFIER_STARTED = "verifier_started"
+    VERIFIER_PASSED = "verifier_passed"
+    VERIFIER_FAILED = "verifier_failed"
+    VERIFIER_ERROR = "verifier_error"
+
     # Git events
     GIT_BRANCH_CREATED = "git_branch_created"
     GIT_COMMITTED = "git_committed"

@@ -30,9 +30,11 @@ class TaskStatus(StrEnum):
     """Task execution status with valid state transitions.
 
     State machine:
-        PENDING → READY → RUNNING → VALIDATING → DONE
-                    │        │           │
-                    │        │           └→ FAILED → READY (retry)
+        PENDING → READY → RUNNING → VALIDATING → VERIFYING → DONE
+                    │        │           │          │
+                    │        │           │          └→ FAILED → READY (retry)
+                    │        │           │              │
+                    │        │           └→ VERIFYING ──┴→ NEEDS_REVIEW → READY
                     │        │               │
                     │        └→ FAILED ──────┴→ NEEDS_REVIEW → READY
                     │                                │
@@ -48,6 +50,7 @@ class TaskStatus(StrEnum):
     AWAITING_APPROVAL = "awaiting_approval"
     RUNNING = "running"
     VALIDATING = "validating"
+    VERIFYING = "verifying"
     DONE = "done"
     FAILED = "failed"
     NEEDS_REVIEW = "needs_review"
@@ -61,7 +64,8 @@ class TaskStatus(StrEnum):
             cls.READY: {cls.RUNNING, cls.AWAITING_APPROVAL},
             cls.AWAITING_APPROVAL: {cls.READY, cls.ABANDONED},
             cls.RUNNING: {cls.VALIDATING, cls.FAILED, cls.NEEDS_REVIEW},
-            cls.VALIDATING: {cls.DONE, cls.FAILED},
+            cls.VALIDATING: {cls.VERIFYING, cls.DONE, cls.FAILED, cls.NEEDS_REVIEW},
+            cls.VERIFYING: {cls.DONE, cls.FAILED, cls.NEEDS_REVIEW},
             cls.FAILED: {cls.READY, cls.NEEDS_REVIEW},
             cls.NEEDS_REVIEW: {cls.READY, cls.ABANDONED},
             cls.DONE: set(),
