@@ -768,6 +768,10 @@ class Scheduler:
         scope-blocking (the scope was already released) and are left to the
         existing cleanup-recovery path.
         """
+        # Phase-agnostic: any open (workdir, scope)-holding handle re-holds the
+        # reservation regardless of execution_phase — a still-open *validation*
+        # handle for an SSH task keeps the scope locked exactly as a task handle
+        # does (detail 6). Do not add an execution_phase filter here.
         hold_states = {"prepared", "running", "terminal"}
         for row in await self._db.get_open_execution_handles():
             if row.get("state") not in hold_states:
