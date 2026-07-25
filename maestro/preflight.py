@@ -622,9 +622,10 @@ def _check_domain_evidence_containment(domain: DomainProfile) -> list[Validation
     itself matched by a `verdicts/topic-x/**` glob; a file under it is).
     """
     verifier_scope = domain.workspace.roles.get("verifier")
-    verifier_write = normalize(verifier_scope.write) if verifier_scope else []
     probe = f"{domain.workspace.evidence_root.rstrip('/')}/__preflight_probe__"
-    if not find_escapes(normalize([probe]), verifier_write):
+    if verifier_scope is not None and not find_escapes(
+        normalize([probe]), normalize(verifier_scope.write)
+    ):
         return []
     return [
         ValidationIssue(
@@ -660,7 +661,14 @@ def _check_domain_role_coherence(
     for w in workstreams:
         if not w.scope:
             continue
-        escapes = find_escapes(normalize(w.scope), normalize(author_write))
+        # No declared author role at all -> nothing covers the workstream's
+        # scope; fail closed (an empty `author_write` would otherwise read
+        # as "no scope to enforce" and pass find_escapes vacuously).
+        escapes = (
+            normalize(w.scope)
+            if author_scope is None
+            else find_escapes(normalize(w.scope), normalize(author_write))
+        )
         if escapes:
             issues.append(
                 ValidationIssue(
@@ -706,9 +714,10 @@ def _check_domain_artifact_declared(domain: DomainProfile) -> list[ValidationIss
     author could never actually produce it — a config-time contradiction.
     """
     author_scope = domain.workspace.roles.get("author")
-    author_write = normalize(author_scope.write) if author_scope else []
     artifact = normalize([domain.verification.artifact])
-    if not find_escapes(artifact, author_write):
+    if author_scope is not None and not find_escapes(
+        artifact, normalize(author_scope.write)
+    ):
         return []
     return [
         ValidationIssue(

@@ -314,3 +314,41 @@ class TestArtifactDeclared:
         report = validate_project(config, check_fs=False)
         errors = [i for i in report.errors if i.code == "domain-artifact-not-writable"]
         assert len(errors) == 1
+
+
+class TestMissingRoleFailsClosed:
+    """Roles dict has no enforced keys at the pydantic level; a domain
+    profile missing "author" or "verifier" entirely must fail closed on
+    the containment checks rather than vacuously pass (empty write-list
+    would otherwise read as "nothing to enforce")."""
+
+    def test_missing_author_role_fails_artifact_declared(self) -> None:
+        domain = profile_dict()
+        del domain["workspace"]["roles"]["author"]
+        config = make_config(domain=domain, workstreams=[])
+        report = validate_project(config, check_fs=False)
+        errors = [i for i in report.errors if i.code == "domain-artifact-not-writable"]
+        assert len(errors) == 1
+
+    def test_missing_verifier_role_fails_evidence_containment(self) -> None:
+        domain = profile_dict()
+        del domain["workspace"]["roles"]["verifier"]
+        config = make_config(domain=domain, workstreams=[])
+        report = validate_project(config, check_fs=False)
+        errors = [
+            i for i in report.errors if i.code == "domain-evidence-root-not-contained"
+        ]
+        assert len(errors) == 1
+
+    def test_missing_author_role_fails_scope_authority(self) -> None:
+        domain = profile_dict()
+        del domain["workspace"]["roles"]["author"]
+        config = make_config(
+            domain=domain, workstreams=[ws(scope=["reports/topic-x/**"])]
+        )
+        report = validate_project(config, check_fs=False)
+        errors = [
+            i for i in report.errors if i.code == "domain-scope-authority-mismatch"
+        ]
+        assert len(errors) == 1
+        assert errors[0].workstream_ids == ["ws-a"]
