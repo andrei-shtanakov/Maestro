@@ -13,16 +13,16 @@ from maestro.domain.verdict import (
 
 @pytest.fixture
 def sample_identity() -> VerdictIdentity:
-    """Create a sample VerdictIdentity for testing."""
+    """Create a sample VerdictIdentity for testing with distinctive hash sentinels."""
     return VerdictIdentity(
         verification_run_id="run-001",
         verification_attempt=1,
         rework_attempt=0,
         workstream_id="ws-001",
         artifact="artifact.md",
-        artifact_sha256="abc123",
-        criteria_sha256="def456",
-        profile_sha256="ghi789",
+        artifact_sha256="cafeaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01",
+        criteria_sha256="cafebbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02",
+        profile_sha256="cafecccccccccccccccccccccccccccccccccccccccccccccccccccccccccc03",
         verified_source_commit="commit1",
         verified_source_tree="tree1",
     )
@@ -98,6 +98,31 @@ def test_build_rework_addendum_excludes_evidence(
     assert "EVIDENCE_SENTINEL_002" not in result
     assert "This is unique evidence text" not in result
     assert "Another unique evidence" not in result
+
+
+def test_build_rework_addendum_excludes_identity_hashes(
+    sample_identity: VerdictIdentity,
+    sample_findings: list[Finding],
+) -> None:
+    """Test that identity hashes (artifact_sha256, criteria_sha256, profile_sha256) never appear."""
+    doc = VerdictDocument(
+        schema_version=2,
+        identity=sample_identity,
+        verdict=VerdictValue.FAIL,
+        findings=sample_findings,
+    )
+    result = build_rework_addendum(doc)
+
+    # Assert none of the distinctive hash sentinels appear
+    assert (
+        "cafeaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01" not in result
+    )
+    assert (
+        "cafebbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02" not in result
+    )
+    assert (
+        "cafecccccccccccccccccccccccccccccccccccccccccccccccccccccccccc03" not in result
+    )
 
 
 def test_build_rework_addendum_deterministic(
@@ -184,6 +209,32 @@ def test_build_rework_addendum_attempt_number_2(
     assert "## Verification feedback (attempt 2)" in result
 
 
+def test_build_rework_addendum_requires_fail_verdict(
+    sample_identity: VerdictIdentity,
+    sample_findings: list[Finding],
+) -> None:
+    """Test that PASS and ERROR verdicts raise ValueError."""
+    # Test PASS verdict
+    doc_pass = VerdictDocument(
+        schema_version=2,
+        identity=sample_identity,
+        verdict=VerdictValue.PASS,
+        findings=sample_findings,
+    )
+    with pytest.raises(ValueError, match="rework addendum requires a FAIL verdict"):
+        build_rework_addendum(doc_pass)
+
+    # Test ERROR verdict
+    doc_error = VerdictDocument(
+        schema_version=2,
+        identity=sample_identity,
+        verdict=VerdictValue.ERROR,
+        findings=sample_findings,
+    )
+    with pytest.raises(ValueError, match="rework addendum requires a FAIL verdict"):
+        build_rework_addendum(doc_error)
+
+
 def test_build_rework_addendum_empty_findings(
     sample_identity: VerdictIdentity,
 ) -> None:
@@ -199,3 +250,5 @@ def test_build_rework_addendum_empty_findings(
     # Should still have header
     assert "## Verification feedback (attempt 1)" in result
     assert "The previous submission FAILED verification" in result
+    # Verify no finding bullets when list is empty
+    assert "- [" not in result

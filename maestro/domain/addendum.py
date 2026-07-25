@@ -5,19 +5,29 @@ carrying only severity and author_feedback (§7 declassification channel). No
 criterion_id, evidence text, hashes, timestamps, or randomness.
 """
 
-from maestro.domain.verdict import VerdictDocument
+from maestro.domain.verdict import VerdictDocument, VerdictValue
 
 
 def build_rework_addendum(document: VerdictDocument) -> str:
-    """Build deterministic rework addendum from a VerdictDocument.
+    """Build deterministic rework addendum from a FAIL VerdictDocument.
+
+    Only ever called on FAIL documents by the rework respawn path (Task 8).
 
     Args:
-        document: The VerdictDocument with identity and findings.
+        document: A VerdictDocument with verdict=FAIL and identity + findings.
 
     Returns:
         A deterministic string containing the verification feedback header
         and the list of findings (severity + author_feedback only).
+
+    Raises:
+        ValueError: If document.verdict is not FAIL.
     """
+    if document.verdict is not VerdictValue.FAIL:
+        raise ValueError(
+            f"rework addendum requires a FAIL verdict, got {document.verdict}"
+        )
+
     attempt = document.identity.verification_attempt
 
     lines = [
