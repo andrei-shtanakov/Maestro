@@ -572,22 +572,29 @@ class TestMonitorRunningFinalize:
 
 class TestSshRecoveryBranch:
     @pytest.mark.anyio
-    async def test_probe_open_handle_uses_probe_ssh_directly_not_backend_probe(
+    async def test_probe_open_handle_routes_through_backend_probe(
         self, tmp_path, monkeypatch
     ) -> None:
+        """Task 7: `_probe_open_handle` no longer hand-composes `probe_ssh`
+        itself — it resolves the backend and calls `backend.probe(ref)`
+        directly. A bare-ssh open handle still lands in NEEDS_REVIEW
+        (`SshBackend.probe` is fail-closed for a bare handle), but now via
+        the single `backend.probe` boundary — a spy on `backend.probe`
+        confirms it was actually consulted, not bypassed."""
         from maestro import orchestrator as orch_mod
 
         monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: False)
         orch, db = await _orch_with_db(tmp_path)
         try:
             backend = _ssh_backend()
+            real_probe = backend.probe
+            calls: list[object] = []
 
-            async def _refuse_probe(ref):
-                raise AssertionError(
-                    "backend.probe() must not be called; probe_ssh directly"
-                )
+            async def _spy_probe(ref):
+                calls.append(ref)
+                return await real_probe(ref)
 
-            backend.probe = _refuse_probe  # type: ignore[method-assign]
+            backend.probe = _spy_probe  # type: ignore[method-assign]
             orch._backends.resolve = MagicMock(return_value=backend)
 
             await db.create_workstream(_seed("w", WorkstreamStatus.READY))
@@ -610,8 +617,11 @@ class TestSshRecoveryBranch:
             count = await orch._recover_stranded_workstreams()
 
             assert count == 1
+            # backend.probe() was actually consulted — the single boundary.
+            assert len(calls) == 1
             w = await db.get_workstream("w")
-            # probe_ssh is fail-closed: always needs_review=True.
+            # probe_ssh (called from inside backend.probe) is fail-closed:
+            # always needs_review=True.
             assert w.status == WorkstreamStatus.NEEDS_REVIEW
         finally:
             await db.close()
@@ -811,14 +821,19 @@ class TestDualEntityRecovery:
         container-blind branch too. With ssh forced clean, the workstream
         can only land in NEEDS_REVIEW if the new container probe ran and
         found the leftover container.
+
+        Task 7: the dual-entity composition now lives inside
+        `SshBackend.probe`, which imports `probe_ssh` lazily from
+        `maestro.execution.ssh_recovery` at call time — so the patch target
+        is that module (not `orchestrator.probe_ssh`, which no longer
+        exists now that `_probe_open_handle` composes nothing itself).
         """
-        from maestro import orchestrator as orch_mod
 
         async def _clean_ssh(ssh, ref):
             del ssh, ref
             return RecoveryVerdict(False, "ssh clean")
 
-        monkeypatch.setattr(orch_mod, "probe_ssh", _clean_ssh)
+        monkeypatch.setattr("maestro.execution.ssh_recovery.probe_ssh", _clean_ssh)
 
         orch, db = await _orch_with_db(tmp_path)
         try:
@@ -876,14 +891,17 @@ class TestDualEntityRecovery:
         probe_ssh is again forced clean so the assertion can only pass if
         the mismatch check itself forces the verdict — proving the branch
         fired rather than piggybacking on ssh's own fail-closed default.
+
+        Task 7: patched at `maestro.execution.ssh_recovery.probe_ssh` (the
+        source module) since `SshBackend.probe` — where the composition now
+        lives — imports it lazily from there at call time.
         """
-        from maestro import orchestrator as orch_mod
 
         async def _clean_ssh(ssh, ref):
             del ssh, ref
             return RecoveryVerdict(False, "ssh clean")
 
-        monkeypatch.setattr(orch_mod, "probe_ssh", _clean_ssh)
+        monkeypatch.setattr("maestro.execution.ssh_recovery.probe_ssh", _clean_ssh)
 
         orch, db = await _orch_with_db(tmp_path)
         try:
@@ -1000,17 +1018,24 @@ class TestDualEntityRecovery:
         single-id (a found container is always ambiguous-or-owned). So
         this test captures the actual kwargs `probe_execution` is called
         with and asserts the full persisted `expected_labels` reached it.
+
+        Task 7: both patches target `maestro.execution.ssh_backend` — that
+        module now owns the dual-entity composition (`SshBackend.probe`)
+        and holds its own module-level `probe_execution` binding (imported
+        at `ssh_backend` module load time), so patching
+        `orchestrator.probe_execution` would no longer have any effect on
+        this path.
         """
-        from maestro import orchestrator as orch_mod
+        from maestro.execution import ssh_backend as ssh_backend_mod
 
         async def _clean_ssh(ssh, ref):
             del ssh, ref
             return RecoveryVerdict(False, "ssh clean")
 
-        monkeypatch.setattr(orch_mod, "probe_ssh", _clean_ssh)
+        monkeypatch.setattr("maestro.execution.ssh_recovery.probe_ssh", _clean_ssh)
 
         captured: dict[str, object] = {}
-        real_probe_execution = orch_mod.probe_execution
+        real_probe_execution = ssh_backend_mod.probe_execution
 
         async def _capturing_probe_execution(
             execution_id, docker, expected_labels=None
@@ -1021,7 +1046,9 @@ class TestDualEntityRecovery:
                 execution_id, docker, expected_labels=expected_labels
             )
 
-        monkeypatch.setattr(orch_mod, "probe_execution", _capturing_probe_execution)
+        monkeypatch.setattr(
+            ssh_backend_mod, "probe_execution", _capturing_probe_execution
+        )
 
         orch, db = await _orch_with_db(tmp_path)
         try:

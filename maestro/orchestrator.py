@@ -29,7 +29,6 @@ from maestro.execution.docker_cli import DockerCli
 from maestro.execution.docker_recovery import (
     GC_CLEAN_OUTCOMES,
     DockerProbe,
-    RecoveryVerdict,
     gc_terminal_handle,
     probe_execution,
 )
@@ -40,10 +39,10 @@ from maestro.execution.models import (
     ExecutionRequest,
     ProgressMirrorPolicy,
 )
-from maestro.execution.resolver import BackendResolver
+from maestro.execution.resolver import BackendResolver, ExecutionConfigError
 from maestro.execution.ssh_backend import SshBackend
 from maestro.execution.ssh_launch import decode_transport_ref
-from maestro.execution.ssh_recovery import gc_ssh_terminal, probe_ssh
+from maestro.execution.ssh_recovery import gc_ssh_terminal
 from maestro.gates import (
     BLOCK_REASON_PREFIX,
     ApprovalMarker,
@@ -635,21 +634,35 @@ class Orchestrator:
         self, workstream_id: str, workstream_handles: dict[str, dict[str, Any]]
     ) -> bool:
         """Probe a non-local workstream's open handle for a possibly-live
-        execution (Task 18: docker `probe_execution`; Task 16: ssh
-        `probe_ssh`, both fail-closed).
+        execution, via the resolved backend's own `probe()` (Task 7: this
+        used to hand-compose `probe_ssh`/`probe_execution`/`decode_transport_ref`
+        here; that composition now lives once, in `SshBackend.probe` /
+        `LocalBackend.probe`, Task 6).
 
         No-op (returns False) when there is no open, non-cleaned handle row
         for this workstream — a local-backed workstream (or one whose
         handle already reached `terminal`/`collected`/`cleaned`) is always
         unaffected, preserving pre-Task-18 recovery behavior exactly.
 
-        SSH is fail-closed by design: `probe_ssh` always returns
-        `needs_review=True` (a remote terminal marker cannot prove collect
-        already applied), so an SSH-backed row here is never silently
-        reclaimed. When the docker verdict confirms no container is left,
-        the open handle row is closed (terminal -> cleaned) here so it
-        doesn't linger open and shadow the workstream's next attempt after
-        it's recovered to READY.
+        The `docker` `backend_id` is still special-cased: it composes
+        `probe_execution` directly against `self._docker` rather than going
+        through `self._backends.resolve("docker")`. That resolver call
+        would build a *fresh* `DockerCli()` (`BackendResolver._build_local`)
+        — a different instance from the test-injectable `self._docker` that
+        startup recovery has always probed with (`Orchestrator(docker=...)`)
+        — so routing it through `backend.probe()` would silently swap in a
+        real, unmocked docker client. Every other backend (ssh today, any
+        future kind tomorrow) is fail-closed via `self._backends.resolve()`
+        + `backend.probe()`; an unresolvable `backend_id` is also treated
+        as needs_review (fail-closed) rather than raising.
+
+        SSH is fail-closed by design: `SshBackend.probe` always returns
+        `needs_review=True` for a bare handle (a remote terminal marker
+        cannot prove collect already applied), so an SSH-backed row here is
+        never silently reclaimed. When the verdict confirms no
+        execution is left, the open handle row is closed (terminal ->
+        cleaned) here so it doesn't linger open and shadow the workstream's
+        next attempt after it's recovered to READY.
         """
         row = workstream_handles.get(workstream_id)
         if row is None:
@@ -657,46 +670,23 @@ class Orchestrator:
         backend_id = row["backend_id"]
         if backend_id == "docker":
             verdict = await probe_execution(row["execution_id"], self._docker)
+            needs_review = verdict.needs_review
         else:
-            backend = self._backends.resolve(backend_id)
-            if isinstance(backend, SshBackend):
-                ref = handle_ref_from_row(row)
-                decoded = decode_transport_ref(ref.transport_ref)
-                ssh_verdict = await probe_ssh(backend._ssh, ref)
-                if decoded["isolation"] == "docker":
-                    # Phase 2c: an ssh-launched execution that itself runs the
-                    # harness inside a container can strand TWO resources — the
-                    # remote supervisor/process-group AND the container. Probe
-                    # both and route to NEEDS_REVIEW if either says so; never
-                    # trust ssh_verdict alone to rule out a leftover container.
-                    if backend.isolation_kind != "docker" or backend.docker is None:
-                        verdict = RecoveryVerdict(
-                            True, "persisted docker isolation but backend is bare"
-                        )
-                    else:
-                        cont = await probe_execution(
-                            row["execution_id"],
-                            backend.docker,
-                            expected_labels=decoded["expected_labels"],
-                        )
-                        verdict = RecoveryVerdict(
-                            ssh_verdict.needs_review or cont.needs_review,
-                            f"ssh={ssh_verdict.reason}; container={cont.reason}",
-                        )
-                else:
-                    verdict = ssh_verdict
+            try:
+                backend = self._backends.resolve(backend_id)
+            except ExecutionConfigError:
+                needs_review = True
             else:
-                verdict = RecoveryVerdict(
-                    True, f"unsupported backend {backend_id!r} for recovery probe"
-                )
-        if not verdict.needs_review:
+                result = await backend.probe(handle_ref_from_row(row))
+                needs_review = result.needs_review
+        if not needs_review:
             await self._db.mark_execution_state(
                 row["execution_id"], "terminal", allowed_from=["prepared", "running"]
             )
             await self._db.mark_execution_state(
                 row["execution_id"], "cleaned", allowed_from=["terminal"]
             )
-        return verdict.needs_review
+        return needs_review
 
     async def _gc_terminal_handles(self, handles: list[dict[str, Any]]) -> int:
         """Best-effort, ownership-checked GC sweep for settled handles.
