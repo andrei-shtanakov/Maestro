@@ -30,7 +30,6 @@ from maestro.execution.docker_recovery import (
     GC_CLEAN_OUTCOMES,
     DockerProbe,
     gc_terminal_handle,
-    probe_execution,
 )
 from maestro.execution.finalize import ensure_finalize_task
 from maestro.execution.handle_ref import handle_ref_from_row
@@ -270,7 +269,9 @@ class Orchestrator:
                 log_dir=pipeline_log_dir(),
             )
 
-        self._backends = BackendResolver(self._config.execution)
+        self._backends = BackendResolver(
+            self._config.execution, local_docker=cast("DockerCli", self._docker)
+        )
         self._running: dict[str, RunningWorkstream] = {}
         self._generating: dict[str, asyncio.Task[None]] = {}
         self._shutdown_grace_seconds: float = 5.0
@@ -644,17 +645,14 @@ class Orchestrator:
         handle already reached `terminal`/`collected`/`cleaned`) is always
         unaffected, preserving pre-Task-18 recovery behavior exactly.
 
-        The `docker` `backend_id` is still special-cased: it composes
-        `probe_execution` directly against `self._docker` rather than going
-        through `self._backends.resolve("docker")`. That resolver call
-        would build a *fresh* `DockerCli()` (`BackendResolver._build_local`)
-        — a different instance from the test-injectable `self._docker` that
-        startup recovery has always probed with (`Orchestrator(docker=...)`)
-        — so routing it through `backend.probe()` would silently swap in a
-        real, unmocked docker client. Every other backend (ssh today, any
-        future kind tomorrow) is fail-closed via `self._backends.resolve()`
-        + `backend.probe()`; an unresolvable `backend_id` is also treated
-        as needs_review (fail-closed) rather than raising.
+        Every backend_id — `docker` included (Task 7b) — is resolved via
+        `self._backends.resolve()` and probed via `backend.probe()`: the
+        resolver is constructed with `local_docker=self._docker` (`__init__`),
+        so `resolve("docker")` returns a `LocalBackend` wired to the very
+        same, test-injectable `DockerCli` startup recovery has always probed
+        with (`Orchestrator(docker=...)`) — not a fresh, un-injectable one.
+        An unresolvable `backend_id` is treated as needs_review (fail-closed)
+        rather than raising.
 
         SSH is fail-closed by design: `SshBackend.probe` always returns
         `needs_review=True` for a bare handle (a remote terminal marker
@@ -668,17 +666,13 @@ class Orchestrator:
         if row is None:
             return False
         backend_id = row["backend_id"]
-        if backend_id == "docker":
-            verdict = await probe_execution(row["execution_id"], self._docker)
-            needs_review = verdict.needs_review
+        try:
+            backend = self._backends.resolve(backend_id)
+        except ExecutionConfigError:
+            needs_review = True
         else:
-            try:
-                backend = self._backends.resolve(backend_id)
-            except ExecutionConfigError:
-                needs_review = True
-            else:
-                result = await backend.probe(handle_ref_from_row(row))
-                needs_review = result.needs_review
+            result = await backend.probe(handle_ref_from_row(row))
+            needs_review = result.needs_review
         if not needs_review:
             await self._db.mark_execution_state(
                 row["execution_id"], "terminal", allowed_from=["prepared", "running"]
