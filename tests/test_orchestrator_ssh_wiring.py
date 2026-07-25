@@ -20,6 +20,7 @@ import pytest
 from maestro.database import Database
 from maestro.execution.docker_recovery import RecoveryVerdict
 from maestro.execution.exec_config import DockerIsolation, SshTransport
+from maestro.execution.local import LocalBackend
 from maestro.execution.models import (
     BackendHealth,
     CollectPolicy,
@@ -823,12 +824,23 @@ class TestSshRecoveryBranch:
     async def test_gc_terminal_handles_docker_unaffected_by_ssh_branch(
         self, tmp_path
     ) -> None:
-        """CRITICAL — zero regression: a docker `terminal` row is still
-        swept exactly as before (unaffected by the new ssh branch)."""
+        """CRITICAL — zero regression: a REAL local-docker "docker" backend
+        (resolved via `self._backends.resolve("docker")`, exactly as
+        production wires it — `LocalBackend` bound to `self._docker`) still
+        GCs its `terminal` row exactly as before (Task 13c: classification
+        now goes through `resolve()` + `accepts_ref()` instead of a literal
+        `backend_id == "docker"` check, but a genuine local-docker backend
+        must behave identically)."""
         orch, db = await _orch_with_db(tmp_path)
         docker = MagicMock()
         docker.ps_ids_by_label = AsyncMock(return_value=[])
         orch._docker = docker
+        # Seed the resolver's "docker" cache slot the way production wires it
+        # (`BackendResolver(local_docker=self._docker)` in `__init__`) —
+        # mirrors `test_orchestrator.py`'s `_set_fake_docker_backend`.
+        orch._backends._cache["docker"] = LocalBackend(
+            backend_id="docker", docker=docker
+        )
         try:
             await db.create_workstream(_seed("w", WorkstreamStatus.READY))
             await db.start_execution(
@@ -849,6 +861,64 @@ class TestSshRecoveryBranch:
             assert swept == 1
             remaining = await db.get_open_execution_handles()
             assert all(h["execution_id"] != "e1" for h in remaining)
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_gc_terminal_handles_ssh_named_docker_leaves_row_uncleaned(
+        self, tmp_path
+    ) -> None:
+        """Task 13c: the LAST residual of the fail-OPEN recovery defect
+        class. A backend named "docker" in config (`backends: {docker:
+        {transport: ssh, ...}}` — config validation allows this; only the
+        legacy `execution.docker` shorthand co-existing with a canonical
+        `backends.docker` is rejected) resolves to an `SshBackend`. Its
+        `terminal` handle row must be left alone — a terminal marker does
+        not prove `collect` ran, so GC-ing it would destroy the record of
+        an uncollected remote run.
+
+        Pre-13c, `_gc_terminal_handles` special-cased `backend_id ==
+        "docker"` as a literal, never calling `resolve()`/`accepts_ref()`,
+        so it always ran LOCAL docker GC (`self._docker.ps_ids_by_label`)
+        against this row — found no matching local container ("no
+        container found", a clean outcome) — and wrongly marked the row
+        `cleaned`. This test MUST FAIL on pre-13c code (row wrongly
+        cleaned, local docker GC called) and pass post-fix (row left
+        intact, local docker GC never consulted)."""
+        orch, db = await _orch_with_db(tmp_path)
+        docker = MagicMock()
+        docker.ps_ids_by_label = AsyncMock(return_value=[])
+        orch._docker = docker
+        backend = _ssh_backend()  # a real SshBackend, resolved for name "docker"
+        orch._backends.resolve = MagicMock(return_value=backend)
+        try:
+            await db.create_workstream(_seed("w", WorkstreamStatus.READY))
+            layout = remote_layout("/var/tmp/m", "e1")
+            transport_ref = encode_transport_ref(
+                "gpu", None, layout.root, layout.status
+            )
+            await db.start_execution(
+                entity_kind="workstream",
+                entity_id="w",
+                expected_status=WorkstreamStatus.READY.value,
+                running_status=WorkstreamStatus.RUNNING.value,
+                execution_id="e1",
+                backend_id="docker",
+                transport_ref=transport_ref,
+                attempt=1,
+                status_marker=layout.status,
+            )
+            await db.mark_execution_state(
+                "e1", "terminal", allowed_from=["prepared", "running"]
+            )
+
+            handles = await db.get_open_execution_handles()
+            swept = await orch._gc_terminal_handles(handles)
+
+            assert swept == 0
+            remaining = await db.get_open_execution_handles()
+            assert any(h["execution_id"] == "e1" for h in remaining)
+            docker.ps_ids_by_label.assert_not_called()
         finally:
             await db.close()
 

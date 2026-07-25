@@ -704,98 +704,134 @@ class Orchestrator:
         the handle `cleaned` — it never touches entity status. Swept across
         all entity kinds since the handle table is shared.
 
-        Docker accepts either `terminal` or `collected`: `collect()` is a
-        no-op for docker, so both states are equally safe to sweep (the
-        phased finalize wiring, Task 16, can leave a docker row at either
-        depending on exactly when a crash lands). SSH only ever sweeps
-        `collected` — a `terminal`-but-not-`collected` SSH row means the
-        remote diff was never confirmed applied, so it is left for human
-        review (`ssh_recovery.probe_ssh` is fail-closed) rather than
-        silently removed here — this is the SSH parallel of docker's
-        terminal -> cleaned GC sweep.
+        Classification is by the persisted `backend_id`, resolved through
+        `BackendResolver` (never a hand-composed/literal `backend_id ==
+        "docker"` check — Task 13c: that literal used to route an
+        SSH-transport backend a user happened to *name* "docker" through
+        local-docker GC, which found no local container and wrongly marked
+        an uncollected remote run `cleaned`):
+
+        - resolved `SshBackend` -> sweeps only `collected` (`terminal`-but-
+          not-`collected` means the remote diff was never confirmed
+          applied, so it is left for human review — `ssh_recovery.probe_ssh`
+          is fail-closed); docker-isolation rows GC the remote container
+          first, then the remote root, only on a clean container outcome.
+        - any other resolved backend (local bare/docker) -> docker GC on
+          both `terminal` and `collected` (`collect()` is a no-op for
+          docker, so both states are equally safe to sweep — the phased
+          finalize wiring, Task 16, can leave a docker row at either
+          depending on exactly when a crash lands).
+        - an unresolvable `backend_id`, or a resolved backend whose
+          `accepts_ref()` rejects the persisted ref (config drift after the
+          handle was minted), is left in place (fail-closed) for the next
+          sweep or a human to resolve — never docker-GC an SSH run's
+          `execution_id` (or vice versa) just because the backend *name*
+          still resolves to something.
 
         A row whose outcome is ambiguous (multiple container matches /
-        label mismatch / probe error / no owner marker / resolve failure),
-        or whose resolved backend's `accepts_ref()` rejects the persisted
-        ref (config drift after the handle was minted), is left in place
-        for the next sweep or a human to resolve.
+        label mismatch / probe error / no owner marker) is likewise left in
+        place for the next sweep or a human to resolve.
         """
         swept = 0
         for row in handles:
             state = row["state"]
+            if state not in ("terminal", "collected"):
+                continue
             backend_id = row["backend_id"]
-            if backend_id == "docker":
-                if state not in ("terminal", "collected"):
+            try:
+                backend = self._backends.resolve(backend_id)
+            except ExecutionConfigError as exc:
+                self._logger.warning(
+                    "recovery: GC skipping handle %s (%s %s): "
+                    "unresolvable backend %r: %s",
+                    row["execution_id"],
+                    row["entity_kind"],
+                    row["entity_id"],
+                    backend_id,
+                    exc,
+                )
+                continue
+
+            ref = handle_ref_from_row(row)
+            if not backend.accepts_ref(ref):
+                # Persisted identity no longer matches the resolved backend
+                # (e.g. isolation reconfigured bare<->docker under the same
+                # name, or "docker" renamed to an ssh transport) — never GC
+                # across identities.
+                self._logger.warning(
+                    "recovery: GC skipping handle %s (%s %s): persisted "
+                    "execution identity does not match resolved backend "
+                    "%r (config drift)",
+                    row["execution_id"],
+                    row["entity_kind"],
+                    row["entity_id"],
+                    backend_id,
+                )
+                continue
+
+            if isinstance(backend, SshBackend):
+                if state != "collected":
                     continue
-                outcome = await gc_terminal_handle(row, self._docker)
-                if outcome in GC_CLEAN_OUTCOMES:
+                try:
+                    decoded = decode_transport_ref(ref.transport_ref)
+                    if decoded["isolation"] == "docker":
+                        # Container-first ordering: never delete the remote
+                        # root (which may hold the only evidence of what the
+                        # container touched) before the container itself is
+                        # confirmed gone.
+                        if backend.docker is None:
+                            continue  # config no longer docker; leave for a human
+                        dk_outcome = await gc_terminal_handle(
+                            {"execution_id": row["execution_id"]},
+                            backend.docker,
+                            expected_labels=decoded["expected_labels"],
+                        )
+                        if dk_outcome not in GC_CLEAN_OUTCOMES:
+                            self._logger.warning(
+                                "recovery: container GC not clean for %s: %s — "
+                                "leaving remote root intact",
+                                row["execution_id"],
+                                dk_outcome,
+                            )
+                            continue
+                    outcome = await gc_ssh_terminal(backend._ssh, ref)
+                except Exception as e:
+                    self._logger.warning(
+                        "recovery: ssh GC failed for handle %s (%s %s): %s",
+                        row["execution_id"],
+                        row["entity_kind"],
+                        row["entity_id"],
+                        e,
+                    )
+                    continue
+                if outcome in _SSH_GC_CLEAN_OUTCOMES:
                     await self._db.mark_execution_state(
-                        row["execution_id"], "cleaned", allowed_from=[state]
+                        row["execution_id"], "cleaned", allowed_from=["collected"]
                     )
                     swept += 1
                 else:
                     self._logger.warning(
-                        "recovery: GC left handle %s (%s %s) as %s: %s",
+                        "recovery: GC left handle %s (%s %s) as collected: %s",
                         row["execution_id"],
                         row["entity_kind"],
                         row["entity_id"],
-                        state,
                         outcome,
                     )
                 continue
-            if state != "collected":
-                continue
-            try:
-                backend = self._backends.resolve(backend_id)
-                if not isinstance(backend, SshBackend):
-                    continue
-                ref = handle_ref_from_row(row)
-                if not backend.accepts_ref(ref):
-                    # Persisted identity no longer matches the resolved
-                    # backend (e.g. isolation reconfigured bare<->docker
-                    # under the same name) — never GC across identities.
-                    continue
-                decoded = decode_transport_ref(ref.transport_ref)
-                if decoded["isolation"] == "docker":
-                    # Container-first ordering: never delete the remote root
-                    # (which may hold the only evidence of what the container
-                    # touched) before the container itself is confirmed gone.
-                    if backend.docker is None:
-                        continue  # config no longer docker; leave for a human
-                    dk_outcome = await gc_terminal_handle(
-                        {"execution_id": row["execution_id"]},
-                        backend.docker,
-                        expected_labels=decoded["expected_labels"],
-                    )
-                    if dk_outcome not in GC_CLEAN_OUTCOMES:
-                        self._logger.warning(
-                            "recovery: container GC not clean for %s: %s — "
-                            "leaving remote root intact",
-                            row["execution_id"],
-                            dk_outcome,
-                        )
-                        continue
-                outcome = await gc_ssh_terminal(backend._ssh, ref)
-            except Exception as e:
-                self._logger.warning(
-                    "recovery: ssh GC failed for handle %s (%s %s): %s",
-                    row["execution_id"],
-                    row["entity_kind"],
-                    row["entity_id"],
-                    e,
-                )
-                continue
-            if outcome in _SSH_GC_CLEAN_OUTCOMES:
+
+            outcome = await gc_terminal_handle(row, self._docker)
+            if outcome in GC_CLEAN_OUTCOMES:
                 await self._db.mark_execution_state(
-                    row["execution_id"], "cleaned", allowed_from=["collected"]
+                    row["execution_id"], "cleaned", allowed_from=[state]
                 )
                 swept += 1
             else:
                 self._logger.warning(
-                    "recovery: GC left handle %s (%s %s) as collected: %s",
+                    "recovery: GC left handle %s (%s %s) as %s: %s",
                     row["execution_id"],
                     row["entity_kind"],
                     row["entity_id"],
+                    state,
                     outcome,
                 )
         return swept
