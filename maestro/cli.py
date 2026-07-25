@@ -514,6 +514,8 @@ async def _run_scheduler(
                             f"[green]Recovery complete[/green]\n"
                             f"RUNNING → READY: {stats.running_recovered}\n"
                             f"VALIDATING → READY: {stats.validating_recovered}\n"
+                            f"VERIFYING → NEEDS_REVIEW: "
+                            f"{stats.verifying_recovered}\n"
                             f"Total recovered: {stats.total_recovered}\n"
                             f"Already done: {stats.tasks_done}",
                             title="State Recovery",
@@ -715,6 +717,26 @@ async def _retry_task(db_path: Path, task_id: str) -> None:
                 f"Task must be in one of: {', '.join(s.value for s in retryable_statuses)}"
             )
             raise typer.Exit(1)
+
+        # Requeue handle-fence (Task 11, spec §8): a verifier-originated
+        # NEEDS_REVIEW must not be re-queued while its
+        # `execution_phase='verification'` handle is still open (not yet
+        # reconciled to `cleaned` by recovery/GC) — the judge subprocess it
+        # represents may still be alive. Fail closed with a clear error
+        # rather than silently re-running the task over it.
+        if task.status == TaskStatus.NEEDS_REVIEW:
+            open_handle = await db.get_open_verification_handle(task_id)
+            if open_handle is not None:
+                err_console.print(
+                    "[red]Cannot retry task:[/red] its verification handle "
+                    f"({open_handle['execution_id']!r}, state "
+                    f"{open_handle['state']!r}) has not been reconciled yet."
+                )
+                err_console.print(
+                    "Wait for recovery/GC to close it (or investigate the "
+                    "judge process) before retrying."
+                )
+                raise typer.Exit(1)
 
         # Reset retry count and status
         await db.update_task_status(

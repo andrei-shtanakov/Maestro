@@ -2035,6 +2035,46 @@ class Database:
         row = await cursor.fetchone()
         return dict(row) if row is not None else None
 
+    async def get_open_verification_handle(self, task_id: str) -> dict[str, Any] | None:
+        """Return a task's open (non-`cleaned`) verification handle, if any.
+
+        Used by the Mode-1 `NEEDS_REVIEW -> READY` requeue fence (`maestro
+        retry`, Task 11) to detect a verifier-originated review whose
+        `execution_phase='verification'` handle has not yet been reconciled
+        to `cleaned` — re-queuing must fail closed until it has. Unlike
+        `get_open_execution_handles`, this is NOT filtered by `backend_id
+        != 'local'` (the verifier gate always runs on `"local"`) and is not
+        keyed by a specific `attempt` — any non-cleaned verification handle
+        for this task, regardless of attempt, blocks the requeue.
+
+        Returns:
+            The most recent matching row, or `None` if the task has no
+            verification handle at all, or all of them are `cleaned`.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            """
+            SELECT execution_id, entity_kind, entity_id, attempt, backend_id,
+                   transport_ref, state, created_at, finished_at,
+                   remote_host, remote_dir, status_marker, collected_at,
+                   execution_phase
+            FROM execution_handles
+            WHERE entity_kind = 'task' AND entity_id = ?
+              AND execution_phase = 'verification' AND state != 'cleaned'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (task_id,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
     # =========================================================================
     # Query by Status
     # =========================================================================
