@@ -14,7 +14,15 @@ from maestro.database import ConcurrentModificationError, Database
 from maestro.domain.profile import CriteriaConfig, VerifierSpec
 from maestro.domain.verdict import VerdictValue
 from maestro.domain.verifier import CommandVerifier, VerificationContext
+from maestro.execution.backend import TaskHandle
 from maestro.execution.local import LocalBackend
+from maestro.execution.models import (
+    BackendHealth,
+    CapabilityResult,
+    ExecutionHandleRef,
+    ExecutionRequest,
+    ProbeResult,
+)
 from maestro.models import Workstream, WorkstreamStatus
 
 
@@ -113,6 +121,39 @@ def _staging(tmp_path: Path) -> Path:
     staging = tmp_path / "staging"
     staging.mkdir()
     return staging / "attempt-001.json"
+
+
+class _SpyBackend:
+    """Wraps a real `ExecutionBackend`, counting `run()` calls.
+
+    A thin delegating spy, not a fake: every method forwards to `inner`
+    except `run`, which increments `run_calls` first. Used to prove a CAS
+    failure gates BEFORE the verifier process spawns — file/row absence
+    alone can't distinguish "never spawned" from "spawned but still
+    sleeping" (a `hang`-mode directive keeps the subprocess alive well past
+    when `verify()` raises).
+    """
+
+    def __init__(self, inner: LocalBackend) -> None:
+        self._inner = inner
+        self.run_calls = 0
+
+    @property
+    def id(self) -> str:
+        return self._inner.id
+
+    async def healthcheck(self) -> BackendHealth:
+        return await self._inner.healthcheck()
+
+    async def can_run(self, req: ExecutionRequest) -> CapabilityResult:
+        return await self._inner.can_run(req)
+
+    async def run(self, req: ExecutionRequest) -> TaskHandle:
+        self.run_calls += 1
+        return await self._inner.run(req)
+
+    async def probe(self, ref: ExecutionHandleRef) -> ProbeResult:
+        return await self._inner.probe(ref)
 
 
 async def test_pass_directive_returns_pass_and_persists_handle(
@@ -311,19 +352,25 @@ async def test_cas_failure_before_spawn_leaves_no_process(
     script = _write_script(tmp_path, [{"mode": "hang"}])
     out_json = _staging(tmp_path)
     ctx = _ctx(worktree, out_json, workstream_id=workstream_id)
+    spy = _SpyBackend(LocalBackend())
     verifier = CommandVerifier(
         _spec(script, workstream_id, timeout=1.0),
         _criteria(),
         "artifact.txt",
-        LocalBackend(),
+        spy,
         db=db,
     )
 
     with pytest.raises(ConcurrentModificationError):
         await verifier.verify(ctx)
 
-    # Never spawned: neither the verdict file nor the stub's cursor file
-    # (only ever written by the process itself) exist.
+    # Primary assertion: the backend's run() was never even called — the
+    # CAS is gated strictly before spawn, not just "spawned but the process
+    # happens to still be sleeping when we check" (file/row absence alone
+    # can't tell those two apart for a `hang`-mode directive).
+    assert spy.run_calls == 0
+    # Secondary: neither the verdict file nor the stub's cursor file (only
+    # ever written by the process itself) exist.
     assert not out_json.exists()
     assert not (script.parent / f"{script.name}.cursor").exists()
     # The staged criteria copy was still cleaned up despite the failure.
