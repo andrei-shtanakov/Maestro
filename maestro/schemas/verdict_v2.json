@@ -1,0 +1,133 @@
+{
+  "$defs": {
+    "Finding": {
+      "description": "One criterion violation reported by the verifier.",
+      "properties": {
+        "criterion_id": {
+          "title": "Criterion Id",
+          "type": "string"
+        },
+        "severity": {
+          "title": "Severity",
+          "type": "string"
+        },
+        "evidence": {
+          "title": "Evidence",
+          "type": "string"
+        },
+        "author_feedback": {
+          "description": "Actionable text authored by the verifier FOR the author \u2014 the explicit declassification channel (\u00a77). The only finding field the rework addendum may carry across the verifier->author boundary (besides severity).",
+          "title": "Author Feedback",
+          "type": "string"
+        }
+      },
+      "required": [
+        "criterion_id",
+        "severity",
+        "evidence",
+        "author_feedback"
+      ],
+      "title": "Finding",
+      "type": "object"
+    },
+    "VerdictIdentity": {
+      "description": "Identity block binding an attempt to run, artifact, rubric, profile.",
+      "properties": {
+        "verification_run_id": {
+          "title": "Verification Run Id",
+          "type": "string"
+        },
+        "verification_attempt": {
+          "minimum": 1,
+          "title": "Verification Attempt",
+          "type": "integer"
+        },
+        "rework_attempt": {
+          "minimum": 0,
+          "title": "Rework Attempt",
+          "type": "integer"
+        },
+        "workstream_id": {
+          "title": "Workstream Id",
+          "type": "string"
+        },
+        "artifact": {
+          "title": "Artifact",
+          "type": "string"
+        },
+        "artifact_sha256": {
+          "title": "Artifact Sha256",
+          "type": "string"
+        },
+        "criteria_sha256": {
+          "title": "Criteria Sha256",
+          "type": "string"
+        },
+        "profile_sha256": {
+          "title": "Profile Sha256",
+          "type": "string"
+        },
+        "verified_source_commit": {
+          "title": "Verified Source Commit",
+          "type": "string"
+        },
+        "verified_source_tree": {
+          "title": "Verified Source Tree",
+          "type": "string"
+        }
+      },
+      "required": [
+        "verification_run_id",
+        "verification_attempt",
+        "rework_attempt",
+        "workstream_id",
+        "artifact",
+        "artifact_sha256",
+        "criteria_sha256",
+        "profile_sha256",
+        "verified_source_commit",
+        "verified_source_tree"
+      ],
+      "title": "VerdictIdentity",
+      "type": "object"
+    },
+    "VerdictValue": {
+      "description": "Fail-closed verdict values; exit contract 0=PASS, 1=FAIL, 2=ERROR.",
+      "enum": [
+        "PASS",
+        "FAIL",
+        "ERROR"
+      ],
+      "title": "VerdictValue",
+      "type": "string"
+    }
+  },
+  "description": "Canonical machine verdict; .md/.raw.txt are non-authoritative sidecars.",
+  "properties": {
+    "schema_version": {
+      "const": 2,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "identity": {
+      "$ref": "#/$defs/VerdictIdentity"
+    },
+    "verdict": {
+      "$ref": "#/$defs/VerdictValue"
+    },
+    "findings": {
+      "items": {
+        "$ref": "#/$defs/Finding"
+      },
+      "title": "Findings",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "identity",
+    "verdict"
+  ],
+  "title": "VerdictDocument",
+  "type": "object"
+}

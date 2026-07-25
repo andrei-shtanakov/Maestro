@@ -115,6 +115,90 @@
       "title": "ArbiterMode",
       "type": "string"
     },
+    "BackendSpec": {
+      "description": "A named execution backend: how to reach it, and how to isolate it.",
+      "properties": {
+        "transport": {
+          "discriminator": {
+            "mapping": {
+              "local": "#/$defs/LocalTransport",
+              "ssh": "#/$defs/SshTransport"
+            },
+            "propertyName": "type"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/LocalTransport"
+            },
+            {
+              "$ref": "#/$defs/SshTransport"
+            }
+          ],
+          "title": "Transport"
+        },
+        "isolation": {
+          "discriminator": {
+            "mapping": {
+              "bare": "#/$defs/BareIsolation",
+              "docker": "#/$defs/DockerIsolation"
+            },
+            "propertyName": "type"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/BareIsolation"
+            },
+            {
+              "$ref": "#/$defs/DockerIsolation"
+            }
+          ],
+          "title": "Isolation"
+        },
+        "secret_env": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Secret Env",
+          "type": "array"
+        },
+        "inherit_secret_defaults": {
+          "default": false,
+          "title": "Inherit Secret Defaults",
+          "type": "boolean"
+        },
+        "max_concurrent": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Concurrent"
+        }
+      },
+      "required": [
+        "transport",
+        "isolation"
+      ],
+      "title": "BackendSpec",
+      "type": "object"
+    },
+    "BareIsolation": {
+      "description": "No isolation; the harness runs directly on the transport's target.",
+      "properties": {
+        "type": {
+          "const": "bare",
+          "default": "bare",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "title": "BareIsolation",
+      "type": "object"
+    },
     "Complexity": {
       "description": "Arbiter-compatible task complexity classification.\n\nValues match `arbiter-core/src/types.rs::Complexity`. Maestro's default\ninference uses scope size as a proxy; callers can override when they\nhave richer signal (token estimates, subtask count, etc.).",
       "enum": [
@@ -153,6 +237,166 @@
         }
       },
       "title": "DefaultsConfig",
+      "type": "object"
+    },
+    "DockerConfig": {
+      "description": "Local Docker isolator configuration.",
+      "properties": {
+        "image": {
+          "title": "Image",
+          "type": "string"
+        },
+        "network": {
+          "default": "none",
+          "title": "Network",
+          "type": "string"
+        },
+        "memory": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Memory"
+        },
+        "cpus": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cpus"
+        },
+        "user": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "User"
+        },
+        "secret_env": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Secret Env",
+          "type": "array"
+        }
+      },
+      "required": [
+        "image"
+      ],
+      "title": "DockerConfig",
+      "type": "object"
+    },
+    "DockerIsolation": {
+      "description": "Isolate the harness inside a Docker container.",
+      "properties": {
+        "type": {
+          "const": "docker",
+          "title": "Type",
+          "type": "string"
+        },
+        "image": {
+          "title": "Image",
+          "type": "string"
+        },
+        "network": {
+          "default": "none",
+          "title": "Network",
+          "type": "string"
+        },
+        "memory": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Memory"
+        },
+        "cpus": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cpus"
+        },
+        "user": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "User"
+        }
+      },
+      "required": [
+        "type",
+        "image"
+      ],
+      "title": "DockerIsolation",
+      "type": "object"
+    },
+    "ExecutionConfig": {
+      "description": "The `execution:` block. Absent \u2192 `local + bare`, old behavior.\n\n`backends` is the canonical named registry (transport x isolation). The\nPhase-1 `docker` field is a legacy shorthand normalized into\n`backends[\"docker\"]`. `local` is always implicit.",
+      "properties": {
+        "default_backend": {
+          "default": "local",
+          "title": "Default Backend",
+          "type": "string"
+        },
+        "secret_env_defaults": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Secret Env Defaults",
+          "type": "array"
+        },
+        "backends": {
+          "additionalProperties": {
+            "$ref": "#/$defs/BackendSpec"
+          },
+          "title": "Backends",
+          "type": "object"
+        },
+        "docker": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DockerConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "ExecutionConfig",
       "type": "object"
     },
     "GitConfig": {
@@ -198,6 +442,19 @@
       ],
       "title": "Language",
       "type": "string"
+    },
+    "LocalTransport": {
+      "description": "Run the harness in-process on the local machine.",
+      "properties": {
+        "type": {
+          "const": "local",
+          "default": "local",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "title": "LocalTransport",
+      "type": "object"
     },
     "NotificationConfig": {
       "description": "Notification configuration.",
@@ -249,6 +506,67 @@
         }
       },
       "title": "NotificationConfig",
+      "type": "object"
+    },
+    "SshTransport": {
+      "description": "Run the harness on a remote host reached over SSH.",
+      "properties": {
+        "type": {
+          "const": "ssh",
+          "title": "Type",
+          "type": "string"
+        },
+        "host": {
+          "title": "Host",
+          "type": "string"
+        },
+        "user": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "User"
+        },
+        "port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Port"
+        },
+        "workdir_root": {
+          "title": "Workdir Root",
+          "type": "string"
+        },
+        "connect_timeout_s": {
+          "default": 10,
+          "title": "Connect Timeout S",
+          "type": "integer"
+        },
+        "ssh_opts": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Ssh Opts",
+          "type": "array"
+        }
+      },
+      "required": [
+        "type",
+        "host",
+        "workdir_root"
+      ],
+      "title": "SshTransport",
       "type": "object"
     },
     "TaskConfig": {
@@ -371,6 +689,25 @@
           ],
           "default": null,
           "description": "Arbiter complexity. If omitted, inferred from scope size at Task.from_config() time."
+        },
+        "backend": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Execution backend name (local|docker); None -> default_backend",
+          "title": "Backend"
+        },
+        "validation_backend": {
+          "default": "local",
+          "description": "Backend for the post-task validation run: 'local' | 'same' (the task's backend) | a named backend. Non-local targets must resolve to transport.type == local; SSH targets fail preflight.",
+          "title": "Validation Backend",
+          "type": "string"
         }
       },
       "required": [
@@ -473,6 +810,18 @@
       ],
       "default": null,
       "description": "Optional arbiter integration. When omitted/None the scheduler stays on zero-config StaticRouting and no subprocess is spawned."
+    },
+    "execution": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ExecutionConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Execution backends config; None keeps zero-config local/bare execution (old behavior)."
     }
   },
   "required": [

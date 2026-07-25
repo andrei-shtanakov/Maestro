@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 
+from maestro.domain.verdict import VerdictDocument
 from maestro.models import OrchestratorConfig, ProjectConfig
 
 
@@ -14,6 +15,7 @@ def main() -> None:
     schemas: dict[str, type] = {
         "project_config.json": ProjectConfig,
         "orchestrator_config.json": OrchestratorConfig,
+        "verdict_v2.json": VerdictDocument,
     }
 
     for filename, model in schemas.items():

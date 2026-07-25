@@ -14,6 +14,7 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from maestro.domain.profile import DomainProfile
 from maestro.execution.exec_config import ExecutionConfig
 
 
@@ -1494,6 +1495,13 @@ class OrchestratorConfig(BaseModel):
         description=(
             "Execution backends config; None keeps zero-config local/bare "
             "execution (old behavior)."
+        ),
+    )
+    domain: DomainProfile | None = Field(
+        default=None,
+        description=(
+            "Domain profile (Stage B). Absent -> legacy behavior, "
+            "byte-identical: no VERIFYING phase, no evidence machinery."
         ),
     )
 
