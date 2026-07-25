@@ -280,7 +280,14 @@ class ClaudeDiffJudge:
             env={"PATH": os.environ.get("PATH", "")},
             inherit_env=False,
             timeout_seconds=self._timeout_seconds,
-            capture_output=True,
+            # capture_output=False: LocalBackend writes the process's raw
+            # stdout directly to `log_path` in FULL, instead of piping it
+            # through `communicate()` and truncating to a fixed tail length
+            # (`LocalBackend._TAIL_LIMIT`, 4000 chars) — a verbose
+            # multi-finding FAIL envelope routinely exceeds that limit, and
+            # parsing the truncated tail drops the front of the JSON
+            # envelope. See `_read_full_stdout`.
+            capture_output=False,
             collect=CollectPolicy(mode="none"),
             labels={"execution_phase": "verification"},
             execution_id=ctx.execution_id,
@@ -288,6 +295,24 @@ class ClaudeDiffJudge:
             attempt=ctx.attempt,
             backend_id=self._backend.id,
         )
+
+    @staticmethod
+    def _read_full_stdout(execution: ExecutionResult) -> str:
+        """The judge's full, untruncated stdout — not the 4000-char tail.
+
+        `_build_request` sets `capture_output=False`, so the backend writes
+        the process's raw stdout directly to `execution.output_log_path` in
+        full (see `LocalBackend.run`/`LocalTaskHandle.wait`), unlike
+        `execution.stdout_tail`, which every backend truncates to a fixed
+        tail length. Falls back to `stdout_tail` only if the log file is
+        missing/unreadable — this never forges a PASS on an unreadable
+        output; the transport check upstream already gates exit_code/
+        timeout, and an unparseable fallback still degrades to ERROR below.
+        """
+        try:
+            return execution.output_log_path.read_text(encoding="utf-8")
+        except OSError:
+            return execution.stdout_tail
 
     def _evaluate(
         self, ctx: TaskVerificationContext, execution: ExecutionResult
@@ -306,14 +331,16 @@ class ClaudeDiffJudge:
                 f"exit_code={execution.exit_code} timed_out={execution.timed_out}"
             )
 
+        full_stdout = self._read_full_stdout(execution)
+
         # Captured as soon as the transport succeeded — even if the envelope
         # or payload later prove invalid, the CLI still ran and may carry a
         # billable `usage`/`total_cost_usd`, which the scheduler wants for
         # cost tracking regardless of the eventual verdict/ERROR outcome.
-        raw_envelope = execution.stdout_tail
+        raw_envelope = full_stdout
 
         try:
-            result_text = _extract_result_text(execution.stdout_tail)
+            result_text = _extract_result_text(full_stdout)
         except _CliEnvelopeError as exc:
             return _task_error(f"claude CLI envelope invalid: {exc}").model_copy(
                 update={"raw_result_envelope": raw_envelope}

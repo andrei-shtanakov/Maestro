@@ -89,7 +89,7 @@ from maestro.validator import (
     build_validation_request,
     execution_result_to_validation,
 )
-from maestro.verifier.config import resolve_verifier_model
+from maestro.verifier.config import VerifierModelError, resolve_verifier_model
 from maestro.verifier.diff import build_scope_patch, compute_identity
 from maestro.verifier.envelope import build_envelope
 from maestro.verifier.judge import ClaudeDiffJudge, TaskVerificationContext
@@ -835,7 +835,31 @@ class Scheduler:
             check_validation_backends(tasks, self._execution)
         except ValidationBackendError as exc:
             raise SchedulerError(str(exc)) from exc
+        self._check_verifier_model()
         self._armed = compute_armed_workdirs(tasks, self._execution)
+
+    def _check_verifier_model(self) -> None:
+        """Resolve the verifier model once at scheduler start (design §4).
+
+        When a `verifier:` block is configured, a missing/typo'd/`retired`/
+        unknown model is a fail-loud config error at scheduler start — it
+        must never surface only after the first task completes. Loads the
+        catalog once here; a corrupt catalog (`CatalogError`) is a global
+        fault and propagates unchanged, halting the run exactly like it
+        would from `_run_verifier`.
+
+        The lazy per-task resolution in `_run_verifier` is unchanged and
+        stays in place for a genuinely runtime fault (e.g. the catalog file
+        is deleted mid-run) — this preflight only ensures a *static*
+        misconfig is never the first thing to fail per-task.
+        """
+        if self._verifier is None:
+            return
+        catalog = load_catalog()
+        try:
+            resolve_verifier_model(self._verifier, catalog)
+        except VerifierModelError as exc:
+            raise SchedulerError(f"verifier model preflight failed: {exc}") from exc
 
     async def _reconstruct_reservations(self) -> None:
         """Rebuild held reservations after a restart (recovery).

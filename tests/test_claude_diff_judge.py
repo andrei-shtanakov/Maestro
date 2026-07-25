@@ -49,10 +49,12 @@ class FakeTaskHandle:
         exit_code: int | None = 0,
         timed_out: bool = False,
         transport_ref: str = "fake:handle-1",
+        output_log_path: Path = Path("/tmp/fake-judge.log"),
     ) -> None:
         self._stdout_tail = stdout_tail
         self._exit_code = exit_code
         self._timed_out = timed_out
+        self._output_log_path = output_log_path
         self.wait_calls = 0
         self.collect_calls = 0
         self.cleanup_calls = 0
@@ -75,7 +77,7 @@ class FakeTaskHandle:
         return ExecutionResult(
             exit_code=self._exit_code,
             stdout_tail=self._stdout_tail,
-            output_log_path=Path("/tmp/fake-judge.log"),
+            output_log_path=self._output_log_path,
             timed_out=self._timed_out,
         )
 
@@ -252,6 +254,28 @@ def _fail_payload() -> str:
     return _cli_envelope(_raw_fail_payload())
 
 
+def _large_raw_fail_payload(num_findings: int = 30) -> str:
+    """A verbose multi-finding FAIL payload — the "several fake-done
+    problems" case the verifier gate exists to catch. Large enough that
+    its CLI envelope exceeds `LocalBackend._TAIL_LIMIT` (4000 chars)."""
+    findings = [
+        {
+            "criterion_id": f"criterion_{i}",
+            "severity": "major",
+            "evidence": "x" * 200,
+            "author_feedback": f"finding {i}: " + "needs a real fix " * 15,
+        }
+        for i in range(num_findings)
+    ]
+    return json.dumps({"verdict": "fail", "findings": findings})
+
+
+def _large_fail_payload(num_findings: int = 30) -> str:
+    """Realistic CLI stdout for a verbose multi-finding `fail` verdict —
+    envelope-wrapped, deliberately > 4000 chars overall."""
+    return _cli_envelope(_large_raw_fail_payload(num_findings))
+
+
 async def test_valid_pass_payload_returns_pass_with_provider_bound_identity(
     tmp_path: Path,
 ) -> None:
@@ -306,6 +330,50 @@ async def test_valid_fail_payload_returns_fail_not_error(tmp_path: Path) -> None
     assert result.document is not None
     assert len(result.document.findings) == 1
     assert result.document.findings[0].criterion_id == "stub_implementation"
+
+
+async def test_large_fail_envelope_parses_from_full_log_not_truncated_tail(
+    tmp_path: Path,
+) -> None:
+    """A verbose multi-finding FAIL envelope that exceeds the backend's
+    4000-char `stdout_tail` truncation limit must still parse as FAIL, not
+    degrade to ERROR.
+
+    `LocalBackend._TAIL_LIMIT` truncates `stdout_tail` (and, historically,
+    even its own log-file mirror) to the *last* 4000 chars — which drops
+    the FRONT of the CLI's `--output-format json` envelope
+    (`{"type":"result","result":"...`). Parsing that truncated prefix-loss
+    is not valid JSON, so the pre-fix judge always turned a big FAIL into
+    an ERROR, diverting exactly the case the verifier gate exists to catch
+    ("judge found several fake-done problems") into manual review instead
+    of a retry.
+
+    This simulates the real fix (`capture_output=False` on the judge's own
+    `ExecutionRequest`): the backend's `stdout_tail` is the truncated tail
+    (as a real backend would still report it), but `output_log_path` is a
+    REAL file holding the full, untruncated stdout — the judge must read
+    and parse THAT.
+    """
+    full_payload = _large_fail_payload()
+    assert len(full_payload) > 4000  # the scenario only matters if it's big enough
+
+    log_path = tmp_path / "judge-full-stdout.log"
+    log_path.write_text(full_payload, encoding="utf-8")
+
+    handle = FakeTaskHandle(
+        stdout_tail=full_payload[-4000:],
+        output_log_path=log_path,
+    )
+    backend = FakeJudgeBackend(handle)
+    judge = ClaudeDiffJudge("claude-haiku-4-5", backend, timeout_seconds=30)
+    ctx = _ctx(tmp_path)
+
+    result = await judge.verify(ctx)
+
+    assert result.outcome is VerdictValue.FAIL
+    assert result.protocol_error is None
+    assert result.document is not None
+    assert len(result.document.findings) == 30
 
 
 async def test_model_never_supplies_identity_provider_binds_it(tmp_path: Path) -> None:
@@ -555,7 +623,11 @@ async def test_judge_request_shape_uses_stdin_and_scratch_cwd_outside_worktree(
     assert "--model" in request.argv
     assert request.argv[-1] == "claude-haiku-4-5"
     assert request.stdin == ctx.envelope
-    assert request.capture_output is True
+    # capture_output=False: the backend writes the process's raw stdout
+    # directly to `request.log_path` in FULL instead of piping it through
+    # `communicate()` and truncating to a fixed tail length. See
+    # `_read_full_stdout` / the large-FAIL-envelope test below.
+    assert request.capture_output is False
     assert request.collect.mode == "none"
     assert request.workdir != ctx.worktree
     assert not str(request.workdir).startswith(str(ctx.worktree))

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from maestro.catalog import Catalog, CatalogModel
 from maestro.dag import DAG
 from maestro.database import Database
 from maestro.execution.exec_config import (
@@ -20,7 +21,7 @@ from maestro.execution.exec_config import (
 )
 from maestro.execution.models import ExecutionHandleRef, ExecutionResult
 from maestro.execution.ssh_collect import CollectConflict
-from maestro.models import AgentType, Task, TaskStatus
+from maestro.models import AgentType, Task, TaskStatus, VerifierConfig
 from maestro.scheduler import RunningTask, Scheduler, SchedulerConfig, SchedulerError
 
 
@@ -46,7 +47,7 @@ def _ssh_exec():
     )
 
 
-def _sched(db, tmp_path, execution):
+def _sched(db, tmp_path, execution, *, verifier=None):
     # Empty DAG + no spawners: the reservation helpers under test never touch
     # dag/spawners. If direct construction breaks, mirror the DAG/mock_spawner
     # fixtures in tests/test_scheduler.py:287-398.
@@ -56,6 +57,7 @@ def _sched(db, tmp_path, execution):
         spawners={},
         config=SchedulerConfig(workdir=tmp_path),
         execution=execution,
+        verifier=verifier,
     )
 
 
@@ -92,6 +94,83 @@ async def test_arm_workdirs_fail_fast_on_unbounded_scope(tmp_path):
     sched = _sched(db, tmp_path, _ssh_exec())
     with pytest.raises(SchedulerError):
         await sched._arm_workdirs()
+    await db.close()
+
+
+async def test_arm_workdirs_fail_fast_on_missing_verifier_model(tmp_path, monkeypatch):
+    """Spec §4: a `verifier:` block with no resolvable model is a fail-loud
+    config error at scheduler start — raised by `_arm_workdirs`, before any
+    task is spawned."""
+    db = await _db(tmp_path)
+    await _add(db, "t1", str(tmp_path / "wd"), "local", ["src/**"])
+    monkeypatch.delenv("MAESTRO_VERIFIER_MODEL", raising=False)
+    sched = _sched(
+        db,
+        tmp_path,
+        ExecutionConfig(),
+        verifier=VerifierConfig(model=None),
+    )
+    try:
+        with pytest.raises(SchedulerError):
+            await sched._arm_workdirs()
+        t1 = await db.get_task("t1")
+        assert t1.status is TaskStatus.PENDING  # never reached RUNNING/DONE
+    finally:
+        await db.close()
+
+
+async def test_arm_workdirs_fail_fast_on_unresolvable_verifier_model(
+    tmp_path, monkeypatch
+):
+    """A verifier model absent from the catalog also fails loud at start."""
+    db = await _db(tmp_path)
+    await _add(db, "t1", str(tmp_path / "wd"), "local", ["src/**"])
+    fake_catalog = Catalog(
+        models={"claude-haiku-4-5": CatalogModel(vendor="anthropic", status="active")},
+        agents=[],
+    )
+    monkeypatch.setattr("maestro.scheduler.load_catalog", lambda: fake_catalog)
+    sched = _sched(
+        db,
+        tmp_path,
+        ExecutionConfig(),
+        verifier=VerifierConfig(model="ghost-model"),
+    )
+    try:
+        with pytest.raises(SchedulerError):
+            await sched._arm_workdirs()
+        t1 = await db.get_task("t1")
+        assert t1.status is TaskStatus.PENDING
+    finally:
+        await db.close()
+
+
+async def test_arm_workdirs_ok_with_valid_verifier_model(tmp_path, monkeypatch):
+    """A resolvable verifier model does not block scheduler start."""
+    db = await _db(tmp_path)
+    await _add(db, "t1", str(tmp_path / "wd"), "local", ["src/**"])
+    fake_catalog = Catalog(
+        models={"claude-haiku-4-5": CatalogModel(vendor="anthropic", status="active")},
+        agents=[],
+    )
+    monkeypatch.setattr("maestro.scheduler.load_catalog", lambda: fake_catalog)
+    sched = _sched(
+        db,
+        tmp_path,
+        ExecutionConfig(),
+        verifier=VerifierConfig(model="claude-haiku-4-5"),
+    )
+    await sched._arm_workdirs()  # no raise
+    await db.close()
+
+
+async def test_arm_workdirs_no_verifier_block_skips_check(tmp_path):
+    """No `verifier:` block at all: the preflight is a no-op (unchanged
+    pre-existing behavior)."""
+    db = await _db(tmp_path)
+    await _add(db, "t1", str(tmp_path / "wd"), "local", ["src/**"])
+    sched = _sched(db, tmp_path, ExecutionConfig(), verifier=None)
+    await sched._arm_workdirs()  # no raise
     await db.close()
 
 
