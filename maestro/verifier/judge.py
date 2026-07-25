@@ -15,6 +15,7 @@ for the scheduler to route.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shutil
 import tempfile
@@ -62,6 +63,8 @@ class TaskVerificationContext(BaseModel):
     run_id: str
     attempt: int
     execution_id: str
+    # Carried for context/audit only — intentionally not read by `verify`
+    # (the diff/scope was already frozen into `envelope` upstream, Task 6).
     worktree: Path
     out_json: Path
     envelope: str
@@ -89,6 +92,49 @@ def _task_error(message: str) -> TaskHandshakeResult:
 
 def _artifact_name(task_id: str) -> str:
     return f"task-diff:{task_id}"
+
+
+class _CliEnvelopeError(ValueError):
+    """The `claude -p --output-format json` CLI envelope is malformed.
+
+    Maps to a fail-closed ERROR upstream — never raised past `_evaluate`.
+    """
+
+
+def _extract_result_text(stdout: str) -> str:
+    """Unwrap the CLI's `--output-format json` result envelope.
+
+    `claude -p ... --output-format json` does NOT print the model's answer
+    directly: it prints a CLI result envelope shaped like
+    `{"type": "result", "subtype": "success", "result": "<model text>",
+    "usage": {...}}` (the same envelope `maestro.cost_tracker.
+    parse_claude_code_log`/`_extract_usage_from_dict` reads `usage`/
+    `total_cost_usd` from). The model's own raw verdict payload is the
+    STRING held in the envelope's top-level `result` field — `--output-
+    format json` is kept (rather than switching format) because a later
+    task needs this same envelope's `usage` for judge cost tracking.
+
+    Args:
+        stdout: The captured CLI stdout (`ExecutionResult.stdout_tail`).
+
+    Returns:
+        The inner `result` string — the model's raw verdict text, still
+        unparsed.
+
+    Raises:
+        _CliEnvelopeError: `stdout` is not valid JSON, not a JSON object,
+            or has no string `result` field.
+    """
+    try:
+        envelope = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise _CliEnvelopeError(f"claude CLI output is not valid JSON: {exc}") from exc
+    if not isinstance(envelope, dict):
+        raise _CliEnvelopeError("claude CLI output is not a JSON object")
+    result = envelope.get("result")
+    if not isinstance(result, str):
+        raise _CliEnvelopeError("claude CLI envelope has no string 'result' field")
+    return result
 
 
 class ClaudeDiffJudge:
@@ -261,7 +307,12 @@ class ClaudeDiffJudge:
             )
 
         try:
-            raw = parse_raw_payload(execution.stdout_tail)
+            result_text = _extract_result_text(execution.stdout_tail)
+        except _CliEnvelopeError as exc:
+            return _task_error(f"claude CLI envelope invalid: {exc}")
+
+        try:
+            raw = parse_raw_payload(result_text)
         except RawPayloadError as exc:
             return _task_error(f"raw verifier payload invalid: {exc}")
 

@@ -201,11 +201,32 @@ async def _handle_state(db: Database, execution_id: str) -> str:
     return row["state"]
 
 
-def _pass_payload() -> str:
+def _cli_envelope(result_text: str) -> str:
+    """A realistic `claude -p --output-format json` CLI result envelope.
+
+    The CLI does NOT print the model's answer directly — it wraps it in an
+    envelope shaped like this (top-level `type`/`subtype`/`result`/`usage`),
+    with the model's own text answer as the `result` STRING (see
+    `maestro/cost_tracker.py`'s `_extract_usage_from_dict`, which reads this
+    exact shape for token/cost parsing).
+    """
+    return json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "result": result_text,
+            "usage": {"input_tokens": 100, "output_tokens": 20},
+            "total_cost_usd": 0.001,
+        }
+    )
+
+
+def _raw_pass_payload() -> str:
+    """The model's own raw verdict text (unwrapped, `{verdict, findings}`)."""
     return json.dumps({"verdict": "pass", "findings": []})
 
 
-def _fail_payload() -> str:
+def _raw_fail_payload() -> str:
     return json.dumps(
         {
             "verdict": "fail",
@@ -219,6 +240,16 @@ def _fail_payload() -> str:
             ],
         }
     )
+
+
+def _pass_payload() -> str:
+    """Realistic CLI stdout for a `pass` verdict — envelope-wrapped."""
+    return _cli_envelope(_raw_pass_payload())
+
+
+def _fail_payload() -> str:
+    """Realistic CLI stdout for a `fail` verdict — envelope-wrapped."""
+    return _cli_envelope(_raw_fail_payload())
 
 
 async def test_valid_pass_payload_returns_pass_with_provider_bound_identity(
@@ -274,7 +305,7 @@ async def test_model_never_supplies_identity_provider_binds_it(tmp_path: Path) -
     result = await judge.verify(ctx)
 
     assert result.document is not None
-    raw_payload = json.loads(_pass_payload())
+    raw_payload = json.loads(_raw_pass_payload())
     assert "task_id" not in raw_payload
     assert "artifact_sha256" not in raw_payload
     assert result.document.identity.task_id == "task-xyz"
@@ -305,7 +336,10 @@ async def test_timeout_is_error(tmp_path: Path) -> None:
     assert result.protocol_error is not None
 
 
-async def test_malformed_raw_payload_is_error(tmp_path: Path) -> None:
+async def test_malformed_cli_envelope_is_error(tmp_path: Path) -> None:
+    """The whole CLI stdout is not even valid JSON (envelope-level failure,
+    before the inner raw-payload parse is ever reached).
+    """
     handle = FakeTaskHandle(stdout_tail="not json at all")
     backend = FakeJudgeBackend(handle)
     judge = ClaudeDiffJudge("claude-haiku-4-5", backend, timeout_seconds=30)
@@ -317,9 +351,12 @@ async def test_malformed_raw_payload_is_error(tmp_path: Path) -> None:
     assert result.protocol_error is not None
 
 
-async def test_extra_key_raw_payload_is_error(tmp_path: Path) -> None:
-    payload = json.dumps({"verdict": "pass", "findings": [], "extra": "nope"})
-    handle = FakeTaskHandle(stdout_tail=payload)
+async def test_envelope_missing_result_field_is_error(tmp_path: Path) -> None:
+    """Valid JSON envelope, but no `result` field at all (e.g. an error
+    envelope) — fail-closed, never crash.
+    """
+    envelope = json.dumps({"type": "result", "subtype": "error_max_turns"})
+    handle = FakeTaskHandle(stdout_tail=envelope)
     backend = FakeJudgeBackend(handle)
     judge = ClaudeDiffJudge("claude-haiku-4-5", backend, timeout_seconds=30)
     ctx = _ctx(tmp_path)
@@ -328,6 +365,71 @@ async def test_extra_key_raw_payload_is_error(tmp_path: Path) -> None:
 
     assert result.outcome is VerdictValue.ERROR
     assert result.protocol_error is not None
+    assert not ctx.out_json.exists()
+
+
+async def test_envelope_result_field_not_a_string_is_error(tmp_path: Path) -> None:
+    """`result` present but not a string (malformed/unexpected CLI shape)."""
+    envelope = json.dumps({"type": "result", "result": {"verdict": "pass"}})
+    handle = FakeTaskHandle(stdout_tail=envelope)
+    backend = FakeJudgeBackend(handle)
+    judge = ClaudeDiffJudge("claude-haiku-4-5", backend, timeout_seconds=30)
+    ctx = _ctx(tmp_path)
+
+    result = await judge.verify(ctx)
+
+    assert result.outcome is VerdictValue.ERROR
+    assert result.protocol_error is not None
+
+
+async def test_extra_key_raw_payload_is_error(tmp_path: Path) -> None:
+    """The envelope unwraps fine; the INNER raw payload is what's strict."""
+    inner = json.dumps({"verdict": "pass", "findings": [], "extra": "nope"})
+    handle = FakeTaskHandle(stdout_tail=_cli_envelope(inner))
+    backend = FakeJudgeBackend(handle)
+    judge = ClaudeDiffJudge("claude-haiku-4-5", backend, timeout_seconds=30)
+    ctx = _ctx(tmp_path)
+
+    result = await judge.verify(ctx)
+
+    assert result.outcome is VerdictValue.ERROR
+    assert result.protocol_error is not None
+
+
+async def test_cli_envelope_is_unwrapped_before_parsing_pass(tmp_path: Path) -> None:
+    """Regression: `claude -p --output-format json` wraps the model's
+    answer in a CLI result envelope (`{"type": "result", "result": "<model
+    text>", "usage": {...}}`) — the provider must unwrap `result` before
+    calling `parse_raw_payload`. Pre-fix code fed the whole envelope
+    straight in, which fails `RawVerdict`'s strict schema (unexpected
+    `type`/`subtype`/`usage` keys, missing `verdict`) and always returned
+    ERROR — this test fails on that code.
+    """
+    handle = FakeTaskHandle(stdout_tail=_cli_envelope(_raw_pass_payload()))
+    backend = FakeJudgeBackend(handle)
+    judge = ClaudeDiffJudge("claude-haiku-4-5", backend, timeout_seconds=30)
+    ctx = _ctx(tmp_path)
+
+    result = await judge.verify(ctx)
+
+    assert result.outcome is VerdictValue.PASS
+    assert result.protocol_error is None
+    assert result.document is not None
+
+
+async def test_cli_envelope_is_unwrapped_before_parsing_fail(tmp_path: Path) -> None:
+    """Same regression as above, for a `fail` verdict inside the envelope."""
+    handle = FakeTaskHandle(stdout_tail=_cli_envelope(_raw_fail_payload()))
+    backend = FakeJudgeBackend(handle)
+    judge = ClaudeDiffJudge("claude-haiku-4-5", backend, timeout_seconds=30)
+    ctx = _ctx(tmp_path)
+
+    result = await judge.verify(ctx)
+
+    assert result.outcome is VerdictValue.FAIL
+    assert result.protocol_error is None
+    assert result.document is not None
+    assert len(result.document.findings) == 1
 
 
 async def test_finalize_drives_handle_through_full_lifecycle(
