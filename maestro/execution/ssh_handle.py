@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,10 +38,19 @@ _TAIL_LIMIT = 4000
 def _tail_text(path: Path) -> str:
     """Bounded, best-effort read of the last `_TAIL_LIMIT` bytes of `path`.
 
-    Mirrors `local._decode_tail`: missing/unreadable files decode to "".
+    Seeks from the end and reads only the final `_TAIL_LIMIT` bytes, so a
+    long-running job's large log is never slurped whole into memory. A byte
+    offset may split a multibyte UTF-8 char at the boundary; `errors=
+    "replace"` handles that (same as slicing raw bytes would). Missing/
+    unreadable files decode to "" (mirrors `local._decode_tail`'s
+    missing->"" semantics).
     """
     try:
-        data = path.read_bytes()[-_TAIL_LIMIT:]
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - _TAIL_LIMIT))
+            data = f.read()
     except OSError:
         return ""
     return data.decode("utf-8", errors="replace")

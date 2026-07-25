@@ -1342,9 +1342,11 @@ class Scheduler:
                     remote_dir=None,
                     status_marker=handle.ref.status_marker,
                 )
-        except Exception:
+        except Exception as exc:
             _obs_log.warning(
-                "execution.persist_launch.failed", execution_id=execution_id
+                "execution.persist_launch.failed",
+                execution_id=execution_id,
+                error=repr(exc),
             )
 
     async def _build_dependency_context(self, task: Task) -> str:

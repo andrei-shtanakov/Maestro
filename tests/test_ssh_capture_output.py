@@ -141,3 +141,28 @@ async def test_final_tail_catch_up_populates_stdout_tail(tmp_path):
     assert result.stderr_tail == ""
     # Verify that at least 2 tail calls were made (monitor + final wait)
     assert seq["tail_calls"] >= 2
+
+
+def test_tail_text_reads_only_last_limit_bytes_of_large_log(tmp_path):
+    """A log larger than `_TAIL_LIMIT` is tailed by seeking from the end —
+    only the final `_TAIL_LIMIT` bytes are returned, never the whole file
+    (guards the seek offset math, not just the small-file path)."""
+    from maestro.execution.ssh_handle import _TAIL_LIMIT, _tail_text
+
+    p = tmp_path / "big.log"
+    body = ("A" * (_TAIL_LIMIT * 3)) + "TAILMARKER\n"
+    p.write_text(body)
+
+    tail = _tail_text(p)
+
+    assert len(tail.encode("utf-8")) == _TAIL_LIMIT
+    assert tail.endswith("TAILMARKER\n")
+    # body is pure ASCII, so the last _TAIL_LIMIT bytes == the last chars.
+    assert tail == body[-_TAIL_LIMIT:]
+
+
+def test_tail_text_missing_file_returns_empty(tmp_path):
+    """Missing/unreadable file decodes to "" (never raises)."""
+    from maestro.execution.ssh_handle import _tail_text
+
+    assert _tail_text(tmp_path / "does-not-exist.log") == ""
