@@ -12,6 +12,7 @@ the bundle in for the evidence commit (§7, §8).
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -69,16 +70,47 @@ def _atomic_write_bytes(dest: Path, data: bytes) -> None:
     """Write `data` to `dest` atomically: tmp sibling, then an atomic rename.
 
     `Path.replace` wraps `os.replace` under the hood — same atomic-rename
-    guarantee, ruff-preferred spelling (PTH105).
+    guarantee, ruff-preferred spelling (PTH105). Used only where an
+    overwrite check has already happened (`materialize`'s idempotent copy);
+    `ingest_attempt` uses `_move_or_selfheal` below instead, which is both
+    atomic AND exclusive (never silently replaces an existing file).
     """
     tmp_path = dest.with_name(f"{dest.name}.tmp")
     tmp_path.write_bytes(data)
     tmp_path.replace(dest)
 
 
-def _move_atomic(src: Path, dest: Path) -> None:
-    """Atomically place `src`'s bytes at `dest`, then remove `src`."""
-    _atomic_write_bytes(dest, src.read_bytes())
+def _move_or_selfheal(src: Path, dest: Path) -> None:
+    """Move `src`'s bytes to `dest` via exclusive hard-link create.
+
+    Writes the bytes to a `.tmp` sibling of `dest` (same directory, so the
+    link below never crosses filesystems), then `os.link(tmp, dest)`: this
+    only succeeds if `dest` does not already exist, closing the
+    check-then-replace TOCTOU window a bare `dest.exists()` guard would
+    leave open.
+
+    If `dest` already exists, `ingest_attempt` no longer treats that alone
+    as a genuine collision (a crash between moving the file and indexing
+    it in the DB can strand exactly this state — see its DB-row precheck).
+    So here we self-heal: byte-identical existing content means the file
+    was already placed correctly by an earlier, interrupted attempt — drop
+    the staged copy and return normally. Divergent content is a real
+    collision — raise `LedgerCollisionError` (fail-closed; `dest` is left
+    untouched either way, `src` is left untouched on the error path too, for
+    forensics).
+    """
+    data = src.read_bytes()
+    tmp_path = dest.with_name(f"{dest.name}.tmp")
+    tmp_path.write_bytes(data)
+    try:
+        os.link(tmp_path, dest)
+    except FileExistsError:
+        tmp_path.unlink()
+        if dest.read_bytes() != data:
+            msg = f"{dest} already exists with different content"
+            raise LedgerCollisionError(msg) from None
+    else:
+        tmp_path.unlink()
     src.unlink()
 
 
@@ -118,31 +150,36 @@ class EvidenceLedger:
         """Move one attempt bundle from staging under the ledger root.
 
         Ingests every outcome — PASS, FAIL, and protocol ERROR alike — as
-        append-only evidence. Refuses to overwrite an existing
-        `attempt-NNN.json` (raises `LedgerCollisionError`); missing `.md`/
-        `.raw.txt` sidecars are recorded as `anomaly=True` on the returned
-        row rather than raised.
+        append-only evidence. Genuine collision (this `(run_id, attempt)` is
+        already indexed in the DB) raises `LedgerCollisionError` before any
+        file is touched. A file already present at the destination WITHOUT
+        a DB row is treated as an orphan from a crash between the file move
+        and the DB insert on a prior attempt at this same call — self-heal:
+        byte-identical content is accepted (idempotent retry), divergent
+        content still raises `LedgerCollisionError` (fail-closed). Missing
+        `.md`/`.raw.txt` sidecars are recorded as `anomaly=True` on the
+        returned row rather than raised.
         """
         stem = _attempt_stem(attempt)
         dest_dir = self._root / workstream_id / run_id
         dest_dir.mkdir(parents=True, exist_ok=True)
 
-        dest_json = dest_dir / f"{stem}.json"
-        if dest_json.exists():
+        existing_rows = await self._db.list_verification_attempts(run_id)
+        if any(row.attempt == attempt for row in existing_rows):
             msg = (
                 f"attempt {attempt} for run {run_id!r} is already ingested "
-                f"at {dest_json}"
+                f"(DB row present)"
             )
             raise LedgerCollisionError(msg)
 
-        src_json = staging / f"{stem}.json"
-        _move_atomic(src_json, dest_json)
+        dest_json = dest_dir / f"{stem}.json"
+        _move_or_selfheal(staging / f"{stem}.json", dest_json)
 
-        dest_md = self._move_optional_sidecar(
-            staging / f"{stem}.md", dest_dir, stem, ".md"
+        dest_md = self._ingest_optional_sidecar(
+            staging / f"{stem}.md", dest_dir / f"{stem}.md"
         )
-        dest_raw = self._move_optional_sidecar(
-            staging / f"{stem}.raw.txt", dest_dir, stem, ".raw.txt"
+        dest_raw = self._ingest_optional_sidecar(
+            staging / f"{stem}.raw.txt", dest_dir / f"{stem}.raw.txt"
         )
 
         artifact_sha256 = (
@@ -176,14 +213,17 @@ class EvidenceLedger:
         )
 
     @staticmethod
-    def _move_optional_sidecar(
-        src: Path, dest_dir: Path, stem: str, suffix: str
-    ) -> Path | None:
-        """Move an optional sidecar file if present; `None` if missing."""
+    def _ingest_optional_sidecar(src: Path, dest: Path) -> Path | None:
+        """Move an optional sidecar file if staged, guarding overwrite too.
+
+        Self-heals a crash-orphaned `dest` the same way the JSON move does
+        (see `_move_or_selfheal`) when the staging copy is already gone but
+        the sidecar was already placed by an interrupted prior attempt.
+        `None` when neither the staged copy nor a placed file exists.
+        """
         if not src.is_file():
-            return None
-        dest = dest_dir / f"{stem}{suffix}"
-        _move_atomic(src, dest)
+            return dest if dest.is_file() else None
+        _move_or_selfheal(src, dest)
         return dest
 
     async def list_bundle(self, run_id: str) -> list[IngestedAttempt]:

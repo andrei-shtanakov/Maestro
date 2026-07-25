@@ -294,6 +294,159 @@ class TestIngestAttempt:
 
 
 # =============================================================================
+# ingest_attempt — crash-window self-heal + exclusive-create moves
+# =============================================================================
+
+
+class TestIngestAttemptCrashWindowSelfHeal:
+    """Reviewer fixes: a crash between the file move and the DB insert must
+    be repairable (self-heal), and the destination move must never silently
+    overwrite (exclusive create, not check-then-replace).
+    """
+
+    @pytest.mark.anyio
+    async def test_orphaned_file_with_no_db_row_selfheals_on_retry(
+        self, ledger: EvidenceLedger, ledger_root: Path
+    ) -> None:
+        """Simulate the crash window: the file landed under the ledger root
+        but the DB insert never happened (process died in between). Retrying
+        `ingest_attempt` with the same staged content must succeed rather
+        than raising forever.
+        """
+        dest_dir = ledger_root / "w1" / "run-1"
+        dest_dir.mkdir(parents=True)
+        (dest_dir / "attempt-001.json").write_text('{"first": true}')
+        # No DB row inserted — this is the orphan.
+
+        staging = ledger.staging_dir("w1", "run-1", 1)
+        _write_bundle(staging, 1, json_body='{"first": true}')
+
+        ingested = await ledger.ingest_attempt(
+            workstream_id="w1",
+            run_id="run-1",
+            attempt=1,
+            result=_pass_result(),
+            staging=staging,
+        )
+
+        assert ingested.attempt == 1
+        assert (dest_dir / "attempt-001.json").read_text() == '{"first": true}'
+        rows = await ledger._db.list_verification_attempts("run-1")
+        assert [r.attempt for r in rows] == [1]
+
+    @pytest.mark.anyio
+    async def test_orphaned_file_with_divergent_content_raises_collision(
+        self, ledger: EvidenceLedger, ledger_root: Path
+    ) -> None:
+        """Same orphan setup, but the staged content disagrees with what's
+        already on disk — this is a real collision, not a repairable crash,
+        so it must fail closed and leave the existing file untouched.
+        """
+        dest_dir = ledger_root / "w1" / "run-1"
+        dest_dir.mkdir(parents=True)
+        (dest_dir / "attempt-001.json").write_text('{"first": true}')
+
+        staging = ledger.staging_dir("w1", "run-1", 1)
+        _write_bundle(staging, 1, json_body='{"different": true}')
+
+        with pytest.raises(LedgerCollisionError):
+            await ledger.ingest_attempt(
+                workstream_id="w1",
+                run_id="run-1",
+                attempt=1,
+                result=_pass_result(),
+                staging=staging,
+            )
+
+        assert (dest_dir / "attempt-001.json").read_text() == '{"first": true}'
+        rows = await ledger._db.list_verification_attempts("run-1")
+        assert rows == []
+
+    @pytest.mark.anyio
+    async def test_db_row_present_still_raises_collision(
+        self, ledger: EvidenceLedger
+    ) -> None:
+        """Fix-1 doesn't weaken the genuine-collision case: an indexed
+        attempt (DB row present) is always rejected, even though this is
+        the same file-state the self-heal path also sees.
+        """
+        staging = ledger.staging_dir("w1", "run-1", 1)
+        _write_bundle(staging, 1, json_body='{"first": true}')
+        await ledger.ingest_attempt(
+            workstream_id="w1",
+            run_id="run-1",
+            attempt=1,
+            result=_pass_result(),
+            staging=staging,
+        )
+
+        staging2 = ledger.staging_dir("w1", "run-1", 1)
+        _write_bundle(staging2, 1, json_body='{"first": true}')
+
+        with pytest.raises(LedgerCollisionError):
+            await ledger.ingest_attempt(
+                workstream_id="w1",
+                run_id="run-1",
+                attempt=1,
+                result=_pass_result(),
+                staging=staging2,
+            )
+
+    @pytest.mark.anyio
+    async def test_sidecar_overwrite_guarded_by_exclusive_create(
+        self, ledger: EvidenceLedger, ledger_root: Path
+    ) -> None:
+        """Minor #3: sidecars get the same overwrite guard as the JSON file.
+        A pre-existing `.md` with different content (planted between
+        staging and the move, no DB row) must not be silently overwritten.
+        """
+        dest_dir = ledger_root / "w1" / "run-1"
+        dest_dir.mkdir(parents=True)
+        (dest_dir / "attempt-001.md").write_text("# original report\n")
+
+        staging = ledger.staging_dir("w1", "run-1", 1)
+        _write_bundle(staging, 1)  # writes a different .md body
+
+        with pytest.raises(LedgerCollisionError):
+            await ledger.ingest_attempt(
+                workstream_id="w1",
+                run_id="run-1",
+                attempt=1,
+                result=_pass_result(),
+                staging=staging,
+            )
+
+        assert (dest_dir / "attempt-001.md").read_text() == "# original report\n"
+
+    @pytest.mark.anyio
+    async def test_sidecar_orphan_with_matching_content_selfheals(
+        self, ledger: EvidenceLedger, ledger_root: Path
+    ) -> None:
+        """Same crash-window self-heal as the JSON case, but for a sidecar:
+        byte-identical existing `.md`/`.raw.txt` are accepted, not rejected.
+        """
+        dest_dir = ledger_root / "w1" / "run-1"
+        dest_dir.mkdir(parents=True)
+        (dest_dir / "attempt-001.md").write_text("# report\n")
+        (dest_dir / "attempt-001.raw.txt").write_text("raw output\n")
+
+        staging = ledger.staging_dir("w1", "run-1", 1)
+        _write_bundle(staging, 1)  # same bodies as _write_bundle's default
+
+        ingested = await ledger.ingest_attempt(
+            workstream_id="w1",
+            run_id="run-1",
+            attempt=1,
+            result=_pass_result(),
+            staging=staging,
+        )
+
+        assert ingested.anomaly is False
+        assert ingested.md_path == dest_dir / "attempt-001.md"
+        assert ingested.raw_path == dest_dir / "attempt-001.raw.txt"
+
+
+# =============================================================================
 # list_bundle
 # =============================================================================
 
