@@ -115,12 +115,15 @@ RUNNING → VALIDATING → VERIFYING → DONE
   dispatcher fires. There is no window where the task is `VERIFYING` but the handle is
   absent.
 - **Events are all emitted explicitly (with the verifier `execution_id`); `TASK_EFFECTS[
-  VERIFYING]` is left EMPTY.** An entry effect fires on the status transition and cannot
-  see the `execution_id` minted by the same CAS, so putting `VERIFIER_STARTED` there would
-  emit it without the id (violating §10's "every verifier event carries the execution
-  id"). Instead: emit `VERIFIER_STARTED` right after the atomic CAS (it now has the id),
-  and `VERIFIER_PASSED/FAILED/ERROR` from the outcome-handler — alongside the dispatcher's
-  normal `TASK_COMPLETED/TASK_FAILED/TASK_NEEDS_REVIEW` on the exit transitions.
+  VERIFYING]` is a NO-OP entry `StatusEffect()` (event=None).** An entry effect fires on
+  the status transition and cannot see the `execution_id` minted by the same CAS, so an
+  auto-fired `VERIFIER_STARTED` there would lack the id (violating §10's "every verifier
+  event carries the execution id"). The entry must still EXIST (the effect-table totality
+  invariant `test_effect_tables_are_total` requires one per `TaskStatus`, like the existing
+  no-op `PENDING: StatusEffect()`) but fire nothing. Instead: emit `VERIFIER_STARTED` right
+  after the atomic CAS (it now has the id), and `VERIFIER_PASSED/FAILED/ERROR` from the
+  outcome-handler — alongside the dispatcher's normal `TASK_COMPLETED/TASK_FAILED/
+  TASK_NEEDS_REVIEW` on the exit transitions.
   `TASK_EFFECTS` stays entry-based and single-effect (`maestro/transitions.py:29`); we do
   not extend it.
 
@@ -398,8 +401,9 @@ event log, correlated by `task_id` + the verifier `execution_id`.
   `execution_phase` and `model`.
 - `maestro/config.py` — parse/validate the `verifier:` block (reject `backend != "local"`).
 - `maestro/event_log.py` — the four verifier events.
-- `maestro/transitions.py` — **`TASK_EFFECTS[VERIFYING]` left EMPTY** (§4; events are
-  emitted explicitly so they carry the `execution_id`).
+- `maestro/transitions.py` — **`TASK_EFFECTS[VERIFYING] = StatusEffect()` (no-op, event=
+  None)** — satisfies the effect-table totality invariant while firing no auto-event; the
+  four events are emitted explicitly so they carry the `execution_id` (§4).
 
 ## 12. Open questions / future work
 

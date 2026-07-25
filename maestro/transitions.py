@@ -36,6 +36,12 @@ TASK_EFFECTS: dict[TaskStatus, StatusEffect] = {
         event=EventType.TASK_STARTED, notification=NotificationEvent.TASK_STARTED
     ),
     TaskStatus.VALIDATING: StatusEffect(event=EventType.VALIDATION_STARTED),
+    # No-op entry: keeps the effect-table totality invariant
+    # (test_effect_tables_are_total) satisfied while firing NO auto-event on
+    # entry — VERIFIER_STARTED is emitted explicitly after the atomic
+    # validating->verifying CAS so it carries the verifier execution_id
+    # (verifier gate, spec 2026-07-25 §4).
+    TaskStatus.VERIFYING: StatusEffect(),
     TaskStatus.DONE: StatusEffect(
         event=EventType.TASK_COMPLETED, notification=NotificationEvent.TASK_COMPLETED
     ),

@@ -1,6 +1,5 @@
 """Tests for TaskStatus.VERIFYING transitions and lifecycle events."""
 
-
 from maestro.event_log import EventType
 from maestro.models import TaskStatus
 from maestro.transitions import TASK_EFFECTS
@@ -98,10 +97,16 @@ class TestVerifierEvents:
 class TestTaskEffectsVerifying:
     """Tests for TASK_EFFECTS configuration regarding VERIFYING."""
 
-    def test_verifying_not_in_task_effects(self) -> None:
-        """Verify TASK_EFFECTS does NOT have an entry for VERIFYING.
+    def test_verifying_effect_is_a_noop_entry(self) -> None:
+        """VERIFYING has a NO-OP `StatusEffect()` entry (event=None).
 
-        The four verifier events are emitted explicitly elsewhere and carry
-        an execution_id, so no automatic StatusEffect is needed for VERIFYING.
+        The effect-table totality invariant (`test_effect_tables_are_total`)
+        requires an entry for every TaskStatus, but VERIFYING must fire NO
+        automatic event on entry — the four verifier events are emitted
+        explicitly (after the atomic validating->verifying CAS) so they carry
+        the verifier execution_id. A no-op `StatusEffect()` satisfies both.
         """
-        assert TASK_EFFECTS.get(TaskStatus.VERIFYING) is None
+        effect = TASK_EFFECTS.get(TaskStatus.VERIFYING)
+        assert effect is not None
+        assert effect.event is None
+        assert effect.notification is None

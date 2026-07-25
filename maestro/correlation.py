@@ -54,6 +54,7 @@ PROJECTIONS: dict[str, dict[str, CommonStatus]] = {
         TaskStatus.AWAITING_APPROVAL: CommonStatus.NEEDS_REVIEW,
         TaskStatus.RUNNING: CommonStatus.RUNNING,
         TaskStatus.VALIDATING: CommonStatus.RUNNING,
+        TaskStatus.VERIFYING: CommonStatus.RUNNING,
         TaskStatus.DONE: CommonStatus.DONE,
         TaskStatus.FAILED: CommonStatus.FAILED,
         TaskStatus.NEEDS_REVIEW: CommonStatus.NEEDS_REVIEW,

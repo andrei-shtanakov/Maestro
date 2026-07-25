@@ -33,7 +33,7 @@
 - `maestro/models.py` — `TaskStatus.VERIFYING` + transitions; `VerifierConfig`; `Task.verifier_baseline_sha`.
 - `maestro/config.py` — parse/validate the `verifier:` block.
 - `maestro/event_log.py` — 4 verifier events.
-- `maestro/transitions.py` — leave `TASK_EFFECTS[VERIFYING]` unset.
+- `maestro/transitions.py` — `TASK_EFFECTS[VERIFYING] = StatusEffect()` (no-op, event=None; satisfies the effect-table totality invariant, fires no auto-event).
 - `maestro/database.py` — migrations 16/17 + baseline CRUD + phase/model cost columns.
 - `maestro/scheduler.py` — the gate in `_handle_task_completion`; baseline capture; reservation lifecycle; verifier cost row; recovery; events.
 - `maestro/cli.py` — requeue handle-fence on the Mode-1 `NEEDS_REVIEW → READY` path.
@@ -285,7 +285,7 @@ def test_unknown_or_retired_model_errors(fake_catalog):
 
 **Interfaces:**
 - Produces: `TaskStatus.VERIFYING = "verifying"`; transitions `VALIDATING: {VERIFYING, DONE, FAILED, NEEDS_REVIEW}`, `VERIFYING: {DONE, FAILED, NEEDS_REVIEW}`; `EventType.VERIFIER_STARTED/VERIFIER_PASSED/VERIFIER_FAILED/VERIFIER_ERROR`.
-- Leave `TASK_EFFECTS[VERIFYING]` **unset** (`maestro/transitions.py` unchanged) — §4 events are emitted explicitly so they carry `execution_id`.
+- Set `TASK_EFFECTS[VERIFYING] = StatusEffect()` (no-op, event=None) — keeps the effect-table totality invariant (`test_effect_tables_are_total`) green while firing no auto-event; §4 events are emitted explicitly so they carry `execution_id`.
 
 - [ ] **Step 1: Write failing tests** — `VALIDATING.can_transition_to(VERIFYING/DONE/NEEDS_REVIEW)` all True; `VERIFYING.can_transition_to(DONE/FAILED/NEEDS_REVIEW)` True, `VERIFYING → RUNNING` False; the four `EventType` members exist; `TASK_EFFECTS.get(TaskStatus.VERIFYING) is None`.
 - [ ] **Step 2: Implement** the enum member, the two transition-map edits, the four events.
