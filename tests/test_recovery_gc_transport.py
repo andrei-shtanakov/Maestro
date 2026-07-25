@@ -375,3 +375,34 @@ async def test_local_docker_terminal_gc_unchanged(db) -> None:
 
     assert docker.rm_calls == ["c1"]
     assert not await _handle_present(db, "e1")
+
+
+async def test_local_docker_collected_gc_cleans(db) -> None:
+    """A local-docker handle in collected state with a still-present
+    container should be GC'd and marked cleaned (spec §5)."""
+    await _seed_task(db, "t1")
+    await db.start_execution(
+        entity_kind="task",
+        entity_id="t1",
+        expected_status="ready",
+        running_status="running",
+        execution_id="e1",
+        backend_id="docker",
+        transport_ref="docker:maestro-e1",
+        attempt=1,
+    )
+    await db.mark_execution_state(
+        "e1", "collected", allowed_from=["prepared"]
+    )
+    await db.update_task_status(
+        "t1", TaskStatus.DONE, expected_status=TaskStatus.RUNNING
+    )
+
+    docker = _FakeDocker(ids=["c1"], labels={"maestro.execution_id": "e1"})
+    execution = ExecutionConfig(docker=DockerConfig(image="test:latest"))
+    recovery = StateRecovery(db, docker=docker, execution=execution)
+
+    await recovery.recover()
+
+    assert docker.rm_calls == ["c1"]  # container was removed
+    assert not await _handle_present(db, "e1")  # handle marked cleaned

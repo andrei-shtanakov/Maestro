@@ -417,8 +417,10 @@ class StateRecovery:
           remote **container** GC first; only on a clean outcome does the
           remote-root GC run -> `cleaned` (container-first: never delete
           the remote root while a container may still reference it).
-        - any other resolved backend (local bare/docker) -> the existing
-          docker GC on `terminal`, unchanged.
+        - any other resolved backend (local bare/docker) -> docker GC on
+          both `terminal` and `collected` states -> `cleaned` on a clean
+          outcome (spec §5: local-docker rows left in `collected` state
+          after a finalize crash have containers that must be removed).
         - an unresolvable `backend_id` is left in place (fail-closed) for
           the next sweep or a human to resolve.
 
@@ -456,16 +458,15 @@ class StateRecovery:
             if isinstance(backend, SshBackend):
                 cleaned = await self._gc_ssh_row(row, backend, state)
             else:
-                if state != "terminal":
-                    continue
                 outcome = await gc_terminal_handle(row, self._docker)
                 cleaned = outcome in GC_CLEAN_OUTCOMES
                 if not cleaned:
                     logger.warning(
-                        "recovery: GC left handle %s (%s %s) as terminal: %s",
+                        "recovery: GC left handle %s (%s %s) as %s: %s",
                         row["execution_id"],
                         row["entity_kind"],
                         row["entity_id"],
+                        state,
                         outcome,
                     )
 
