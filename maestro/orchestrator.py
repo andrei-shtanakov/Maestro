@@ -18,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from maestro._vendor.obs import child_env, current_pipeline_id, span
 from maestro.changed_paths import changed_paths_since
@@ -156,6 +156,41 @@ _STRANDED_INFLIGHT = (
 _SSH_GC_CLEAN_OUTCOMES = frozenset({"removed", "no owner marker; skipped"})
 """`gc_ssh_terminal` outcomes after which a `collected` handle is safe to
 mark `cleaned` — nothing remote is left to account for."""
+
+_VerifyProbeVerdict = Literal["alive", "dead", "ambiguous"]
+"""Classification of a VERIFYING workstream's latest verification-phase
+execution handle at startup recovery (Task 9, §4/§10):
+
+- ``"alive"``: the verifier subprocess is still running — leave the
+  workstream in VERIFYING untouched (never a duplicate spawn).
+- ``"dead"``: the handle is gone/collected, or no handle was ever persisted
+  for this attempt (the crash landed before the verifier spawned) — safe to
+  re-enter ``_run_verification``, which mints a NEW attempt under the SAME
+  run_id (append-only evidence).
+- ``"ambiguous"``: liveness cannot be determined (the handle still carries
+  its pre-spawn placeholder transport_ref — the verification-loop analogue
+  of ``_SPAWNING_SENTINEL`` — or the probe itself failed) — fail closed to
+  NEEDS_REVIEW, mirroring the existing live-orphan rule for RUNNING.
+"""
+
+
+def _decode_local_verify_pid(transport_ref: str) -> int | None:
+    """Extract the pid from a local verification handle's `transport_ref`.
+
+    `CommandVerifier._pre_spawn_persist` seeds a placeholder
+    (`"<backend_id>:verify-<execution_id>"`) BEFORE the subprocess spawns;
+    `update_execution_handle_launch` overwrites it with the real
+    `"local_pid:<pid>"` value (`BareIsolator.transport_ref`) once
+    `backend.run()` returns. Returns `None` for the placeholder (or any
+    other non-matching string) — the caller treats that as the ambiguous,
+    spawn-in-flight window, never as a decodable pid.
+    """
+    if not transport_ref.startswith("local_pid:"):
+        return None
+    try:
+        return int(transport_ref.split(":", 1)[1])
+    except ValueError:
+        return None
 
 
 def build_ssh_execution_request(
@@ -611,6 +646,13 @@ class Orchestrator:
                     "Failed to reconcile FAILED workstream '%s': %s", w.id, e
                 )
 
+        # Stage B (Task 9): VERIFYING reconcile. Deliberately NOT part of
+        # `_STRANDED_INFLIGHT` — the generic table's "reset via FAILED ->
+        # READY" pattern would discard in-flight verification state (the
+        # run_id/attempt counters, and an unmaterialized PASS already in the
+        # ledger); VERIFYING needs its own rules (see the method docstring).
+        recovered += await self._recover_verifying_workstreams()
+
         if recovered:
             self._logger.info(
                 "Recovered %d stranded workstream(s) on startup", recovered
@@ -621,6 +663,179 @@ class Orchestrator:
         await self._gc_terminal_handles(open_handles)
 
         return recovered
+
+    async def _recover_verifying_workstreams(self) -> int:
+        """Reconcile workstreams stranded in VERIFYING by a hard crash
+        (Task 9, §4/§10).
+
+        Rules (each mirrors an existing stranded-state convention, adapted
+        so a crash never discards in-flight verification state or duplicate-
+        spawns a verifier over a possibly-live one):
+
+        - A PASS attempt already in the ledger but not yet materialized
+          (crash inside `_finalize_verification`) re-enters finalization
+          ONLY — idempotent by the evidence-commit trailer, never a new
+          verifier run. Checked FIRST, before probing any handle.
+        - Otherwise, the latest verification-phase execution handle is
+          probed (`_probe_verification_handle`): alive -> leave in VERIFYING
+          untouched (no duplicate spawn); dead/never-spawned -> re-enter
+          `_run_verification` (mints a NEW `verification_attempt` under the
+          SAME run_id — append-only evidence, safe to retry); ambiguous
+          (spawn in flight at the crash, or a probe error) -> fail closed to
+          NEEDS_REVIEW, the same accounting as the existing live-orphan rule
+          for RUNNING.
+
+        `rework_attempt` is untouched by every branch here — only
+        `_route_fail` (a genuine FAIL verdict) ever increments it.
+
+        Best-effort per workstream; never raises. No-op when no domain
+        profile is configured (`self._ledger is None`): VERIFYING is
+        unreachable on the legacy zero-change path.
+        """
+        if self._ledger is None:
+            return 0
+        recovered = 0
+        for w in await self._db.get_workstreams_by_status(WorkstreamStatus.VERIFYING):
+            try:
+                recovered += await self._recover_one_verifying(w)
+            except Exception as e:
+                self._logger.error(
+                    "Failed to recover VERIFYING workstream '%s': %s", w.id, e
+                )
+        return recovered
+
+    async def _recover_one_verifying(self, w: Workstream) -> int:
+        """Reconcile a single VERIFYING workstream; returns 1 if an action
+        was taken (re-entered finalization/verification, or parked for
+        review), 0 if left untouched (a live verifier)."""
+        assert self._ledger is not None
+        run_id = w.verification_run_id
+        if run_id is not None:
+            bundle = await self._ledger.list_bundle(run_id)
+            pass_row = next(
+                (r for r in reversed(bundle) if r.verdict is VerdictValue.PASS),
+                None,
+            )
+            if pass_row is not None and not pass_row.materialized:
+                workspace = self._workspace_mgr.get_workspace_path(w.id)
+                commit = await self._workspace_head(workspace)
+                if commit is None:
+                    reason = (
+                        "verification recovery: cannot read worktree HEAD "
+                        "for stranded finalization"
+                    )
+                    self._logger.warning("%s for '%s'", reason, w.id)
+                    await self._route_verifying_needs_review(w.id, reason)
+                    return 1
+                self._logger.info(
+                    "Recovering workstream '%s' from stranded VERIFYING: "
+                    "PASS attempt %d already ledgered but not materialized — "
+                    "re-entering finalization only",
+                    w.id,
+                    pass_row.attempt,
+                )
+                await self._finalize_verification(
+                    w.id, workspace, run_id=run_id, verified_source_commit=commit
+                )
+                return 1
+
+        probe = await self._probe_verification_handle(w.id, w.verification_attempt)
+        if probe == "alive":
+            self._logger.info(
+                "Workstream '%s' stranded in VERIFYING with a live verifier "
+                "process — leaving in place (no duplicate spawn)",
+                w.id,
+            )
+            return 0
+        if probe == "ambiguous":
+            reason = (
+                "verification handle probe is ambiguous after restart (a "
+                "spawn may have been in progress at the crash) — state "
+                "uncertain, sending to NEEDS_REVIEW"
+            )
+            self._logger.warning("%s for '%s'", reason, w.id)
+            await self._route_verifying_needs_review(w.id, reason)
+            return 1
+
+        self._logger.info(
+            "Recovering workstream '%s' from stranded VERIFYING: verifier "
+            "handle is dead/never-spawned — re-entering verification",
+            w.id,
+        )
+        workspace = self._workspace_mgr.get_workspace_path(w.id)
+        # Reset the per-session ERROR budget, mirroring the READY -> VERIFYING
+        # reverify resume dispatch (`_spawn_workstream`'s RESUME_REVERIFY
+        # branch) — a crash-recovery re-entry is a fresh session too.
+        await self._update_fields(w.id, verification_error_attempt=0)
+        await self._run_verification(w.id, workspace)
+        return 1
+
+    async def _route_verifying_needs_review(
+        self, workstream_id: str, reason: str
+    ) -> None:
+        """Fail-closed VERIFYING -> NEEDS_REVIEW (direct edge — VERIFYING's
+        transition table allows it, unlike RUNNING which must go via
+        FAILED). Same accounting as the existing live-orphan rule."""
+        await self._transition(
+            workstream_id,
+            WorkstreamStatus.NEEDS_REVIEW,
+            expected_status=WorkstreamStatus.VERIFYING,
+            message=reason,
+            error_message=reason,
+        )
+        self._stats.failed += 1
+
+    async def _probe_verification_handle(
+        self, workstream_id: str, attempt: int
+    ) -> _VerifyProbeVerdict:
+        """Classify the verification-phase execution handle for `attempt`
+        (the workstream's persisted `verification_attempt` counter — the
+        attempt `_run_verification` was driving when the crash happened).
+
+        No handle row at all for that attempt means the crash landed before
+        `CommandVerifier._pre_spawn_persist` ever ran — nothing was spawned,
+        definitively "dead". A row whose `transport_ref` is still the
+        pre-spawn placeholder is the verification-loop's parallel of
+        `_SPAWNING_SENTINEL`: a spawn may have been in flight at the crash,
+        so liveness cannot be determined — "ambiguous", fail closed.
+        Otherwise the handle carries a real backend ref: local is probed by
+        pid directly (`_is_pid_alive`); non-local backends reuse the same
+        fail-closed verdict machinery `_probe_open_handle` uses for RUNNING
+        recovery (`probe_execution`/`probe_ssh`).
+        """
+        if attempt <= 0:
+            return "dead"
+        row = await self._db.get_execution_handle(
+            entity_kind="workstream",
+            entity_id=workstream_id,
+            execution_phase="verification",
+            attempt=attempt,
+        )
+        if row is None:
+            return "dead"
+        backend_id = row["backend_id"]
+        if backend_id == "local":
+            pid = _decode_local_verify_pid(row["transport_ref"])
+            if pid is None:
+                return "ambiguous"
+            return "alive" if _is_pid_alive(pid) else "dead"
+        if row["state"] not in ("prepared", "running"):
+            # Already resolved elsewhere (verification handles normally never
+            # advance past "prepared", but treat any settled state as safe).
+            return "dead"
+        try:
+            backend = self._backends.resolve(backend_id)
+        except Exception:
+            return "ambiguous"
+        if isinstance(backend, SshBackend):
+            verdict = await probe_ssh(backend._ssh, _handle_ref_from_row(row))
+        elif backend_id == "docker":
+            verdict = await probe_execution(row["execution_id"], self._docker)
+        else:
+            verdict = RecoveryVerdict(
+                True, f"unsupported backend {backend_id!r} for recovery probe"
+            )
+        return "ambiguous" if verdict.needs_review else "dead"
 
     def _is_ssh_terminal_strand(self, handle_row: dict[str, Any]) -> bool:
         """True if `handle_row` is an SSH-resolved execution stranded in the

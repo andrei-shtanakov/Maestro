@@ -1800,6 +1800,47 @@ class Database:
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
+    async def get_execution_handle(
+        self,
+        *,
+        entity_kind: Literal["task", "workstream"],
+        entity_id: str,
+        execution_phase: str,
+        attempt: int,
+    ) -> dict[str, Any] | None:
+        """Return the execution-handle row for one entity/phase/attempt.
+
+        Unlike `get_open_execution_handles`, this is NOT filtered by
+        `backend_id != 'local'` — it is the lookup a caller uses when it
+        already knows exactly which handle it wants (e.g. Stage B VERIFYING
+        recovery, Task 9), including local-backed handles that the
+        crash-recovery sweep otherwise never sees. `None` when no such row
+        exists (e.g. the crash landed before the handle was ever persisted).
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            """
+            SELECT execution_id, entity_kind, entity_id, attempt, backend_id,
+                   transport_ref, state, created_at, finished_at,
+                   remote_host, remote_dir, status_marker, collected_at,
+                   execution_phase
+            FROM execution_handles
+            WHERE entity_kind = ? AND entity_id = ? AND execution_phase = ?
+              AND attempt = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (entity_kind, entity_id, execution_phase, attempt),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
     # =========================================================================
     # Query by Status
     # =========================================================================
