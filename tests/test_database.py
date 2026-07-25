@@ -1439,6 +1439,8 @@ class TestSchemaMigrationsJournal:
                 (13, "workstreams_verification_columns"),
                 (14, "verification_attempts_table"),
                 (15, "execution_phase_verification"),
+                (16, "tasks_verifier_baseline_sha"),
+                (17, "task_costs_phase_model"),
             ]
         finally:
             await db.close()
@@ -1462,7 +1464,7 @@ class TestSchemaMigrationsJournal:
             )
             row = await cursor.fetchone()
             assert row is not None
-            assert row["n"] == 15
+            assert row["n"] == 17
         finally:
             await db2.close()
 
@@ -1550,6 +1552,8 @@ class TestSchemaMigrationsJournal:
                 (13, "workstreams_verification_columns"),
                 (14, "verification_attempts_table"),
                 (15, "execution_phase_verification"),
+                (16, "tasks_verifier_baseline_sha"),
+                (17, "task_costs_phase_model"),
             ]
             # Sanity: the idempotent ALTERs must not have fired twice.
             cursor = await db._connection.execute("PRAGMA table_info(tasks)")

@@ -627,6 +627,13 @@ class Task(BaseModel):
             "uses NULL as 'delivery still pending'."
         ),
     )
+    verifier_baseline_sha: str | None = Field(
+        default=None,
+        description=(
+            "Git sha the verifier gate used as its baseline for this task's "
+            "diff; None until the verifier gate first runs."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_retry_count(self) -> Self:
@@ -966,6 +973,17 @@ class TaskCost(BaseModel):
         ),
     )
     attempt: int = Field(default=1, ge=1, description="Retry attempt number")
+    execution_phase: str = Field(
+        default="task",
+        description=(
+            "Which execution phase this cost belongs to "
+            "(task|validation|verification); default 'task'"
+        ),
+    )
+    model: str | None = Field(
+        default=None,
+        description="Model identifier used for this attempt, when known",
+    )
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
         description="Record creation timestamp",
