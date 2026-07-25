@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from maestro.execution.ssh_launch import (
     build_descriptor,
     decode_transport_ref,
@@ -48,6 +50,18 @@ def test_transport_ref_v2_docker_roundtrip():
     assert d["v"] == 2
     assert d["isolation"] == "docker"
     assert d["expected_labels"] == labels
+
+
+def test_transport_ref_rejects_unknown_isolation():
+    with pytest.raises(ValueError, match="isolation must be"):
+        encode_transport_ref("h", 22, "/r/x", "/r/x/x.status", isolation="dokcer")
+
+
+def test_transport_ref_docker_requires_labels():
+    with pytest.raises(ValueError, match="non-empty expected_labels"):
+        encode_transport_ref(
+            "h", 22, "/r/x", "/r/x/x.status", isolation="docker", expected_labels={}
+        )
 
 
 def test_transport_ref_default_is_bare():

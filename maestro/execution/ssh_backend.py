@@ -178,7 +178,12 @@ class SshBackend:
                             image,
                             "sh",
                             "-c",
-                            f"command -v {tool}",
+                            # tool as a positional ($1), never interpolated into
+                            # the shell string, so a config-supplied tool name
+                            # cannot inject shell syntax.
+                            'command -v -- "$1"',
+                            "sh",
+                            tool,
                         ]
                     )
             except TimeoutError:

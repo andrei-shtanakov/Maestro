@@ -88,7 +88,16 @@ def encode_transport_ref(
     `isolation` (`"bare"|"docker"`) and `expected_labels` are the recovery
     SSOT for a run's isolation identity — persisted so a config edit after
     launch cannot change how the run is probed/GC'd.
+
+    Fails closed on an ambiguous ref: `isolation` must be exactly `"bare"` or
+    `"docker"` (a typo must never silently decode as bare), and a `"docker"`
+    ref must carry a non-empty `expected_labels` (else recovery/GC would
+    silently downgrade to a single-id ownership check).
     """
+    if isolation not in ("bare", "docker"):
+        raise ValueError(f"isolation must be 'bare' or 'docker', got {isolation!r}")
+    if isolation == "docker" and not expected_labels:
+        raise ValueError("docker isolation requires a non-empty expected_labels")
     return json.dumps(
         {
             "v": 2,

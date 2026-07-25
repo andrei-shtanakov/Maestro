@@ -126,7 +126,20 @@ def _docker_req(tmp_path):
     wd.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=wd, check=True)
     subprocess.run(
-        ["git", "commit", "-q", "--allow-empty", "-m", "x"], cwd=wd, check=True
+        [
+            "git",
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x",
+        ],
+        cwd=wd,
+        check=True,
     )
     return ExecutionRequest(
         run_id="api",
@@ -317,3 +330,33 @@ async def test_can_run_docker_scratch_probe_timeout_reported_as_missing():
     res = await _docker_backend(runner).can_run(_can_run_req())
     assert not res.ok
     assert any("scratch" in m for m in res.missing_tools)
+
+
+@pytest.mark.anyio
+async def test_can_run_docker_tool_probe_is_injection_safe():
+    """A tool name carrying shell metacharacters is passed as a positional
+    (`$1`), never interpolated into the `sh -c` string, so it cannot inject
+    shell syntax into the in-image probe."""
+    seen: list[str] = []
+
+    async def runner(argv, stdin):
+        tail = argv[-1]
+        seen.append(tail)
+        if tail == "mktemp -d":
+            return RunResult(0, "/tmp/maestro-scratch-xyz\n", "")
+        return RunResult(0, "ok", "")
+
+    req = ExecutionRequest(
+        run_id="w",
+        execution_id="e",
+        argv=["x"],
+        workdir=Path("/tmp"),
+        log_path=Path("/tmp/l"),
+        collect=CollectPolicy(mode="none"),
+        required_tools=["evil; rm -rf /"],
+    )
+    await _docker_backend(runner).can_run(req)
+    tool_tail = next(t for t in seen if "command -v" in t)
+    # fixed shell body uses a positional; the tool value is shell-quoted inert
+    assert 'command -v -- "$1"' in tool_tail
+    assert "'evil; rm -rf /'" in tool_tail
