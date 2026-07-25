@@ -748,3 +748,80 @@ async def test_rework_exhausted_needs_review_requeues_as_reverify(
 
     rows = await db.list_verification_attempts(run_id)
     assert [r.verdict for r in rows] == ["FAIL", "PASS"]
+
+
+# =============================================================================
+# F5: verifier execution pinned to the local backend
+# =============================================================================
+
+
+async def test_verifier_runs_on_local_backend_despite_nonlocal_default(
+    tmp_path: Path, worktree: Path, db: Database
+) -> None:
+    """F5: the verifier is pinned to the local backend even when the execution
+    config's default_backend is something else (docker in production — a named
+    local backend "authbox" stands in for it here so no docker daemon is
+    needed). The persisted verification handle records backend_id="local",
+    never the configured author backend."""
+    from maestro.execution.exec_config import (
+        BackendSpec,
+        BareIsolation,
+        ExecutionConfig,
+        LocalTransport,
+    )
+
+    script = _write_script(tmp_path, [{"verdict": "PASS"}])
+    execution = ExecutionConfig(
+        default_backend="authbox",
+        backends={
+            "authbox": BackendSpec(
+                transport=LocalTransport(), isolation=BareIsolation()
+            )
+        },
+    )
+    config = _config(worktree, _profile(script), execution=execution)
+    orch, _ws_mgr, _dec = _make_orch(db, worktree, config)
+    await _create_workstream(db, WorkstreamStatus.VERIFYING)
+
+    await orch._run_verification(WORKSTREAM_ID, worktree)
+
+    ws = await db.get_workstream(WORKSTREAM_ID)
+    assert ws.status is WorkstreamStatus.DONE
+    handle = await db.get_execution_handle(
+        entity_kind="workstream",
+        entity_id=WORKSTREAM_ID,
+        execution_phase="verification",
+        attempt=1,
+    )
+    assert handle is not None
+    # NOT "authbox": the verifier ran on the local backend, not the workstream's
+    # (default) author backend.
+    assert handle["backend_id"] == "local"
+
+
+# =============================================================================
+# F6: synthetic forensic JSON is marked
+# =============================================================================
+
+
+async def test_synthetic_forensic_json_is_marked(
+    tmp_path: Path, worktree: Path, db: Database
+) -> None:
+    """F6: a protocol ERROR that wrote no verdict file gets a forensic bundle
+    stamped `"synthetic": true`, so ingest can distinguish it from a real
+    verifier-authored document."""
+    script = _write_script(tmp_path, [{"mode": "missing_file"}])
+    config = _config(worktree, _profile(script, error_budget=0))
+    orch, _ws_mgr, _dec = _make_orch(db, worktree, config)
+    await _create_workstream(db, WorkstreamStatus.VERIFYING)
+
+    await orch._run_verification(WORKSTREAM_ID, worktree)
+
+    ws = await db.get_workstream(WORKSTREAM_ID)
+    assert ws.status is WorkstreamStatus.FAILED
+    run_id = ws.verification_run_id
+    assert run_id is not None
+    rows = await db.list_verification_attempts(run_id)
+    assert [r.verdict for r in rows] == ["ERROR"]
+    payload = json.loads(Path(rows[0].json_path).read_text())  # noqa: ASYNC240
+    assert payload["synthetic"] is True

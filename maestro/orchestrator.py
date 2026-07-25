@@ -49,6 +49,7 @@ from maestro.execution.docker_recovery import (
     probe_execution,
 )
 from maestro.execution.finalize import ensure_finalize_task
+from maestro.execution.local import LocalBackend
 from maestro.execution.models import (
     CollectPolicy,
     ExecutionHandleRef,
@@ -2314,7 +2315,16 @@ class Orchestrator:
             await self._route_verifying_needs_review(workstream_id, reason)
             return
 
-        backend = self._backends.resolve(workstream.backend)
+        # Stage B scope: the verifier ALWAYS runs on the local backend,
+        # regardless of `workstream.backend`. The verifier is orchestrator-side
+        # (its `{out}`/`{criteria}` live under `<db_dir>/evidence/`, outside any
+        # author isolation); the backend gate governs the AUTHOR's isolation
+        # only. A docker-isolated backend here would mount only `req.workdir`,
+        # so the evidence paths would be invisible in-container and every
+        # attempt would ERROR. Non-local verifier backends are explicitly
+        # deferred (see the TODO in `_probe_verification_handle` about ssh +
+        # docker isolation for verification recovery).
+        backend = LocalBackend()
         verifier = CommandVerifier(
             verification.verifier,
             verification.criteria,
@@ -2355,6 +2365,7 @@ class Orchestrator:
                 out_json.write_text(
                     json.dumps(
                         {
+                            "synthetic": True,
                             "outcome": result.outcome.value,
                             "protocol_error": result.protocol_error,
                         }
