@@ -326,6 +326,7 @@ class SshBackend:
                 if self._isolation is not None
                 else None
             ),
+            capture_output=req.capture_output,
         )
         handle.start()
         return handle

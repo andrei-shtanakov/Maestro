@@ -31,6 +31,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MAX_BACKOFF_S = 30.0
+_TAIL_LIMIT = 4000
+
+
+def _tail_text(path: Path) -> str:
+    """Bounded, best-effort read of the last `_TAIL_LIMIT` bytes of `path`.
+
+    Mirrors `local._decode_tail`: missing/unreadable files decode to "".
+    """
+    try:
+        data = path.read_bytes()[-_TAIL_LIMIT:]
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="replace")
 
 
 @dataclass
@@ -81,6 +94,7 @@ class SshTaskHandle:
         expected_owner: str | None = None,
         mirror_spec: MirrorSpec | None = None,
         container_ops: "ContainerOps | None" = None,
+        capture_output: bool = False,
     ) -> None:
         """Initialize the handle; call `start()` to spawn the monitor.
 
@@ -88,6 +102,10 @@ class SshTaskHandle:
         `terminate`/`kill` also stop the container (killing the remote
         `docker run` client alone does not stop the container), and
         `cleanup` removes it before the remote `rm -rf`.
+
+        `capture_output`, when set, makes `wait()` return a bounded combined
+        tail read from the local mirror log (see `wait()` for why
+        `stderr_tail` stays empty).
         """
         self._ssh = ssh
         self._layout = layout
@@ -99,6 +117,7 @@ class SshTaskHandle:
         self._expected_owner = expected_owner
         self._mirror = mirror_spec
         self._container_ops = container_ops
+        self._capture_output = capture_output
         self._exit_code: int | None = None
         self._terminal = asyncio.Event()
         self._timed_out = False
@@ -198,10 +217,24 @@ class SshTaskHandle:
             await self._ssh.run(["kill", f"-{sig}", f"-{pgid}"])
 
     async def wait(self) -> ExecutionResult:
-        """Await terminal completion and return the cached result."""
+        """Await terminal completion and return the cached result.
+
+        On `capture_output`, do a final tail (bytes may have landed between
+        the monitor's last tail and completion) and return a bounded
+        combined tail. The remote supervisor merges stdout+stderr into one
+        log, so `stderr_tail` stays "" (separate stderr needs a supervisor
+        protocol/version bump — out of scope here).
+        """
         await self._terminal.wait()
+        stdout_tail = ""
+        if self._capture_output:
+            with contextlib.suppress(Exception):
+                await self._tail_log()
+            stdout_tail = _tail_text(self._log_path)
         return ExecutionResult(
             exit_code=self._exit_code,
+            stdout_tail=stdout_tail,
+            stderr_tail="",
             output_log_path=self._log_path,
             timed_out=self._timed_out,
         )
