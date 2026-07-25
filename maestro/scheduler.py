@@ -73,7 +73,6 @@ from maestro.retry import RetryManager
 from maestro.transitions import TransitionDispatcher
 from maestro.validator import (
     ValidationResult,
-    Validator,
     build_validation_request,
     execution_result_to_validation,
 )
@@ -308,7 +307,6 @@ class Scheduler:
         self._shutdown_requested = False
         self._shutdown_event = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._validator = Validator()
 
     @property
     def is_running(self) -> bool:
