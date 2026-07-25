@@ -1905,9 +1905,7 @@ class Scheduler:
         ``_run_durable_validation`` from ``_handle_task_completion`` instead.
         """
         if not task.validation_cmd:
-            return ValidationResult(
-                success=True, exit_code=0, stdout="", stderr=""
-            )
+            return ValidationResult(success=True, exit_code=0, stdout="", stderr="")
         backend = self._resolve_validation_backend(task)
         run_id = f"val-{task.id}-{task.retry_count + 1}"
         try:
@@ -1960,9 +1958,7 @@ class Scheduler:
             execution_phase="validation",
         )
         validating = await self._db.get_task(task.id)
-        await self._dispatch_committed_transition(
-            validating, frm=TaskStatus.RUNNING
-        )
+        await self._dispatch_committed_transition(validating, frm=TaskStatus.RUNNING)
 
         try:
             handle = await backend.run(request)
@@ -2005,9 +2001,7 @@ class Scheduler:
             )
         return execution_result_to_validation(fin.execution)
 
-    async def _route_validation_infra_review(
-        self, task_id: str, reason: str
-    ) -> None:
+    async def _route_validation_infra_review(self, task_id: str, reason: str) -> None:
         """Route a validation infrastructure failure to NEEDS_REVIEW.
 
         VALIDATING -> FAILED -> NEEDS_REVIEW (VALIDATING has no direct edge to

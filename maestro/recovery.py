@@ -119,6 +119,7 @@ class StateRecovery:
             RecoveryStatistics with details about recovered tasks.
         """
         open_handles = await self._db.get_open_execution_handles()
+
         # Filter to prepared/running, and split by execution_phase: a task can
         # have both a stale terminal row (prior attempt, cleanup unconfirmed)
         # and a fresh running row (current attempt) open at once, AND — once
@@ -148,9 +149,7 @@ class StateRecovery:
         # equal live-container hazard). validation wins on key collision, so a
         # stale task handle never shadows a live validation handle (detail 4).
         validating_handles = {**task_phase, **validation_phase}
-        validating_recovered = await self._recover_validating_tasks(
-            validating_handles
-        )
+        validating_recovered = await self._recover_validating_tasks(validating_handles)
 
         # Best-effort GC of leftover containers for settled entities.
         await self._gc_terminal_handles(open_handles)

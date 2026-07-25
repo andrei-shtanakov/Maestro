@@ -113,9 +113,7 @@ async def _seed_running(db, tmp_path) -> Task:
 
 
 def _req(task):
-    return build_validation_request(
-        task, backend_id="sandbox", run_id="v1", attempt=1
-    )
+    return build_validation_request(task, backend_id="sandbox", run_id="v1", attempt=1)
 
 
 async def test_durable_validation_success_marks_handle_cleaned(db, tmp_path):
@@ -152,6 +150,5 @@ async def test_unknown_launch_holds_and_preserves_handle(db, tmp_path):
     assert "t1" in sch._validation_hold
     rows = await db.get_open_execution_handles()
     assert any(
-        r["execution_phase"] == "validation" and r["state"] == "prepared"
-        for r in rows
+        r["execution_phase"] == "validation" and r["state"] == "prepared" for r in rows
     )  # preserved for recovery

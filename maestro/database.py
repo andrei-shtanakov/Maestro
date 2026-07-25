@@ -775,9 +775,7 @@ class Database:
         'task'.
         """
         assert self._connection is not None
-        cursor = await self._connection.execute(
-            "PRAGMA table_info(execution_handles)"
-        )
+        cursor = await self._connection.execute("PRAGMA table_info(execution_handles)")
         columns = {row["name"] for row in await cursor.fetchall()}
         if "execution_phase" not in columns:
             await self._connection.execute(
