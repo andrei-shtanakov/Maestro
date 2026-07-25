@@ -257,6 +257,26 @@ async def test_alive_handle_leaves_verifying_untouched(
     assert ws.rework_attempt == 0
     assert count == 0
     assert orch._stats.failed == 0
+    # Non-vacuous check (pre-Task-9 code has no such registry at all):
+    # "leave in place" must actually register the orphan for re-polling,
+    # or nothing will ever notice it finishing.
+    assert orch._verifying_orphans == {WORKSTREAM_ID: 1}
+
+    # Simulate the orphaned process finishing (pid now looks dead) and
+    # drive one main-loop re-poll tick.
+    monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: False)
+    await orch._poll_verifying_orphans()
+
+    ws = await db.get_workstream(WORKSTREAM_ID)
+    assert ws.status is WorkstreamStatus.DONE
+    assert ws.verification_run_id == "run-1"
+    assert ws.verification_attempt == 2  # a FRESH attempt was minted
+    assert ws.rework_attempt == 0
+    assert WORKSTREAM_ID not in orch._verifying_orphans
+
+    rows = await db.list_verification_attempts("run-1")
+    assert [r.attempt for r in rows] == [2]
+    assert [r.verdict for r in rows] == ["PASS"]
 
 
 # =============================================================================
@@ -423,3 +443,105 @@ async def test_unmaterialized_pass_reenters_finalization_only(
     assert [r.verdict for r in rows] == ["PASS"]
     assert rows[0].materialized is True
     assert len(_evidence_commits(worktree, run_id)) == 1
+
+
+# =============================================================================
+# Orphan re-poll (fix-up): still alive -> keep waiting; probe turns
+# ambiguous mid-poll -> NEEDS_REVIEW fail-closed
+# =============================================================================
+
+
+async def test_poll_verifying_orphan_still_alive_keeps_waiting(
+    tmp_path: Path, worktree: Path, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from maestro import orchestrator as orch_mod
+
+    monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: True)
+
+    script = _write_script(tmp_path, [{"verdict": "PASS"}])  # must NOT be run
+    config = _config(worktree, _profile(script))
+    orch = _make_orch(db, worktree, config)
+
+    await _create_workstream(db, verification_run_id="run-1", verification_attempt=1)
+    await db.start_execution(
+        entity_kind="workstream",
+        entity_id=WORKSTREAM_ID,
+        expected_status="verifying",
+        running_status="verifying",
+        execution_id="exec-1",
+        backend_id="local",
+        transport_ref="local:verify-exec-1",
+        attempt=1,
+        execution_phase="verification",
+    )
+    await db.update_execution_handle_launch(
+        "exec-1",
+        transport_ref="local_pid:4242",
+        remote_host=None,
+        remote_dir=None,
+        status_marker=None,
+    )
+    await orch._recover_stranded_workstreams()
+    assert orch._verifying_orphans == {WORKSTREAM_ID: 1}
+
+    # Still alive on the next tick -- no duplicate spawn, stays registered.
+    await orch._poll_verifying_orphans()
+
+    ws = await db.get_workstream(WORKSTREAM_ID)
+    assert ws.status is WorkstreamStatus.VERIFYING
+    assert ws.verification_attempt == 1
+    assert ws.rework_attempt == 0
+    assert orch._verifying_orphans == {WORKSTREAM_ID: 1}
+    assert orch._stats.failed == 0
+
+
+async def test_poll_verifying_orphan_ambiguous_needs_review(
+    tmp_path: Path, worktree: Path, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A probe error/ambiguity discovered mid-poll (not at startup) fails
+    closed exactly like the startup-time ambiguous branch."""
+    from maestro import orchestrator as orch_mod
+
+    monkeypatch.setattr(orch_mod, "_is_pid_alive", lambda _pid: True)
+
+    script = _write_script(tmp_path, [{"verdict": "PASS"}])  # must NOT be run
+    config = _config(worktree, _profile(script))
+    orch = _make_orch(db, worktree, config)
+
+    await _create_workstream(db, verification_run_id="run-1", verification_attempt=1)
+    await db.start_execution(
+        entity_kind="workstream",
+        entity_id=WORKSTREAM_ID,
+        expected_status="verifying",
+        running_status="verifying",
+        execution_id="exec-1",
+        backend_id="local",
+        transport_ref="local:verify-exec-1",
+        attempt=1,
+        execution_phase="verification",
+    )
+    await db.update_execution_handle_launch(
+        "exec-1",
+        transport_ref="local_pid:4242",
+        remote_host=None,
+        remote_dir=None,
+        status_marker=None,
+    )
+    await orch._recover_stranded_workstreams()
+    assert orch._verifying_orphans == {WORKSTREAM_ID: 1}
+
+    # Simulate a probe error on the next tick (e.g. a DB hiccup reading the
+    # handle row) rather than a clean alive/dead answer.
+    async def _boom(_workstream_id: str, _attempt: int) -> str:
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr(orch, "_probe_verification_handle", _boom)
+
+    await orch._poll_verifying_orphans()
+
+    ws = await db.get_workstream(WORKSTREAM_ID)
+    assert ws.status is WorkstreamStatus.NEEDS_REVIEW
+    assert ws.verification_attempt == 1
+    assert ws.rework_attempt == 0
+    assert WORKSTREAM_ID not in orch._verifying_orphans
+    assert orch._stats.failed == 1

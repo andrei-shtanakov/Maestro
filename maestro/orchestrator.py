@@ -352,6 +352,14 @@ class Orchestrator:
             self._ledger = EvidenceLedger(db, evidence_root)
         self._running: dict[str, RunningWorkstream] = {}
         self._generating: dict[str, asyncio.Task[None]] = {}
+        # Task 9 fix-up: VERIFYING workstreams whose verifier process was
+        # found alive at startup recovery (`_recover_one_verifying`'s
+        # "alive" branch) — maps workstream_id -> the verification_attempt
+        # being watched. `_poll_verifying_orphans` (called every main-loop
+        # tick) is what makes "leave in place, resume monitoring" actually
+        # resume something; without it a recovered-alive orphan would sit
+        # in VERIFYING forever with nothing ever re-checking it.
+        self._verifying_orphans: dict[str, int] = {}
         self._shutdown_grace_seconds: float = 5.0
         self._shutdown_requested = False
         self._shutdown_event = asyncio.Event()
@@ -743,9 +751,16 @@ class Orchestrator:
         if probe == "alive":
             self._logger.info(
                 "Workstream '%s' stranded in VERIFYING with a live verifier "
-                "process — leaving in place (no duplicate spawn)",
+                "process — leaving in place, registered for main-loop "
+                "re-poll (no duplicate spawn)",
                 w.id,
             )
+            # `_poll_verifying_orphans` is what makes "leave in place" a
+            # real resume rather than a dead end: startup recovery has no
+            # asyncio Task to attach to (the orchestrator that spawned this
+            # process is gone), so re-checking it happens on the main-loop
+            # tick instead.
+            self._verifying_orphans[w.id] = w.verification_attempt
             return 0
         if probe == "ambiguous":
             reason = (
@@ -828,6 +843,18 @@ class Orchestrator:
         except Exception:
             return "ambiguous"
         if isinstance(backend, SshBackend):
+            # TODO(reviewer Important #2): this does not mirror
+            # `_probe_open_handle`'s isolation dispatch — an ssh-launched
+            # verifier whose remote harness itself runs inside a container
+            # (Phase 2c, `decoded["isolation"] == "docker"`) should also
+            # probe that container (`probe_execution` with
+            # `expected_labels`) and fail closed if EITHER probe says so,
+            # exactly like `_probe_open_handle` does for RUNNING recovery.
+            # Currently masked because `probe_ssh` is unconditionally
+            # fail-closed (`needs_review=True` always) regardless of
+            # isolation, so the missing dual-probe never changes the
+            # outcome today — but it must be added before any non-local
+            # verifier backend combined with docker isolation is wired up.
             verdict = await probe_ssh(backend._ssh, _handle_ref_from_row(row))
         elif backend_id == "docker":
             verdict = await probe_execution(row["execution_id"], self._docker)
@@ -836,6 +863,89 @@ class Orchestrator:
                 True, f"unsupported backend {backend_id!r} for recovery probe"
             )
         return "ambiguous" if verdict.needs_review else "dead"
+
+    async def _poll_verifying_orphans(self) -> None:
+        """Re-check every VERIFYING workstream recovered with a possibly-live
+        verifier process (`_recover_one_verifying`'s "alive" branch, tracked
+        in `self._verifying_orphans`).
+
+        This is what makes "leave in place, resume monitoring" a real
+        resume: `_run_verification`'s `await verifier.verify(ctx)` for that
+        process died with the crashed coroutine, and there is no live
+        asyncio Task to re-attach to — so the only way to ever notice the
+        orphan finishing is to re-probe it on a schedule. Called once per
+        main-loop tick.
+
+        - Still alive -> keep waiting; never a duplicate spawn (the
+          design's explicit invariant for this branch).
+        - Dead -> the orphaned process's own exit code/handshake was never
+          awaited by any Maestro code, so it can never be validated or
+          replayed; the only sound path is a FRESH verification attempt
+          under the SAME run_id (append-only evidence tolerates this,
+          exactly like the startup-recovery "dead" rule).
+        - Probe error/ambiguous -> fail closed to NEEDS_REVIEW, the same
+          accounting as the startup-time ambiguous branch.
+
+        Best-effort: a per-workstream failure is logged and skipped rather
+        than raised, so one bad probe never stalls the main loop.
+        """
+        if not self._verifying_orphans:
+            return
+        for workstream_id, attempt in list(self._verifying_orphans.items()):
+            try:
+                await self._poll_one_verifying_orphan(workstream_id, attempt)
+            except Exception as e:
+                self._logger.error(
+                    "Failed to re-poll VERIFYING orphan '%s': %s", workstream_id, e
+                )
+
+    async def _poll_one_verifying_orphan(
+        self, workstream_id: str, attempt: int
+    ) -> None:
+        workstream = await self._db.get_workstream(workstream_id)
+        if workstream.status is not WorkstreamStatus.VERIFYING:
+            # Left VERIFYING through some other path (e.g. an operator
+            # action) -- stop tracking it.
+            self._verifying_orphans.pop(workstream_id, None)
+            return
+
+        try:
+            probe = await self._probe_verification_handle(workstream_id, attempt)
+        except Exception as e:
+            self._logger.error(
+                "Probe failed while re-polling VERIFYING orphan '%s': %s",
+                workstream_id,
+                e,
+            )
+            probe = "ambiguous"
+
+        if probe == "alive":
+            return  # keep waiting, no duplicate spawn
+
+        self._verifying_orphans.pop(workstream_id, None)
+
+        if probe == "ambiguous":
+            reason = (
+                "verification handle probe turned ambiguous while "
+                "re-polling a recovered orphan — state uncertain, sending "
+                "to NEEDS_REVIEW"
+            )
+            self._logger.warning("%s for '%s'", reason, workstream_id)
+            await self._route_verifying_needs_review(workstream_id, reason)
+            return
+
+        self._logger.info(
+            "VERIFYING orphan '%s' is no longer alive — its handshake was "
+            "never awaited, so re-entering verification with a FRESH "
+            "attempt under the same run_id",
+            workstream_id,
+        )
+        workspace = self._workspace_mgr.get_workspace_path(workstream_id)
+        # Reset the per-session ERROR budget, mirroring the READY ->
+        # VERIFYING reverify resume dispatch and the startup-recovery "dead"
+        # branch — this re-poll re-entry is a fresh session too.
+        await self._update_fields(workstream_id, verification_error_attempt=0)
+        await self._run_verification(workstream_id, workspace)
 
     def _is_ssh_terminal_strand(self, handle_row: dict[str, Any]) -> bool:
         """True if `handle_row` is an SSH-resolved execution stranded in the
@@ -1121,6 +1231,10 @@ class Orchestrator:
 
             # Monitor running processes
             await self._monitor_running()
+
+            # Re-check any VERIFYING orphans recovered alive at startup
+            # (Task 9 fix-up) — see `_poll_verifying_orphans`.
+            await self._poll_verifying_orphans()
 
             # Wait before next iteration
             with contextlib.suppress(TimeoutError):
