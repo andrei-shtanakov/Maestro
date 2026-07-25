@@ -790,15 +790,92 @@ class TestSshRecoveryBranch:
             await db.close()
 
     @pytest.mark.anyio
+    async def test_ssh_terminal_handle_reconfigured_to_local_docker_needs_review(
+        self, tmp_path
+    ) -> None:
+        """Task 13d fix / spec decision #5: a workstream's execution handle
+        was minted by an SSH backend and is stranded in the terminal window
+        (real JSON `transport_ref`, `state == "terminal"`), but the backend
+        NAME has since been reconfigured to local+docker. Recovery must
+        still route to NEEDS_REVIEW — never fall through to the generic
+        pid/reset branch and silently re-READY the workstream over a
+        possibly-uncollected remote diff. `_is_ssh_terminal_strand` used to
+        classify by `isinstance(backend, SshBackend)` on the *resolved*
+        backend only, so this reconfigured-name case resolved to a
+        `LocalBackend` and returned False — fail-OPEN. This test MUST FAIL
+        on pre-fix code (workstream ends up READY)."""
+        from maestro.execution.local import LocalBackend
+
+        orch, db = await _orch_with_db(tmp_path)
+        try:
+            docker = MagicMock()
+            docker.ps_ids_by_label = AsyncMock(return_value=[])
+            # Reconfigured: 'gpu' now resolves to a local-docker backend.
+            backend = LocalBackend(backend_id="gpu", docker=docker)
+            orch._backends.resolve = MagicMock(return_value=backend)
+
+            await db.create_workstream(
+                _seed("w", WorkstreamStatus.READY, backend="gpu")
+            )
+            layout = remote_layout("/var/tmp/m", "e1")
+            transport_ref = encode_transport_ref(
+                "gpu", None, layout.root, layout.status
+            )
+            await db.start_execution(
+                entity_kind="workstream",
+                entity_id="w",
+                expected_status=WorkstreamStatus.READY.value,
+                running_status=WorkstreamStatus.RUNNING.value,
+                execution_id="e1",
+                backend_id="gpu",
+                transport_ref=transport_ref,
+                attempt=1,
+                status_marker=layout.status,
+            )
+            await db.update_execution_handle_launch(
+                "e1",
+                transport_ref=transport_ref,
+                remote_host="gpu",
+                remote_dir=layout.root,
+                status_marker=layout.status,
+            )
+            await db.mark_execution_state(
+                "e1", "terminal", allowed_from=["prepared", "running"]
+            )
+            w0 = await db.get_workstream("w")
+            assert w0.status == WorkstreamStatus.RUNNING
+            retry_before = w0.retry_count
+
+            count = await orch._recover_stranded_workstreams()
+
+            assert count == 1
+            w = await db.get_workstream("w")
+            assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            assert w.retry_count == retry_before
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
     async def test_docker_terminal_handle_still_resets_to_ready(self, tmp_path) -> None:
         """Zero docker regression: a docker `terminal` handle in the same
         stranded-RUNNING situation still resets to READY (docker collect is a
         no-op, so reset-and-rerun stays safe) — the new ssh-terminal routing
-        must never touch docker."""
+        must never touch docker.
+
+        The backend name is seeded into the resolver's cache the way
+        production wires it (`BackendResolver(local_docker=self._docker)` in
+        `__init__`, mirrored by `test_gc_terminal_handles_docker_unaffected_
+        by_ssh_branch` below) so `backend_id="docker"` actually resolves —
+        a genuinely-matching local-docker identity, not an unresolvable
+        name (which Task 13d's fail-closed `_is_ssh_terminal_strand` now
+        correctly routes to NEEDS_REVIEW instead of silently resetting)."""
         orch, db = await _orch_with_db(tmp_path)
         docker = MagicMock()
         docker.ps_ids_by_label = AsyncMock(return_value=[])
         orch._docker = docker
+        orch._backends._cache["docker"] = LocalBackend(
+            backend_id="docker", docker=docker
+        )
         try:
             await db.create_workstream(_seed("w", WorkstreamStatus.READY))
             await db.start_execution(

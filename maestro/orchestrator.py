@@ -580,17 +580,31 @@ class Orchestrator:
         return recovered
 
     def _is_ssh_terminal_strand(self, handle_row: dict[str, Any]) -> bool:
-        """True if `handle_row` is an SSH-resolved execution stranded in the
-        terminal/collected window — the case that must route to NEEDS_REVIEW
-        rather than silently re-run (spec §G/§J). Docker rows return False
-        (docker `collect` is a no-op, so its reset-and-rerun stays safe)."""
+        """True if `handle_row` is stranded in the terminal/collected window
+        and must route to NEEDS_REVIEW rather than silently re-run (spec
+        §G/§J, decision #5): either the resolved backend is `SshBackend`, or
+        the persisted ref identity no longer matches the resolved backend
+        (config drift — e.g. the backend NAME was reconfigured from
+        `transport: ssh` to `transport: local, isolation: docker` between
+        the crash and this restart). An unresolvable backend is likewise
+        fail-closed to True — never assume it's safe to reset. Docker rows
+        whose identity still matches return False (docker `collect` is a
+        no-op, so its reset-and-rerun stays safe).
+
+        This mirrors the `accepts_ref()` gate already used by
+        `_probe_open_handle` / `_gc_terminal_handles` for the
+        prepared/running and GC paths — terminal/collected handles don't
+        flow through either of those, so this is their only guard against
+        the fail-open case: a config change alone must never be enough to
+        turn a stranded SSH run back into a silent re-run."""
         if handle_row["state"] not in ("terminal", "collected"):
             return False
         try:
             backend = self._backends.resolve(handle_row["backend_id"])
         except Exception:
-            return False
-        return isinstance(backend, SshBackend)
+            return True  # unresolvable backend -> fail-closed to review
+        ref = handle_ref_from_row(handle_row)
+        return isinstance(backend, SshBackend) or not backend.accepts_ref(ref)
 
     async def _route_ssh_terminal_strand(
         self,
