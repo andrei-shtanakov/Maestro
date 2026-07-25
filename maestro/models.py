@@ -797,6 +797,35 @@ class DefaultsConfig(BaseModel):
     )
 
 
+class VerifierConfig(BaseModel):
+    """Opt-in adversarial LLM verifier-gate config (verifier-gate Mode-1).
+
+    Absent (`None` on `ProjectConfig.verifier`) keeps today's behavior
+    byte-for-byte: no `VERIFYING` phase, `VALIDATING -> DONE` directly.
+    `backend` is pinned to `"local"` for this slice — read-only is policy
+    isolation (scratch cwd, no collect, envelope on stdin), never OS
+    isolation; rejecting any other value at construction time keeps that
+    claim honest. Model resolution is intentionally NOT done here — see
+    `maestro.verifier.config.resolve_verifier_model`, which is isolated from
+    the main `resolve_model` precedence (never reads `MAESTRO_<H>_MODEL` or a
+    catalog default, only `verifier.model` then `MAESTRO_VERIFIER_MODEL`).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    runner: Literal["claude"] = "claude"
+    model: str | None = Field(
+        default=None,
+        description=(
+            "Verifier model id. None defers to $MAESTRO_VERIFIER_MODEL at "
+            "resolution time; never falls back to a catalog default."
+        ),
+    )
+    timeout_seconds: int = Field(default=120, ge=1)
+    max_diff_bytes: int = Field(default=100_000, ge=1)
+    backend: Literal["local"] = "local"
+
+
 class ProjectConfig(BaseModel):
     """Project configuration model for YAML parsing.
 
@@ -831,6 +860,13 @@ class ProjectConfig(BaseModel):
         description=(
             "Execution backends config; None keeps zero-config local/bare "
             "execution (old behavior)."
+        ),
+    )
+    verifier: VerifierConfig | None = Field(
+        default=None,
+        description=(
+            "Opt-in adversarial LLM verifier gate; None keeps "
+            "VALIDATING -> DONE with no VERIFYING phase (old behavior)."
         ),
     )
 
