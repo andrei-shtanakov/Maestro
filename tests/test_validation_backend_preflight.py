@@ -35,14 +35,13 @@ SSH_CFG = ExecutionConfig.model_validate(
 )
 
 
-def test_explicit_ssh_validation_backend_fails():
-    with pytest.raises(ValidationBackendError, match="gpu"):
-        check_validation_backends([_task("gpu")], SSH_CFG)
+def test_explicit_ssh_validation_backend_passes():
+    # PR2: SSH validation backends are supported — no rejection.
+    check_validation_backends([_task("gpu")], SSH_CFG)
 
 
-def test_same_on_ssh_task_fails():
-    with pytest.raises(ValidationBackendError):
-        check_validation_backends([_task("same", backend="gpu")], SSH_CFG)
+def test_same_on_ssh_task_passes():
+    check_validation_backends([_task("same", backend="gpu")], SSH_CFG)
 
 
 def test_local_and_default_pass():
@@ -50,10 +49,10 @@ def test_local_and_default_pass():
     check_validation_backends([_task("same", backend="local")], SSH_CFG)
 
 
-def test_same_with_no_backend_resolves_to_ssh_default_and_fails():
+def test_same_with_no_backend_resolves_to_ssh_default_and_passes():
     # default_backend is SSH and the task pins no backend -> `same` resolves to
-    # the SSH default, exactly as BackendResolver.resolve(None) would. It must
-    # fail preflight, not slip through.
+    # the SSH default, exactly as BackendResolver.resolve(None) would. SSH is
+    # supported (PR2), so this must pass, not raise.
     ssh_default = ExecutionConfig.model_validate(
         {
             "default_backend": "gpu",
@@ -65,8 +64,15 @@ def test_same_with_no_backend_resolves_to_ssh_default_and_fails():
             },
         }
     )
-    with pytest.raises(ValidationBackendError, match="gpu"):
-        check_validation_backends([_task("same", backend=None)], ssh_default)
+    check_validation_backends([_task("same", backend=None)], ssh_default)
+
+
+def test_unknown_named_validation_backend_fails():
+    # An explicitly named validation_backend that resolves to no known
+    # backend must still fail fast at preflight, not surface a late
+    # ExecutionConfigError inside the validation run.
+    with pytest.raises(ValidationBackendError, match="does-not-exist"):
+        check_validation_backends([_task("does-not-exist")], SSH_CFG)
 
 
 def test_no_validation_cmd_skipped():
