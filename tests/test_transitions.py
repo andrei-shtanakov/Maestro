@@ -111,9 +111,9 @@ async def test_same_state_fires_nothing():
 async def test_empty_effect_fires_only_callback():
     rec = _Rec()
     d = _disp(rec)
-    s = TransitionSubject("task", "t", "T", TaskStatus.VALIDATING)  # empty effect
+    s = TransitionSubject("task", "t", "T", TaskStatus.PENDING)  # empty effect
     await d.fire(s, frm=TaskStatus.RUNNING)
-    assert rec.cb == [("t", "running", "validating")]  # STRINGS, not enums
+    assert rec.cb == [("t", "running", "pending")]  # STRINGS, not enums
     assert not rec.events and not rec.notifs
 
 

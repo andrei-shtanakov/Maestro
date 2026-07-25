@@ -119,22 +119,37 @@ class StateRecovery:
             RecoveryStatistics with details about recovered tasks.
         """
         open_handles = await self._db.get_open_execution_handles()
-        # Filter to prepared/running: a task can have both a stale terminal
-        # row (prior attempt, cleanup unconfirmed) and a fresh running row
-        # (current attempt) open at once. Without this filter, dict
-        # construction has no defined winner between them — a terminal row
-        # could shadow the live one and silently bypass the probe below.
-        task_handles = {
-            h["entity_id"]: h
-            for h in open_handles
-            if h["entity_kind"] == "task" and h["state"] in ("prepared", "running")
-        }
 
-        # Recover RUNNING tasks
-        running_recovered = await self._recover_running_tasks(task_handles)
+        # Filter to prepared/running, and split by execution_phase: a task can
+        # have both a stale terminal row (prior attempt, cleanup unconfirmed)
+        # and a fresh running row (current attempt) open at once, AND — once
+        # validation runs on a durable backend — a still-open task-phase handle
+        # alongside a live validation-phase handle for the same entity_id.
+        # Keying by entity_id alone would let one shadow the other; splitting by
+        # phase lets RUNNING recovery probe the task handle and VALIDATING
+        # recovery probe the validation handle.
+        def _by_phase(phase: str) -> dict[str, dict[str, Any]]:
+            return {
+                h["entity_id"]: h
+                for h in open_handles
+                if h["entity_kind"] == "task"
+                and h["state"] in ("prepared", "running")
+                and h.get("execution_phase", "task") == phase
+            }
 
-        # Recover VALIDATING tasks
-        validating_recovered = await self._recover_validating_tasks(task_handles)
+        task_phase = _by_phase("task")
+        validation_phase = _by_phase("validation")
+
+        # Recover RUNNING tasks: the task-phase handle is the live execution.
+        running_recovered = await self._recover_running_tasks(task_phase)
+
+        # Recover VALIDATING tasks: prefer the validation-phase handle (the
+        # validation container), but fall back to a still-open task-phase
+        # handle (a primary container whose finalize never completed is an
+        # equal live-container hazard). validation wins on key collision, so a
+        # stale task handle never shadows a live validation handle (detail 4).
+        validating_handles = {**task_phase, **validation_phase}
+        validating_recovered = await self._recover_validating_tasks(validating_handles)
 
         # Best-effort GC of leftover containers for settled entities.
         await self._gc_terminal_handles(open_handles)

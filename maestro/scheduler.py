@@ -37,7 +37,7 @@ from maestro.cost_tracker import effective_cost, parse_and_create_cost
 from maestro.dag import DAG
 from maestro.database import ConcurrentModificationError, Database, TaskNotFoundError
 from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
-from maestro.execution.backend import TaskHandle
+from maestro.execution.backend import ExecutionBackend, TaskHandle
 from maestro.execution.exec_config import ExecutionConfig
 from maestro.execution.finalize import FinalizationResult, ensure_finalize_task
 from maestro.execution.models import CollectPolicy, ExecutionRequest
@@ -68,9 +68,14 @@ from maestro.models import (
 )
 from maestro.notifications.base import Notification, NotificationEvent
 from maestro.notifications.manager import NotificationManager
+from maestro.preflight import ValidationBackendError, check_validation_backends
 from maestro.retry import RetryManager
 from maestro.transitions import TransitionDispatcher
-from maestro.validator import ValidationResult, Validator
+from maestro.validator import (
+    ValidationResult,
+    build_validation_request,
+    execution_result_to_validation,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -291,6 +296,10 @@ class Scheduler:
         self._backends = BackendResolver(self._execution, mode="scheduler")
         self._armed: set[Path] = set()
         self._reservations = ReservationRegistry()
+        # Tasks whose (workdir, scope) reservation must be HELD because a
+        # durable validation launch was uncertain (detail 6). Released only by
+        # cleanup/recovery, never by the scheduling-time release rule.
+        self._validation_hold: set[str] = set()
 
         self._running_tasks: dict[str, RunningTask] = {}
         self._last_tick: tuple[int, int, int] | None = None
@@ -298,7 +307,6 @@ class Scheduler:
         self._shutdown_requested = False
         self._shutdown_event = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._validator = Validator()
 
     @property
     def is_running(self) -> bool:
@@ -742,6 +750,10 @@ class Scheduler:
             validate_ssh_scopes(tasks, self._execution)
         except UnboundedRemoteScopeError as exc:
             raise SchedulerError(str(exc)) from exc
+        try:
+            check_validation_backends(tasks, self._execution)
+        except ValidationBackendError as exc:
+            raise SchedulerError(str(exc)) from exc
         self._armed = compute_armed_workdirs(tasks, self._execution)
 
     async def _reconstruct_reservations(self) -> None:
@@ -754,6 +766,10 @@ class Scheduler:
         scope-blocking (the scope was already released) and are left to the
         existing cleanup-recovery path.
         """
+        # Phase-agnostic: any open (workdir, scope)-holding handle re-holds the
+        # reservation regardless of execution_phase — a still-open *validation*
+        # handle for an SSH task keeps the scope locked exactly as a task handle
+        # does (detail 6). Do not add an execution_phase filter here.
         hold_states = {"prepared", "running", "terminal"}
         for row in await self._db.get_open_execution_handles():
             if row.get("state") not in hold_states:
@@ -1249,6 +1265,10 @@ class Scheduler:
                         expected_status=TaskStatus.READY,
                     )
                 self._retry_ready_times.pop(task_id, None)
+                # A fresh dispatch supersedes any stale validation hold from a
+                # prior uncertain-launch attempt of this task; otherwise the
+                # stale entry would block this attempt's reservation release.
+                self._validation_hold.discard(task_id)
 
                 handle = await backend.run(request)
             except ConcurrentModificationError:
@@ -1440,7 +1460,12 @@ class Scheduler:
                 # tasks free it once `collected` landed. A collect-conflict
                 # (terminal-only, no `collected`) HOLDS the reservation —
                 # matches recovery's re-hold of `terminal` handles.
-                if exec_id is None or fin.collect_succeeded:
+                # A held validation (uncertain durable launch) keeps the
+                # (workdir, scope) reservation until cleanup/recovery frees it —
+                # the durable validation ran against the same workdir (detail 6).
+                if (
+                    exec_id is None or fin.collect_succeeded
+                ) and task_id not in self._validation_hold:
                     to_release.append(task_id)
             else:
                 # Check for timeout
@@ -1519,13 +1544,50 @@ class Scheduler:
         if return_code == 0:
             # Success - check if validation is needed
             if task.validation_cmd:
-                await self._transition(
-                    task_id,
-                    TaskStatus.VALIDATING,
-                    expected_status=TaskStatus.RUNNING,
-                )
-                # Run validation with the Validator class
-                validation_result = await self._run_validation(task)
+                # The VALIDATING transition differs by backend: local does a
+                # plain transition then runs; a durable (non-local) backend
+                # folds the RUNNING->VALIDATING transition into its atomic mint
+                # (start_execution) inside _run_durable_validation.
+                backend = self._resolve_validation_backend(task)
+                if backend.id == "local":
+                    await self._transition(
+                        task_id,
+                        TaskStatus.VALIDATING,
+                        expected_status=TaskStatus.RUNNING,
+                    )
+                    validation_result = await self._run_validation(task)
+                else:
+                    try:
+                        request = build_validation_request(
+                            task,
+                            backend_id=backend.id,
+                            run_id=f"val-{task_id}-{task.retry_count + 1}",
+                            attempt=task.retry_count + 1,
+                        )
+                    except ValueError as e:
+                        # Unparseable/empty validation_cmd: a plain transition
+                        # then a failed result (a code-level validation failure,
+                        # not an infra failure) — mirrors the local path's
+                        # ValueError handling in _run_validation.
+                        await self._transition(
+                            task_id,
+                            TaskStatus.VALIDATING,
+                            expected_status=TaskStatus.RUNNING,
+                        )
+                        validation_result = ValidationResult(
+                            success=False,
+                            exit_code=None,
+                            stdout="",
+                            stderr="",
+                            error_message=str(e),
+                        )
+                    else:
+                        validation_result = await self._run_durable_validation(
+                            task, backend, request
+                        )
+                        if validation_result is None:
+                            # Infra failure already routed to NEEDS_REVIEW.
+                            return
                 if validation_result.success:
                     done_task = await self._transition(
                         task_id,
@@ -1840,18 +1902,147 @@ class Scheduler:
         # Handle as failure
         await self._handle_task_failure(task_id, running_task.task, error_msg)
 
-    async def _run_validation(self, task: Task) -> ValidationResult:
-        """Run validation command for a task.
+    def _resolve_validation_backend(self, task: Task) -> ExecutionBackend:
+        """Resolve the backend for a task's validation run.
 
-        Args:
-            task: The task to validate.
-
-        Returns:
-            ValidationResult with execution details.
+        'local' -> the bare LocalBackend; 'same' -> the task's own backend;
+        a named value -> that backend. Preflight has already rejected any
+        SSH target, so this only yields local-transport backends.
         """
-        return await self._validator.validate_task(
-            task.validation_cmd,
-            task.workdir,
+        name = task.validation_backend
+        if name == "local":
+            return self._backends.resolve("local")
+        if name == "same":
+            return self._backends.resolve(task.backend)
+        return self._backends.resolve(name)
+
+    async def _run_validation(self, task: Task) -> ValidationResult:
+        """Run a task's validation on the LOCAL backend (no durable handle).
+
+        Behavior-preserving path used when ``validation_backend`` resolves to
+        the bare LocalBackend: build the validation ExecutionRequest, run it,
+        and map the captured result. Non-local backends are driven by
+        ``_run_durable_validation`` from ``_handle_task_completion`` instead.
+        """
+        if not task.validation_cmd:
+            return ValidationResult(success=True, exit_code=0, stdout="", stderr="")
+        backend = self._resolve_validation_backend(task)
+        run_id = f"val-{task.id}-{task.retry_count + 1}"
+        try:
+            request = build_validation_request(
+                task,
+                backend_id=backend.id,
+                run_id=run_id,
+                attempt=task.retry_count + 1,
+            )
+        except ValueError as e:
+            return ValidationResult(
+                success=False,
+                exit_code=None,
+                stdout="",
+                stderr="",
+                error_message=str(e),
+            )
+        handle = await backend.run(request)
+        result = await handle.wait()
+        return execution_result_to_validation(result)
+
+    async def _run_durable_validation(
+        self, task: Task, backend: ExecutionBackend, request: ExecutionRequest
+    ) -> ValidationResult | None:
+        """Durable validation on a non-local backend.
+
+        Atomically mints the RUNNING->VALIDATING transition together with a
+        `validation`-phase execution_handles row, dispatches the committed
+        transition (fires VALIDATION_STARTED), runs, and finalizes
+        (wait -> terminal -> collect(none) -> collected -> cleanup -> cleaned).
+
+        Returns the ValidationResult on a real pass/fail. Returns None when a
+        launch failure routes the task to NEEDS_REVIEW (infrastructure
+        failure, not a code validation failure).
+        """
+        execution_id = str(uuid.uuid4())
+        attempt = task.retry_count + 1
+        request = request.model_copy(
+            update={"execution_id": execution_id, "attempt": attempt}
+        )
+        await self._db.start_execution(
+            entity_kind="task",
+            entity_id=task.id,
+            expected_status=TaskStatus.RUNNING.value,
+            running_status=TaskStatus.VALIDATING.value,
+            execution_id=execution_id,
+            backend_id=backend.id,
+            transport_ref=f"{backend.id}:maestro-{execution_id}",
+            attempt=attempt,
+            execution_phase="validation",
+        )
+        validating = await self._db.get_task(task.id)
+        await self._dispatch_committed_transition(validating, frm=TaskStatus.RUNNING)
+
+        try:
+            handle = await backend.run(request)
+        except LaunchNotStarted:
+            # Provably never launched: close the handle deterministically,
+            # release is allowed (no live container), route to NEEDS_REVIEW.
+            # Not a task attempt -> no retry consumed.
+            await self._db.mark_execution_state(
+                execution_id, "terminal", allowed_from=["prepared", "running"]
+            )
+            await self._db.mark_execution_state(
+                execution_id, "cleaned", allowed_from=["terminal"]
+            )
+            await self._route_validation_infra_review(
+                task.id, "validation launch provably not started"
+            )
+            return None
+        except Exception:
+            # Uncertain: a container may be live. Preserve the prepared handle,
+            # HOLD the reservation, route immediately to NEEDS_REVIEW (no wait
+            # for recovery). Recovery re-holds + probes the open handle.
+            self._validation_hold.add(task.id)
+            await self._route_validation_infra_review(
+                task.id, "validation launch result unknown"
+            )
+            return None
+
+        running_val = RunningTask(
+            task=validating,
+            handle=handle,
+            started_at=datetime.now(UTC),
+            log_file=request.log_path,
+            execution_id=execution_id,
+            backend_id=backend.id,
+        )
+        fin = await self._finalize_running(running_val)
+        if fin.cleaned:
+            await self._db.mark_execution_state(
+                execution_id, "cleaned", allowed_from=["collected"]
+            )
+        return execution_result_to_validation(fin.execution)
+
+    async def _route_validation_infra_review(self, task_id: str, reason: str) -> None:
+        """Route a validation infrastructure failure to NEEDS_REVIEW.
+
+        VALIDATING -> FAILED -> NEEDS_REVIEW (VALIDATING has no direct edge to
+        NEEDS_REVIEW). This is NOT a code validation failure and consumes no
+        task retry; there is no validation-only re-run in PR1 (documented
+        limitation), so it is fail-closed for a human decision.
+        """
+        message = f"validation infrastructure failure: {reason}"
+        await self._transition(
+            task_id,
+            TaskStatus.FAILED,
+            expected_status=TaskStatus.VALIDATING,
+            message=message,
+            error_message=message,
+        )
+        await self._transition(
+            task_id,
+            TaskStatus.NEEDS_REVIEW,
+            expected_status=TaskStatus.FAILED,
+            message=message,
+            error_message=message,
         )
 
     async def _get_completed_task_ids(self) -> set[str]:
