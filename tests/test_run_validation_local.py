@@ -56,6 +56,17 @@ async def test_local_validation_fails_with_output(db, tmp_path):
     assert "boom" in res.output
 
 
+async def test_local_validation_leaves_no_stray_file_in_workdir(db, tmp_path):
+    # The captured-output mirror log must NOT land in the task workdir, or
+    # auto-commit's `git add -A` would sweep it into the repo.
+    sch = _sched(db, tmp_path)
+    await sch._run_validation(_task(tmp_path, "true"))
+    stray = list(tmp_path.glob("*maestro-validation*")) + list(
+        tmp_path.glob(".maestro-validation*")
+    )
+    assert stray == []
+
+
 async def test_no_cmd_is_success(db, tmp_path):
     sch = _sched(db, tmp_path)
     t = Task(

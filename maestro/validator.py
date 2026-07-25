@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import shlex
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -330,11 +331,15 @@ def build_validation_request(
     argv = shlex.split(task.validation_cmd)
     if not argv:
         raise ValueError("empty validation command")
+    # The captured-output mirror log lives OUTSIDE the task workdir: a bare
+    # LocalBackend writes it in wait(), and dropping it inside the repo would
+    # pollute the tree (and get swept into `git add -A` by auto-commit).
+    log_path = Path(tempfile.gettempdir()) / f"maestro-validation-{run_id}.log"
     return ExecutionRequest(
         run_id=run_id,
         argv=argv,
         workdir=Path(task.workdir),
-        log_path=Path(task.workdir) / f".maestro-validation-{run_id}.log",
+        log_path=log_path,
         capture_output=True,
         inherit_env=True,
         timeout_seconds=float(Validator.DEFAULT_TIMEOUT),
