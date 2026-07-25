@@ -50,6 +50,25 @@ def test_local_and_default_pass():
     check_validation_backends([_task("same", backend="local")], SSH_CFG)
 
 
+def test_same_with_no_backend_resolves_to_ssh_default_and_fails():
+    # default_backend is SSH and the task pins no backend -> `same` resolves to
+    # the SSH default, exactly as BackendResolver.resolve(None) would. It must
+    # fail preflight, not slip through.
+    ssh_default = ExecutionConfig.model_validate(
+        {
+            "default_backend": "gpu",
+            "backends": {
+                "gpu": {
+                    "transport": {"type": "ssh", "host": "gpu", "workdir_root": "/t"},
+                    "isolation": {"type": "bare"},
+                },
+            },
+        }
+    )
+    with pytest.raises(ValidationBackendError, match="gpu"):
+        check_validation_backends([_task("same", backend=None)], ssh_default)
+
+
 def test_no_validation_cmd_skipped():
     t = Task(
         id="t",

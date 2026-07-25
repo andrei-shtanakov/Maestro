@@ -333,8 +333,15 @@ def build_validation_request(
         raise ValueError("empty validation command")
     # The captured-output mirror log lives OUTSIDE the task workdir: a bare
     # LocalBackend writes it in wait(), and dropping it inside the repo would
-    # pollute the tree (and get swept into `git add -A` by auto-commit).
-    log_path = Path(tempfile.gettempdir()) / f"maestro-validation-{run_id}.log"
+    # pollute the tree (and get swept into `git add -A` by auto-commit). Use
+    # mkstemp so the name is unpredictable and the file is created O_EXCL/0600 —
+    # a predictable /tmp path is a symlink-overwrite and collision vector
+    # (CWE-377). We only need the path; close the fd (wait() reopens by name).
+    fd, log_name = tempfile.mkstemp(
+        prefix=f"maestro-validation-{run_id}-", suffix=".log"
+    )
+    os.close(fd)
+    log_path = Path(log_name)
     return ExecutionRequest(
         run_id=run_id,
         argv=argv,

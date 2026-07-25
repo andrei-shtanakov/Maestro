@@ -40,14 +40,20 @@ def check_validation_backends(
     raises — never a silent fallback to local. Tasks without a validation_cmd
     are skipped.
     """
-    registry = (execution or ExecutionConfig()).normalized()
+    exec_cfg = execution or ExecutionConfig()
+    registry = exec_cfg.normalized()
+    default_backend = exec_cfg.default_backend
     for task in tasks:
         if not task.validation_cmd:
             continue
         name = task.validation_backend
         if name == "local":
             continue
-        resolved = task.backend if name == "same" else name
+        # `same` follows the runtime resolver exactly: task.backend, or the
+        # config default when the task pins no backend (BackendResolver.resolve
+        # maps None -> default_backend). Resolving `same` to None here would let
+        # an SSH *default* backend slip through this gate.
+        resolved = (task.backend or default_backend) if name == "same" else name
         spec = registry.get(resolved) if resolved is not None else None
         transport = spec.transport if spec is not None else None
         if isinstance(transport, SshTransport):
