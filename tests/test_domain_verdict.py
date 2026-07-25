@@ -123,3 +123,11 @@ def test_error_verdict_with_exit_2(tmp_path: Path) -> None:
     result = evaluate_handshake(p, exit_code=2, timed_out=False, expected=EXPECTED)
     assert result.outcome is VerdictValue.ERROR
     assert result.protocol_error is None  # infrastructure ERROR, not protocol
+
+
+def test_non_utf8_file_is_error(tmp_path: Path) -> None:
+    p = tmp_path / "attempt-001.json"
+    p.write_bytes(b"\xff\xfe garbled \x80")
+    result = evaluate_handshake(p, exit_code=2, timed_out=False, expected=EXPECTED)
+    assert result.outcome is VerdictValue.ERROR
+    assert result.protocol_error is not None

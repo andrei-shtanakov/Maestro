@@ -122,7 +122,7 @@ def evaluate_handshake(
         return _protocol_error(f"verdict file missing: {json_path}")
     try:
         document = VerdictDocument.model_validate(json.loads(json_path.read_text()))
-    except (json.JSONDecodeError, ValidationError, OSError) as exc:
+    except (ValueError, ValidationError, OSError) as exc:
         return _protocol_error(f"verdict file invalid: {exc}")
 
     identity = document.identity
