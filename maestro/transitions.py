@@ -35,7 +35,7 @@ TASK_EFFECTS: dict[TaskStatus, StatusEffect] = {
     TaskStatus.RUNNING: StatusEffect(
         event=EventType.TASK_STARTED, notification=NotificationEvent.TASK_STARTED
     ),
-    TaskStatus.VALIDATING: StatusEffect(),
+    TaskStatus.VALIDATING: StatusEffect(event=EventType.VALIDATION_STARTED),
     TaskStatus.DONE: StatusEffect(
         event=EventType.TASK_COMPLETED, notification=NotificationEvent.TASK_COMPLETED
     ),
