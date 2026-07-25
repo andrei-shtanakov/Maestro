@@ -97,17 +97,31 @@ Resolution:
 | `same`     | the task's resolved backend (`task.backend` → `default_backend`) |
 | `<name>`   | the named backend                               |
 
+### Persistence (must survive resume)
+
+The scheduler re-reads `Task` from SQLite after a resume, so the field cannot live
+only on the Pydantic models — the `tasks` table currently persists `validation_cmd`
+but has no `validation_backend` column (`database.py:59`). PR1 adds:
+
+- `tasks.validation_backend TEXT NOT NULL DEFAULT 'local'`;
+- a `_migrate_*` migration (`ALTER TABLE tasks ADD COLUMN … DEFAULT 'local'`);
+- create / update / row→model wiring in `database.py` (alongside `validation_cmd`);
+- a resume test proving a `same` / named value round-trips through SQLite.
+
 ### Preflight (fail-loud, PR1)
 
 A dedicated check rejects a config where `validation_backend` resolves to a
-backend whose `transport.type != "local"`. It runs:
+backend whose `transport.type != "local"`. The **scheduler-start gate is the only
+Mode-1 preflight** for this check: it runs at scheduler start alongside the
+existing `validate_ssh_scopes(...)` call (`scheduler.py:742`).
 
-- standalone in `maestro validate` (Mode-1 config path), and
-- as a fail-fast gate at scheduler start, alongside the existing
-  `validate_ssh_scopes(...)` call (`scheduler.py:742`).
+`maestro validate` is **not** a Mode-1 gate for this: that command takes a Mode-2
+`project.yaml` and calls `load_orchestrator_config()` (`cli.py:966`); it never
+loads a Mode-1 tasks config. A standalone `maestro validate-tasks` would expand
+scope and is out of scope for PR1.
 
-Message names the task id, the offending `validation_backend` value, and the
-resolved backend/transport, and states that SSH validation is a PR2 follow-up.
+The gate message names the task id, the offending `validation_backend` value, and
+the resolved backend/transport, and states that SSH validation is a PR2 follow-up.
 
 ## Lifecycle details (normative)
 
@@ -133,26 +147,52 @@ shape (`scheduler.py:1372`) with validation-phase `mark_execution_state` closure
 
 ### 2. Committed-transition dispatch after the atomic RUNNING→VALIDATING mint
 
+**Prerequisite — wire the event.** `TASK_EFFECTS[VALIDATING]` is currently empty
+(`StatusEffect()`, `transitions.py:38`): `EventType.VALIDATION_STARTED` exists in
+the enum but is attached to no transition, so today the VALIDATING transition fires
+nothing. PR1 wires `VALIDATION_STARTED` into `TASK_EFFECTS[VALIDATING]` — a new,
+intentional observable behavior. It applies to **both** the plain and durable paths,
+so they stay symmetric in their potential effects (that symmetry is the point — a
+dead enum and path-divergent effects are the failure mode being closed).
+
 For a durable (non-local) validation backend, the `RUNNING → VALIDATING`
 transition is folded into `start_execution` (atomic CAS + handle insert). Because
 that write is atomic it cannot go through `_transition`; it MUST be followed by
 `_dispatch_committed_transition(task, frm=RUNNING)` (`scheduler.py:362`) so the
-`VALIDATION_STARTED` event/notification actually fires. Skipping it reproduces the
+now-wired `VALIDATION_STARTED` effect actually fires. Skipping it reproduces the
 status-committed-but-effect-not-dispatched (anti-desync) defect class. The local
-validation path keeps the plain `_transition(RUNNING→VALIDATING)` (no handle).
+validation path keeps the plain `_transition(RUNNING→VALIDATING)`, which fires the
+same effect (no handle).
 
 ### 3. Launch-failure taxonomy after persistence
 
-`start_execution` transitions the entity and creates the `prepared` row **before**
-`backend.run()` (`database.py:1332`). After that persistence, a failed launch is
-classified (mirroring the primary dispatch, `scheduler.py:1254-1264`):
+`start_execution` transitions the entity (`RUNNING → VALIDATING`) and creates the
+`prepared` row **before** `backend.run()` (`database.py:1332`). After that
+persistence, a failed validation launch is classified (mirroring the primary
+dispatch, `scheduler.py:1254-1264`) with exact machine states:
 
-- `LaunchNotStarted` — the validator provably never launched → the handle is
-  closed deterministically and the task takes a **validation-infrastructure-failure**
-  outcome (not a validation *failure* of the task's code).
-- **Unknown** launch result (e.g. handshake lost) — the `prepared` handle is
-  **preserved**; the task stays **fail-closed** for recovery to probe → `NEEDS_REVIEW`.
-- Never delete the row or bounce the task back to `RUNNING` on an uncertain launch.
+- **`LaunchNotStarted`** — the validator provably never launched. Nothing runs
+  remotely, so:
+  - handle: `prepared → cleaned` (deterministic close, nothing to reap);
+  - reservation: **released** (proven-not-started — see detail 6);
+  - task: `VALIDATING → FAILED → NEEDS_REVIEW`, message = validation-infrastructure
+    failure. **This does not consume a task retry.**
+- **Unknown launch result** (e.g. handshake lost) — a container may be live against
+  the bind-mounted workdir. The scheduler does **not** wait for a crash+recovery; it
+  routes immediately:
+  - handle: **preserved** in `prepared` (fail-closed — recovery/cleanup must probe
+    the possibly-live container);
+  - reservation: **HELD** (detail 6);
+  - task: `VALIDATING → FAILED → NEEDS_REVIEW`.
+- Never delete the row or bounce the task back to `RUNNING`/`READY` on either.
+
+**Retry-accounting rationale / limitation.** The task retry path re-runs the whole
+task (authoring agent **and** validation), not validation alone. A proven-not-started
+validation is not an authoring-agent attempt; counting it as one would force a
+re-run of already-successful coding work. Because the state machine has no
+validation-only re-run, PR1 does **not** silently retry: both infra outcomes are
+**fail-closed to `NEEDS_REVIEW`** for a human decision. Documenting the absence of a
+validation-only retry as an explicit PR1 limitation is deliberate.
 
 ### 4. `execution_phase` participates in every query and recovery selection
 
@@ -176,6 +216,27 @@ so a **named local bare** backend also gets a durable handle. That is safe and i
 adopted **literally** for validation. PR1 does **not** introduce a new
 `requires_durable_handle` capability abstraction.
 
+### 6. The task reservation covers the validation execution too
+
+The `(workdir, scope)` reservation is released today purely on the **primary
+task's** finalization (`scheduler.py:1438` — release iff `exec_id is None or
+fin.collect_succeeded`). But a durable validation runs a **second** execution
+against the **same** bind-mounted workdir, so releasing on primary finalize alone
+would free a `(workdir, scope)` that a live (or uncertain) validation container is
+still using. The reservation lifetime MUST extend to cover validation:
+
+- **Release** only once the workdir is durably free: validation `LaunchNotStarted`
+  (proven not started) **or** the validation handle reached `collected`/`cleaned`.
+- **HOLD** while the validation handle is `prepared`/`running`/`terminal`
+  (uncertain or in-flight) — mirrors the primary path's HOLD on a collect conflict.
+- **Recovery** re-holds the reservation for any open validation handle it finds
+  (same reconstruction the primary path uses for a `terminal`/open task handle).
+- The **only** subsequent release paths are validation cleanup succeeding or an
+  explicit operator waive — never a guess made at scheduling time.
+
+Local validation (no handle, `backend.id == "local"`) is unaffected: it holds no
+separate reservation and the primary-task release rule stands.
+
 ## Components touched
 
 - `maestro/models.py` — `validation_backend` on `Task` + `TaskConfig` (+ passthrough
@@ -190,14 +251,20 @@ adopted **literally** for validation. PR1 does **not** introduce a new
   becomes the `LocalBackend` path (behavior-preserving).
 - `maestro/scheduler.py` — `_run_validation` resolves the validation backend and
   drives run→finalize; durable RUNNING→VALIDATING mint + committed dispatch;
-  launch-failure taxonomy for the validation launch.
+  launch-failure taxonomy (detail 3); reservation held across validation (detail 6);
+  the scheduler-start SSH-validation fail-loud gate (`scheduler.py:742`, the only
+  Mode-1 gate).
+- `maestro/transitions.py` — wire `EventType.VALIDATION_STARTED` into
+  `TASK_EFFECTS[VALIDATING]` (detail 2).
 - `maestro/database.py` — `start_execution(..., execution_phase='task')` param;
   `execution_handles.execution_phase` column + `_migrate_*` (ADD COLUMN … DEFAULT
-  'task'); phase-aware `get_open_execution_handles` consumers.
+  'task'); phase-aware `get_open_execution_handles` consumers; **plus**
+  `tasks.validation_backend` column + `_migrate_*` (DEFAULT 'local') + create/update/
+  row→model wiring (persistence).
 - `maestro/recovery.py` — phase-split `task_handles`; VALIDATING recovery probes
-  the validation-phase handle.
-- `maestro/preflight.py` (+ `scheduler.py:742` gate) — SSH-validation-target
-  fail-loud check.
+  the validation-phase handle; re-hold the reservation for an open validation handle.
+- `maestro/preflight.py` — the reusable resolve-and-check helper the scheduler-start
+  gate calls (`maestro validate` is Mode-2 only and is **not** wired to this check).
 
 ## Argv / shell parity
 
@@ -220,14 +287,25 @@ on `&&`/pipes is as unsupported after this slice as before it.
 - **Recovery selection (point 4):** a task with a stale open **task**-phase handle
   AND an active **validation**-phase handle → recovery selects the *validation*
   handle for VALIDATING and probes it; routes fail-closed to `NEEDS_REVIEW`.
-- **Launch taxonomy (point 3):** `LaunchNotStarted` → infra-failure outcome, handle
-  closed; unknown → `prepared` handle preserved, task fail-closed.
-- **Preflight fail-loud:** `validation_backend` resolving to an SSH backend fails
-  `maestro validate` and the scheduler start gate with a task-named message.
-- **Migration:** ADD COLUMN default `'task'` is a no-op on an existing DB; existing
-  rows read back `execution_phase='task'`.
-- **Committed dispatch (point 2):** the RUNNING→VALIDATING durable mint fires
-  `VALIDATION_STARTED`.
+- **Launch taxonomy (detail 3):** `LaunchNotStarted` → handle `prepared→cleaned`,
+  reservation released, task `VALIDATING→FAILED→NEEDS_REVIEW`, **no retry consumed**;
+  unknown launch → `prepared` handle preserved, reservation HELD, task
+  `VALIDATING→FAILED→NEEDS_REVIEW` immediately (no wait for recovery).
+- **Reservation hold (detail 6):** an uncertain/in-flight validation handle HOLDS
+  the `(workdir, scope)` reservation; it is released only on proven-not-started or
+  `collected`/`cleaned`; recovery re-holds it for an open validation handle.
+- **Preflight fail-loud (Mode-1 gate):** `validation_backend` resolving to an SSH
+  backend fails the **scheduler-start** gate with a task-named message. (No
+  `maestro validate` assertion — that command is Mode-2 only.)
+- **Persistence / resume (point 2 of review):** a `same` / named `validation_backend`
+  round-trips through SQLite — a task re-read after resume keeps the value, not
+  `'local'`.
+- **Migrations:** `execution_handles.execution_phase` DEFAULT `'task'` and
+  `tasks.validation_backend` DEFAULT `'local'` are no-ops on an existing DB; existing
+  rows read back the defaults.
+- **Committed dispatch + event wiring (detail 2):** `TASK_EFFECTS[VALIDATING]` now
+  carries `VALIDATION_STARTED`; both the durable mint (committed dispatch) and the
+  local plain `_transition` fire it.
 
 ## Non-goals (PR1)
 
