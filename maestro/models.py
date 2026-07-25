@@ -967,18 +967,19 @@ class WorkspaceType(StrEnum):
 class WorkstreamStatus(StrEnum):
     """Workstream execution status with valid state transitions.
 
-    State machine (§4 topology: VERIFYING is a durable state):
-        PENDING → DECOMPOSING → READY → RUNNING → VERIFYING → MERGING → PR_CREATED → DONE
-                                  │        ↑            │
-                                  │        └────────────┘ (rework)
-                                  │
+    State machine:
+        PENDING → DECOMPOSING → READY → RUNNING → MERGING → PR_CREATED → DONE
+                                  │        │  └→ FAILED → READY (retry)
+                                  │        │              └→ NEEDS_REVIEW
+                                  │        └→ VERIFYING   (domain verification)
+                                  │              ├─ PASS + evidence commit → MERGING
+                                  │              ├─ FAIL, rework left      → READY
+                                  │              ├─ FAIL, budget exhausted → NEEDS_REVIEW
+                                  │              ├─ ERROR retries exhausted→ FAILED
+                                  │              └─ live orphan/ambiguity  → NEEDS_REVIEW
+                                  │        (READY + reverify marker → VERIFYING;
+                                  │         finalization happens INSIDE VERIFYING)
                                   └→ ABANDONED
-
-        VERIFYING transitions:
-          • MERGING (verdict PASS; finalization inside VERIFYING, commit persisted)
-          • READY (verdict FAIL; rework loop)
-          • NEEDS_REVIEW (orphan, rework exhausted)
-          • FAILED (error exhausted)
     """
 
     PENDING = "pending"

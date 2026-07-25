@@ -13,6 +13,7 @@ from maestro.domain.profile import (
     profile_sha256,
     render_argv,
 )
+from maestro.domain.resume import RESUME_REVERIFY, RESUME_REWORK
 from maestro.domain.verdict import (
     EchoExpectations,
     Finding,
@@ -26,6 +27,8 @@ from maestro.domain.verdict import (
 
 __all__ = [
     "ALLOWED_PLACEHOLDERS",
+    "RESUME_REVERIFY",
+    "RESUME_REWORK",
     "CriteriaConfig",
     "DeliveryPolicy",
     "DomainProfile",
