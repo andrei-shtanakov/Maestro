@@ -11,8 +11,10 @@ This module provides the main scheduler loop that:
 import asyncio
 import contextlib
 import logging
+import shutil
 import signal
 import subprocess
+import tempfile
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -23,7 +25,7 @@ from subprocess import Popen
 from typing import Protocol
 
 from maestro._vendor import obs
-from maestro.catalog import CatalogError, HarnessModelUnresolved
+from maestro.catalog import CatalogError, HarnessModelUnresolved, load_catalog
 from maestro.coordination.arbiter_errors import ArbiterUnavailable
 from maestro.coordination.routing import (
     IN_FLIGHT_STATUSES,
@@ -36,6 +38,7 @@ from maestro.coordination.routing import (
 from maestro.cost_tracker import effective_cost, parse_and_create_cost
 from maestro.dag import DAG
 from maestro.database import ConcurrentModificationError, Database, TaskNotFoundError
+from maestro.domain.verdict import VerdictValue
 from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
 from maestro.execution.backend import ExecutionBackend, TaskHandle
 from maestro.execution.exec_config import ExecutionConfig
@@ -65,6 +68,7 @@ from maestro.models import (
     TaskOutcomeStatus,
     TaskStatus,
     TransitionSubject,
+    VerifierConfig,
     harness_of_agent_id,
     model_of_agent_id,
 )
@@ -78,6 +82,11 @@ from maestro.validator import (
     build_validation_request,
     execution_result_to_validation,
 )
+from maestro.verifier.config import resolve_verifier_model
+from maestro.verifier.diff import build_scope_patch, compute_identity
+from maestro.verifier.envelope import build_envelope
+from maestro.verifier.judge import ClaudeDiffJudge, TaskVerificationContext
+from maestro.verifier.prompt import profile_sha256
 
 
 logger = logging.getLogger(__name__)
@@ -257,6 +266,7 @@ class Scheduler:
         routing: RoutingStrategy | None = None,
         arbiter_mode: ArbiterMode = ArbiterMode.ADVISORY,
         execution: ExecutionConfig | None = None,
+        verifier: VerifierConfig | None = None,
     ) -> None:
         """Initialize scheduler.
 
@@ -275,6 +285,10 @@ class Scheduler:
                 block of the project config). None keeps the zero-config
                 local/bare path — `BackendResolver` resolves every task to
                 `LocalBackend`, identical to the pre-Task-8 behavior.
+            verifier: Optional adversarial LLM verifier-gate config (the
+                `verifier:` block of the project config). None keeps
+                today's behavior byte-for-byte: `VALIDATING -> DONE`
+                directly, no `VERIFYING` phase for any task.
         """
         self._db = db
         self._dag = dag
@@ -296,6 +310,7 @@ class Scheduler:
         self._abandon_outcome_after_s: int = 300
         self._execution = execution or ExecutionConfig()
         self._backends = BackendResolver(self._execution, mode="scheduler")
+        self._verifier = verifier
         self._armed: set[Path] = set()
         self._reservations = ReservationRegistry()
         # Tasks whose (workdir, scope) reservation must be HELD because a
@@ -1107,6 +1122,43 @@ class Scheduler:
             msg = f"Working directory is not a directory: {workdir}"
             raise SchedulerError(msg)
 
+        # Verifier-gate baseline capture (design §5): the FIRST dispatch of a
+        # verifier-enabled task records `git rev-parse HEAD` of the (shared)
+        # workdir as its diff baseline — once, never overwritten (guarded by
+        # `verifier_baseline_sha is None` here AND at the DB layer). This is
+        # also where the clean-worktree precondition (§5.1) is enforced: a
+        # dirty workdir at first dispatch means the verifier's later diff
+        # could not be trusted to reflect only this task's change, so the
+        # task is routed to NEEDS_REVIEW instead of ever running.
+        if self._verifier_enabled(task) and task.verifier_baseline_sha is None:
+            try:
+                dirty = self._git_worktree_dirty(workdir)
+                baseline_sha = self._git_head_sha(workdir)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                message = f"verifier baseline capture failed: {exc}"
+                await self._transition(
+                    task_id,
+                    TaskStatus.NEEDS_REVIEW,
+                    expected_status=TaskStatus.READY,
+                    message=message,
+                    error_message=message,
+                )
+                return False
+            if dirty:
+                message = (
+                    "verifier gate: workdir has uncommitted changes at first dispatch"
+                )
+                await self._transition(
+                    task_id,
+                    TaskStatus.NEEDS_REVIEW,
+                    expected_status=TaskStatus.READY,
+                    message=message,
+                    error_message=message,
+                )
+                return False
+            if await self._db.update_task_verifier_baseline(task_id, baseline_sha):
+                task = task.model_copy(update={"verifier_baseline_sha": baseline_sha})
+
         # Build context from completed dependencies
         context = await self._build_dependency_context(task)
 
@@ -1643,22 +1695,28 @@ class Scheduler:
                             # Infra failure already routed to NEEDS_REVIEW.
                             return
                 if validation_result.success:
-                    done_task = await self._transition(
-                        task_id,
-                        TaskStatus.DONE,
-                        expected_status=TaskStatus.VALIDATING,
-                        result_summary="Task completed successfully",
-                    )
-                    self._auto_commit_task(task)
-                    outcome = await self._build_outcome(done_task, exit_code=0)
-                    await self._try_report_outcome(done_task, outcome)
-                    _obs_log.info(
-                        "task.completed",
-                        task_id=task_id,
-                        agent=task.routed_agent_type or task.agent_type.value,
-                        validation_passed=True,
-                        backend_id=running_task.backend_id,
-                    )
+                    if self._verifier_enabled(task):
+                        # Mode-1 adversarial verifier gate (design §4/§6):
+                        # replaces the direct VALIDATING -> DONE below with
+                        # VALIDATING -> VERIFYING -> {DONE, retry, NEEDS_REVIEW}.
+                        await self._run_verifier(task_id, task, running_task)
+                    else:
+                        done_task = await self._transition(
+                            task_id,
+                            TaskStatus.DONE,
+                            expected_status=TaskStatus.VALIDATING,
+                            result_summary="Task completed successfully",
+                        )
+                        self._auto_commit_task(task)
+                        outcome = await self._build_outcome(done_task, exit_code=0)
+                        await self._try_report_outcome(done_task, outcome)
+                        _obs_log.info(
+                            "task.completed",
+                            task_id=task_id,
+                            agent=task.routed_agent_type or task.agent_type.value,
+                            validation_passed=True,
+                            backend_id=running_task.backend_id,
+                        )
                 else:
                     # Include validation output in error for retry context
                     error_msg = self._format_validation_error(validation_result)
@@ -1718,7 +1776,11 @@ class Scheduler:
             error_message: Error message describing the failure.
             validation_result: The validation result with captured output.
         """
-        # Get current task state from DB (fresh to avoid stale retry_count)
+        # Get current task state from DB (fresh to avoid stale retry_count).
+        # Also doubles as the CAS `expected_status` below instead of a
+        # hardcoded VALIDATING — the verifier gate (design §6) calls this
+        # same retry path from VERIFYING on a FAIL verdict, and both
+        # VALIDATING->FAILED and VERIFYING->FAILED are valid transitions.
         current_task = await self._db.get_task(task_id)
 
         # Build error message with validation output for retry context
@@ -1750,7 +1812,7 @@ class Scheduler:
             failed_task = await self._transition(
                 task_id,
                 TaskStatus.FAILED,
-                expected_status=TaskStatus.VALIDATING,
+                expected_status=current_task.status,
                 message=full_error,
                 error_message=full_error,
                 retry_count=new_retry_count,
@@ -1802,7 +1864,7 @@ class Scheduler:
             failed_task = await self._transition(
                 task_id,
                 TaskStatus.FAILED,
-                expected_status=TaskStatus.VALIDATING,
+                expected_status=current_task.status,
                 message=full_error,
                 error_message=full_error,
             )
@@ -1815,6 +1877,243 @@ class Scheduler:
                 TaskStatus.NEEDS_REVIEW,
                 expected_status=TaskStatus.FAILED,
                 message=full_error,
+            )
+
+    def _verifier_enabled(self, task: Task) -> bool:
+        """Whether `task` goes through the Mode-1 adversarial verifier gate.
+
+        Requires a project-level `verifier:` block, a `validation_cmd`
+        (there is nothing to gate without a validated result), and a
+        non-empty `scope` — `build_scope_patch` rejects an empty scope
+        outright, and an unscoped task has no bounded diff to judge.
+        """
+        return (
+            self._verifier is not None
+            and bool(task.validation_cmd)
+            and bool(task.scope)
+        )
+
+    @staticmethod
+    def _git_head_sha(workdir: Path) -> str:
+        """`git rev-parse HEAD` for `workdir` — the verifier gate's baseline."""
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        return result.stdout.strip()
+
+    @staticmethod
+    def _git_worktree_dirty(workdir: Path) -> bool:
+        """True if `workdir` has any uncommitted change (tracked or untracked).
+
+        Enforces the verifier gate's clean-worktree precondition (design
+        §5.1) at a task's first dispatch, before its baseline sha is ever
+        recorded — a dirty workdir means a later scope-bounded diff could
+        pick up changes this task never made.
+        """
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        return bool(result.stdout.strip())
+
+    async def _run_verifier(
+        self,
+        task_id: str,
+        task: Task,
+        running_task: RunningTask,
+    ) -> None:
+        """Run the Mode-1 adversarial diff-judge gate (design §4/§6).
+
+        Replaces a direct `VALIDATING -> DONE` for a verifier-enabled task
+        whose validation just passed with
+        `VALIDATING -> VERIFYING -> {DONE, retry-via-FAILED, NEEDS_REVIEW}`.
+
+        Step 1 (still VALIDATING): build the scope-bounded patch + identity
+        hashes + stdin envelope, and resolve the verifier model. ANY failure
+        here (oversize/binary diff, a git failure, no baseline sha, no
+        resolvable verifier model) is a fail-closed gate fault —
+        NEEDS_REVIEW straight from VALIDATING, `VERIFIER_ERROR` only; the
+        judge process never started, so `VERIFIER_STARTED` must never fire
+        on this path. A global `CatalogError` (corrupt catalog) is NOT
+        swallowed here — it re-raises to halt the whole run, mirroring how
+        `_spawn_ready_tasks` treats the same exception.
+
+        Step 2: atomically CAS VALIDATING -> VERIFYING while minting a
+        durable execution handle (mirrors `_run_durable_validation`'s
+        RUNNING -> VALIDATING mint), then emit `VERIFIER_STARTED`.
+
+        Step 3/4: run the judge and route: PASS -> DONE (+ auto-commit +
+        outcome report + `VERIFIER_PASSED`); FAIL -> `_handle_validation_failure`
+        (the existing retry path, findings folded into the error context) +
+        `VERIFIER_FAILED`; ERROR -> NEEDS_REVIEW from VERIFYING +
+        `VERIFIER_ERROR`.
+        """
+        cfg = self._verifier
+        if cfg is None:
+            # Invariant: callers only reach here via `_verifier_enabled`.
+            return
+        worktree = Path(task.workdir)
+
+        try:
+            if not task.scope:
+                raise ValueError("verifier gate requires a non-empty task.scope")
+            if task.verifier_baseline_sha is None:
+                raise ValueError(
+                    "verifier gate has no baseline sha recorded for this task"
+                )
+            patch = build_scope_patch(
+                worktree,
+                task.verifier_baseline_sha,
+                task.scope,
+                max_bytes=cfg.max_diff_bytes,
+            )
+            artifact_sha256, criteria_sha256, verified_scope_sha256 = compute_identity(
+                task, patch
+            )
+            envelope = build_envelope(
+                task_id=task_id,
+                title=task.title,
+                prompt=task.prompt,
+                validation_cmd=task.validation_cmd,
+                scope=task.scope,
+                patch=patch,
+                artifact_sha256=artifact_sha256,
+                criteria_sha256=criteria_sha256,
+                verified_scope_sha256=verified_scope_sha256,
+            )
+            verified_source_commit = self._git_head_sha(worktree)
+            catalog = load_catalog()
+            verifier_model = resolve_verifier_model(cfg, catalog)
+        except CatalogError:
+            raise
+        except Exception as exc:
+            message = f"verifier envelope preflight failed: {exc}"
+            self._emit_event(
+                EventType.VERIFIER_ERROR, {"task_id": task_id, "error": message}
+            )
+            await self._transition(
+                task_id,
+                TaskStatus.NEEDS_REVIEW,
+                expected_status=TaskStatus.VALIDATING,
+                message=message,
+                error_message=message,
+            )
+            return
+
+        execution_id = str(uuid.uuid4())
+        attempt = task.retry_count + 1
+        backend = self._backends.resolve("local")
+        await self._db.start_execution(
+            entity_kind="task",
+            entity_id=task_id,
+            expected_status=TaskStatus.VALIDATING.value,
+            running_status=TaskStatus.VERIFYING.value,
+            execution_id=execution_id,
+            backend_id=backend.id,
+            transport_ref=f"{backend.id}:verify-{execution_id}",
+            attempt=attempt,
+            execution_phase="verification",
+        )
+        verifying_task = await self._db.get_task(task_id)
+        await self._dispatch_committed_transition(
+            verifying_task, frm=TaskStatus.VALIDATING
+        )
+        self._emit_event(
+            EventType.VERIFIER_STARTED,
+            {"task_id": task_id, "execution_id": execution_id},
+        )
+
+        out_dir = Path(tempfile.mkdtemp(prefix="maestro-verify-out-"))
+        try:
+            ctx = TaskVerificationContext(
+                task_id=task_id,
+                run_id=f"verify-{task_id}-{attempt}",
+                attempt=attempt,
+                execution_id=execution_id,
+                worktree=worktree,
+                out_json=out_dir / "verdict.json",
+                envelope=envelope,
+                artifact_sha256=artifact_sha256,
+                criteria_sha256=criteria_sha256,
+                profile_sha256=profile_sha256(),
+                verified_source_commit=verified_source_commit,
+                verified_scope_sha256=verified_scope_sha256,
+            )
+            judge = ClaudeDiffJudge(
+                model=verifier_model,
+                backend=backend,
+                timeout_seconds=cfg.timeout_seconds,
+                db=self._db,
+            )
+            result = await judge.verify(ctx)
+        finally:
+            shutil.rmtree(out_dir, ignore_errors=True)
+
+        if result.outcome is VerdictValue.PASS:
+            done_task = await self._transition(
+                task_id,
+                TaskStatus.DONE,
+                expected_status=TaskStatus.VERIFYING,
+                result_summary="Task completed successfully (verifier PASS)",
+            )
+            self._auto_commit_task(task)
+            outcome = await self._build_outcome(done_task, exit_code=0, attempt=attempt)
+            await self._try_report_outcome(done_task, outcome)
+            self._emit_event(
+                EventType.VERIFIER_PASSED,
+                {"task_id": task_id, "execution_id": execution_id},
+            )
+            _obs_log.info(
+                "task.completed",
+                task_id=task_id,
+                agent=task.routed_agent_type or task.agent_type.value,
+                validation_passed=True,
+                verifier_passed=True,
+                backend_id=running_task.backend_id,
+            )
+        elif result.outcome is VerdictValue.FAIL:
+            findings = result.document.findings if result.document else []
+            feedback = "\n".join(
+                f.author_feedback for f in findings if f.author_feedback
+            )
+            message = "verifier gate FAIL"
+            if feedback:
+                message = f"{message}:\n{feedback}"
+            self._emit_event(
+                EventType.VERIFIER_FAILED,
+                {"task_id": task_id, "execution_id": execution_id},
+            )
+            verifier_validation_result = ValidationResult(
+                success=False,
+                exit_code=1,
+                stdout="",
+                stderr="",
+                error_message=message,
+            )
+            await self._handle_validation_failure(
+                task_id, task, message, verifier_validation_result
+            )
+        else:
+            message = result.protocol_error or "verifier gate ERROR"
+            self._emit_event(
+                EventType.VERIFIER_ERROR,
+                {"task_id": task_id, "execution_id": execution_id, "error": message},
+            )
+            await self._transition(
+                task_id,
+                TaskStatus.NEEDS_REVIEW,
+                expected_status=TaskStatus.VERIFYING,
+                message=message,
+                error_message=message,
             )
 
     async def _handle_task_failure(
@@ -2208,6 +2507,7 @@ async def create_scheduler_from_config(
     arbiter_mode: ArbiterMode = ArbiterMode.ADVISORY,
     arbiter_enabled: bool = False,
     execution: ExecutionConfig | None = None,
+    verifier: VerifierConfig | None = None,
 ) -> Scheduler:
     """Create a scheduler from task configurations.
 
@@ -2232,6 +2532,9 @@ async def create_scheduler_from_config(
         execution: Optional execution-backends config (the project's
             `execution:` block); forwarded to `Scheduler` for per-task
             backend resolution. None keeps the zero-config local path.
+        verifier: Optional adversarial LLM verifier-gate config (the
+            project's `verifier:` block); forwarded to `Scheduler`. None
+            keeps `VALIDATING -> DONE` with no `VERIFYING` phase.
 
     Returns:
         Configured Scheduler instance.
@@ -2273,4 +2576,5 @@ async def create_scheduler_from_config(
         routing=routing,
         arbiter_mode=arbiter_mode,
         execution=execution,
+        verifier=verifier,
     )

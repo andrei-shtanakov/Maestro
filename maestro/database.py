@@ -1461,6 +1461,43 @@ class Database:
         )
         await self._connection.commit()
 
+    async def update_task_verifier_baseline(
+        self, task_id: str, baseline_sha: str
+    ) -> bool:
+        """Persist the verifier gate's baseline sha for a task — write-once.
+
+        `WHERE verifier_baseline_sha IS NULL` makes this a write-once guard
+        at the DB level: once a task's baseline is recorded (at its first
+        dispatch, design §5), a later call for the same task — e.g. a retry
+        re-dispatch — is a silent no-op rather than clobbering the original
+        baseline the verifier gate's diffs are pinned to.
+
+        Args:
+            task_id: ID of the task to record the baseline for.
+            baseline_sha: The commit sha (`git rev-parse HEAD` of the task's
+                workdir at first dispatch) to record.
+
+        Returns:
+            True if this call set the baseline (row was NULL and got
+            written), False if a baseline was already recorded (no-op).
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            """
+            UPDATE tasks SET verifier_baseline_sha = ?
+            WHERE id = ? AND verifier_baseline_sha IS NULL
+            """,
+            (baseline_sha, task_id),
+        )
+        await self._connection.commit()
+        return cursor.rowcount > 0
+
     async def mark_outcome_reported(
         self,
         task_id: str,
