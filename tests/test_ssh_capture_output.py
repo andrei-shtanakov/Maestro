@@ -77,3 +77,69 @@ async def test_wait_returns_empty_tail_without_capture_output(tmp_path):
     result = await h.wait()
     assert result.stdout_tail == ""
     assert result.stderr_tail == ""
+
+
+@pytest.mark.anyio
+async def test_final_tail_catch_up_populates_stdout_tail(tmp_path):
+    """Prove the final _tail_log() in wait() fetches fresh remote bytes.
+
+    Configures fake ssh so the final tail in wait() returns content NOT
+    pre-written to the log. The ONLY way those bytes reach stdout_tail is
+    via the final _tail_log() call in wait(). If that call is removed,
+    this test fails.
+    """
+    seq = {"tail_calls": 0}
+
+    class CountingFakeSsh:
+        def __init__(self):
+            self.calls: list[list[str]] = []
+
+        async def __call__(self, argv, stdin):
+            self.calls.append(argv)
+            j = " ".join(argv)
+
+            # Count tail -c calls; return fresh bytes only on second+ calls
+            if "tail" in j and "-c" in j:
+                seq["tail_calls"] += 1
+                # First tail (monitor loop): returns empty
+                # Second+ tail (final in wait()): returns fresh bytes
+                if seq["tail_calls"] >= 2:
+                    return RunResult(0, "late remote bytes\n", "")
+                return RunResult(0, "", "")
+
+            # Status marker: becomes available after first tail
+            if ".status" in j:
+                return RunResult(
+                    0,
+                    json.dumps(
+                        {"pid": 5, "pgid": 5, "exit_code": 0, "completed_at": 1.0}
+                    ),
+                    "",
+                )
+
+            return RunResult(0, "", "")
+
+    fake = CountingFakeSsh()
+    ssh = SshCli(
+        SshTransport(type="ssh", host="gpu", workdir_root="/w"), runner=fake
+    )
+    layout = remote_layout("/w", "e1")
+    h = SshTaskHandle(
+        ssh,
+        layout,
+        _ref(),
+        log_path=tmp_path / "log",
+        timeout_seconds=None,
+        collect_spec=CollectSpec(tmp_path / "wt", tmp_path / "st", tmp_path / "j", {}),
+        poll_interval=0.01,
+        capture_output=True,
+    )
+
+    h.start()
+    result = await h.wait()
+
+    # The final tail catch-up MUST have been called and populated stdout_tail
+    assert "late remote bytes" in result.stdout_tail
+    assert result.stderr_tail == ""
+    # Verify that at least 2 tail calls were made (monitor + final wait)
+    assert seq["tail_calls"] >= 2
