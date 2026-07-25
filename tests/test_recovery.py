@@ -8,8 +8,18 @@ from typing import Any
 import pytest
 
 from maestro.database import Database, create_database
+from maestro.execution.exec_config import DockerConfig, ExecutionConfig
 from maestro.models import Task, TaskConfig, TaskStatus
 from maestro.recovery import RecoveryStatistics, StateRecovery
+
+
+# Task 9: resolving "docker" through BackendResolver (instead of a
+# hand-composed docker special-case) requires a registry entry for it — the
+# legacy `execution.docker` shorthand normalizes into `backends["docker"]`.
+# `StateRecovery(..., local_docker=cast(DockerCli, self._docker))` wires the
+# resolved backend's docker client to the same injected `_FakeDocker` these
+# tests already pass via `docker=`.
+_DOCKER_EXEC = ExecutionConfig(docker=DockerConfig(image="test:latest"))
 
 
 class _FakeDocker:
@@ -603,12 +613,12 @@ class TestDockerBackedRecovery:
         assert task.status == TaskStatus.RUNNING
 
         docker = _FakeDocker(ids=["c1"], labels={"maestro.execution_id": "exec-1"})
-        recovery = StateRecovery(db_with_tasks, docker=docker)
+        recovery = StateRecovery(db_with_tasks, docker=docker, execution=_DOCKER_EXEC)
         stats = await recovery.recover()
 
         task = await db_with_tasks.get_task("task-1")
         assert task.status == TaskStatus.NEEDS_REVIEW
-        assert "Docker recovery" in (task.error_message or "")
+        assert "container" in (task.error_message or "").lower()
         assert stats.running_recovered == 1
 
     @pytest.mark.anyio
@@ -630,7 +640,7 @@ class TestDockerBackedRecovery:
         )
 
         docker = _FakeDocker(ids=[])
-        recovery = StateRecovery(db_with_tasks, docker=docker)
+        recovery = StateRecovery(db_with_tasks, docker=docker, execution=_DOCKER_EXEC)
         await recovery.recover()
 
         task = await db_with_tasks.get_task("task-1")
@@ -656,7 +666,7 @@ class TestDockerBackedRecovery:
         )
 
         docker = _FakeDocker(ids=[])
-        recovery = StateRecovery(db_with_tasks, docker=docker)
+        recovery = StateRecovery(db_with_tasks, docker=docker, execution=_DOCKER_EXEC)
         await recovery.recover()
 
         task = await db_with_tasks.get_task("task-1")
@@ -677,7 +687,7 @@ class TestDockerBackedRecovery:
         await db_with_tasks.update_task_status("task-1", TaskStatus.RUNNING)
 
         docker = _FakeDocker(ids=["c1"], labels={"maestro.execution_id": "exec-1"})
-        recovery = StateRecovery(db_with_tasks, docker=docker)
+        recovery = StateRecovery(db_with_tasks, docker=docker, execution=_DOCKER_EXEC)
         stats = await recovery.recover()
 
         task = await db_with_tasks.get_task("task-1")
@@ -708,7 +718,7 @@ class TestDockerBackedRecovery:
         )
 
         docker = _FakeDocker(ids=["c1", "c2"])  # ambiguous -> fail closed
-        recovery = StateRecovery(db_with_tasks, docker=docker)
+        recovery = StateRecovery(db_with_tasks, docker=docker, execution=_DOCKER_EXEC)
         stats = await recovery.recover()
 
         task = await db_with_tasks.get_task("task-1")
@@ -743,7 +753,7 @@ class TestDockerBackedRecovery:
         )
 
         docker = _FakeDocker(ids=["c1"], labels={"maestro.execution_id": "exec-1"})
-        recovery = StateRecovery(db_with_tasks, docker=docker)
+        recovery = StateRecovery(db_with_tasks, docker=docker, execution=_DOCKER_EXEC)
         await recovery.recover()
 
         assert docker.rm_calls == ["c1"]
@@ -812,7 +822,7 @@ class TestDockerBackedRecovery:
         db_with_tasks.get_open_execution_handles = _fake_open_handles  # type: ignore[method-assign]
 
         docker = _FakeDocker(ids=["c1"], labels={"maestro.execution_id": "exec-new"})
-        recovery = StateRecovery(db_with_tasks, docker=docker)
+        recovery = StateRecovery(db_with_tasks, docker=docker, execution=_DOCKER_EXEC)
         stats = await recovery.recover()
 
         # The probe must have queried the live attempt's execution_id, not

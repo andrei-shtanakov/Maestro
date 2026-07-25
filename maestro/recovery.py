@@ -9,7 +9,7 @@ re-execution.
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from maestro.coordination.arbiter_errors import ArbiterUnavailable
 from maestro.coordination.routing import (
@@ -24,8 +24,10 @@ from maestro.execution.docker_recovery import (
     GC_CLEAN_OUTCOMES,
     DockerProbe,
     gc_terminal_handle,
-    probe_execution,
 )
+from maestro.execution.exec_config import ExecutionConfig
+from maestro.execution.handle_ref import handle_ref_from_row
+from maestro.execution.resolver import BackendResolver, ExecutionConfigError
 from maestro.models import Task, TaskOutcome, TaskOutcomeStatus, TaskStatus
 
 
@@ -82,17 +84,33 @@ class StateRecovery:
         print(stats)
     """
 
-    def __init__(self, db: Database, docker: DockerProbe | None = None) -> None:
+    def __init__(
+        self,
+        db: Database,
+        docker: DockerProbe | None = None,
+        execution: ExecutionConfig | None = None,
+    ) -> None:
         """Initialize state recovery.
 
         Args:
             db: Database connection for task state access.
             docker: Docker CLI wrapper used to probe execution_handles rows
-                for docker-backed tasks before re-READYing them. Injectable
-                for tests; defaults to a real `DockerCli()`.
+                for local-docker-backed tasks before re-READYing them.
+                Injectable for tests; defaults to a real `DockerCli()`. Also
+                wired into the `BackendResolver` as `local_docker` so a
+                resolved local-docker backend's `probe()` hits this same
+                client instead of a fresh, un-injectable one.
+            execution: Execution-backends config (the `execution:` block)
+                used to resolve each open handle's persisted `backend_id`
+                to its `ExecutionBackend` for probing. `None` keeps the
+                zero-config local/bare path (only `backends["local"]`
+                resolvable).
         """
         self._db = db
         self._docker = docker or DockerCli()
+        self._backends = BackendResolver(
+            execution, mode="scheduler", local_docker=cast("DockerCli", self._docker)
+        )
 
     async def recover(
         self, routing: RoutingStrategy | None = None
@@ -101,14 +119,14 @@ class StateRecovery:
 
         Finds all tasks in RUNNING or VALIDATING state and transitions
         them back to READY for re-execution — unless an open, non-local
-        `execution_handles` row exists for the task and `probe_execution`
-        finds (or cannot rule out) a live/leftover container, in which
-        case the task is routed to NEEDS_REVIEW instead (fail-closed: a
+        `execution_handles` row exists for the task and its resolved
+        backend's `probe()` says review is needed (fail-closed: a
         docker-backed task is never silently re-run over a container that
-        might still be alive). Tasks in terminal states (DONE, ABANDONED)
-        are not affected. `terminal`-state handles (any entity) are swept
-        for ownership-checked GC as a side effect — see
-        `_gc_terminal_handles`.
+        might still be alive, and any SSH-backed task is never silently
+        re-run at all — collect may be unconfirmed). Tasks in terminal
+        states (DONE, ABANDONED) are not affected. `terminal`-state handles
+        (any entity) are swept for ownership-checked GC as a side effect —
+        see `_gc_terminal_handles`.
 
         Args:
             routing: Optional RoutingStrategy. When supplied, arbiter
@@ -120,22 +138,40 @@ class StateRecovery:
         """
         open_handles = await self._db.get_open_execution_handles()
 
-        # Filter to prepared/running, and split by execution_phase: a task can
-        # have both a stale terminal row (prior attempt, cleanup unconfirmed)
-        # and a fresh running row (current attempt) open at once, AND — once
-        # validation runs on a durable backend — a still-open task-phase handle
-        # alongside a live validation-phase handle for the same entity_id.
-        # Keying by entity_id alone would let one shadow the other; splitting by
-        # phase lets RUNNING recovery probe the task handle and VALIDATING
-        # recovery probe the validation handle.
+        # Filter to prepared/running/terminal/collected, and split by
+        # execution_phase: a task can have both a stale terminal row (prior
+        # attempt, cleanup unconfirmed) and a fresh running row (current
+        # attempt) open at once, AND — once validation runs on a durable
+        # backend — a still-open task-phase handle alongside a live
+        # validation-phase handle for the same entity_id. Keying by
+        # entity_id alone would let one shadow the other; splitting by phase
+        # lets RUNNING recovery probe the task handle and VALIDATING
+        # recovery probe the validation handle. `terminal`/`collected` are
+        # included (PR2 §4c) so a handle stranded past `running` — including
+        # one whose outcome was lost after `collected` — still reaches the
+        # backend-probe router instead of being silently skipped. Within one
+        # (entity_id, phase), a prepared/running row always wins over a
+        # terminal/collected one — the in-flight current attempt must never
+        # be shadowed by stale bookkeeping left over from a prior attempt
+        # whose cleanup confirmation never landed; the terminal/collected
+        # row is only surfaced when it is the *sole* open handle for that
+        # (entity_id, phase).
         def _by_phase(phase: str) -> dict[str, dict[str, Any]]:
-            return {
-                h["entity_id"]: h
+            candidates = [
+                h
                 for h in open_handles
                 if h["entity_kind"] == "task"
-                and h["state"] in ("prepared", "running")
+                and h["state"] in ("prepared", "running", "terminal", "collected")
                 and h.get("execution_phase", "task") == phase
-            }
+            ]
+            result: dict[str, dict[str, Any]] = {}
+            for h in candidates:
+                if h["state"] in ("prepared", "running"):
+                    result[h["entity_id"]] = h
+            for h in candidates:
+                if h["state"] in ("terminal", "collected"):
+                    result.setdefault(h["entity_id"], h)
+            return result
 
         task_phase = _by_phase("task")
         validation_phase = _by_phase("validation")
@@ -179,9 +215,10 @@ class StateRecovery:
         """Recover tasks stuck in RUNNING state.
 
         Transitions RUNNING → FAILED → READY to allow re-execution — unless
-        the task has an open docker-backed handle and `probe_execution`
-        says review is needed, in which case it goes RUNNING → NEEDS_REVIEW
-        instead (a direct edge, valid per the `TaskStatus` state diagram).
+        the task has an open, non-local execution handle and its resolved
+        backend's `probe()` says review is needed, in which case it goes
+        RUNNING → NEEDS_REVIEW instead (a direct edge, valid per the
+        `TaskStatus` state diagram).
 
         Args:
             task_handles: Map of `entity_id` -> open `execution_handles`
@@ -194,7 +231,7 @@ class StateRecovery:
         recovered = 0
 
         for task in running_tasks:
-            if await self._route_docker_task_to_review(task, task_handles):
+            if await self._route_open_handle_to_review(task, task_handles):
                 recovered += 1
                 continue
             await self._transition_to_ready(task, "Recovered after scheduler restart")
@@ -208,10 +245,10 @@ class StateRecovery:
         """Recover tasks stuck in VALIDATING state.
 
         Transitions VALIDATING → FAILED → READY to allow re-execution —
-        unless the task has an open docker-backed handle and
-        `probe_execution` says review is needed, in which case it goes
-        VALIDATING → FAILED → NEEDS_REVIEW instead (VALIDATING has no
-        direct edge to NEEDS_REVIEW; see the `TaskStatus` state diagram).
+        unless the task has an open, non-local execution handle and its
+        resolved backend's `probe()` says review is needed, in which case
+        it goes VALIDATING → FAILED → NEEDS_REVIEW instead (VALIDATING has
+        no direct edge to NEEDS_REVIEW; see the `TaskStatus` state diagram).
 
         Args:
             task_handles: Map of `entity_id` -> open `execution_handles`
@@ -224,7 +261,7 @@ class StateRecovery:
         recovered = 0
 
         for task in validating_tasks:
-            if await self._route_docker_task_to_review(task, task_handles):
+            if await self._route_open_handle_to_review(task, task_handles):
                 recovered += 1
                 continue
             await self._transition_to_ready(
@@ -234,14 +271,33 @@ class StateRecovery:
 
         return recovered
 
-    async def _route_docker_task_to_review(
+    async def _route_open_handle_to_review(
         self, task: Task, task_handles: dict[str, dict[str, Any]]
     ) -> bool:
-        """Probe a docker-backed task and route it to NEEDS_REVIEW if needed.
+        """Probe a task's open handle via its resolved backend; route to
+        NEEDS_REVIEW unless the backend proves it safe to reclaim.
 
         No-op (returns False) for tasks with no open, non-cleaned handle
-        row — a local-backed task is always unaffected, preserving the
-        pre-Task-18 recovery behavior exactly.
+        row — a plain local task (no durable handle row at all) is always
+        unaffected, preserving the pre-Task-18 recovery behavior exactly.
+
+        Per the PR2 §4c state matrix, classification is by the persisted
+        `backend_id` — resolved through `BackendResolver` — never by a
+        nullable coordinate or hand-composed transport check:
+
+        - a `collected` handle (any backend) always routes to review: the
+          scope reservation is already GC-eligible and the handle itself is
+          safe to leave alone, but the crashed task's outcome was never
+          recorded, so it cannot be silently re-READYed or treated as done.
+        - otherwise, the row is probed via `backend.probe()` — the single,
+          transport-correct recovery boundary. A local bare/docker backend
+          can prove "no live PID/container" (`needs_review=False`) and is
+          safely reclaimed; an SSH backend (bare or docker) always answers
+          `needs_review=True` for an open handle (collect unconfirmed).
+        - an unresolvable `backend_id`, or any exception raised while
+          probing (e.g. a placeholder SSH row with no real coordinates yet,
+          crashed before `update_execution_handle_launch`), fails closed to
+          NEEDS_REVIEW rather than falling through to a default backend.
 
         Args:
             task: The RUNNING or VALIDATING task being recovered.
@@ -250,31 +306,71 @@ class StateRecovery:
 
         Returns:
             True if the task was routed to NEEDS_REVIEW (caller must not
-            also re-READY it); False if there is nothing to probe.
+            also re-READY it); False if there is nothing to probe or the
+            backend confirmed it is safe to reclaim.
         """
         row = task_handles.get(task.id)
-        if row is None or row["state"] not in ("prepared", "running"):
+        if row is None:
             return False
 
-        verdict = await probe_execution(row["execution_id"], self._docker)
-        if not verdict.needs_review:
-            # Confirmed no container: the execution is done. Close the open
-            # handle row now so it doesn't linger open/shadow the fresh
-            # attempt's own handle after the task is re-READYed.
-            await self._db.mark_execution_state(
-                row["execution_id"], "terminal", allowed_from=["prepared", "running"]
+        if row["state"] == "collected":
+            await self._route_to_review(
+                task,
+                f"execution {row['execution_id']!r} was collected but its "
+                "outcome was never recorded before the crash",
             )
-            await self._db.mark_execution_state(
-                row["execution_id"], "cleaned", allowed_from=["terminal"]
+            return True
+
+        try:
+            backend = self._backends.resolve(row["backend_id"])
+        except ExecutionConfigError as exc:
+            await self._route_to_review(
+                task, f"unresolvable backend {row['backend_id']!r}: {exc}"
             )
+            return True
+
+        try:
+            result = await backend.probe(handle_ref_from_row(row))
+        except Exception as exc:
+            # failure (e.g. a placeholder ref with no real coordinates yet)
+            # means review, never a silent reclaim.
+            await self._route_to_review(task, f"probe failed: {exc}")
+            return True
+
+        if not result.needs_review:
+            await self._close_handle(row["execution_id"])
             return False
 
-        message = f"Docker recovery: {verdict.reason}"
+        await self._route_to_review(task, result.detail or "needs review")
+        return True
+
+    async def _close_handle(self, execution_id: str) -> None:
+        """Confirmed safe to reclaim: close the open handle row.
+
+        Marks the handle `terminal` then `cleaned` (both are no-ops if the
+        row is already past that point) so it doesn't linger open and
+        shadow the fresh attempt's own handle after the task is re-READYed.
+        """
+        await self._db.mark_execution_state(
+            execution_id, "terminal", allowed_from=["prepared", "running"]
+        )
+        await self._db.mark_execution_state(
+            execution_id, "cleaned", allowed_from=["terminal"]
+        )
+
+    async def _route_to_review(self, task: Task, reason: str) -> None:
+        """Route a RUNNING/VALIDATING task to NEEDS_REVIEW.
+
+        RUNNING has a direct edge to NEEDS_REVIEW; VALIDATING does not, so
+        it goes through FAILED first (both valid per the `TaskStatus` state
+        diagram).
+        """
+        message = f"recovery: {reason}"
         logger.warning(
-            "recovery: task '%s' has a possibly-live container (%s) — "
-            "routing to NEEDS_REVIEW instead of READY",
+            "recovery: task '%s' has a possibly-live/unresolved execution "
+            "(%s) — routing to NEEDS_REVIEW instead of READY",
             task.id,
-            verdict.reason,
+            reason,
         )
         if task.status == TaskStatus.VALIDATING:
             await self._db.update_task_status(
@@ -289,7 +385,6 @@ class StateRecovery:
             await self._db.update_task_status(
                 task.id, TaskStatus.NEEDS_REVIEW, error_message=message
             )
-        return True
 
     async def _gc_terminal_handles(self, handles: list[dict[str, Any]]) -> int:
         """Best-effort, ownership-checked GC sweep for `terminal` handles.
