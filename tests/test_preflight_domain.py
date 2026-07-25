@@ -237,6 +237,17 @@ class TestSpecGenSsot:
         errors = [i for i in report.errors if i.code == "domain-spec-gen-ssot-conflict"]
         assert len(errors) == 1
 
+    def test_domain_spec_gen_without_budget_is_error(self) -> None:
+        """F4: spec_gen with no budget_usd would run uncapped -> fail closed."""
+        domain = profile_dict(spec_gen={"timeout_minutes": 5.0})
+        config = make_config(
+            domain=domain,
+            spec_runner=SpecRunnerConfig(spec_gen_budget_usd=None),
+        )
+        report = validate_project(config, check_fs=False)
+        errors = [i for i in report.errors if i.code == "domain-spec-gen-no-budget"]
+        assert len(errors) == 1
+
 
 class TestVerifierOnlySourceSanity:
     def test_verifier_only_source_outside_repo_ok(self) -> None:

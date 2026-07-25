@@ -741,23 +741,41 @@ def _check_domain_spec_gen_ssot(
     `domain.spec_gen` and the legacy `spec_runner.spec_gen_budget_usd`
     (default 1.0 — "unset" means explicitly nulled) must not both be
     active; otherwise it's ambiguous which budget actually governs
-    `spec-runner plan --full`.
+    `spec-runner plan --full`. When `domain.spec_gen` is the source of truth
+    it MUST carry a `budget_usd`, or spec generation would run uncapped (the
+    legacy budget having been nulled by this same rule).
     """
-    if domain.spec_gen is None or spec_runner.spec_gen_budget_usd is None:
+    if domain.spec_gen is None:
         return []
-    return [
-        ValidationIssue(
-            severity="error",
-            code="domain-spec-gen-ssot-conflict",
-            workstream_ids=[],
-            message=(
-                "domain.spec_gen and spec_runner.spec_gen_budget_usd are "
-                "both set; spec-gen budget has a single source of truth — "
-                "set spec_runner.spec_gen_budget_usd: null when "
-                "domain.spec_gen is configured."
-            ),
+    issues: list[ValidationIssue] = []
+    if domain.spec_gen.budget_usd is None:
+        issues.append(
+            ValidationIssue(
+                severity="error",
+                code="domain-spec-gen-no-budget",
+                workstream_ids=[],
+                message=(
+                    "domain.spec_gen is set but budget_usd is null; spec "
+                    "generation would run uncapped — set "
+                    "domain.spec_gen.budget_usd."
+                ),
+            )
         )
-    ]
+    if spec_runner.spec_gen_budget_usd is not None:
+        issues.append(
+            ValidationIssue(
+                severity="error",
+                code="domain-spec-gen-ssot-conflict",
+                workstream_ids=[],
+                message=(
+                    "domain.spec_gen and spec_runner.spec_gen_budget_usd are "
+                    "both set; spec-gen budget has a single source of truth — "
+                    "set spec_runner.spec_gen_budget_usd: null when "
+                    "domain.spec_gen is configured."
+                ),
+            )
+        )
+    return issues
 
 
 def _check_domain_verifier_only_source(

@@ -15,13 +15,34 @@ import tempfile
 from collections.abc import Awaitable, Callable
 from fnmatch import fnmatch
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from maestro._vendor.obs import child_env
 from maestro.models import SPEC_PREFIX, WorkstreamConfig
 
 
+if TYPE_CHECKING:
+    from maestro.domain import DomainProfile
+
+
 class DecomposerError(Exception):
     """Base exception for decomposition errors."""
+
+
+def resolve_spec_gen_settings(
+    domain: "DomainProfile | None", legacy_budget_usd: float | None
+) -> tuple[float | None, float | None]:
+    """Resolve (budget_usd, timeout_minutes) for spec generation (§9 SSOT).
+
+    When ``domain.spec_gen`` is set it is the single source of truth; otherwise
+    the legacy ``spec_runner.spec_gen_budget_usd`` supplies the budget and there
+    is no generation timeout. Preflight guarantees the domain budget is not null
+    when ``domain.spec_gen`` is configured, so wiring it here can never fall
+    back to an uncapped run.
+    """
+    if domain is not None and domain.spec_gen is not None:
+        return domain.spec_gen.budget_usd, domain.spec_gen.timeout_minutes
+    return legacy_budget_usd, None
 
 
 class ScopeOverlapWarning:
@@ -101,6 +122,7 @@ class ProjectDecomposer:
         repo_path: Path,
         claude_command: str = "claude",
         spec_gen_budget_usd: float | None = 1.0,
+        spec_gen_timeout_minutes: float | None = None,
     ) -> None:
         """Initialize the decomposer.
 
@@ -109,10 +131,13 @@ class ProjectDecomposer:
             claude_command: Claude CLI command name.
             spec_gen_budget_usd: USD cap for `spec-runner plan --full`;
                 None disables the cap.
+            spec_gen_timeout_minutes: wall-clock cap for spec generation;
+                None keeps the built-in default (30 min).
         """
         self._repo_path = repo_path
         self._claude_command = claude_command
         self._spec_gen_budget_usd = spec_gen_budget_usd
+        self._spec_gen_timeout_minutes = spec_gen_timeout_minutes
         self._logger = logging.getLogger(__name__)
 
     def _get_repo_tree(self, max_depth: int = 3) -> str:
@@ -287,7 +312,7 @@ class ProjectDecomposer:
         self,
         workstream: WorkstreamConfig,
         workspace_path: Path,
-        timeout_minutes: int = 30,
+        timeout_minutes: float | None = None,
         *,
         on_pid: Callable[[int], Awaitable[None]] | None = None,
     ) -> None:
@@ -296,10 +321,21 @@ class ProjectDecomposer:
         Writes spec/maestro-{requirements,design,tasks}.md into the workspace.
         spec-runner owns the tasks.md format (no built-in prompt copy).
 
+        `timeout_minutes` overrides the configured spec-gen timeout for this
+        call; when omitted it falls back to `spec_gen_timeout_minutes` (from
+        `domain.spec_gen`), then to the built-in 30-minute default.
+
         Raises:
             DecomposerError: if spec-runner is missing, exits non-zero,
                 times out, or exits 0 without producing spec/maestro-tasks.md.
         """
+        effective_timeout = (
+            timeout_minutes
+            if timeout_minutes is not None
+            else self._spec_gen_timeout_minutes
+            if self._spec_gen_timeout_minutes is not None
+            else 30
+        )
         spec_dir = workspace_path / "spec"
         spec_dir.mkdir(exist_ok=True)
 
@@ -336,7 +372,7 @@ class ProjectDecomposer:
                 workstream.id,
             )
             await self._run_spec_runner(
-                cmd, workspace_path, timeout_minutes, on_pid=on_pid
+                cmd, workspace_path, effective_timeout, on_pid=on_pid
             )
         finally:
             desc_path.unlink(missing_ok=True)  # noqa: ASYNC240
@@ -354,7 +390,7 @@ class ProjectDecomposer:
         self,
         cmd: list[str],
         cwd: Path,
-        timeout_minutes: int,
+        timeout_minutes: float,
         *,
         on_pid: Callable[[int], Awaitable[None]] | None = None,
     ) -> None:

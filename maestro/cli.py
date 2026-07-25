@@ -53,7 +53,7 @@ from maestro.config import load_orchestrator_config
 from maestro.coordination.arbiter_client import ArbiterClient, ArbiterClientConfig
 from maestro.coordination.routing import RoutingStrategy, make_routing_strategy
 from maestro.dag import DAG
-from maestro.decomposer import ProjectDecomposer
+from maestro.decomposer import ProjectDecomposer, resolve_spec_gen_settings
 from maestro.event_log import create_event_logger
 from maestro.git import GitManager
 from maestro.logging_bridge import setup_logging
@@ -1351,9 +1351,13 @@ async def _run_orchestrator(
             git_manager=git_mgr,
             workspace_base=workspace_base,
         )
+        spec_gen_budget, spec_gen_timeout = resolve_spec_gen_settings(
+            config.domain, config.spec_runner.spec_gen_budget_usd
+        )
         decomposer = ProjectDecomposer(
             repo_path=repo_path,
-            spec_gen_budget_usd=config.spec_runner.spec_gen_budget_usd,
+            spec_gen_budget_usd=spec_gen_budget,
+            spec_gen_timeout_minutes=spec_gen_timeout,
         )
         pr_manager = PRManager(git_manager=git_mgr)
 
