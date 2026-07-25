@@ -20,6 +20,7 @@ from maestro.execution.models import (
     PreparedRun,
     ProbeResult,
 )
+from maestro.execution.ref_identity import RefIdentity, ref_identity
 
 
 if TYPE_CHECKING:
@@ -277,3 +278,10 @@ class LocalBackend:
             )
         verdict = await probe_execution(ref.execution_id, self._docker)
         return ProbeResult(needs_review=verdict.needs_review, detail=verdict.reason)
+
+    def accepts_ref(self, ref: ExecutionHandleRef) -> bool:
+        """Own identity is `("local", "docker" if self._docker else "bare")`;
+        a mismatched or unclassifiable (`("unknown","unknown")`) ref never
+        matches -> caller fails closed rather than probing."""
+        own = RefIdentity("local", "docker" if self._docker is not None else "bare")
+        return ref_identity(ref.transport_ref) == own

@@ -83,6 +83,9 @@ class _FakeBackend:
     async def probe(self, ref: ExecutionHandleRef) -> ProbeResult:
         return ProbeResult(needs_review=False, alive=False)
 
+    def accepts_ref(self, ref: ExecutionHandleRef) -> bool:
+        return True
+
 
 @pytest.fixture
 async def db(tmp_path):

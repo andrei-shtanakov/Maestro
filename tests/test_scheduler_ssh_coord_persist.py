@@ -1,15 +1,22 @@
-"""Task 8: persist real remote coords minted by `SshBackend.run()`.
+"""Task 8 (+ Task 13a generalization): persist the real ref minted by
+`backend.run()` for ANY durable (non-"local") backend.
 
 `start_execution` seeds only a placeholder string `transport_ref` (and NULL
 `remote_host`/`remote_dir`/`status_marker`) before the backend actually
-launches. `SshBackend.run()` mints the *real* JSON `transport_ref` +
-`remote_dir`/`status_marker` on `handle.ref`. Without writing those back onto
-the `execution_handles` row, Mode-1 recovery (Task 9) can never decode a ref
-to probe the remote workspace.
+launches. `backend.run()` mints the *real* ref on `handle.ref` -- JSON for
+SSH (`remote_dir`/`status_marker` too), opaque `local_pid:`/`docker:` for a
+named local-bare/local-docker backend. Without writing those back onto the
+`execution_handles` row, recovery can never decode/classify a ref to probe
+the run.
+
+Task 13a generalized `Scheduler._persist_ssh_launch` (SSH-only,
+`isinstance(backend, SshBackend)`) into `Scheduler._persist_launch`, gated on
+`backend.id != "local"` instead -- so a named local-bare or local-docker
+durable backend now also gets its real ref persisted, not just SSH.
 
 Mirrors the Mode-2 orchestrator's already-covered write-back
 (`tests/test_orchestrator_ssh_wiring.py::test_ssh_backend_persists_minted_handle_coordinates`),
-but exercises the two Mode-1 scheduler call sites instead: task dispatch
+but exercises the Mode-1 scheduler call sites instead: task dispatch
 (`_spawn_task`) and durable validation (`_run_durable_validation`).
 """
 
@@ -184,16 +191,25 @@ async def test_dispatch_persists_minted_ssh_coords(
     json.loads(row["transport_ref"])
 
 
-async def test_docker_dispatch_unaffected_by_ssh_persist_branch(
+async def test_named_docker_dispatch_persists_minted_docker_ref(
     tmp_path: Path, db: Database
 ) -> None:
-    """Zero regression: a non-SshBackend non-local backend (docker) keeps the
-    placeholder transport_ref start_execution seeded -- the ssh-only persist
-    branch must never fire for it."""
-    from tests.fakes.fake_execution_backend import FakeExecutionBackend
+    """Task 13a generalization: a non-SshBackend durable backend (docker) now
+    ALSO gets its real minted ref written back -- the persist branch is keyed
+    off `backend.id != "local"`, not `isinstance(backend, SshBackend)`. The
+    fake's `run()` mints the same `docker:maestro-<execution_id>` shape
+    `DockerIsolator.transport_ref` produces for a real local-docker run."""
+    from tests.fakes.fake_execution_backend import FakeExecutionBackend, FakeTaskHandle
 
     class _FakeDockerBackend(FakeExecutionBackend):
         id = "docker"
+
+        async def run(self, req):
+            handle = FakeTaskHandle(exit_code=0)
+            handle.ref = handle.ref.model_copy(
+                update={"transport_ref": f"docker:maestro-{req.execution_id}"}
+            )
+            return handle
 
     task_id = "docker-task-1"
     task = Task(
@@ -225,7 +241,63 @@ async def test_docker_dispatch_unaffected_by_ssh_persist_branch(
     running_task = sched._running_tasks[task_id]
     execution_id = cast("str", running_task.execution_id)
     row = await _row_for(db, execution_id)
+    # For this backend id the placeholder (`f"{backend.id}:maestro-{id}"`)
+    # and the real minted ref happen to be textually identical
+    # (`"docker:maestro-<id>"` either way) -- the meaningful assertion is
+    # that the persist call fired at all (see the bare-pool case below for
+    # a backend where placeholder != real ref), not that the string
+    # changed.
     assert row["transport_ref"] == f"docker:maestro-{execution_id}"
+    assert row["remote_host"] is None
+    assert row["remote_dir"] is None
+
+
+async def test_named_local_bare_dispatch_persists_minted_pid_ref(
+    tmp_path: Path, db: Database
+) -> None:
+    """A durable (non-"local") backend that mints a bare local_pid: ref (e.g.
+    a named local-bare pool) also gets that real ref written back over the
+    placeholder -- the guard is `backend.id != "local"`, independent of
+    transport/isolation."""
+    from tests.fakes.fake_execution_backend import FakeExecutionBackend
+
+    class _FakeNamedBareBackend(FakeExecutionBackend):
+        id = "bare-pool"
+
+    task_id = "bare-pool-task-1"
+    task = Task(
+        id=task_id,
+        title="Bare pool task",
+        prompt="P",
+        workdir=str(tmp_path),
+        agent_type=AgentType.CLAUDE_CODE,
+        status=TaskStatus.READY,
+        max_retries=2,
+        backend="bare-pool",
+    )
+    await db.create_task(task)
+    (tmp_path / "logs").mkdir(exist_ok=True)
+
+    sched = Scheduler(
+        db=db,
+        dag=DAG([]),
+        spawners={"claude_code": _ssh_spawner()},
+        config=SchedulerConfig(
+            max_concurrent=3, workdir=tmp_path, log_dir=tmp_path / "logs"
+        ),
+    )
+    sched._backends.resolve = lambda _name: _FakeNamedBareBackend()  # type: ignore[method-assign]
+
+    started = await sched._spawn_task(task_id)
+    assert started is True
+
+    running_task = sched._running_tasks[task_id]
+    execution_id = cast("str", running_task.execution_id)
+    row = await _row_for(db, execution_id)
+    # FakeExecutionBackend's default run() mints `local_pid:1` (fake_pid
+    # defaults to "1" when the label is unset) -- NOT the placeholder.
+    assert row["transport_ref"] != f"bare-pool:maestro-{execution_id}"
+    assert row["transport_ref"] == "local_pid:1"
     assert row["remote_host"] is None
     assert row["remote_dir"] is None
 

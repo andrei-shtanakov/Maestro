@@ -24,6 +24,7 @@ from maestro.execution.models import (
     ExecutionRequest,
     ProbeResult,
 )
+from maestro.execution.ref_identity import RefIdentity, ref_identity
 from maestro.execution.secret_file import write_env_file
 from maestro.execution.ssh_cli import Runner, RunResult, SshCli
 from maestro.execution.ssh_collect import capture_baseline
@@ -452,6 +453,13 @@ class SshBackend:
             needs = needs or cont.needs_review
             detail = f"{detail}; container: {cont.reason}"
         return ProbeResult(needs_review=needs, detail=detail)
+
+    def accepts_ref(self, ref: ExecutionHandleRef) -> bool:
+        """Own identity is `("ssh", self.isolation_kind)`; a mismatched or
+        unclassifiable (`("unknown","unknown")`) ref never matches ->
+        caller fails closed rather than probing."""
+        own = RefIdentity("ssh", self.isolation_kind)
+        return ref_identity(ref.transport_ref) == own
 
 
 async def _run_local(argv: list[str]) -> None:

@@ -150,3 +150,6 @@ class FakeExecutionBackend:
 
     async def probe(self, ref: ExecutionHandleRef) -> ProbeResult:
         raise NotImplementedError("not exercised by scheduler tests")
+
+    def accepts_ref(self, ref: ExecutionHandleRef) -> bool:
+        raise NotImplementedError("not exercised by scheduler tests")

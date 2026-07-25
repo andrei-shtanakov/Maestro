@@ -83,3 +83,10 @@ class ExecutionBackend(Protocol):
     async def probe(self, ref: ExecutionHandleRef) -> ProbeResult:
         """Is a persisted run still alive (post-restart recovery)?"""
         ...
+
+    def accepts_ref(self, ref: ExecutionHandleRef) -> bool:
+        """Does this resolved backend's (transport, isolation) match the identity
+        the persisted ref was minted with? False = config drift / unknown ref ->
+        recovery must NEEDS_REVIEW without probing (never reclaim across
+        identities)."""
+        ...
