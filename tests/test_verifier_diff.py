@@ -142,6 +142,43 @@ class TestBuildScopePatch:
         with pytest.raises(ValueError):
             build_scope_patch(scoped_repo, baseline, [], max_bytes=1000)
 
+    def test_non_ascii_paths_tracked_and_untracked(self, scoped_repo: Path) -> None:
+        """Regression: `core.quotepath=false` must apply to EVERY git call.
+
+        A default-locale `git` C-quotes non-ASCII path bytes in `ls-files`/
+        `--name-status` output unless `core.quotepath=false` is set on the
+        call — not just the patch-text `diff`. Pre-fix this either crashed
+        `git add -N` (the untracked case, fed the quoted literal as a
+        pathspec) or made the manifest path disagree with the patch text
+        (the tracked case), corrupting the manifest/identity hashes.
+        """
+        tracked_name = "café.txt"
+        untracked_name = "файл.txt"
+        (scoped_repo / "in_scope" / tracked_name).write_text("original\n")
+        _commit_all(scoped_repo, "add non-ascii tracked file")
+        baseline = _head(scoped_repo)
+
+        (scoped_repo / "in_scope" / tracked_name).write_text("original\nchanged\n")
+        (scoped_repo / "in_scope" / untracked_name).write_text("new file\n")
+
+        result = build_scope_patch(
+            scoped_repo, baseline, ["in_scope"], max_bytes=1_000_000
+        )
+
+        manifest_paths = {e.path for e in result.manifest}
+        tracked_manifest_path = next(p for p in manifest_paths if tracked_name in p)
+        untracked_manifest_path = next(p for p in manifest_paths if untracked_name in p)
+
+        # The manifest path must be the real, unquoted name — not a C-quoted
+        # escape sequence like `"caf\303\251.txt"`.
+        assert tracked_manifest_path == f"in_scope/{tracked_name}"
+        assert untracked_manifest_path == f"in_scope/{untracked_name}"
+
+        # Manifest and patch text must agree (both unquoted).
+        patch_text = result.patch_bytes.decode("utf-8")
+        assert tracked_manifest_path in patch_text
+        assert untracked_manifest_path in patch_text
+
 
 class _Task:
     """Minimal stand-in satisfying `compute_identity`'s structural `TaskLike`."""

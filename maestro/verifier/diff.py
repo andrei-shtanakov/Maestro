@@ -126,15 +126,7 @@ def build_scope_patch(
             _run_git(["add", "-N", "--", *untracked], cwd=worktree, env=env)
 
         patch_bytes = _run_git(
-            [
-                "-c",
-                "core.quotepath=false",
-                "diff",
-                "--no-ext-diff",
-                baseline_sha,
-                "--",
-                *scope,
-            ],
+            ["diff", "--no-ext-diff", baseline_sha, "--", *scope],
             cwd=worktree,
             env=env,
         ).stdout
@@ -219,6 +211,15 @@ def _canonical_patch_envelope(patch: ScopePatch) -> bytes:
     return manifest_json + b"\n" + patch.patch_bytes
 
 
+# Applied to EVERY git invocation in this module (not just the patch-text
+# `diff`) — a path is otherwise C-quoted by git whenever it contains
+# non-ASCII bytes, which would (a) break `git ls-files`/`add -N` pathspec
+# round-tripping for untracked non-ASCII files and (b) make `--name-status`
+# disagree with the (quotepath=false) patch text for tracked ones, corrupting
+# the manifest and the identity hashes derived from it.
+_GIT_BASE_ARGS = ["-c", "core.quotepath=false"]
+
+
 def _run_git(
     args: list[str], *, cwd: Path, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[bytes]:
@@ -227,7 +228,7 @@ def _run_git(
     if env:
         full_env.update(env)
     return subprocess.run(
-        ["git", *args],
+        ["git", *_GIT_BASE_ARGS, *args],
         cwd=cwd,
         env=full_env,
         capture_output=True,
