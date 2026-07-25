@@ -70,7 +70,10 @@ def _write_script(tmp_path: Path, directives: list[dict]) -> Path:
     return script
 
 
-def _spec(script: Path, workstream_id: str, timeout: float = 5.0) -> VerifierSpec:
+def _spec(script: Path, timeout: float = 5.0) -> VerifierSpec:
+    # workstream_id is conveyed to the verifier subprocess via the
+    # MAESTRO_WORKSTREAM_ID env var (CommandVerifier._build_request), never
+    # argv — the argv template is shared across an entire profile.
     argv = [
         sys.executable,
         str(STUB_VERIFIER),
@@ -86,8 +89,6 @@ def _spec(script: Path, workstream_id: str, timeout: float = 5.0) -> VerifierSpe
         "{run_id}",
         "--attempt",
         "{attempt}",
-        "--workstream-id",
-        workstream_id,
     ]
     return VerifierSpec(argv=argv, timeout_seconds=timeout, error_retry_budget=2)
 
@@ -103,12 +104,13 @@ def _ctx(
     workstream_id: str = "topic-x",
     run_id: str = "run-1",
     attempt: int = 1,
+    rework_attempt: int = 0,
 ) -> VerificationContext:
     return VerificationContext(
         workstream_id=workstream_id,
         run_id=run_id,
         attempt=attempt,
-        rework_attempt=0,
+        rework_attempt=rework_attempt,
         worktree=worktree,
         out_json=out_json,
         profile_sha256="p" * 64,
@@ -176,7 +178,7 @@ async def test_pass_directive_returns_pass_and_persists_handle(
     out_json = _staging(tmp_path)
     ctx = _ctx(worktree, out_json, workstream_id=workstream_id)
     verifier = CommandVerifier(
-        _spec(script, workstream_id),
+        _spec(script),
         _criteria(),
         "artifact.txt",
         LocalBackend(),
@@ -210,7 +212,7 @@ async def test_fail_directive_returns_fail_with_findings(
     out_json = _staging(tmp_path)
     ctx = _ctx(worktree, out_json)
     verifier = CommandVerifier(
-        _spec(script, ctx.workstream_id), _criteria(), "artifact.txt", LocalBackend()
+        _spec(script), _criteria(), "artifact.txt", LocalBackend()
     )
 
     result = await verifier.verify(ctx)
@@ -228,7 +230,7 @@ async def test_exit_mismatch_is_protocol_error(tmp_path: Path, worktree: Path) -
     out_json = _staging(tmp_path)
     ctx = _ctx(worktree, out_json)
     verifier = CommandVerifier(
-        _spec(script, ctx.workstream_id), _criteria(), "artifact.txt", LocalBackend()
+        _spec(script), _criteria(), "artifact.txt", LocalBackend()
     )
 
     result = await verifier.verify(ctx)
@@ -242,7 +244,7 @@ async def test_missing_file_is_error(tmp_path: Path, worktree: Path) -> None:
     out_json = _staging(tmp_path)
     ctx = _ctx(worktree, out_json)
     verifier = CommandVerifier(
-        _spec(script, ctx.workstream_id), _criteria(), "artifact.txt", LocalBackend()
+        _spec(script), _criteria(), "artifact.txt", LocalBackend()
     )
 
     result = await verifier.verify(ctx)
@@ -257,7 +259,7 @@ async def test_hang_past_timeout_is_error_no_exception(
     out_json = _staging(tmp_path)
     ctx = _ctx(worktree, out_json)
     verifier = CommandVerifier(
-        _spec(script, ctx.workstream_id, timeout=1.0),
+        _spec(script, timeout=1.0),
         _criteria(),
         "artifact.txt",
         LocalBackend(),
@@ -276,7 +278,7 @@ async def test_dirty_worktree_after_run_is_protocol_error(
     out_json = _staging(tmp_path)
     ctx = _ctx(worktree, out_json)
     verifier = CommandVerifier(
-        _spec(script, ctx.workstream_id), _criteria(), "artifact.txt", LocalBackend()
+        _spec(script), _criteria(), "artifact.txt", LocalBackend()
     )
 
     result = await verifier.verify(ctx)
@@ -292,7 +294,7 @@ async def test_criteria_sha_mismatch_never_spawns_verifier(
     out_json = _staging(tmp_path)
     ctx = _ctx(worktree, out_json)
     verifier = CommandVerifier(
-        _spec(script, ctx.workstream_id),
+        _spec(script),
         _criteria(sha256="0" * 64),
         "artifact.txt",
         LocalBackend(),
@@ -316,7 +318,7 @@ async def test_staged_criteria_copy_is_deleted_after_attempt(
     out_json = _staging(tmp_path)
     ctx = _ctx(worktree, out_json)
     verifier = CommandVerifier(
-        _spec(script, ctx.workstream_id), _criteria(), "artifact.txt", LocalBackend()
+        _spec(script), _criteria(), "artifact.txt", LocalBackend()
     )
 
     result = await verifier.verify(ctx)
@@ -357,7 +359,7 @@ async def test_cas_failure_before_spawn_leaves_no_process(
     ctx = _ctx(worktree, out_json, workstream_id=workstream_id)
     spy = _SpyBackend(LocalBackend())
     verifier = CommandVerifier(
-        _spec(script, workstream_id, timeout=1.0),
+        _spec(script, timeout=1.0),
         _criteria(),
         "artifact.txt",
         spy,
@@ -397,7 +399,7 @@ async def test_wrong_artifact_sha_is_protocol_error(
     out_json = _staging(tmp_path)
     ctx = _ctx(worktree, out_json)
     verifier = CommandVerifier(
-        _spec(script, ctx.workstream_id), _criteria(), "artifact.txt", LocalBackend()
+        _spec(script), _criteria(), "artifact.txt", LocalBackend()
     )
 
     result = await verifier.verify(ctx)
@@ -405,3 +407,63 @@ async def test_wrong_artifact_sha_is_protocol_error(
     assert result.outcome is VerdictValue.ERROR
     assert result.protocol_error is not None
     assert "artifact sha256" in result.protocol_error
+
+
+async def test_workstream_id_echoed_via_env_not_argv(
+    tmp_path: Path, worktree: Path
+) -> None:
+    """The stub reads `workstream_id` from `MAESTRO_WORKSTREAM_ID` (never
+    argv, per `_spec`'s shared template) and the handshake accepts it.
+    """
+    script = _write_script(tmp_path, [{"verdict": "PASS"}])
+    out_json = _staging(tmp_path)
+    ctx = _ctx(worktree, out_json, workstream_id="topic-y-report")
+    verifier = CommandVerifier(
+        _spec(script), _criteria(), "artifact.txt", LocalBackend()
+    )
+
+    result = await verifier.verify(ctx)
+
+    assert result.outcome is VerdictValue.PASS
+    assert result.document is not None
+    assert result.document.identity.workstream_id == "topic-y-report"
+
+
+async def test_rework_attempt_echoed_from_env_on_rework(
+    tmp_path: Path, worktree: Path
+) -> None:
+    """A rework (respawn) attempt conveys `rework_attempt=1` via
+    `MAESTRO_REWORK_ATTEMPT`; the stub echoes it and the handshake records
+    it in the document — a verifier hardcoding 0 would now fail here.
+    """
+    script = _write_script(tmp_path, [{"verdict": "PASS"}])
+    out_json = _staging(tmp_path)
+    ctx = _ctx(worktree, out_json, rework_attempt=1)
+    verifier = CommandVerifier(
+        _spec(script), _criteria(), "artifact.txt", LocalBackend()
+    )
+
+    result = await verifier.verify(ctx)
+
+    assert result.outcome is VerdictValue.PASS
+    assert result.document is not None
+    assert result.document.identity.rework_attempt == 1
+
+
+async def test_wrong_rework_attempt_is_protocol_error(
+    tmp_path: Path, worktree: Path
+) -> None:
+    script = _write_script(
+        tmp_path, [{"mode": "wrong_echo", "field": "rework_attempt"}]
+    )
+    out_json = _staging(tmp_path)
+    ctx = _ctx(worktree, out_json, rework_attempt=1)
+    verifier = CommandVerifier(
+        _spec(script), _criteria(), "artifact.txt", LocalBackend()
+    )
+
+    result = await verifier.verify(ctx)
+
+    assert result.outcome is VerdictValue.ERROR
+    assert result.protocol_error is not None
+    assert "rework_attempt" in result.protocol_error

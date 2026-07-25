@@ -83,6 +83,7 @@ class EchoExpectations(BaseModel):
 
     run_id: str
     attempt: int
+    rework_attempt: int
     workstream_id: str
     artifact: str
     profile_sha256: str
@@ -131,6 +132,11 @@ def evaluate_handshake(
         for name, got, want in (
             ("verification_run_id", identity.verification_run_id, expected.run_id),
             ("verification_attempt", identity.verification_attempt, expected.attempt),
+            (
+                "rework_attempt",
+                identity.rework_attempt,
+                expected.rework_attempt,
+            ),
             ("workstream_id", identity.workstream_id, expected.workstream_id),
             ("artifact", identity.artifact, expected.artifact),
             ("profile_sha256", identity.profile_sha256, expected.profile_sha256),

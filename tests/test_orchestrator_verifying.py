@@ -111,8 +111,7 @@ def _verifier_spec(script: Path, *, error_budget: int = 2) -> VerifierSpec:
         "{run_id}",
         "--attempt",
         "{attempt}",
-        "--workstream-id",
-        WORKSTREAM_ID,
+        # workstream_id is conveyed via MAESTRO_WORKSTREAM_ID env, not argv.
     ]
     return VerifierSpec(
         argv=argv, timeout_seconds=10.0, error_retry_budget=error_budget
