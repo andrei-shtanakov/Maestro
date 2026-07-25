@@ -46,8 +46,11 @@ class VerificationContext(BaseModel):
 
     `out_json` is Maestro-assigned (ledger staging, Task 5's
     `EvidenceLedger.staging_dir`); the verifier never chooses its own output
-    address. `profile_sha256`/`verified_source_commit`/`verified_source_tree`
-    are computed by Maestro and must be echoed back unchanged (§5).
+    address. `workstream_id`/`rework_attempt`/`profile_sha256`/
+    `verified_source_commit`/`verified_source_tree` are computed by Maestro
+    and must be echoed back unchanged (§5) — conveyed to the verifier
+    subprocess via `MAESTRO_*` env vars, never argv (the argv placeholder
+    set is a small, profile-shared template).
     """
 
     model_config = ConfigDict(frozen=True)
@@ -186,6 +189,7 @@ class CommandVerifier:
         expected = EchoExpectations(
             run_id=ctx.run_id,
             attempt=ctx.attempt,
+            rework_attempt=ctx.rework_attempt,
             workstream_id=ctx.workstream_id,
             artifact=self._artifact,
             profile_sha256=ctx.profile_sha256,
@@ -259,10 +263,12 @@ class CommandVerifier:
                 "MAESTRO_PROFILE_SHA256": ctx.profile_sha256,
                 "MAESTRO_VERIFIED_SOURCE_COMMIT": ctx.verified_source_commit,
                 "MAESTRO_VERIFIED_SOURCE_TREE": ctx.verified_source_tree,
+                "MAESTRO_WORKSTREAM_ID": ctx.workstream_id,
+                "MAESTRO_REWORK_ATTEMPT": str(ctx.rework_attempt),
             },
             # Deliberately NOT inherit_env=True: `build_local_env` (Phase 0)
             # drops `req.env` entirely whenever `inherit_env` is True, which
-            # would silently swallow the three echo-field env vars above.
+            # would silently swallow the five echo-field env vars above.
             inherit_env=False,
             timeout_seconds=self._spec.timeout_seconds,
             collect=CollectPolicy(mode="none"),

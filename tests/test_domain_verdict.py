@@ -16,6 +16,7 @@ from maestro.domain.verdict import (
 EXPECTED = EchoExpectations(
     run_id="01JRUNID0000000000000000",
     attempt=1,
+    rework_attempt=0,
     workstream_id="topic-x-report",
     artifact="reports/topic-x/result.md",
     profile_sha256="p" * 64,
@@ -107,10 +108,12 @@ def test_timeout_invalidates_valid_file(tmp_path: Path) -> None:
         ("verified_source_tree", "e" * 40),
         ("verification_run_id", "OTHER"),
         ("artifact", "reports/other.md"),
+        ("workstream_id", "wrong-workstream"),
+        ("rework_attempt", 5),
     ],
 )
 def test_echo_field_mismatch_is_protocol_error(
-    tmp_path: Path, field: str, value: str
+    tmp_path: Path, field: str, value: object
 ) -> None:
     p = write_verdict(tmp_path, make_verdict("PASS", **{field: value}))
     result = evaluate_handshake(p, exit_code=0, timed_out=False, expected=EXPECTED)

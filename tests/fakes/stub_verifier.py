@@ -32,11 +32,13 @@ Directive shapes (one list element per invocation, consumed in order):
         artifact file's sha256.
 
 Echo values (``profile_sha256``, ``verified_source_commit``,
-``verified_source_tree``) are read from the ``MAESTRO_*`` env vars the
-caller sets; ``verification_run_id``/``verification_attempt``/``artifact``
-are read from argv; ``workstream_id`` is read from ``--workstream-id`` (not
-one of Maestro's templated argv placeholders — a real per-workstream
-verifier command would hardcode its own topic the same way).
+``verified_source_tree``, ``workstream_id``, ``rework_attempt``) are all
+read from ``MAESTRO_*`` env vars the caller sets — none of them are argv
+placeholders, since the argv template is shared across an entire profile
+(potentially many workstreams) and can't smuggle a per-invocation literal
+like a workstream id or a rework counter. ``verification_run_id``/
+``verification_attempt``/``artifact`` are read from argv (the closed
+placeholder set Maestro's preflight allows).
 """
 
 import argparse
@@ -61,7 +63,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--criteria", required=True)
     parser.add_argument("--verification-run-id", required=True)
     parser.add_argument("--attempt", required=True, type=int)
-    parser.add_argument("--workstream-id", required=True)
     return parser.parse_args()
 
 
@@ -93,8 +94,8 @@ def _base_identity(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "verification_run_id": args.verification_run_id,
         "verification_attempt": args.attempt,
-        "rework_attempt": 0,
-        "workstream_id": args.workstream_id,
+        "rework_attempt": int(os.environ.get("MAESTRO_REWORK_ATTEMPT", "0")),
+        "workstream_id": os.environ.get("MAESTRO_WORKSTREAM_ID", ""),
         "artifact": args.artifact,
         "artifact_sha256": _sha256_file(Path(args.artifact)),
         "criteria_sha256": _sha256_file(Path(args.criteria)),
@@ -155,7 +156,7 @@ def _handle_mode(mode: str, directive: dict[str, Any], args: argparse.Namespace)
     if mode == "wrong_echo":
         identity = _base_identity(args)
         field = directive["field"]
-        if field == "verification_attempt":
+        if field in ("verification_attempt", "rework_attempt"):
             identity[field] = identity[field] + 1
         else:
             identity[field] = f"wrong-{identity[field]}"
