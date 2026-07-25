@@ -7,6 +7,21 @@
   operator re-queue for gate-blocked workstreams — NEEDS_REVIEW → READY with
   `error_message` preserved (used to require a raw sqlite UPDATE).
 
+### Changed
+- **`validation_backend` default flipped `local` → `same` (validation_backend
+  PR3).** Post-task validation now runs by default in the *same* backend the
+  task ran in (environment parity), instead of always on the local host.
+  **No-op for the common case:** a task with no `execution` config (or
+  `default_backend: local`) and no per-task `backend` still validates on the
+  bare local host — `same` resolves to the default `local` backend.
+  **Behavior change only where a task actually runs on a Docker or SSH
+  backend:** its validation now executes durably inside that backend (its own
+  execution handle), so the validation command sees the task's real
+  toolchain/filesystem rather than the host's. Set `validation_backend: local`
+  explicitly to keep host-local validation. Existing persisted tasks keep their
+  recorded value (no data-migration; migration 12 only changes the column
+  default for new rows); only newly-created tasks pick up the new default.
+
 ### Fixed
 - **Gates approval memory survives phase overwrites (H-3):** the single-slot
   `error_message` marker gets overwritten when a later phase blocks; the

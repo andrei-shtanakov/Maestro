@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     timeout_minutes INTEGER DEFAULT 30,
     requires_approval BOOLEAN DEFAULT FALSE,
     validation_cmd TEXT,
-    validation_backend TEXT NOT NULL DEFAULT 'local',
+    validation_backend TEXT NOT NULL DEFAULT 'same',
     task_type TEXT NOT NULL DEFAULT 'feature',
     language TEXT NOT NULL DEFAULT 'other',
     complexity TEXT NOT NULL DEFAULT 'moderate',
@@ -441,6 +441,11 @@ class Database:
             (9, "ssh_handle_columns", self._migrate_ssh_handle_columns),
             (10, "execution_phase", self._migrate_execution_phase),
             (11, "tasks_validation_backend", self._migrate_tasks_validation_backend),
+            (
+                12,
+                "tasks_validation_backend_default_same",
+                self._migrate_tasks_validation_backend_default_same,
+            ),
         ]
 
         for version, name, fn in ordered:
@@ -798,6 +803,101 @@ class Database:
                 "ALTER TABLE tasks ADD COLUMN validation_backend "
                 "TEXT NOT NULL DEFAULT 'local'"
             )
+
+    async def _migrate_tasks_validation_backend_default_same(self) -> None:
+        """Migration 12: flip the `tasks.validation_backend` column DEFAULT from
+        'local' to 'same' (PR3 default flip), for fresh/upgraded schema parity.
+
+        SQLite cannot ALTER a column default in place, so the table is rebuilt
+        (canonical 12-step). Unlike the `execution_handles` rebuilds (migrations
+        7/9), `tasks` has ON DELETE CASCADE children (task_dependencies,
+        agent_logs, task_costs) and `foreign_keys` is ON — so `DROP TABLE tasks`
+        would fire an implicit DELETE that cascades and wipes those children.
+        `PRAGMA foreign_keys` is a no-op inside a transaction, and migrations
+        run inside one, so we first `commit()` to reach autocommit, disable FKs,
+        rebuild, commit, then re-enable FKs.
+
+        Decision B (no data-migration): existing rows are copied verbatim —
+        a persisted 'local' stays 'local'; only the default for NEW inserts
+        changes (and the application always writes the field explicitly). The
+        column list is read from the live table so the copy stays correct
+        regardless of physical column order. Idempotent: a DB whose default is
+        already 'same' (fresh, from SCHEMA_SQL) skips the rebuild entirely.
+        """
+        assert self._connection is not None
+        cursor = await self._connection.execute("PRAGMA table_info(tasks)")
+        rows = await cursor.fetchall()
+        vb = next((r for r in rows if r["name"] == "validation_backend"), None)
+        if vb is None or (vb["dflt_value"] or "").strip("'\"") == "same":
+            return  # column missing (shouldn't happen after m11) or already 'same'
+
+        cols = ", ".join(r["name"] for r in rows)
+        # Canonical post-migration `tasks` schema: SCHEMA_SQL columns (with the
+        # 'same' default) plus `backend` (migration 8) appended last.
+        tasks_new_sql = """
+        CREATE TABLE tasks_new (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            branch TEXT,
+            workdir TEXT NOT NULL,
+            agent_type TEXT NOT NULL DEFAULT 'claude_code',
+            status TEXT NOT NULL DEFAULT 'pending',
+            assigned_to TEXT,
+            scope TEXT,
+            priority INTEGER DEFAULT 0,
+            max_retries INTEGER DEFAULT 2,
+            retry_count INTEGER DEFAULT 0,
+            timeout_minutes INTEGER DEFAULT 30,
+            requires_approval BOOLEAN DEFAULT FALSE,
+            validation_cmd TEXT,
+            validation_backend TEXT NOT NULL DEFAULT 'same',
+            task_type TEXT NOT NULL DEFAULT 'feature',
+            language TEXT NOT NULL DEFAULT 'other',
+            complexity TEXT NOT NULL DEFAULT 'moderate',
+            result_summary TEXT,
+            error_message TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            routed_agent_type TEXT,
+            arbiter_decision_id TEXT,
+            arbiter_route_reason TEXT,
+            arbiter_outcome_reported_at TIMESTAMP,
+            backend TEXT
+        )
+        """
+        # Exit the migration transaction so PRAGMA foreign_keys takes effect
+        # (no-op inside a transaction). Prior migrations this run are already
+        # journaled; committing them here is safe and idempotent.
+        await self._connection.commit()
+        await self._connection.execute("PRAGMA foreign_keys=OFF")
+        try:
+            # Clear any orphan left by a previously-interrupted rebuild: the
+            # `commit()` above put us in autocommit, so `CREATE TABLE tasks_new`
+            # commits standalone. Without this guard, a crash after it (before
+            # v12 is journaled) would make the re-run's CREATE fail
+            # "already exists" and brick `connect()`. IF EXISTS makes migration
+            # 12 re-runnable.
+            await self._connection.execute("DROP TABLE IF EXISTS tasks_new")
+            await self._connection.execute(tasks_new_sql)
+            await self._connection.execute(
+                f"INSERT INTO tasks_new ({cols}) SELECT {cols} FROM tasks"
+            )
+            await self._connection.execute("DROP TABLE tasks")
+            await self._connection.execute("ALTER TABLE tasks_new RENAME TO tasks")
+            await self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)"
+            )
+            await self._connection.commit()
+        except Exception:
+            # Roll back the open rebuild transaction so the `finally` PRAGMA
+            # actually takes effect (it is a no-op inside a transaction) and no
+            # half-applied statements linger; the original `tasks` is intact.
+            await self._connection.rollback()
+            raise
+        finally:
+            await self._connection.execute("PRAGMA foreign_keys=ON")
 
     @asynccontextmanager
     async def transaction(self) -> AsyncGenerator[aiosqlite.Connection, None]:

@@ -28,12 +28,13 @@ async def test_validation_backend_round_trips(db):
     assert got.validation_backend == "same"
 
 
-async def test_validation_backend_defaults_local(db):
+async def test_validation_backend_defaults_same(db):
+    """PR3: the default is now 'same' (validate in the task's own backend)."""
     await db.create_task(
         Task(id="t2", title="t", prompt="p", workdir="/tmp", status=TaskStatus.READY)
     )
     got = await db.get_task("t2")
-    assert got.validation_backend == "local"
+    assert got.validation_backend == "same"
 
 
 async def test_validation_backend_survives_update(db):

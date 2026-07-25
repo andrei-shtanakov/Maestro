@@ -1959,9 +1959,10 @@ class Scheduler:
     def _resolve_validation_backend(self, task: Task) -> ExecutionBackend:
         """Resolve the backend for a task's validation run.
 
-        'local' -> the bare LocalBackend; 'same' -> the task's own backend;
-        a named value -> that backend. Preflight has already rejected any
-        SSH target, so this only yields local-transport backends.
+        'local' -> the bare LocalBackend; 'same' -> the task's own backend
+        (the default since PR3); a named value -> that backend. May yield a
+        non-local backend (docker or, since PR2, SSH), whose validation runs
+        durably; preflight only rejects an unknown named backend.
         """
         name = task.validation_backend
         if name == "local":
