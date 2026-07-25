@@ -967,20 +967,25 @@ class WorkspaceType(StrEnum):
 class WorkstreamStatus(StrEnum):
     """Workstream execution status with valid state transitions.
 
-    State machine:
-        PENDING → DECOMPOSING → READY → RUNNING → MERGING → PR_CREATED → DONE
-                                  │        │
-                                  │        └→ FAILED → READY (retry)
-                                  │                      │
-                                  │                      └→ NEEDS_REVIEW
+    State machine (§4 topology: VERIFYING is a durable state):
+        PENDING → DECOMPOSING → READY → RUNNING → VERIFYING → MERGING → PR_CREATED → DONE
+                                  │        ↑            │
+                                  │        └────────────┘ (rework)
                                   │
                                   └→ ABANDONED
+
+        VERIFYING transitions:
+          • MERGING (verdict PASS; finalization inside VERIFYING, commit persisted)
+          • READY (verdict FAIL; rework loop)
+          • NEEDS_REVIEW (orphan, rework exhausted)
+          • FAILED (error exhausted)
     """
 
     PENDING = "pending"
     DECOMPOSING = "decomposing"
     READY = "ready"
     RUNNING = "running"
+    VERIFYING = "verifying"
     MERGING = "merging"
     PR_CREATED = "pr_created"
     DONE = "done"
@@ -996,8 +1001,14 @@ class WorkstreamStatus(StrEnum):
         return {
             cls.PENDING: {cls.DECOMPOSING, cls.READY},
             cls.DECOMPOSING: {cls.READY, cls.FAILED},
-            cls.READY: {cls.RUNNING, cls.NEEDS_REVIEW, cls.ABANDONED},
-            cls.RUNNING: {cls.MERGING, cls.FAILED},
+            cls.READY: {cls.RUNNING, cls.VERIFYING, cls.NEEDS_REVIEW, cls.ABANDONED},
+            cls.RUNNING: {cls.MERGING, cls.VERIFYING, cls.FAILED},
+            cls.VERIFYING: {
+                cls.MERGING,
+                cls.READY,
+                cls.FAILED,
+                cls.NEEDS_REVIEW,
+            },
             cls.MERGING: {cls.PR_CREATED, cls.FAILED},
             cls.PR_CREATED: {cls.DONE, cls.FAILED},
             cls.FAILED: {cls.READY, cls.NEEDS_REVIEW},

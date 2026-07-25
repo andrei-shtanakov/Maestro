@@ -55,6 +55,7 @@ WORKSTREAM_EFFECTS: dict[WorkstreamStatus, StatusEffect] = {
         event=EventType.WORKSTREAM_RUNNING,
         notification=NotificationEvent.WORKSTREAM_STARTED,
     ),
+    WorkstreamStatus.VERIFYING: StatusEffect(event=EventType.WORKSTREAM_VERIFYING),
     WorkstreamStatus.MERGING: StatusEffect(event=EventType.WORKSTREAM_MERGING),
     WorkstreamStatus.PR_CREATED: StatusEffect(event=EventType.WORKSTREAM_PR_CREATED),
     WorkstreamStatus.DONE: StatusEffect(

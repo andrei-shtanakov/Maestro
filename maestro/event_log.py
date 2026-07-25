@@ -36,6 +36,7 @@ class EventType(StrEnum):
     WORKSTREAM_READY = "workstream_ready"
     WORKSTREAM_DECOMPOSING = "workstream_decomposing"
     WORKSTREAM_RUNNING = "workstream_running"
+    WORKSTREAM_VERIFYING = "workstream_verifying"
     WORKSTREAM_MERGING = "workstream_merging"
     WORKSTREAM_PR_CREATED = "workstream_pr_created"
     WORKSTREAM_DONE = "workstream_done"
