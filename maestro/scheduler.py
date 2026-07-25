@@ -37,7 +37,7 @@ from maestro.cost_tracker import effective_cost, parse_and_create_cost
 from maestro.dag import DAG
 from maestro.database import ConcurrentModificationError, Database, TaskNotFoundError
 from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
-from maestro.execution.backend import TaskHandle
+from maestro.execution.backend import ExecutionBackend, TaskHandle
 from maestro.execution.exec_config import ExecutionConfig
 from maestro.execution.finalize import FinalizationResult, ensure_finalize_task
 from maestro.execution.models import CollectPolicy, ExecutionRequest
@@ -71,7 +71,12 @@ from maestro.notifications.manager import NotificationManager
 from maestro.preflight import ValidationBackendError, check_validation_backends
 from maestro.retry import RetryManager
 from maestro.transitions import TransitionDispatcher
-from maestro.validator import ValidationResult, Validator
+from maestro.validator import (
+    ValidationResult,
+    Validator,
+    build_validation_request,
+    execution_result_to_validation,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -1845,19 +1850,63 @@ class Scheduler:
         # Handle as failure
         await self._handle_task_failure(task_id, running_task.task, error_msg)
 
-    async def _run_validation(self, task: Task) -> ValidationResult:
-        """Run validation command for a task.
+    def _resolve_validation_backend(self, task: Task) -> ExecutionBackend:
+        """Resolve the backend for a task's validation run.
 
-        Args:
-            task: The task to validate.
-
-        Returns:
-            ValidationResult with execution details.
+        'local' -> the bare LocalBackend; 'same' -> the task's own backend;
+        a named value -> that backend. Preflight has already rejected any
+        SSH target, so this only yields local-transport backends.
         """
-        return await self._validator.validate_task(
-            task.validation_cmd,
-            task.workdir,
-        )
+        name = task.validation_backend
+        if name == "local":
+            return self._backends.resolve("local")
+        if name == "same":
+            return self._backends.resolve(task.backend)
+        return self._backends.resolve(name)
+
+    async def _run_validation(self, task: Task) -> ValidationResult:
+        """Run validation for a task through the execution layer.
+
+        No validation_cmd -> trivially successful. Local backend -> run and
+        wait (no durable handle; behavior-preserving). Non-local backend ->
+        the durable path (see ``_run_durable_validation``).
+        """
+        if not task.validation_cmd:
+            return ValidationResult(
+                success=True, exit_code=0, stdout="", stderr=""
+            )
+        backend = self._resolve_validation_backend(task)
+        run_id = f"val-{task.id}-{task.retry_count + 1}"
+        try:
+            request = build_validation_request(
+                task,
+                backend_id=backend.id,
+                run_id=run_id,
+                attempt=task.retry_count + 1,
+            )
+        except ValueError as e:
+            return ValidationResult(
+                success=False,
+                exit_code=None,
+                stdout="",
+                stderr="",
+                error_message=str(e),
+            )
+        if backend.id == "local":
+            handle = await backend.run(request)
+            result = await handle.wait()
+            return execution_result_to_validation(result)
+        return await self._run_durable_validation(task, backend, request)
+
+    async def _run_durable_validation(
+        self, task: Task, backend: ExecutionBackend, request: ExecutionRequest
+    ) -> ValidationResult:
+        """Durable validation on a non-local backend (implemented in Task 7).
+
+        Task 7 widens the return to ``ValidationResult | None`` (None = infra
+        failure already routed to NEEDS_REVIEW) and updates the caller.
+        """
+        raise NotImplementedError("durable validation lands in Task 7")
 
     async def _get_completed_task_ids(self) -> set[str]:
         """Get IDs of all completed tasks.
