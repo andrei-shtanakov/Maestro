@@ -54,6 +54,7 @@ class CollectSpec:
     staging_dir: Path
     journal_dir: Path
     baseline: dict[str, str]
+    mode: str = "whole_worktree"
     scope: list[str] | None = None
 
 
@@ -261,11 +262,16 @@ class SshTaskHandle:
     async def collect(self) -> CollectResult:
         """Rsync the remote repo to staging, then plan + apply the collect.
 
+        `mode == "none"` is a true no-op: no rsync, no plan/apply, ssh is
+        never touched — the caller opted out of collecting anything back.
+
         Raises `CollectConflict` (from `ssh_collect.plan_collect`) if the
         remote's changes conflict with local worktree divergence, a
         forbidden path, or a symlink/traversal escape — no worktree
         mutation occurs in that case.
         """
+        if self._collect.mode == "none":
+            return CollectResult(applied=False, detail="collect=none: no-op")
         staging = self._collect.staging_dir
         staging.mkdir(parents=True, exist_ok=True)
         pulled = await self._ssh.rsync(

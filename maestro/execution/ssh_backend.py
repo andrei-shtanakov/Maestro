@@ -317,6 +317,7 @@ class SshBackend:
                 staging,
                 journal,
                 baseline,
+                mode=req.collect.mode,
                 scope=_collect_scope(req.collect),
             ),
             expected_owner=req.execution_id,
