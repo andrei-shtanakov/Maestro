@@ -28,10 +28,17 @@ from maestro.execution.docker_recovery import (
 from maestro.execution.exec_config import ExecutionConfig
 from maestro.execution.handle_ref import handle_ref_from_row
 from maestro.execution.resolver import BackendResolver, ExecutionConfigError
+from maestro.execution.ssh_backend import SshBackend
+from maestro.execution.ssh_launch import decode_transport_ref
+from maestro.execution.ssh_recovery import gc_ssh_terminal
 from maestro.models import Task, TaskOutcome, TaskOutcomeStatus, TaskStatus
 
 
 logger = logging.getLogger(__name__)
+
+_SSH_GC_CLEAN_OUTCOMES = frozenset({"removed", "no owner marker; skipped"})
+"""`gc_ssh_terminal` outcomes after which a `collected` handle is safe to
+mark `cleaned` — mirrors `orchestrator.py`'s constant of the same name."""
 
 
 @dataclass(frozen=True)
@@ -387,17 +394,37 @@ class StateRecovery:
             )
 
     async def _gc_terminal_handles(self, handles: list[dict[str, Any]]) -> int:
-        """Best-effort, ownership-checked GC sweep for `terminal` handles.
+        """Best-effort, ownership-checked GC sweep — transport/isolation-aware.
 
-        A `terminal` handle means the entity behind it already reached a
-        settled status (finalize ran) but container cleanup was never
-        confirmed. This only removes the leftover container (if any) and
-        marks the handle `cleaned` — it never touches entity status. Swept
-        across all entity kinds (task and workstream), since the handle
-        table is shared and no other recovery path currently GCs it.
-        A row whose outcome is ambiguous (multiple matches / label
-        mismatch / probe error) is left as `terminal` for the next sweep
-        or a human to resolve.
+        A `terminal`/`collected` handle means the entity behind it already
+        reached a settled status (finalize ran) but resource cleanup was
+        never confirmed. This only removes leftover containers/remote
+        artifacts and marks the handle `cleaned` — it never touches entity
+        status. Swept across all entity kinds (task and workstream), since
+        the handle table is shared.
+
+        Classification is by the persisted `backend_id`, resolved through
+        `BackendResolver` (never a hand-composed transport/isolation check):
+
+        - resolved `SshBackend`, `terminal` state -> **never GC'd**. A
+          terminal marker does not prove `collect` ran, so the remote tmp
+          must be preserved for the operator (this is the bug this task
+          fixes: docker-GC'ing an SSH `terminal` row destroyed the record
+          of an uncollected remote run).
+        - resolved `SshBackend`, `collected` bare -> guarded remote-root GC
+          (`gc_ssh_terminal`) -> `cleaned` on a clean outcome.
+        - resolved `SshBackend`, `collected` docker (persisted isolation) ->
+          remote **container** GC first; only on a clean outcome does the
+          remote-root GC run -> `cleaned` (container-first: never delete
+          the remote root while a container may still reference it).
+        - any other resolved backend (local bare/docker) -> the existing
+          docker GC on `terminal`, unchanged.
+        - an unresolvable `backend_id` is left in place (fail-closed) for
+          the next sweep or a human to resolve.
+
+        A row whose outcome is ambiguous (multiple container matches /
+        label mismatch / probe error / no owner marker / resolve failure)
+        is left in place for the next sweep or a human to resolve.
 
         Args:
             handles: Open `execution_handles` rows (any state) from
@@ -408,23 +435,125 @@ class StateRecovery:
         """
         swept = 0
         for row in handles:
-            if row["state"] != "terminal":
+            state = row["state"]
+            if state not in ("terminal", "collected"):
                 continue
-            outcome = await gc_terminal_handle(row, self._docker)
-            if outcome in GC_CLEAN_OUTCOMES:
-                await self._db.mark_execution_state(
-                    row["execution_id"], "cleaned", allowed_from=["terminal"]
-                )
-                swept += 1
-            else:
+
+            try:
+                backend = self._backends.resolve(row["backend_id"])
+            except ExecutionConfigError as exc:
                 logger.warning(
-                    "recovery: GC left handle %s (%s %s) as terminal: %s",
+                    "recovery: GC skipping handle %s (%s %s): "
+                    "unresolvable backend %r: %s",
                     row["execution_id"],
                     row["entity_kind"],
                     row["entity_id"],
-                    outcome,
+                    row["backend_id"],
+                    exc,
                 )
+                continue
+
+            if isinstance(backend, SshBackend):
+                cleaned = await self._gc_ssh_row(row, backend, state)
+            else:
+                if state != "terminal":
+                    continue
+                outcome = await gc_terminal_handle(row, self._docker)
+                cleaned = outcome in GC_CLEAN_OUTCOMES
+                if not cleaned:
+                    logger.warning(
+                        "recovery: GC left handle %s (%s %s) as terminal: %s",
+                        row["execution_id"],
+                        row["entity_kind"],
+                        row["entity_id"],
+                        outcome,
+                    )
+
+            if cleaned:
+                await self._db.mark_execution_state(
+                    row["execution_id"], "cleaned", allowed_from=[state]
+                )
+                swept += 1
         return swept
+
+    async def _gc_ssh_row(
+        self, row: dict[str, Any], backend: SshBackend, state: str
+    ) -> bool:
+        """GC a single SSH-backed handle row.
+
+        `terminal` is never GC'd here (collect unconfirmed; the remote tmp
+        must be preserved). `collected` runs a guarded remote-root GC,
+        container-first when the persisted `transport_ref` carries a
+        docker isolation. Never raises — any failure is logged and treated
+        as "not cleaned", leaving the row for the next sweep.
+        """
+        if state != "collected":
+            return False
+
+        ref = handle_ref_from_row(row)
+        try:
+            decoded = decode_transport_ref(ref.transport_ref)
+        except Exception as exc:
+            logger.warning(
+                "recovery: GC could not decode transport_ref for handle %s (%s %s): %s",
+                row["execution_id"],
+                row["entity_kind"],
+                row["entity_id"],
+                exc,
+            )
+            return False
+
+        try:
+            if decoded.get("isolation") == "docker":
+                # Container-first ordering: never delete the remote root
+                # (which may hold the only evidence of what the container
+                # touched) before the container itself is confirmed gone.
+                if backend.docker is None:
+                    logger.warning(
+                        "recovery: GC left handle %s (%s %s) as collected: "
+                        "persisted docker isolation but backend has no "
+                        "docker client",
+                        row["execution_id"],
+                        row["entity_kind"],
+                        row["entity_id"],
+                    )
+                    return False
+                dk_outcome = await gc_terminal_handle(
+                    {"execution_id": row["execution_id"]},
+                    backend.docker,
+                    expected_labels=decoded.get("expected_labels"),
+                )
+                if dk_outcome not in GC_CLEAN_OUTCOMES:
+                    logger.warning(
+                        "recovery: container GC not clean for handle %s "
+                        "(%s %s): %s — leaving remote root intact",
+                        row["execution_id"],
+                        row["entity_kind"],
+                        row["entity_id"],
+                        dk_outcome,
+                    )
+                    return False
+            outcome = await gc_ssh_terminal(backend._ssh, ref)
+        except Exception as exc:
+            logger.warning(
+                "recovery: ssh GC failed for handle %s (%s %s): %s",
+                row["execution_id"],
+                row["entity_kind"],
+                row["entity_id"],
+                exc,
+            )
+            return False
+
+        if outcome in _SSH_GC_CLEAN_OUTCOMES:
+            return True
+        logger.warning(
+            "recovery: GC left handle %s (%s %s) as collected: %s",
+            row["execution_id"],
+            row["entity_kind"],
+            row["entity_id"],
+            outcome,
+        )
+        return False
 
     async def _transition_to_ready(self, task: Task, reason: str) -> None:
         """Transition a task back to READY state for re-execution.
