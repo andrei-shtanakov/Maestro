@@ -1,5 +1,6 @@
 """Domain contracts and verification runtime (Stage B, design v1.1)."""
 
+from maestro.domain.addendum import build_rework_addendum
 from maestro.domain.ledger import EvidenceLedger, IngestedAttempt, LedgerCollisionError
 from maestro.domain.profile import (
     ALLOWED_PLACEHOLDERS,
@@ -55,6 +56,7 @@ __all__ = [
     "VerificationSection",
     "VerifierSpec",
     "WorkspacePolicy",
+    "build_rework_addendum",
     "evaluate_handshake",
     "profile_sha256",
     "render_argv",
