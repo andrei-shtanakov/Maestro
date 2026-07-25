@@ -8,6 +8,7 @@ setup, process spawning, monitoring, and PR creation.
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import signal
@@ -23,6 +24,19 @@ from maestro._vendor.obs import child_env, current_pipeline_id, span
 from maestro.changed_paths import changed_paths_since
 from maestro.database import Database
 from maestro.decomposer import ProjectDecomposer
+from maestro.domain import (
+    RESUME_REVERIFY,
+    RESUME_REWORK,
+    CommandVerifier,
+    EvidenceLedger,
+    LedgerCollisionError,
+    VerdictDocument,
+    VerdictValue,
+    VerificationContext,
+    VerificationSection,
+    build_rework_addendum,
+    profile_sha256,
+)
 from maestro.event_log import get_event_logger
 from maestro.execution.backend import TaskHandle
 from maestro.execution.docker_cli import DockerCli
@@ -73,6 +87,15 @@ from maestro.workspace import WorkspaceManager, ensure_harness_excludes
 
 class OrchestratorError(Exception):
     """Base exception for orchestrator errors."""
+
+
+class _EvidenceContainmentError(Exception):
+    """Raised inside PASS finalization for a fail-closed containment breach.
+
+    Distinct from a delivery-preparation IO error: this routes the workstream
+    to NEEDS_REVIEW (evidence escaping verifier.write, or a stale PASS), never
+    a silent stay-in-VERIFYING.
+    """
 
 
 StatusChangeCallback = Callable[[str, str, str], None]
@@ -285,6 +308,13 @@ class Orchestrator:
             )
 
         self._backends = BackendResolver(self._config.execution)
+        # Stage B evidence ledger: built only when a domain profile is active,
+        # so legacy (domain=None) runs stay byte-identical with no evidence
+        # machinery. Root lives beside the DB file, never inside a worktree.
+        self._ledger: EvidenceLedger | None = None
+        if config.domain is not None:
+            evidence_root = Path(db.db_path).parent / "evidence"
+            self._ledger = EvidenceLedger(db, evidence_root)
         self._running: dict[str, RunningWorkstream] = {}
         self._generating: dict[str, asyncio.Task[None]] = {}
         self._shutdown_grace_seconds: float = 5.0
@@ -1017,6 +1047,27 @@ class Orchestrator:
         ):
             return
 
+        # Stage B resume dispatch (before DECOMPOSING — a resume never
+        # re-decomposes). REVERIFY re-enters the verification loop over the
+        # untouched worktree; REWORK is the ONLY path that respawns the author,
+        # and it does so with the FAIL findings appended to the spec-gen
+        # description (§7 declassification channel).
+        rework_addendum: str | None = None
+        if workstream.resume_reason == RESUME_REVERIFY:
+            workspace = self._workspace_mgr.get_workspace_path(workstream_id)
+            await self._transition(
+                workstream_id,
+                WorkstreamStatus.VERIFYING,
+                expected_status=WorkstreamStatus.READY,
+                resume_reason=None,
+                verification_error_attempt=0,
+            )
+            await self._run_verification(workstream_id, workspace)
+            return
+        is_rework_resume = workstream.resume_reason == RESUME_REWORK
+        if is_rework_resume:
+            rework_addendum = await self._load_rework_addendum(workstream)
+
         # Transition to DECOMPOSING; write the spawning sentinel up front — it
         # marks a spawn-in-progress AND overwrites any stale prior generation
         # pid (re-decompose).
@@ -1054,11 +1105,16 @@ class Orchestrator:
 
         # Generate spec for this workstream
         # Always regenerate: the repo may already have spec/maestro-tasks.md
-        # from a previous run or different project phase
+        # from a previous run or different project phase.
+        # On a Stage B rework respawn, the verifier's FAIL feedback is appended
+        # to the description so spec generation can incorporate it (§7).
+        description = workstream.description
+        if rework_addendum is not None:
+            description = f"{workstream.description}\n\n{rework_addendum}"
         workstream_config = WorkstreamConfig(
             id=workstream.id,
             title=workstream.title,
-            description=workstream.description,
+            description=description,
             scope=workstream.scope,
             depends_on=workstream.depends_on,
             priority=workstream.priority,
@@ -1274,6 +1330,12 @@ class Orchestrator:
         # recovery uses execution_handles, not pid (Task 18) — leaving the
         # real pid here for non-local backends too is harmless.
         await self._update_fields(workstream_id, process_pid=handle.os_pid)
+
+        # Stage B: clear the rework marker ONLY after a successful respawn, so
+        # a crash before the process is live re-picks the rework path (and its
+        # addendum) rather than a plain re-run.
+        if is_rework_resume:
+            await self._update_fields(workstream_id, resume_reason=None)
 
         self._logger.info(
             "Spawned spec-runner for '%s' (PID %s) in %s",
@@ -1719,11 +1781,45 @@ class Orchestrator:
         if not await self._gate_ex_post(workstream_id, workstream, workspace_path):
             return
 
+        # Stage B: with a domain profile active, the workstream must pass its
+        # final verification before delivery. Enter VERIFYING and hand off to
+        # the verification loop; the loop owns every terminal transition from
+        # here (MERGING on PASS via finalization, READY/NEEDS_REVIEW/FAILED
+        # otherwise). Legacy (domain=None) falls straight through to the
+        # merge/PR tail, byte-identical to before.
+        profile = self._config.domain
+        if profile is not None:
+            await self._transition(
+                workstream_id,
+                WorkstreamStatus.VERIFYING,
+                expected_status=WorkstreamStatus.RUNNING,
+                verification_error_attempt=0,
+            )
+            await self._run_verification(workstream_id, workspace_path)
+            return
+
+        await self._merge_and_pr(
+            workstream_id, workstream, expected_status=WorkstreamStatus.RUNNING
+        )
+
+    async def _merge_and_pr(
+        self,
+        workstream_id: str,
+        workstream: Workstream,
+        *,
+        expected_status: WorkstreamStatus,
+    ) -> None:
+        """Delivery tail: MERGING -> (PR) -> merge-into-base -> DONE + cleanup.
+
+        Shared by the legacy success path (`expected_status=RUNNING`) and
+        Stage B finalization (`expected_status=VERIFYING`); the only
+        difference is the state the workstream transitions into MERGING from.
+        """
         # Transition to MERGING
         await self._transition(
             workstream_id,
             WorkstreamStatus.MERGING,
-            expected_status=WorkstreamStatus.RUNNING,
+            expected_status=expected_status,
         )
 
         # Push branch and create PR
@@ -1830,6 +1926,334 @@ class Orchestrator:
 
         # Cleanup workspace
         self._workspace_mgr.cleanup_workspace(workstream_id)
+
+    async def _run_verification(self, workstream_id: str, workspace_path: Path) -> None:
+        """Drive the VERIFYING loop for one workstream (Stage B, §4/§6).
+
+        The workstream is already in VERIFYING. Runs the configured verifier
+        with a per-session ERROR-retry budget; owns every terminal transition:
+        PASS -> finalization (MERGING), FAIL -> READY (rework) or NEEDS_REVIEW
+        (rework budget exhausted), ERROR budget exhausted -> FAILED (reverify).
+        """
+        profile = self._config.domain
+        assert profile is not None and self._ledger is not None
+        ledger = self._ledger
+        verification = profile.verification
+
+        workstream = await self._db.get_workstream(workstream_id)
+        run_id = workstream.verification_run_id
+        if not run_id:
+            run_id = str(uuid.uuid4())
+            await self._update_fields(workstream_id, verification_run_id=run_id)
+
+        commit = await self._workspace_head(workspace_path)
+        tree = await self._workspace_tree(workspace_path)
+        if commit is None or tree is None:
+            reason = "verification: cannot read worktree HEAD/tree"
+            self._logger.warning("%s for '%s'", reason, workstream_id)
+            await self._transition(
+                workstream_id,
+                WorkstreamStatus.NEEDS_REVIEW,
+                expected_status=WorkstreamStatus.VERIFYING,
+                message=reason,
+                error_message=reason,
+            )
+            self._stats.failed += 1
+            return
+
+        backend = self._backends.resolve(workstream.backend)
+        verifier = CommandVerifier(
+            verification.verifier,
+            verification.criteria,
+            verification.artifact,
+            backend,
+            db=self._db,
+        )
+        prof_sha = profile_sha256(profile)
+        error_budget = verification.verifier.error_retry_budget
+
+        error_attempt = 0
+        last_error = "verification error budget exhausted"
+        while error_attempt <= error_budget:
+            attempt = workstream.verification_attempt + 1
+            await self._update_fields(workstream_id, verification_attempt=attempt)
+            workstream = await self._db.get_workstream(workstream_id)
+
+            staging = ledger.staging_dir(workstream_id, run_id, attempt)
+            out_json = staging / f"attempt-{attempt:03d}.json"
+            ctx = VerificationContext(
+                workstream_id=workstream_id,
+                run_id=run_id,
+                attempt=attempt,
+                rework_attempt=workstream.rework_attempt,
+                worktree=workspace_path,
+                out_json=out_json,
+                profile_sha256=prof_sha,
+                verified_source_commit=commit,
+                verified_source_tree=tree,
+            )
+            result = await verifier.verify(ctx)
+            # Every outcome is evidence. A protocol ERROR that never produced a
+            # verdict file (pre-spawn violation, or a verifier that wrote
+            # nothing) still gets a forensic bundle so ingest has something to
+            # store — the DB row's verdict/protocol_error carry the meaning.
+            if not out_json.exists():
+                out_json.parent.mkdir(parents=True, exist_ok=True)
+                out_json.write_text(
+                    json.dumps(
+                        {
+                            "outcome": result.outcome.value,
+                            "protocol_error": result.protocol_error,
+                        }
+                    )
+                )
+            await ledger.ingest_attempt(
+                workstream_id=workstream_id,
+                run_id=run_id,
+                attempt=attempt,
+                result=result,
+                staging=staging,
+            )
+
+            if result.outcome is VerdictValue.PASS:
+                await self._finalize_verification(
+                    workstream_id,
+                    workspace_path,
+                    run_id=run_id,
+                    verified_source_commit=commit,
+                )
+                return
+            if result.outcome is VerdictValue.FAIL:
+                await self._route_fail(workstream_id, workstream, verification)
+                return
+
+            # ERROR: consume one unit of the per-session retry budget.
+            last_error = result.protocol_error or "verification protocol error"
+            error_attempt += 1
+            await self._update_fields(
+                workstream_id, verification_error_attempt=error_attempt
+            )
+
+        # Error budget exhausted: fail-closed to FAILED, tagged for reverify so
+        # an operator re-queue routes back to VERIFYING (never an author
+        # respawn, §4 invariant).
+        self._logger.warning(
+            "Verification error budget exhausted for '%s': %s",
+            workstream_id,
+            last_error,
+        )
+        await self._transition(
+            workstream_id,
+            WorkstreamStatus.FAILED,
+            expected_status=WorkstreamStatus.VERIFYING,
+            resume_reason=RESUME_REVERIFY,
+            message=last_error,
+            error_message=last_error,
+        )
+        self._stats.failed += 1
+
+    async def _route_fail(
+        self,
+        workstream_id: str,
+        workstream: Workstream,
+        verification: VerificationSection,
+    ) -> None:
+        """Route a genuine FAIL verdict: rework respawn or review.
+
+        Under budget -> READY tagged RESUME_REWORK (the ONLY path that sets it,
+        §4 invariant), pids cleared; budget exhausted -> NEEDS_REVIEW.
+        """
+        if workstream.rework_attempt < verification.rework_budget:
+            await self._transition(
+                workstream_id,
+                WorkstreamStatus.READY,
+                expected_status=WorkstreamStatus.VERIFYING,
+                resume_reason=RESUME_REWORK,
+                rework_attempt=workstream.rework_attempt + 1,
+                process_pid=None,
+                generation_pid=None,
+            )
+            return
+        reason = (
+            f"verification FAILED and rework budget "
+            f"({verification.rework_budget}) is exhausted"
+        )
+        self._logger.warning("%s for '%s'", reason, workstream_id)
+        await self._transition(
+            workstream_id,
+            WorkstreamStatus.NEEDS_REVIEW,
+            expected_status=WorkstreamStatus.VERIFYING,
+            message=reason,
+            error_message=reason,
+        )
+        self._stats.failed += 1
+
+    async def _finalize_verification(
+        self,
+        workstream_id: str,
+        workspace_path: Path,
+        *,
+        run_id: str,
+        verified_source_commit: str,
+    ) -> None:
+        """PASS finalization (§8): materialize evidence, commit it, deliver.
+
+        The workstream stays in VERIFYING throughout preparation. A
+        delivery-preparation error (unwritable evidence root, git/IO failure)
+        leaves it in VERIFYING so recovery re-enters idempotently; a
+        containment violation (evidence escaping verifier.write, or a stale
+        PASS whose parent no longer matches the verified commit) fails closed
+        to NEEDS_REVIEW. Only a clean evidence commit proceeds to the delivery
+        tail (MERGING -> PR -> merge -> DONE).
+        """
+        profile = self._config.domain
+        assert profile is not None and self._ledger is not None
+        workstream = await self._db.get_workstream(workstream_id)
+        try:
+            materialized = await self._ledger.materialize(
+                run_id=run_id,
+                worktree=workspace_path,
+                evidence_root=profile.workspace.evidence_root,
+            )
+            await self._commit_evidence(
+                workspace_path,
+                run_id=run_id,
+                verified_source_commit=verified_source_commit,
+                materialized=materialized,
+            )
+            await self._ledger.mark_materialized(run_id)
+        except _EvidenceContainmentError as exc:
+            self._logger.warning(
+                "Verification finalization blocked for '%s': %s",
+                workstream_id,
+                exc,
+            )
+            await self._transition(
+                workstream_id,
+                WorkstreamStatus.NEEDS_REVIEW,
+                expected_status=WorkstreamStatus.VERIFYING,
+                message=str(exc),
+                error_message=str(exc),
+            )
+            self._stats.failed += 1
+            return
+        except (OSError, RuntimeError, LedgerCollisionError) as exc:
+            # Delivery-preparation error: STAY in VERIFYING, recovery re-enters.
+            self._logger.warning(
+                "Verification finalization deferred for '%s' (stays VERIFYING): %s",
+                workstream_id,
+                exc,
+            )
+            return
+
+        await self._merge_and_pr(
+            workstream_id, workstream, expected_status=WorkstreamStatus.VERIFYING
+        )
+
+    async def _commit_evidence(
+        self,
+        workspace_path: Path,
+        *,
+        run_id: str,
+        verified_source_commit: str,
+        materialized: list[Path],
+    ) -> None:
+        """Stage the materialized evidence and commit it onto the branch.
+
+        Idempotent: a commit already carrying this run's trailer (a recovery
+        re-entry after a crash between commit and mark) is left as-is. Raises
+        `_EvidenceContainmentError` when the staged set escapes verifier.write
+        or when HEAD no longer equals the verified source commit (stale PASS).
+        """
+        profile = self._config.domain
+        assert profile is not None
+        trailer = f"Maestro-Verification-Run: {run_id}"
+        if await self._evidence_commit_exists(workspace_path, trailer):
+            return
+
+        rels = [str(Path(p).relative_to(workspace_path)) for p in materialized]
+        await self._git_check(workspace_path, "add", "--", *rels)
+        staged = await self._git_check(
+            workspace_path, "diff", "--cached", "--name-only"
+        )
+        staged_paths = normalize([line for line in staged.splitlines() if line])
+        write_globs = normalize(profile.workspace.roles["verifier"].write)
+        escapes = find_escapes(staged_paths, write_globs)
+        if escapes:
+            msg = (
+                "verification evidence escapes verifier.write scope: "
+                f"{', '.join(sorted(escapes))}"
+            )
+            raise _EvidenceContainmentError(msg)
+
+        head = await self._workspace_head(workspace_path)
+        if head != verified_source_commit:
+            msg = (
+                "stale PASS: worktree HEAD "
+                f"{(head or 'unreadable')[:12]} no longer matches the verified "
+                f"source commit {verified_source_commit[:12]}"
+            )
+            raise _EvidenceContainmentError(msg)
+
+        message = f"verification evidence {run_id}\n\n{trailer}"
+        await self._git_check(workspace_path, "commit", "-m", message)
+
+    async def _evidence_commit_exists(self, workspace_path: Path, trailer: str) -> bool:
+        """True when a commit carrying `trailer` already exists on the branch."""
+        out = await self._git_check(
+            workspace_path, "log", "-F", "--grep", trailer, "--format=%H"
+        )
+        return bool(out.strip())
+
+    async def _load_rework_addendum(self, workstream: Workstream) -> str | None:
+        """Build the author-facing rework addendum from the latest FAIL.
+
+        Reads the highest-attempt FAIL of the run from the ledger and renders
+        the §7 declassification channel (severity + author_feedback only). No
+        FAIL evidence -> None (nothing to append).
+        """
+        if self._ledger is None or not workstream.verification_run_id:
+            return None
+        bundle = await self._ledger.list_bundle(workstream.verification_run_id)
+        fail = self._ledger.latest_fail(bundle)
+        if fail is None:
+            return None
+        document = VerdictDocument.model_validate_json(fail.json_path.read_text())
+        return build_rework_addendum(document)
+
+    @staticmethod
+    async def _workspace_tree(workspace: Path) -> str | None:
+        """HEAD tree sha of a worktree, or None when unreadable."""
+        process = await asyncio.create_subprocess_exec(
+            "git",
+            "-C",
+            str(workspace),
+            "rev-parse",
+            "HEAD^{tree}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await process.communicate()
+        if process.returncode != 0:
+            return None
+        return stdout.decode().strip()
+
+    @staticmethod
+    async def _git_check(workspace: Path, *args: str) -> str:
+        """Run a git command in `workspace`; return stdout, raise on failure."""
+        process = await asyncio.create_subprocess_exec(
+            "git",
+            "-C",
+            str(workspace),
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            detail = stderr.decode().strip()
+            raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
+        return stdout.decode()
 
     async def _handle_failure(
         self,

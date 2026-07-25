@@ -398,6 +398,11 @@ class Database:
         """Check if database connection is active."""
         return self._connection is not None
 
+    @property
+    def db_path(self) -> str:
+        """On-disk path of the SQLite file (``:memory:`` for in-memory)."""
+        return self._db_path
+
     async def connect(self) -> None:
         """Open database connection with WAL mode and foreign keys.
 
