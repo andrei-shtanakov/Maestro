@@ -529,3 +529,73 @@ class TestNonVerifierTaskUnaffected:
         assert scheduler._reservations.holds("t1") is False
         other = scope_to_reservation(str(wd), ["file.txt"])
         assert scheduler._reservations.try_acquire("other", other) is True
+
+
+class TestNonVerifierTaskBlockedByHeldVerifierReservation:
+    """Regression: the `_try_reserve` short-circuit must not let a
+    DIFFERENT, non-verifier task silently bypass an overlapping reservation
+    that a verifier-enabled task on the SAME (local, never-armed) workdir
+    currently holds.
+
+    Before the fix, `_try_reserve` short-circuited to `True` whenever
+    `not self._is_armed(task) and not self._verifier_enabled(task)` — true
+    for task B here regardless of what task A holds, so B never called
+    `try_acquire` and never saw A's held reservation. That let B run
+    concurrently and mutate files under A's verifier diff, corrupting A's
+    attribution. This test fails on the pre-fix code (B's second
+    `_try_reserve` below returns True immediately instead of False).
+    """
+
+    async def test_overlapping_non_verifier_task_blocked_then_unblocked(
+        self,
+        db: Database,
+        repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _modify_scope_file(repo)
+        task_a = await _make_running_task(db, repo, task_id="a", scope=["file.txt"])
+        _install_fake_model_resolution(monkeypatch)
+        _install_fake_judge(monkeypatch, _pass_result(task_a.id))
+
+        scheduler = _scheduler(
+            db,
+            repo,
+            verifier=VerifierConfig(model="m", timeout_seconds=5),
+            task_id="a",
+            scope=["file.txt"],
+        )
+        monkeypatch.setattr(scheduler, "_auto_commit_task", lambda _t: None)
+
+        # A holds the reservation (simulating its first dispatch).
+        assert scheduler._try_reserve(task_a) is True
+
+        # B: a DIFFERENT task on the SAME local (never-armed) workdir with
+        # an overlapping scope, but with no validation_cmd of its own — so
+        # `_verifier_enabled(task_b)` is False even though the scheduler has
+        # a verifier configured. B is not armed either (no SSH backend).
+        b_config = TaskConfig(
+            id="b",
+            title="Do another thing",
+            prompt="Change another thing.",
+            agent_type=AgentType.CLAUDE_CODE,
+            scope=["file.txt"],
+        )
+        task_b = Task.from_config(b_config, str(repo))
+        assert scheduler._verifier_enabled(task_b) is False
+        assert scheduler._is_armed(task_b) is False
+
+        # While A holds: B must be BLOCKED, not silently let through.
+        assert scheduler._try_reserve(task_b) is False
+        assert scheduler._reservations.holds("b") is False
+
+        # A completes (PASS) -> DONE -> releases its reservation.
+        final_a = await _complete(scheduler, db, task_a.id)
+        assert final_a.status is TaskStatus.DONE
+        assert scheduler._reservations.holds("a") is False
+
+        # Now B can acquire — the scope is genuinely free. (B need not be
+        # registered long-term in the registry — a non-verifier task only
+        # needs to be unblocked, not held, once no conflict remains; it may
+        # legitimately take the short-circuit path here since nothing else
+        # is held on this workdir anymore.)
+        assert scheduler._try_reserve(task_b) is True

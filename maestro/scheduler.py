@@ -845,14 +845,31 @@ class Scheduler:
     def _try_reserve(self, task: Task) -> bool:
         """Acquire the (workdir, scope) reservation.
 
-        No-op off armed workdirs, UNLESS `task` is verifier-enabled: the
-        verifier gate (design §5.3) needs unambiguous diff attribution for
+        No-op off armed workdirs, UNLESS `task` is verifier-enabled (the
+        verifier gate, design §5.3, needs unambiguous diff attribution for
         its scope-bounded patch regardless of backend, so it engages the
-        reservation even on a local (non-SSH, non-armed) workdir.
+        reservation even on a local, non-SSH, non-armed workdir) OR the
+        registry already holds ANY reservation on this workdir.
+
+        That third condition is load-bearing, not defensive filler: a
+        verifier task holds its reservation long past its own dispatch
+        (through VALIDATING/VERIFYING/retry/NEEDS_REVIEW). A different,
+        non-verifier, non-armed task sharing that same local workdir must
+        not be allowed to take the short-circuit and skip `try_acquire`
+        while that hold is live — it would run concurrently and mutate
+        files under the held task's verifier diff, corrupting its
+        attribution. Once anything is held on a workdir, every task on it
+        goes through `try_acquire` so an actual overlap check runs; a
+        non-verifier task that loses the race here simply retries later
+        (it still releases immediately after its own collect, unchanged).
         """
-        if not self._is_armed(task) and not self._verifier_enabled(task):
-            return True
         r = scope_to_reservation(task.workdir, task.scope)
+        if (
+            not self._is_armed(task)
+            and not self._verifier_enabled(task)
+            and not self._reservations.any_held_for_workdir(r.workdir)
+        ):
+            return True
         return self._reservations.try_acquire(task.id, r)
 
     def _emit_tick(self, ready: int, running: int, completed: int) -> None:
