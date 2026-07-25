@@ -25,6 +25,7 @@ from maestro.models import (
     TaskCost,
     TaskStatus,
     TaskType,
+    VerificationAttemptRow,
     Workstream,
     WorkstreamStatus,
 )
@@ -151,7 +152,7 @@ CREATE TABLE IF NOT EXISTS execution_handles (
     backend_id     TEXT NOT NULL,
     transport_ref  TEXT NOT NULL,
     state          TEXT NOT NULL CHECK (state IN ('prepared','running','terminal','collected','cleaned')),
-    execution_phase TEXT NOT NULL DEFAULT 'task' CHECK (execution_phase IN ('task','validation')),
+    execution_phase TEXT NOT NULL DEFAULT 'task' CHECK (execution_phase IN ('task','validation','verification')),
     created_at     TEXT NOT NULL,
     finished_at    TEXT,
     remote_host    TEXT,
@@ -194,7 +195,13 @@ CREATE TABLE IF NOT EXISTS workstreams (
     max_retries INTEGER DEFAULT 2,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     started_at TIMESTAMP,
-    completed_at TIMESTAMP
+    completed_at TIMESTAMP,
+    -- Stage B verification (SB-T3)
+    verification_run_id TEXT,
+    verification_attempt INTEGER NOT NULL DEFAULT 0,
+    verification_error_attempt INTEGER NOT NULL DEFAULT 0,
+    rework_attempt INTEGER NOT NULL DEFAULT 0,
+    resume_reason TEXT
 );
 
 CREATE TABLE IF NOT EXISTS workstream_dependencies (
@@ -206,6 +213,24 @@ CREATE TABLE IF NOT EXISTS workstream_dependencies (
 );
 
 CREATE INDEX IF NOT EXISTS idx_workstreams_status ON workstreams(status);
+
+-- Stage B verification (SB-T3): index table over the on-disk evidence
+-- ledger (Task 5 owns the files under <db_dir>/evidence/<workstream_id>/
+-- <run_id>/attempt-NNN.*). One row per verification attempt.
+CREATE TABLE IF NOT EXISTS verification_attempts (
+    run_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    workstream_id TEXT NOT NULL,
+    verdict TEXT NOT NULL CHECK (verdict IN ('PASS','FAIL','ERROR')),
+    protocol_error TEXT,
+    artifact_sha256 TEXT,
+    json_path TEXT NOT NULL,
+    md_path TEXT,
+    raw_path TEXT,
+    materialized INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (run_id, attempt)
+);
 """
 
 
@@ -344,6 +369,11 @@ def _row_to_workstream(row: aiosqlite.Row) -> Workstream:
         created_at=(_parse_datetime(row["created_at"]) or datetime.now(UTC)),
         started_at=_parse_datetime(row["started_at"]),
         completed_at=_parse_datetime(row["completed_at"]),
+        verification_run_id=row["verification_run_id"],
+        verification_attempt=row["verification_attempt"],
+        verification_error_attempt=row["verification_error_attempt"],
+        rework_attempt=row["rework_attempt"],
+        resume_reason=row["resume_reason"],
         depends_on=[],  # Populated separately
     )
 
@@ -367,6 +397,11 @@ class Database:
     def is_connected(self) -> bool:
         """Check if database connection is active."""
         return self._connection is not None
+
+    @property
+    def db_path(self) -> str:
+        """On-disk path of the SQLite file (``:memory:`` for in-memory)."""
+        return self._db_path
 
     async def connect(self) -> None:
         """Open database connection with WAL mode and foreign keys.
@@ -445,6 +480,21 @@ class Database:
                 12,
                 "tasks_validation_backend_default_same",
                 self._migrate_tasks_validation_backend_default_same,
+            ),
+            (
+                13,
+                "workstreams_verification_columns",
+                self._migrate_workstreams_verification_columns,
+            ),
+            (
+                14,
+                "verification_attempts_table",
+                self._migrate_verification_attempts_table,
+            ),
+            (
+                15,
+                "execution_phase_verification",
+                self._migrate_execution_phase_verification,
             ),
         ]
 
@@ -803,6 +853,145 @@ class Database:
                 "ALTER TABLE tasks ADD COLUMN validation_backend "
                 "TEXT NOT NULL DEFAULT 'local'"
             )
+
+    async def _migrate_workstreams_verification_columns(self) -> None:
+        """Migration 13: add Stage B verification columns to `workstreams`.
+
+        Five additive columns tracking the VERIFYING FSM's durable state:
+        `verification_run_id`, `verification_attempt`,
+        `verification_error_attempt`, `rework_attempt`, `resume_reason`.
+        NULL/0 for all pre-existing rows. Idempotent via PRAGMA table_info,
+        same shape as `_migrate_tasks_arbiter_columns`.
+        """
+        assert self._connection is not None
+        cursor = await self._connection.execute("PRAGMA table_info(workstreams)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+
+        migrations = [
+            (
+                "verification_run_id",
+                "ALTER TABLE workstreams ADD COLUMN verification_run_id TEXT",
+            ),
+            (
+                "verification_attempt",
+                "ALTER TABLE workstreams ADD COLUMN verification_attempt "
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "verification_error_attempt",
+                "ALTER TABLE workstreams ADD COLUMN verification_error_attempt "
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "rework_attempt",
+                "ALTER TABLE workstreams ADD COLUMN rework_attempt "
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "resume_reason",
+                "ALTER TABLE workstreams ADD COLUMN resume_reason TEXT",
+            ),
+        ]
+        for column, ddl in migrations:
+            if column not in columns:
+                await self._connection.execute(ddl)
+
+    async def _migrate_verification_attempts_table(self) -> None:
+        """Migration 14: Stage B evidence-ledger index table.
+
+        `CREATE TABLE IF NOT EXISTS` — a no-op on databases whose SCHEMA_SQL
+        already created the table; creates it for pre-v14 databases.
+        Mirrors `_migrate_gate_approvals` (migration 6).
+        """
+        assert self._connection is not None
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS verification_attempts (
+                run_id TEXT NOT NULL,
+                attempt INTEGER NOT NULL,
+                workstream_id TEXT NOT NULL,
+                verdict TEXT NOT NULL CHECK (verdict IN ('PASS','FAIL','ERROR')),
+                protocol_error TEXT,
+                artifact_sha256 TEXT,
+                json_path TEXT NOT NULL,
+                md_path TEXT,
+                raw_path TEXT,
+                materialized INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (run_id, attempt)
+            )
+            """
+        )
+
+    async def _migrate_execution_phase_verification(self) -> None:
+        """Migration 15: widen `execution_handles.execution_phase` CHECK.
+
+        SQLite cannot ALTER a CHECK constraint, so this rebuilds the table
+        (rename -> create-new -> copy -> drop) and re-creates its indexes,
+        same shape as `_migrate_ssh_handle_columns` (migration 9).
+
+        Idempotent via `sqlite_master.sql`: a fresh database already gets
+        the widened CHECK from SCHEMA_SQL (and an already-migrated database
+        has it from a prior run of this migration), so this checks the
+        table's own DDL text for `'verification'` rather than PRAGMA
+        table_info (which cannot see CHECK constraint contents) and no-ops
+        when already widened.
+        """
+        assert self._connection is not None
+        cursor = await self._connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='execution_handles'"
+        )
+        row = await cursor.fetchone()
+        if row is not None and "verification" in (row["sql"] or ""):
+            return
+
+        await self._connection.execute(
+            "ALTER TABLE execution_handles RENAME TO execution_handles_old"
+        )
+        await self._connection.execute(
+            """
+            CREATE TABLE execution_handles (
+                execution_id   TEXT PRIMARY KEY,
+                entity_kind    TEXT NOT NULL CHECK (entity_kind IN ('task','workstream')),
+                entity_id      TEXT NOT NULL,
+                attempt        INTEGER NOT NULL,
+                backend_id     TEXT NOT NULL,
+                transport_ref  TEXT NOT NULL,
+                state          TEXT NOT NULL CHECK (state IN ('prepared','running','terminal','collected','cleaned')),
+                execution_phase TEXT NOT NULL DEFAULT 'task' CHECK (execution_phase IN ('task','validation','verification')),
+                created_at     TEXT NOT NULL,
+                finished_at    TEXT,
+                remote_host    TEXT,
+                remote_dir     TEXT,
+                status_marker  TEXT,
+                collected_at   TEXT
+            )
+            """
+        )
+        await self._connection.execute(
+            """
+            INSERT INTO execution_handles
+                (execution_id, entity_kind, entity_id, attempt, backend_id,
+                 transport_ref, state, execution_phase, created_at,
+                 finished_at, remote_host, remote_dir, status_marker,
+                 collected_at)
+            SELECT execution_id, entity_kind, entity_id, attempt, backend_id,
+                   transport_ref, state, execution_phase, created_at,
+                   finished_at, remote_host, remote_dir, status_marker,
+                   collected_at
+            FROM execution_handles_old
+            """
+        )
+        await self._connection.execute("DROP TABLE execution_handles_old")
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS ix_exec_state_backend "
+            "ON execution_handles (state, backend_id)"
+        )
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS ix_exec_entity "
+            "ON execution_handles (entity_kind, entity_id, attempt)"
+        )
 
     async def _migrate_tasks_validation_backend_default_same(self) -> None:
         """Migration 12: flip the `tasks.validation_backend` column DEFAULT from
@@ -1711,6 +1900,47 @@ class Database:
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
+    async def get_execution_handle(
+        self,
+        *,
+        entity_kind: Literal["task", "workstream"],
+        entity_id: str,
+        execution_phase: str,
+        attempt: int,
+    ) -> dict[str, Any] | None:
+        """Return the execution-handle row for one entity/phase/attempt.
+
+        Unlike `get_open_execution_handles`, this is NOT filtered by
+        `backend_id != 'local'` — it is the lookup a caller uses when it
+        already knows exactly which handle it wants (e.g. Stage B VERIFYING
+        recovery, Task 9), including local-backed handles that the
+        crash-recovery sweep otherwise never sees. `None` when no such row
+        exists (e.g. the crash landed before the handle was ever persisted).
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            """
+            SELECT execution_id, entity_kind, entity_id, attempt, backend_id,
+                   transport_ref, state, created_at, finished_at,
+                   remote_host, remote_dir, status_marker, collected_at,
+                   execution_phase
+            FROM execution_handles
+            WHERE entity_kind = ? AND entity_id = ? AND execution_phase = ?
+              AND attempt = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (entity_kind, entity_id, execution_phase, attempt),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
     # =========================================================================
     # Query by Status
     # =========================================================================
@@ -2299,10 +2529,13 @@ class Database:
                     workspace_path, status, scope, priority,
                     pr_url, process_pid, generation_pid, subtask_progress,
                     error_message, retry_count, max_retries,
-                    created_at, started_at, completed_at
+                    created_at, started_at, completed_at,
+                    verification_run_id, verification_attempt,
+                    verification_error_attempt, rework_attempt, resume_reason
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -2324,6 +2557,11 @@ class Database:
                     _format_datetime(workstream.created_at),
                     _format_datetime(workstream.started_at),
                     _format_datetime(workstream.completed_at),
+                    workstream.verification_run_id,
+                    workstream.verification_attempt,
+                    workstream.verification_error_attempt,
+                    workstream.rework_attempt,
+                    workstream.resume_reason,
                 ),
             )
         except sqlite3.IntegrityError as e:
@@ -2466,6 +2704,11 @@ class Database:
             "pr_url",
             "retry_count",
             "branch",
+            "verification_run_id",
+            "verification_attempt",
+            "verification_error_attempt",
+            "rework_attempt",
+            "resume_reason",
         }
         for field_name, value in extra_fields.items():
             if field_name in allowed:
@@ -2569,6 +2812,131 @@ class Database:
         await self._connection.commit()
 
         return cursor.rowcount > 0
+
+    # =========================================================================
+    # Verification Attempts Operations (Stage B, SB-T3)
+    # =========================================================================
+
+    async def insert_verification_attempt(
+        self,
+        *,
+        run_id: str,
+        attempt: int,
+        workstream_id: str,
+        verdict: str,
+        json_path: str,
+        protocol_error: str | None = None,
+        artifact_sha256: str | None = None,
+        md_path: str | None = None,
+        raw_path: str | None = None,
+    ) -> None:
+        """Index one verification attempt in the evidence ledger (Task 5).
+
+        Append-only: `(run_id, attempt)` is the primary key, so re-inserting
+        the same attempt raises `sqlite3.IntegrityError` rather than
+        silently overwriting evidence. `verdict` must be one of
+        `'PASS'`, `'FAIL'`, `'ERROR'` (enforced by a CHECK constraint) —
+        any other value also raises `sqlite3.IntegrityError`.
+
+        Args:
+            run_id: Verification run identifier.
+            attempt: Attempt number within the run.
+            workstream_id: Workstream this attempt belongs to.
+            verdict: `'PASS'`, `'FAIL'`, or `'ERROR'`.
+            json_path: Path to the ingested `attempt-NNN.json` bundle file.
+            protocol_error: Protocol-violation message, if any.
+            artifact_sha256: SHA-256 of the verified artifact, if known.
+            md_path: Path to the `.md` sidecar, if present.
+            raw_path: Path to the `.raw.txt` sidecar, if present.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        await self._connection.execute(
+            """
+            INSERT INTO verification_attempts
+                (run_id, attempt, workstream_id, verdict, protocol_error,
+                 artifact_sha256, json_path, md_path, raw_path, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                attempt,
+                workstream_id,
+                verdict,
+                protocol_error,
+                artifact_sha256,
+                json_path,
+                md_path,
+                raw_path,
+                _format_datetime(datetime.now(UTC)),
+            ),
+        )
+        await self._connection.commit()
+
+    async def list_verification_attempts(
+        self, run_id: str
+    ) -> list[VerificationAttemptRow]:
+        """List all attempts indexed for a verification run, oldest first.
+
+        Args:
+            run_id: Verification run identifier.
+
+        Returns:
+            Attempts ordered by `attempt` ascending; empty list if the run
+            has no indexed attempts.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            "SELECT * FROM verification_attempts WHERE run_id = ? ORDER BY attempt ASC",
+            (run_id,),
+        )
+        rows = await cursor.fetchall()
+        return [
+            VerificationAttemptRow(
+                run_id=row["run_id"],
+                attempt=row["attempt"],
+                workstream_id=row["workstream_id"],
+                verdict=row["verdict"],
+                protocol_error=row["protocol_error"],
+                artifact_sha256=row["artifact_sha256"],
+                json_path=row["json_path"],
+                md_path=row["md_path"],
+                raw_path=row["raw_path"],
+                materialized=bool(row["materialized"]),
+                created_at=_parse_datetime(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    async def mark_attempts_materialized(self, run_id: str) -> None:
+        """Mark every indexed attempt of a run as materialized into the PR.
+
+        Args:
+            run_id: Verification run identifier.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        await self._connection.execute(
+            "UPDATE verification_attempts SET materialized = 1 WHERE run_id = ?",
+            (run_id,),
+        )
+        await self._connection.commit()
 
     # =========================================================================
     # Gate Approvals Operations

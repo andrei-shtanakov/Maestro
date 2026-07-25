@@ -64,6 +64,7 @@ PROJECTIONS: dict[str, dict[str, CommonStatus]] = {
         WorkstreamStatus.READY: CommonStatus.PENDING,
         WorkstreamStatus.DECOMPOSING: CommonStatus.RUNNING,
         WorkstreamStatus.RUNNING: CommonStatus.RUNNING,
+        WorkstreamStatus.VERIFYING: CommonStatus.RUNNING,
         WorkstreamStatus.MERGING: CommonStatus.RUNNING,
         WorkstreamStatus.PR_CREATED: CommonStatus.NEEDS_REVIEW,
         WorkstreamStatus.DONE: CommonStatus.DONE,

@@ -13,8 +13,46 @@ from maestro.decomposer import (
     ProjectDecomposer,
     ScopeOverlapWarning,
     _patterns_overlap,
+    resolve_spec_gen_settings,
+)
+from maestro.domain import (
+    CriteriaConfig,
+    DeliveryPolicy,
+    DomainProfile,
+    RoleScopes,
+    SpecGenSection,
+    VerificationSection,
+    VerifierSpec,
+    WorkspacePolicy,
 )
 from maestro.models import SPEC_PREFIX, WorkstreamConfig
+
+
+def _domain_with_spec_gen(
+    *, budget_usd: float | None, timeout_minutes: float | None = None
+) -> DomainProfile:
+    """Minimal DomainProfile whose spec_gen carries the given budget/timeout."""
+    return DomainProfile(
+        verification=VerificationSection(
+            verifier=VerifierSpec(
+                argv=["v", "--out", "{out}"], timeout_seconds=60.0, error_retry_budget=0
+            ),
+            artifact="a.md",
+            rework_budget=0,
+            verdict_schema_version=2,
+            criteria=CriteriaConfig(
+                visibility="shared", source="c.yaml", sha256="b" * 64
+            ),
+        ),
+        workspace=WorkspacePolicy(
+            roles={"verifier": RoleScopes(write=["evidence/**"])},
+            evidence_root="evidence",
+        ),
+        delivery=DeliveryPolicy(
+            local_merge="before_remote_pr", remote="github_pr", evidence="all"
+        ),
+        spec_gen=SpecGenSection(budget_usd=budget_usd, timeout_minutes=timeout_minutes),
+    )
 
 
 # =============================================================================
@@ -412,6 +450,37 @@ class TestGenerateSpec:
         ) as exec_mock:
             await dec.generate_spec(workstream, workspace)
         assert "--budget" not in list(exec_mock.call_args[0])
+
+    @pytest.mark.anyio
+    async def test_domain_spec_gen_budget_is_wired(
+        self, temp_dir: Path, workstream: WorkstreamConfig
+    ) -> None:
+        """F4: domain.spec_gen.budget_usd is the SSOT and reaches --budget."""
+        workspace = temp_dir / "ws"
+        (workspace / "spec").mkdir(parents=True)
+        (workspace / "spec" / f"{SPEC_PREFIX}tasks.md").write_text(
+            "x", encoding="utf-8"
+        )
+        domain = _domain_with_spec_gen(budget_usd=2.5)
+        budget, timeout = resolve_spec_gen_settings(domain, None)
+        assert budget == 2.5
+        assert timeout is None
+        dec = ProjectDecomposer(
+            repo_path=temp_dir,
+            spec_gen_budget_usd=budget,
+            spec_gen_timeout_minutes=timeout,
+        )
+        proc = self._fake_proc()
+        with patch(
+            "asyncio.create_subprocess_exec", AsyncMock(return_value=proc)
+        ) as exec_mock:
+            await dec.generate_spec(workstream, workspace)
+        cmd = list(exec_mock.call_args[0])
+        assert "--budget" in cmd and cmd[cmd.index("--budget") + 1] == "2.5"
+
+    def test_resolve_spec_gen_falls_back_to_legacy_budget(self) -> None:
+        """No domain.spec_gen -> legacy spec_runner budget, no gen timeout."""
+        assert resolve_spec_gen_settings(None, 1.0) == (1.0, None)
 
     @pytest.mark.anyio
     async def test_nonzero_exit_raises(

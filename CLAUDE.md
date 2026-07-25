@@ -138,11 +138,16 @@ PENDING -> READY -> RUNNING -> VALIDATING -> DONE
 
 ```
 PENDING -> DECOMPOSING -> READY -> RUNNING -> MERGING -> PR_CREATED -> DONE
-                            |         |
-                            |         └-> FAILED -> READY (retry)
-                            |               |
-                            |               └-> NEEDS_REVIEW -> READY
-                            |
+                            |        |  └-> FAILED -> READY (retry)
+                            |        |              └-> NEEDS_REVIEW
+                            |        └-> VERIFYING   (domain verification)
+                            |               |-> PASS + evidence commit  -> MERGING
+                            |               |-> FAIL, rework left       -> READY
+                            |               |-> FAIL, budget exhausted  -> NEEDS_REVIEW
+                            |               |-> ERROR retries exhausted -> FAILED
+                            |               └-> live orphan/ambiguity   -> NEEDS_REVIEW
+                            |        (READY + reverify marker -> VERIFYING;
+                            |         finalization happens INSIDE VERIFYING)
                             └-> ABANDONED
 ```
 
@@ -159,6 +164,7 @@ An ex-post gate block that the operator approved resumes at the ex-post edge (H-
 - **Conflict prevention**: Workstreams define `scope` (file/dir globs), decomposer validates non-overlap
 - **Storage**: SQLite (single file, no external services)
 - **Spec-runner**: External package (PyPI) handles subtask execution within a worktree
+- **Domain verification (Stage B)**: activation is by-presence — `domain.verification.verifier` in a workstream's `project.yaml` turns the VERIFYING phase on; an absent `domain:` (or no `verifier`) takes the pre-Stage-B path byte-identically (zero-change guarantee, proven by the unchanged full test suite). Verdict contract v2 is run-keyed with a strict handshake (echoed run_id/attempt/sha); malformed or mismatched echoes are protocol ERROR, never softened to FAIL. The evidence ledger lives at `<db_dir>/evidence/`, outside the worktree, durably recording each attempt and unreachable by the author until delivery. Exactly one evidence commit lands on the branch at delivery, tagged `Maestro-Verification-Run: <run_id>`; finalization checks that trailer first, so re-running it is idempotent across retries/crashes. Rework (author respawn) and reverify (operator-approved resume) are distinct `resume_reason` paths — author respawn fires ONLY on a genuine FAIL, never on ERROR or an ambiguous recovery outcome. `criteria_visibility: verifier_only` is capability-gated in preflight and refused unless the author backend is docker-isolated. `CommandVerifier` runs through the shared execution layer (`execution_phase="verification"`), inheriting the same recovery/probe machinery — including live-orphan re-poll — as task and validation executions.
 
 ### Orchestrator Flow
 

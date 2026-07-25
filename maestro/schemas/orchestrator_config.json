@@ -102,6 +102,337 @@
       "title": "ArbiterMode",
       "type": "string"
     },
+    "BackendSpec": {
+      "description": "A named execution backend: how to reach it, and how to isolate it.",
+      "properties": {
+        "transport": {
+          "discriminator": {
+            "mapping": {
+              "local": "#/$defs/LocalTransport",
+              "ssh": "#/$defs/SshTransport"
+            },
+            "propertyName": "type"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/LocalTransport"
+            },
+            {
+              "$ref": "#/$defs/SshTransport"
+            }
+          ],
+          "title": "Transport"
+        },
+        "isolation": {
+          "discriminator": {
+            "mapping": {
+              "bare": "#/$defs/BareIsolation",
+              "docker": "#/$defs/DockerIsolation"
+            },
+            "propertyName": "type"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/BareIsolation"
+            },
+            {
+              "$ref": "#/$defs/DockerIsolation"
+            }
+          ],
+          "title": "Isolation"
+        },
+        "secret_env": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Secret Env",
+          "type": "array"
+        },
+        "inherit_secret_defaults": {
+          "default": false,
+          "title": "Inherit Secret Defaults",
+          "type": "boolean"
+        },
+        "max_concurrent": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Concurrent"
+        }
+      },
+      "required": [
+        "transport",
+        "isolation"
+      ],
+      "title": "BackendSpec",
+      "type": "object"
+    },
+    "BareIsolation": {
+      "description": "No isolation; the harness runs directly on the transport's target.",
+      "properties": {
+        "type": {
+          "const": "bare",
+          "default": "bare",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "title": "BareIsolation",
+      "type": "object"
+    },
+    "CriteriaConfig": {
+      "description": "Rubric reference. `source` is a reference, never inline rubric bytes.\n\nFor visibility=shared the source is a repo-relative path; for\nverifier_only it is an operator-side reference whose BYTES are the only\nsecret \u2014 the reference string itself is visible to the author (\u00a77, \u00a79).",
+      "properties": {
+        "visibility": {
+          "enum": [
+            "shared",
+            "verifier_only"
+          ],
+          "title": "Visibility",
+          "type": "string"
+        },
+        "source": {
+          "title": "Source",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "visibility",
+        "source",
+        "sha256"
+      ],
+      "title": "CriteriaConfig",
+      "type": "object"
+    },
+    "DeliveryPolicy": {
+      "description": "Declare-and-validate: names the one supported semantics (\u00a78).",
+      "properties": {
+        "local_merge": {
+          "const": "before_remote_pr",
+          "title": "Local Merge",
+          "type": "string"
+        },
+        "remote": {
+          "const": "github_pr",
+          "title": "Remote",
+          "type": "string"
+        },
+        "evidence": {
+          "const": "all",
+          "title": "Evidence",
+          "type": "string"
+        }
+      },
+      "required": [
+        "local_merge",
+        "remote",
+        "evidence"
+      ],
+      "title": "DeliveryPolicy",
+      "type": "object"
+    },
+    "DockerConfig": {
+      "description": "Local Docker isolator configuration.",
+      "properties": {
+        "image": {
+          "title": "Image",
+          "type": "string"
+        },
+        "network": {
+          "default": "none",
+          "title": "Network",
+          "type": "string"
+        },
+        "memory": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Memory"
+        },
+        "cpus": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cpus"
+        },
+        "user": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "User"
+        },
+        "secret_env": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Secret Env",
+          "type": "array"
+        }
+      },
+      "required": [
+        "image"
+      ],
+      "title": "DockerConfig",
+      "type": "object"
+    },
+    "DockerIsolation": {
+      "description": "Isolate the harness inside a Docker container.",
+      "properties": {
+        "type": {
+          "const": "docker",
+          "title": "Type",
+          "type": "string"
+        },
+        "image": {
+          "title": "Image",
+          "type": "string"
+        },
+        "network": {
+          "default": "none",
+          "title": "Network",
+          "type": "string"
+        },
+        "memory": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Memory"
+        },
+        "cpus": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cpus"
+        },
+        "user": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "User"
+        }
+      },
+      "required": [
+        "type",
+        "image"
+      ],
+      "title": "DockerIsolation",
+      "type": "object"
+    },
+    "DomainProfile": {
+      "properties": {
+        "verification": {
+          "$ref": "#/$defs/VerificationSection"
+        },
+        "workspace": {
+          "$ref": "#/$defs/WorkspacePolicy"
+        },
+        "delivery": {
+          "$ref": "#/$defs/DeliveryPolicy"
+        },
+        "spec_gen": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpecGenSection"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "verification",
+        "workspace",
+        "delivery"
+      ],
+      "title": "DomainProfile",
+      "type": "object"
+    },
+    "ExecutionConfig": {
+      "description": "The `execution:` block. Absent \u2192 `local + bare`, old behavior.\n\n`backends` is the canonical named registry (transport x isolation). The\nPhase-1 `docker` field is a legacy shorthand normalized into\n`backends[\"docker\"]`. `local` is always implicit.",
+      "properties": {
+        "default_backend": {
+          "default": "local",
+          "title": "Default Backend",
+          "type": "string"
+        },
+        "secret_env_defaults": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Secret Env Defaults",
+          "type": "array"
+        },
+        "backends": {
+          "additionalProperties": {
+            "$ref": "#/$defs/BackendSpec"
+          },
+          "title": "Backends",
+          "type": "object"
+        },
+        "docker": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DockerConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "ExecutionConfig",
+      "type": "object"
+    },
     "GatesConfig": {
       "additionalProperties": false,
       "description": "Gates-in-DAG guard config (WS-006 skeleton, steward DESIGN-611). Opt-in.\n\nWhen present, the orchestrator evaluates risk gates at two transition\nedges \u2014 ex-ante before READY -> RUNNING (declared workstream scope) and\nex-post before RUNNING -> MERGING (the actual diff) \u2014 by shelling out to\n``steward risk-classify`` (single source of truth for tiers; Maestro never\ncomputes risk itself). ``mode`` is fixed fail_closed: a missing or errored\nverdict on a mandatory gate blocks the transition.",
@@ -160,6 +491,19 @@
       "title": "GatesConfig",
       "type": "object"
     },
+    "LocalTransport": {
+      "description": "Run the harness in-process on the local machine.",
+      "properties": {
+        "type": {
+          "const": "local",
+          "default": "local",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "title": "LocalTransport",
+      "type": "object"
+    },
     "NotificationConfig": {
       "description": "Notification configuration.",
       "properties": {
@@ -210,6 +554,54 @@
         }
       },
       "title": "NotificationConfig",
+      "type": "object"
+    },
+    "RoleScopes": {
+      "properties": {
+        "write": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Write",
+          "type": "array"
+        }
+      },
+      "required": [
+        "write"
+      ],
+      "title": "RoleScopes",
+      "type": "object"
+    },
+    "SpecGenSection": {
+      "description": "Domain-owned spec-generation budgets; single SSOT rule in preflight.",
+      "properties": {
+        "budget_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Budget Usd"
+        },
+        "timeout_minutes": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timeout Minutes"
+        }
+      },
+      "title": "SpecGenSection",
       "type": "object"
     },
     "SpecRunnerConfig": {
@@ -321,6 +713,172 @@
       "title": "SpecRunnerConfig",
       "type": "object"
     },
+    "SshTransport": {
+      "description": "Run the harness on a remote host reached over SSH.",
+      "properties": {
+        "type": {
+          "const": "ssh",
+          "title": "Type",
+          "type": "string"
+        },
+        "host": {
+          "title": "Host",
+          "type": "string"
+        },
+        "user": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "User"
+        },
+        "port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Port"
+        },
+        "workdir_root": {
+          "title": "Workdir Root",
+          "type": "string"
+        },
+        "connect_timeout_s": {
+          "default": 10,
+          "title": "Connect Timeout S",
+          "type": "integer"
+        },
+        "ssh_opts": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Ssh Opts",
+          "type": "array"
+        }
+      },
+      "required": [
+        "type",
+        "host",
+        "workdir_root"
+      ],
+      "title": "SshTransport",
+      "type": "object"
+    },
+    "VerificationSection": {
+      "description": "Workstream-final verification; presence activates VERIFYING (\u00a74, \u00a79).",
+      "properties": {
+        "verifier": {
+          "$ref": "#/$defs/VerifierSpec"
+        },
+        "artifact": {
+          "title": "Artifact",
+          "type": "string"
+        },
+        "rework_budget": {
+          "maximum": 10,
+          "minimum": 0,
+          "title": "Rework Budget",
+          "type": "integer"
+        },
+        "verdict_schema_version": {
+          "const": 2,
+          "title": "Verdict Schema Version",
+          "type": "integer"
+        },
+        "criteria": {
+          "$ref": "#/$defs/CriteriaConfig"
+        }
+      },
+      "required": [
+        "verifier",
+        "artifact",
+        "rework_budget",
+        "verdict_schema_version",
+        "criteria"
+      ],
+      "title": "VerificationSection",
+      "type": "object"
+    },
+    "VerifierSpec": {
+      "description": "How to invoke the verifier: argv template, no shell interpolation.",
+      "properties": {
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Argv",
+          "type": "array"
+        },
+        "timeout_seconds": {
+          "exclusiveMinimum": 0,
+          "title": "Timeout Seconds",
+          "type": "number"
+        },
+        "error_retry_budget": {
+          "maximum": 10,
+          "minimum": 0,
+          "title": "Error Retry Budget",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "argv",
+        "timeout_seconds",
+        "error_retry_budget"
+      ],
+      "title": "VerifierSpec",
+      "type": "object"
+    },
+    "WorkspacePolicy": {
+      "description": "Per-role write authority + declared outputs (\u00a76). Declarative only.",
+      "properties": {
+        "roles": {
+          "additionalProperties": {
+            "$ref": "#/$defs/RoleScopes"
+          },
+          "title": "Roles",
+          "type": "object"
+        },
+        "read_only": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Read Only",
+          "type": "array"
+        },
+        "evidence_root": {
+          "title": "Evidence Root",
+          "type": "string"
+        },
+        "expected_outputs": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": "Expected Outputs",
+          "type": "object"
+        }
+      },
+      "required": [
+        "roles",
+        "evidence_root"
+      ],
+      "title": "WorkspacePolicy",
+      "type": "object"
+    },
     "WorkstreamConfig": {
       "description": "Configuration for a single workstream (independent work unit).\n\nUsed in YAML config or produced by auto-decomposition.",
       "properties": {
@@ -365,6 +923,19 @@
           "minimum": -100,
           "title": "Priority",
           "type": "integer"
+        },
+        "backend": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Execution backend name (local|docker); None -> default_backend",
+          "title": "Backend"
         }
       },
       "required": [
@@ -487,6 +1058,30 @@
       ],
       "default": null,
       "description": "Gates-in-DAG guard config (WS-006); None disables gates."
+    },
+    "execution": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ExecutionConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Execution backends config; None keeps zero-config local/bare execution (old behavior)."
+    },
+    "domain": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DomainProfile"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Domain profile (Stage B). Absent -> legacy behavior, byte-identical: no VERIFYING phase, no evidence machinery."
     }
   },
   "required": [

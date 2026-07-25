@@ -14,6 +14,7 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from maestro.domain.profile import DomainProfile
 from maestro.execution.exec_config import ExecutionConfig
 
 
@@ -969,11 +970,16 @@ class WorkstreamStatus(StrEnum):
 
     State machine:
         PENDING → DECOMPOSING → READY → RUNNING → MERGING → PR_CREATED → DONE
-                                  │        │
-                                  │        └→ FAILED → READY (retry)
-                                  │                      │
-                                  │                      └→ NEEDS_REVIEW
-                                  │
+                                  │        │  └→ FAILED → READY (retry)
+                                  │        │              └→ NEEDS_REVIEW
+                                  │        └→ VERIFYING   (domain verification)
+                                  │              ├─ PASS + evidence commit → MERGING
+                                  │              ├─ FAIL, rework left      → READY
+                                  │              ├─ FAIL, budget exhausted → NEEDS_REVIEW
+                                  │              ├─ ERROR retries exhausted→ FAILED
+                                  │              └─ live orphan/ambiguity  → NEEDS_REVIEW
+                                  │        (READY + reverify marker → VERIFYING;
+                                  │         finalization happens INSIDE VERIFYING)
                                   └→ ABANDONED
     """
 
@@ -981,6 +987,7 @@ class WorkstreamStatus(StrEnum):
     DECOMPOSING = "decomposing"
     READY = "ready"
     RUNNING = "running"
+    VERIFYING = "verifying"
     MERGING = "merging"
     PR_CREATED = "pr_created"
     DONE = "done"
@@ -996,8 +1003,14 @@ class WorkstreamStatus(StrEnum):
         return {
             cls.PENDING: {cls.DECOMPOSING, cls.READY},
             cls.DECOMPOSING: {cls.READY, cls.FAILED},
-            cls.READY: {cls.RUNNING, cls.NEEDS_REVIEW, cls.ABANDONED},
-            cls.RUNNING: {cls.MERGING, cls.FAILED},
+            cls.READY: {cls.RUNNING, cls.VERIFYING, cls.NEEDS_REVIEW, cls.ABANDONED},
+            cls.RUNNING: {cls.MERGING, cls.VERIFYING, cls.FAILED},
+            cls.VERIFYING: {
+                cls.MERGING,
+                cls.READY,
+                cls.FAILED,
+                cls.NEEDS_REVIEW,
+            },
             cls.MERGING: {cls.PR_CREATED, cls.FAILED},
             cls.PR_CREATED: {cls.DONE, cls.FAILED},
             cls.FAILED: {cls.READY, cls.NEEDS_REVIEW},
@@ -1153,6 +1166,14 @@ class Workstream(BaseModel):
     completed_at: datetime | None = Field(
         default=None, description="Completion timestamp"
     )
+    verification_run_id: str | None = Field(default=None)
+    verification_attempt: int = Field(default=0, ge=0)
+    verification_error_attempt: int = Field(default=0, ge=0)
+    rework_attempt: int = Field(default=0, ge=0)
+    resume_reason: str | None = Field(
+        default=None,
+        description="verification_rework | verification_reverify | None",
+    )
 
     def can_transition_to(self, target: WorkstreamStatus) -> bool:
         """Check if transition to target status is valid."""
@@ -1206,6 +1227,27 @@ class Workstream(BaseModel):
             priority=config.priority,
             backend=config.backend,
         )
+
+
+class VerificationAttemptRow(BaseModel):
+    """One row of the `verification_attempts` index table (Stage B).
+
+    Read model for `Database.list_verification_attempts`; the JSON/MD/RAW
+    paths point at the evidence-ledger bundle on disk (Task 5 owns the
+    files themselves), this table only indexes them per `(run_id, attempt)`.
+    """
+
+    run_id: str
+    attempt: int
+    workstream_id: str
+    verdict: str = Field(description="PASS | FAIL | ERROR")
+    protocol_error: str | None = Field(default=None)
+    artifact_sha256: str | None = Field(default=None)
+    json_path: str
+    md_path: str | None = Field(default=None)
+    raw_path: str | None = Field(default=None)
+    materialized: bool = Field(default=False)
+    created_at: datetime | None = Field(default=None)
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -1495,6 +1537,13 @@ class OrchestratorConfig(BaseModel):
         description=(
             "Execution backends config; None keeps zero-config local/bare "
             "execution (old behavior)."
+        ),
+    )
+    domain: DomainProfile | None = Field(
+        default=None,
+        description=(
+            "Domain profile (Stage B). Absent -> legacy behavior, "
+            "byte-identical: no VERIFYING phase, no evidence machinery."
         ),
     )
 
