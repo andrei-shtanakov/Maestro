@@ -18,10 +18,44 @@ from pydantic import BaseModel, Field
 
 from maestro.dag import find_cycle
 from maestro.decomposer import ProjectDecomposer
-from maestro.models import GatesConfig, OrchestratorConfig, WorkstreamConfig
+from maestro.execution.exec_config import ExecutionConfig, SshTransport
+from maestro.models import GatesConfig, OrchestratorConfig, Task, WorkstreamConfig
 
 
 Severity = Literal["error", "warning"]
+
+
+class ValidationBackendError(Exception):
+    """A task's validation_backend resolves to an unsupported (SSH) backend."""
+
+
+def check_validation_backends(
+    tasks: list[Task], execution: ExecutionConfig | None
+) -> None:
+    """Fail loud if any task's validation runs on a non-local-transport backend.
+
+    PR1 supports validation only on ``transport.type == local`` (bare or
+    Docker). ``same`` resolves to the task's own backend; a named value
+    resolves directly; ``local`` is always the local backend. An SSH target
+    raises — never a silent fallback to local. Tasks without a validation_cmd
+    are skipped.
+    """
+    registry = (execution or ExecutionConfig()).normalized()
+    for task in tasks:
+        if not task.validation_cmd:
+            continue
+        name = task.validation_backend
+        if name == "local":
+            continue
+        resolved = task.backend if name == "same" else name
+        spec = registry.get(resolved) if resolved is not None else None
+        transport = spec.transport if spec is not None else None
+        if isinstance(transport, SshTransport):
+            raise ValidationBackendError(
+                f"task '{task.id}': validation_backend '{name}' resolves to "
+                f"backend '{resolved}' (transport ssh:{transport.host}); SSH "
+                f"validation is a PR2 follow-up. Use validation_backend: local."
+            )
 
 
 class ValidationIssue(BaseModel):

@@ -68,6 +68,7 @@ from maestro.models import (
 )
 from maestro.notifications.base import Notification, NotificationEvent
 from maestro.notifications.manager import NotificationManager
+from maestro.preflight import ValidationBackendError, check_validation_backends
 from maestro.retry import RetryManager
 from maestro.transitions import TransitionDispatcher
 from maestro.validator import ValidationResult, Validator
@@ -741,6 +742,10 @@ class Scheduler:
         try:
             validate_ssh_scopes(tasks, self._execution)
         except UnboundedRemoteScopeError as exc:
+            raise SchedulerError(str(exc)) from exc
+        try:
+            check_validation_backends(tasks, self._execution)
+        except ValidationBackendError as exc:
             raise SchedulerError(str(exc)) from exc
         self._armed = compute_armed_workdirs(tasks, self._execution)
 
