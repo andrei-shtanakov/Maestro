@@ -72,6 +72,9 @@ async def test_spawn_failure_cleans_materialized_files(tmp_path: Path):
         def transport_ref(self, prepared, pid):
             return f"local_pid:{pid}"
 
+        async def after_spawn(self, prepared, proc):
+            return None
+
         def wrap(self, local, prepared, ref):
             return local
 

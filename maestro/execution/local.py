@@ -34,6 +34,17 @@ if TYPE_CHECKING:
 _TAIL_LIMIT = 4000
 
 
+class VerifierLaunchError(RuntimeError):
+    """Raised when a verifier isolator's post-spawn hook fails to confirm.
+
+    Signals a fail-closed launch: `LocalBackend.run` kills the freshly
+    spawned process and cleans up the isolator's materialized artifacts
+    rather than returning a live handle. Task 3's `VerifierDockerIsolator`
+    raises this (or lets the underlying error propagate) from
+    `after_spawn` when the container's credential handoff never confirms.
+    """
+
+
 class LocalTaskHandle:
     """TaskHandle over a local asyncio.subprocess.Process."""
 
@@ -244,6 +255,17 @@ class LocalBackend:
         if req.stdin is not None and proc.stdin is not None:
             proc.stdin.write(req.stdin.encode("utf-8"))
             proc.stdin.close()
+        try:
+            await self._isolator.after_spawn(prepared, proc)
+        except BaseException:
+            # Fail-closed: a post-spawn hook failure (e.g. the verifier
+            # credential handoff never confirmed) must not hand back a live
+            # handle. Kill the process and clean the isolator's artifacts.
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+            _cleanup_prepared(prepared)
+            raise
         ref = ExecutionHandleRef(
             backend_id=req.backend_id,
             run_id=req.run_id,
