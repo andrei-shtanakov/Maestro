@@ -2022,27 +2022,33 @@ class Orchestrator:
             return False
 
         if self._config.domain is not None:
+            # The marker's job — skip re-gating the already-approved ex-post
+            # escape — is done now that we're resuming past the gate into
+            # VERIFYING. Clear it HERE, atomically with the status write,
+            # rather than preserving it to DONE the way the legacy tail
+            # does: unlike the legacy tail (a straight shot to MERGING), the
+            # VERIFYING loop can cycle this workstream back through READY
+            # multiple times (FAIL-with-budget rework, ERROR-budget-exhausted
+            # reverify), and `_spawn_workstream` checks THIS SAME marker+sha
+            # before it ever looks at `resume_reason`. A separate follow-up
+            # write would leave a crash window between the two: transition
+            # lands, process dies before the marker clears, and the next
+            # rework/reverify READY dispatch is hijacked straight back into
+            # this ex-post path — silently skipping the author respawn /
+            # reverify bookkeeping those paths exist for. A single CAS write
+            # closes that window. Also clear `process_pid`/`generation_pid`
+            # here: a gate-blocked workstream can carry stale pids through
+            # NEEDS_REVIEW -> READY (`approve_workstream_with_gate_record`
+            # doesn't touch them), and leaving them set risks recovery
+            # mistaking this VERIFYING entry for a live orphan.
             await self._transition(
                 workstream.id,
                 WorkstreamStatus.VERIFYING,
                 expected_status=WorkstreamStatus.READY,
+                error_message=None,
+                process_pid=None,
+                generation_pid=None,
             )
-            # The marker's job — skip re-gating the already-approved ex-post
-            # escape — is done now that we've resumed past the gate into
-            # VERIFYING. Clear it here rather than preserving it to DONE the
-            # way the legacy tail does: unlike the legacy tail (a straight
-            # shot to MERGING), the VERIFYING loop can cycle this workstream
-            # back through READY multiple times (FAIL-with-budget rework,
-            # ERROR-budget-exhausted reverify), and `_spawn_workstream`
-            # checks THIS SAME marker+sha before it ever looks at
-            # `resume_reason`. A left-over marker would keep matching (the
-            # worktree HEAD is often still the approved sha right after a
-            # FAIL, before rework touches it) and hijack a genuine rework or
-            # reverify resume straight back into VERIFYING — silently
-            # skipping the author respawn / reverify bookkeeping those paths
-            # exist for. Clearing it now is a same-state field patch (no
-            # status dispatch).
-            await self._update_fields(workstream.id, error_message=None)
             self._logger.info(
                 "Resuming workstream '%s' at the ex-post gate into VERIFYING "
                 "(domain profile active, approved sha %s)",

@@ -593,6 +593,84 @@ async def test_ex_post_resume_domain_active_fail_routes_to_rework_not_merging(
     assert ws.error_message is None
 
 
+async def test_ex_post_resume_domain_transition_clears_marker_and_pids_atomically(
+    tmp_path: Path, worktree: Path, db: Database
+) -> None:
+    """Regression (Copilot review on PR #109): the READY -> VERIFYING
+    transition must clear the ex-post marker AND stale pids in the SAME
+    write as the status change, not a follow-up patch.
+
+    A separate follow-up write leaves a crash window: the READY -> VERIFYING
+    transition lands, the process dies before the marker clears, and the
+    workstream later cycles back to READY (a FAIL/ERROR route) still
+    carrying the stale ex_post marker+sha. `_spawn_workstream` matches that
+    marker before it ever looks at `resume_reason` and hijacks the resume
+    right back into this ex-post path — silently skipping the rework/reverify
+    handling that route exists for. A single CAS write closes that window:
+    the state "transitioned to VERIFYING but marker/pids still present"
+    becomes unreachable.
+
+    Also: `approve_workstream_with_gate_record` (NEEDS_REVIEW -> READY)
+    never touches `process_pid`/`generation_pid`, so a gate-blocked
+    workstream can carry stale pids into this resume — assert those are
+    cleared too, in the same write.
+    """
+    sha = _run_git(["rev-parse", "HEAD"], worktree).strip()
+    script = _write_script(tmp_path, [{"verdict": "PASS"}])
+    config = _config(worktree, _profile(script))
+    orch, _ws_mgr, _dec = _make_orch(db, worktree, config)
+    await _create_workstream(
+        db,
+        WorkstreamStatus.NEEDS_REVIEW,
+        error_message=_ex_post_marker(sha),
+        process_pid=999,
+        generation_pid=888,
+    )
+    await db.approve_workstream_with_gate_record(WORKSTREAM_ID, "ex_post", sha)
+
+    calls: list[dict] = []
+    original = db.update_workstream_status
+
+    async def spy(zid, status, *args, **kwargs):
+        result = await original(zid, status, *args, **kwargs)
+        calls.append({"status": status, **kwargs})
+        # The READY -> VERIFYING transition (the actual status-change CAS
+        # write, not the later same-state `_update_fields` patches that
+        # `_run_verification` issues under the same VERIFYING status).
+        if (
+            status == WorkstreamStatus.VERIFYING
+            and kwargs.get("expected_status") == WorkstreamStatus.READY
+        ):
+            # The instant this write lands, the row must already show the
+            # marker and both pids cleared -- proving it was ONE write, not
+            # a transition followed by a separate patch that a crash could
+            # land between.
+            assert result.error_message is None
+            assert result.process_pid is None
+            assert result.generation_pid is None
+        return result
+
+    db.update_workstream_status = spy  # type: ignore[method-assign]
+
+    await orch._spawn_workstream(WORKSTREAM_ID)
+
+    verifying_calls = [
+        c
+        for c in calls
+        if c["status"] == WorkstreamStatus.VERIFYING
+        and c.get("expected_status") == WorkstreamStatus.READY
+    ]
+    assert len(verifying_calls) == 1
+    call = verifying_calls[0]
+    # The extra fields travelled IN the transition call, not a follow-up.
+    assert "error_message" in call and call["error_message"] is None
+    assert "process_pid" in call and call["process_pid"] is None
+    assert "generation_pid" in call and call["generation_pid"] is None
+
+    ws = await db.get_workstream(WORKSTREAM_ID)
+    assert ws.status is WorkstreamStatus.DONE
+
+
 # =============================================================================
 # Zero-change: domain=None
 # =============================================================================
