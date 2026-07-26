@@ -75,6 +75,28 @@ uv add <package>
 uv add --dev <package>
 ```
 
+## Gotchas
+
+Each of these has cost a full session at least once — they are not hypothetical.
+
+- **Run pytest in the FOREGROUND.** A workspace watchdog kills long-running *background*
+  `pytest` processes under contention: the run reports "killed" with empty output, and the
+  orphaned processes keep holding SQLite locks (once for 15h). Verify with targeted
+  foreground runs (specific files, `-k` halves) plus `pyrefly check` and `ruff`, and let PR
+  CI carry the full suite. Never offload the suite to a background wait.
+- **Any test that builds a `Database` must close it via a fixture** (`yield d; await d.close()`).
+  An unclosed aiosqlite connection is a ResourceWarning-as-error plus a lingering thread —
+  it surfaces as a ~120s hang, not as a failure.
+- **pyrefly silently checks ZERO files under an excluded path.** It honors every
+  gitignore/exclude file *up the tree* and excludes dot-directories (`**/.[!/.]*/**/*`), so
+  running it from inside `.worktrees/<name>/` reports a clean `0 errors` having examined
+  nothing. Put linked worktrees at a **sibling, non-dotted, non-ignored** path
+  (`../maestro-<slug>-wt`), and treat the `INFO N errors` completion line as the evidence.
+- **Other sessions share this workspace.** A parallel actor may hold `master` in another
+  worktree (`git worktree list`) and may be mid-migration in the same files — check before
+  claiming a migration number, and expect tmp-path/plugin-ordering flakiness under broad
+  `-k` selection that disappears when the file is run standalone.
+
 ## Architecture
 
 ### Core modules in `maestro/`
@@ -99,6 +121,9 @@ uv add --dev <package>
 - **preflight.py**: Mode-2 config validation — ValidationReport (errors/warnings), dangling-dep + cycle detection (shared dag.find_cycle), two-tier scope-overlap (static heuristic + exact file-set intersection), repo/glob filesystem checks; runs standalone (`maestro validate`) and as a fail-fast gate inside `maestro orchestrate`
 - **scaffold.py**: `maestro init` generator — commented project.yaml template with git-derived autofill, self-checked against OrchestratorConfig before writing
 - **spec_runner.py**: Integration boundary between Maestro and the external spec-runner
+- **transitions.py**: The single declarative status→side-effect table (`TASK_EFFECTS` / `WORKSTREAM_EFFECTS`) plus its dispatcher — events and notifications are *derived* from a status transition, never hand-synced at each call site (idea #10). A totality test asserts every status has an entry, so **adding a status forces a table entry** — that is why a new phase like `VERIFYING` necessarily touches this file.
+- **logging_bridge.py**: `ObsBridgeHandler` + `setup_logging` — routes every stdlib `logging` call into the obs OTel JSONL pipeline; WARNING+ is additionally mirrored to stderr (replacing `lastResort`). The vendored `_vendor/obs.py` is untouched by this.
+- **changed_paths.py**: Git-diff → repo-relative POSIX path list, the input to both the scope gate and the verifier diff
 - **correlation.py**: WorkCorrelation v1 reference implementation (`contracts/work-correlation/`) — Maestro mints `work_item_id` (= task/workstream id), surjective status projection onto the common enum with `source_status` kept verbatim, spec↔DAG bridge (`<parent>/<TASK-nnn>` + `source_locator`)
 
 **Multi-process orchestration (new):**
@@ -107,12 +132,21 @@ uv add --dev <package>
 - **decomposer.py**: Project decomposition via Claude CLI into workstreams (`decompose`) + async spec generation delegated to `spec-runner plan --full` (`generate_spec` — spec-runner owns the tasks.md format; runs as a background task in the orchestrator, budget-capped via `SpecRunnerConfig.spec_gen_budget_usd`)
 - **pr_manager.py**: GitHub PR creation via `gh` CLI
 
+**Governance gates (Mode 2, opt-in — absent `gates:` config is a byte-identical no-op):**
+- **gates.py**: Guard hooks on exactly two workstream edges — **ex-ante** before `READY -> RUNNING` (classifies the *declared* `scope`) and **ex-post** before `RUNNING -> MERGING` (classifies the *actual* diff, so it catches scope violations the author actually committed). Risk tiers come from `steward risk-classify` and **only** from there — Maestro never computes risk itself (DESIGN-610/612). Fail-closed at every tier: a mandatory gate whose verdict is missing or errored *blocks*. A blocked workstream goes to `NEEDS_REVIEW` carrying an approval marker; a new commit changes the SHA and invalidates the approval. Gates whose enforcement point lies outside these two edges (branch protection, PR review) are recorded as advisory annotations, not blocks — that transition belongs to the git host, not to Maestro's table.
+- **gate_approvals.py**: The `gate_approvals` table is the *single authority* on "was this (workstream, phase, sha) approved", written in one transaction by `maestro workstream-approve`. The marker in `error_message` is operator UX plus the H-6 resume-position signal; the verdict store is pure evidence. **Neither of those grants approval** — only the table does.
+- **scope_gate.py**: Pure containment matcher (no git, no FS, no DB) — `find_escapes` answers only "which changed paths are matched by none of the declared scope globs". Backs `maestro check-scope` (exit 1 on escape) and the ex-post gate.
+
 **Subpackages:**
 - **spawners/**: AgentSpawner ABC + implementations (claude_code, codex_cli, aider, announce, opencode) + registry. opencode (`opencode run --format json -m opencode/<model>`, ADR-ECO-003c) is the first open-model agentic harness: open models (glm-5.1, qwen3.6, …) reach routing as `opencode@<model>`. Its cost comes from opencode's own per-step `part.cost` (persisted as `TaskCost.reported_cost_usd`); when the log reports none, the arbiter sees unknown (`cost_usd=None`), never 0.0
 - **coordination/**: MCP server (FastMCP) + REST API (FastAPI) with /workstreams endpoints; Arbiter routing (`routing.py` strategies, vendored `arbiter_client.py` MCP client, `arbiter_errors.py`)
 - **benchmark/**: R-06b/R-07 benchmark-aware routing — async runner, ATP client, spawner→responder adapter, and Arbiter feedback wiring (`arbiter_report.py`)
 - **notifications/**: Desktop notifications (macOS/Linux)
 - **dashboard/**: Web UI with DAG visualization (Mermaid.js) + SSE updates
+- **execution/**: The transport/isolation layer every long-running subprocess goes through — `ExecutionRequest` → `Isolator` (`BareIsolator` identity / `DockerIsolator` / `VerifierDockerIsolator`) → backend (`LocalBackend`, `SshBackend`) → durable `TaskHandle`, plus `finalize.py` (single-owner finalization; a cleanup fault never rewrites the exit code), `resolver.py` (per-dispatch backend choice), `reservations.py` (`(workdir, scope)` locks with conservative path-anchor overlap), and `probe()` — the one isolation-aware, fail-closed recovery boundary shared by Mode-1 `StateRecovery` and the Mode-2 orchestrator. Task, validation and verification executions are all the same machinery, distinguished only by `execution_phase`.
+- **domain/**: Mode-2 domain verification (Stage B) — `VerificationProvider` Protocol, verdict contract v2 (`schemas/verdict_v2.json`) with its run-keyed handshake, `CommandVerifier`, and the evidence ledger. Activation is **by presence**: no `domain.verification.verifier` in `project.yaml` means the pre-Stage-B path runs byte-identically.
+- **verifier/**: Mode-1 task-level verifier gate (config / diff / envelope / prompt / judge). Reuses the `domain/` verdict primitives additively rather than shipping a parallel stack.
+- **resources/**: Shipped inert templates (e.g. the catalog scaffold `maestro models init` copies)
 - **schemas/**: JSON-schema generation for config/contract artifacts
 - **_vendor/**: Vendored observability lib (`obs.py`) — structlog-based spans, trace propagation, and `child_env()` for cross-process trace continuity
 
@@ -157,6 +191,11 @@ PENDING -> DECOMPOSING -> READY -> RUNNING -> MERGING -> PR_CREATED -> DONE
                             |         finalization happens INSIDE VERIFYING)
                             └-> ABANDONED
 ```
+
+With a `gates:` block configured, two guard edges are inserted (see `gates.py` above):
+`READY -> RUNNING` is preceded by the **ex-ante** gate and `RUNNING -> MERGING` by the
+**ex-post** gate; either one blocking routes the workstream to `NEEDS_REVIEW` instead of
+advancing. Both are fail-closed — a missing or errored verdict blocks at every tier.
 
 An ex-post gate block that the operator approved resumes at the ex-post edge (H-6): READY + approval marker + unchanged worktree HEAD -> straight to MERGING tail, no regen/respawn; the marker in error_message clears only at DONE.
 
@@ -206,10 +245,19 @@ An ex-post gate block that the operator approved resumes at the ex-post edge (H-
 ## Ideas and Docs
 
 - Направление/идеи (авторинг workstream'ов, scaffold/SDK): см. `docs/idea-workstream-framework.md`
+- **`TODO.md` — командный уровень.** Микрошаги реализации живут в
+  `docs/superpowers/specs/` + `docs/superpowers/plans/`, поштучные решения — в SDD-леджере
+  `.superpowers/sdd/progress.md`. Пункты `TODO.md` несут опциональные инлайн-теги
+  `@owner:` / `@blocked_by:` / `@trigger:` (контракт — «Правила ведения» в самом файле).
+  Их читает `robin-runtime`, опознавая пункт по нормализованному тексту **первой строки**:
+  дописать тег безопасно, **переформулировать существующий открытый пункт — нет**
+  (даёт фантомную пару «закрыт/открыт» в дайджесте).
 
 ## Repo scope & boundaries
 
-- **Этот репо:** `maestro` — git-корень `all_ai_orchestrators/maestro/`, remote `git@github.com:andrei-shtanakov/maestro.git`.
+- **Этот репо:** `maestro` — рабочая директория `all_ai_orchestrators/Maestro/` (имя папки в
+  верхнем регистре — историческое; канон после переименования 2026-07-16 — lowercase `maestro`),
+  remote `git@github.com:andrei-shtanakov/maestro.git`.
 - **Соседи (READ-ONLY reference):** `../arbiter/`, `../atp-platform/`, `../deployer/`, `../dispatcher/`, `../libretto/`, `../proctor/`, `../prograph/`, `../prograph-vault/`, `../robin-runtime/`, `../robin-toolkit/`, `../spec-runner/`, `../spec-runner-vscode/`, `../steward/` — их код не редактировать.
 - Нужна правка у соседа → **стоп**: запиши handoff в `../prograph-vault/authored/notes/`
   (кросс-проектное) или `../_cowork_output/` (черновик), не трогай его файлы.
