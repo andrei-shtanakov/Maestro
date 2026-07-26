@@ -74,3 +74,12 @@ def test_verifier_config_local_with_docker_block_rejected():
 def test_verifier_config_docker_ok():
     c = VerifierConfig(backend="docker", model="m", docker=_cfg())
     assert c.backend == "docker" and c.docker is not None
+
+
+def test_size_and_cpus_values_are_stripped():
+    # A whitespace-bearing size/cpus must be stored trimmed so it can never
+    # reach the `docker run --memory/--cpus/--tmpfs` argv untrimmed.
+    c = _cfg(memory=" 512m ", cpus=" 1 ", tmpfs_size=" 64m ")
+    assert c.memory == "512m"
+    assert c.cpus == "1"
+    assert c.tmpfs_size == "64m"

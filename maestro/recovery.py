@@ -449,6 +449,13 @@ class StateRecovery:
                 if outcome not in GC_CLEAN_OUTCOMES:
                     return  # preserve for next sweep
                 self._cleanup_credential_artifacts(row["execution_id"])
+            elif backend_id != "local":
+                # Unknown verification backend (neither local nor
+                # verifier-docker): preserve rather than mark cleaned, mirroring
+                # `_gc_terminal_handles`'s fail-closed stance on unresolvable
+                # backends. Unreachable today (only those two mint verification
+                # handles) — defense-in-depth against a future backend id.
+                return
             await self._db.mark_execution_state(
                 row["execution_id"], "cleaned", allowed_from=[state]
             )

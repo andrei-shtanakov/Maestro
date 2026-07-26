@@ -73,14 +73,14 @@ class VerifierDockerConfig(BaseModel):
     def _memory_bounds(cls, value: str) -> str:
         if not _MEM_MIN <= _parse_docker_size_bytes(value) <= _MEM_MAX:
             raise ValueError(f"memory must be within 128m..8g: {value!r}")
-        return value
+        return value.strip()
 
     @field_validator("tmpfs_size")
     @classmethod
     def _tmpfs_bounds(cls, value: str) -> str:
         if not _TMPFS_MIN <= _parse_docker_size_bytes(value) <= _TMPFS_MAX:
             raise ValueError(f"tmpfs_size must be within 16m..1g: {value!r}")
-        return value
+        return value.strip()
 
     @field_validator("cpus")
     @classmethod
@@ -90,7 +90,7 @@ class VerifierDockerConfig(BaseModel):
         parsed = float(value)
         if not math.isfinite(parsed) or not _CPUS_MIN <= parsed <= _CPUS_MAX:
             raise ValueError(f"cpus must be within 0.1..8: {value!r}")
-        return value
+        return value.strip()
 
     @field_validator("pids_limit")
     @classmethod
