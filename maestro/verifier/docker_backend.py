@@ -29,7 +29,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
 
-    from maestro.execution.backend import TaskHandle
+    from maestro.execution.backend import ExecutionBackend, TaskHandle
+    from maestro.models import VerifierConfig
     from maestro.verifier.docker_config import VerifierDockerConfig
 
 
@@ -234,3 +235,31 @@ class VerifierDockerIsolator:
             docker=self._docker,
             ref=ref,
         )
+
+
+def build_verifier_backend(
+    verifier_cfg: VerifierConfig,
+    *,
+    local_backend: ExecutionBackend,
+    exec_root: Path,
+    docker_cli: DockerCli | None = None,
+) -> ExecutionBackend:
+    """Build the verifier backend for BOTH dispatch and recovery (spec §3.4).
+
+    `local` returns the passed backend verbatim (behavior-identical seam,
+    honors injected/fake backends). `docker` builds a LocalBackend wrapping
+    VerifierDockerIsolator with backend_id "verifier-docker"; `docker_cli` is
+    required there (None → ValueError, never a hidden client).
+    """
+    if verifier_cfg.backend == "local":
+        return local_backend
+    if verifier_cfg.docker is None:  # defense-in-depth; config validator also guards
+        raise ValueError("verifier.backend='docker' requires a verifier.docker block")
+    if docker_cli is None:
+        raise ValueError("verifier docker path requires an explicit DockerCli")
+    from maestro.execution.local import LocalBackend
+
+    isolator = VerifierDockerIsolator(
+        verifier_cfg.docker, exec_root=exec_root, docker=docker_cli
+    )
+    return LocalBackend(isolator, backend_id="verifier-docker", docker=docker_cli)
