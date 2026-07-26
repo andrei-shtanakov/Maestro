@@ -249,23 +249,36 @@ class CommandVerifier:
             "attempt": str(ctx.attempt),
         }
         argv = render_argv(self._spec.argv, values)
+        env = {
+            # `inherit_env=False` below means `req.env` is the *entire*
+            # child environment (plus tracing vars) — PATH must be
+            # passed explicitly or a non-absolute argv[0] (e.g. `uv`,
+            # per the §9 example invocation) can't be resolved.
+            "PATH": os.environ.get("PATH", ""),
+            "MAESTRO_PROFILE_SHA256": ctx.profile_sha256,
+            "MAESTRO_VERIFIED_SOURCE_COMMIT": ctx.verified_source_commit,
+            "MAESTRO_VERIFIED_SOURCE_TREE": ctx.verified_source_tree,
+            "MAESTRO_WORKSTREAM_ID": ctx.workstream_id,
+            "MAESTRO_REWORK_ATTEMPT": str(ctx.rework_attempt),
+        }
+        # HOME/USER passthrough: the verifier is orchestrator-side trusted
+        # infrastructure (never reaches the author, so author isolation is
+        # unaffected). CLI toolchains invoked as the verifier command
+        # (claude, gh, git, ...) locate user config/keychain identity via
+        # HOME/USER — e.g. the pinned `claude` CLI fails auth on macOS
+        # without USER (Keychain identity) and HOME (config discovery).
+        # Passed through only when present in the parent env, never
+        # fabricated.
+        for var in ("HOME", "USER"):
+            value = os.environ.get(var)
+            if value is not None:
+                env[var] = value
         return ExecutionRequest(
             run_id=f"verify-{ctx.run_id}-{ctx.attempt}",
             argv=argv,
             workdir=ctx.worktree,
             log_path=ctx.out_json.with_suffix(".log"),
-            env={
-                # `inherit_env=False` below means `req.env` is the *entire*
-                # child environment (plus tracing vars) — PATH must be
-                # passed explicitly or a non-absolute argv[0] (e.g. `uv`,
-                # per the §9 example invocation) can't be resolved.
-                "PATH": os.environ.get("PATH", ""),
-                "MAESTRO_PROFILE_SHA256": ctx.profile_sha256,
-                "MAESTRO_VERIFIED_SOURCE_COMMIT": ctx.verified_source_commit,
-                "MAESTRO_VERIFIED_SOURCE_TREE": ctx.verified_source_tree,
-                "MAESTRO_WORKSTREAM_ID": ctx.workstream_id,
-                "MAESTRO_REWORK_ATTEMPT": str(ctx.rework_attempt),
-            },
+            env=env,
             # Deliberately NOT inherit_env=True: `build_local_env` (Phase 0)
             # drops `req.env` entirely whenever `inherit_env` is True, which
             # would silently swallow the five echo-field env vars above.
