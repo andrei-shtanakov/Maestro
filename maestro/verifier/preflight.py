@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import uuid
 from typing import TYPE_CHECKING
 
 from maestro.verifier.docker_backend import ANTHROPIC_ENV_KEY, _security_flags
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
     from maestro.verifier.docker_config import VerifierDockerConfig
 
 _FORBIDDEN_CHARS = ("\x00", "\r", "\n")
-_PROBE_NAME = "maestro-verify-preflight"
+_PROBE_NAME_PREFIX = "maestro-verify-preflight"
 
 
 class VerifierPreflightError(RuntimeError):
@@ -63,9 +64,12 @@ async def run_verifier_docker_preflight(
     credential, docker daemon unreachable, image absent (never auto-pulled),
     or the `claude --version` probe missing/non-zero under the hardened
     profile. The probe itself never receives the credential (no
-    `ANTHROPIC_API_KEY`, no `--env-file`) and always runs with `--rm`, a
-    unique name/label, and is force-killed + removed on timeout so it never
-    leaks a container.
+    `ANTHROPIC_API_KEY`, no `--env-file`), runs under a unique per-invocation
+    container name (so a stale container from a prior crashed/timed-out
+    invocation can never collide with this one via `docker run --name`
+    conflict), and always runs with `--rm` plus a guaranteed best-effort
+    kill+remove in a `finally` so nothing leaks a container regardless of
+    which path (success, halt, timeout) is taken.
     """
     _check_api_key(env)
     if not await docker.version_ok():
@@ -73,13 +77,14 @@ async def run_verifier_docker_preflight(
     if not await docker.image_exists(cfg.image):
         raise VerifierPreflightError(f"image absent (no auto-pull): {cfg.image}")
 
+    name = f"{_PROBE_NAME_PREFIX}-{uuid.uuid4().hex}"
     uid, gid = cfg.user.split(":")
     argv = [
         "docker",
         "run",
         "--rm",
         "--name",
-        _PROBE_NAME,
+        name,
         "--label",
         "maestro.verify_preflight=1",
         *_security_flags(cfg, uid, gid),
@@ -87,18 +92,21 @@ async def run_verifier_docker_preflight(
         "claude",
         "--version",
     ]
-    await _run_version_probe(argv, docker=docker, timeout_s=timeout_s)
+    await _run_version_probe(argv, docker=docker, name=name, timeout_s=timeout_s)
     return await _inspect_image_id(cfg.image)
 
 
 async def _run_version_probe(
-    argv: list[str], *, docker: DockerCli, timeout_s: float
+    argv: list[str], *, docker: DockerCli, name: str, timeout_s: float
 ) -> None:
     """Run `claude --version` under the hardened profile; raise on failure.
 
-    No credential is passed (no env, no `--env-file`); `--rm` plus a
-    best-effort `docker kill` on timeout guarantee no leaked container even
-    if the process-level kill races the container's own lifecycle.
+    No credential is passed (no env, no `--env-file`). Cleanup is
+    guaranteed via a `finally`: `--rm` handles the normal-exit case, and the
+    `finally` block best-effort `docker kill`/`docker rm`s the uniquely
+    named container regardless of whether this function returns normally,
+    times out, or raises — belt-and-suspenders so a preflight failure never
+    leaves a container behind to poison the next invocation's `--name`.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -110,22 +118,26 @@ async def _run_version_probe(
         raise VerifierPreflightError(f"docker CLI not found: {exc}") from exc
 
     try:
-        await asyncio.wait_for(proc.wait(), timeout=timeout_s)
-    except TimeoutError as exc:
-        proc.kill()
-        with contextlib.suppress(Exception):
-            await proc.wait()
-        with contextlib.suppress(Exception):
-            await docker.kill(_PROBE_NAME)
-        raise VerifierPreflightError(
-            "claude --version probe timed out under the hardened profile"
-        ) from exc
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=timeout_s)
+        except TimeoutError as exc:
+            proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+            raise VerifierPreflightError(
+                "claude --version probe timed out under the hardened profile"
+            ) from exc
 
-    if proc.returncode != 0:
-        raise VerifierPreflightError(
-            "claude --version failed under the hardened profile "
-            f"(exit={proc.returncode}); image/CLI/hardening incompatible"
-        )
+        if proc.returncode != 0:
+            raise VerifierPreflightError(
+                "claude --version failed under the hardened profile "
+                f"(exit={proc.returncode}); image/CLI/hardening incompatible"
+            )
+    finally:
+        with contextlib.suppress(Exception):
+            await docker.kill(name)
+        with contextlib.suppress(Exception):
+            await docker.rm(name)
 
 
 async def _inspect_image_id(image: str) -> str:

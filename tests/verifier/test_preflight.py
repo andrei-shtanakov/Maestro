@@ -61,6 +61,27 @@ async def test_api_key_with_newline_halts():
         )
 
 
+async def test_api_key_with_nul_halts():
+    """Halt matrix (spec §6.1) enumerates NUL/CR/LF individually; NUL alone
+    must halt even without an accompanying newline."""
+    with pytest.raises(VerifierPreflightError):
+        await run_verifier_docker_preflight(
+            _cfg(),
+            docker=_FakeDocker(),  # type: ignore[arg-type]
+            env={"ANTHROPIC_API_KEY": "sk\x00x"},
+        )
+
+
+async def test_api_key_with_carriage_return_halts():
+    """Halt matrix (spec §6.1): a lone CR (no LF) must also halt."""
+    with pytest.raises(VerifierPreflightError):
+        await run_verifier_docker_preflight(
+            _cfg(),
+            docker=_FakeDocker(),  # type: ignore[arg-type]
+            env={"ANTHROPIC_API_KEY": "sk\rx"},
+        )
+
+
 async def test_docker_unreachable_halts():
     with pytest.raises(VerifierPreflightError, match="docker"):
         await run_verifier_docker_preflight(
@@ -108,3 +129,48 @@ async def test_scheduler_preflight_halts_on_missing_key(monkeypatch):
 
     with pytest.raises(SchedulerError, match="preflight"):
         await sch._check_verifier_model()
+
+
+def _raising_preflight_spy(*_args, **_kwargs):
+    """Fails the test if the docker preflight is ever invoked."""
+    raise AssertionError(
+        "run_verifier_docker_preflight must not be called for a "
+        "non-docker/absent verifier backend"
+    )
+
+
+async def test_local_backend_skips_docker_preflight(monkeypatch):
+    """`verifier.backend == 'local'` must never reach the docker preflight.
+
+    Guards against a regression that would silently re-add a docker call
+    on the local path (spec §6 says the preflight is docker-only).
+    """
+    import maestro.scheduler as S
+    from maestro.models import VerifierConfig
+    from maestro.scheduler import Scheduler
+
+    monkeypatch.setattr(S, "run_verifier_docker_preflight", _raising_preflight_spy)
+    sch = Scheduler.__new__(Scheduler)
+    sch._verifier = VerifierConfig(backend="local", model="m", runner="claude")
+    sch._verifier_docker_cli = None
+    monkeypatch.setattr(
+        sch, "_emit_event", lambda *_args, **_kwargs: None, raising=False
+    )
+    monkeypatch.setattr(S, "load_catalog", lambda: None, raising=True)
+    monkeypatch.setattr(
+        S, "resolve_verifier_model", lambda _cfg, _cat: "m", raising=True
+    )
+
+    await sch._check_verifier_model()  # must return cleanly, no AssertionError
+
+
+async def test_absent_verifier_skips_docker_preflight(monkeypatch):
+    """`self._verifier is None` must never reach the docker preflight."""
+    import maestro.scheduler as S
+    from maestro.scheduler import Scheduler
+
+    monkeypatch.setattr(S, "run_verifier_docker_preflight", _raising_preflight_spy)
+    sch = Scheduler.__new__(Scheduler)
+    sch._verifier = None
+
+    await sch._check_verifier_model()  # must return cleanly, no AssertionError
