@@ -11,6 +11,7 @@ This module provides the main scheduler loop that:
 import asyncio
 import contextlib
 import logging
+import os
 import shutil
 import signal
 import subprocess
@@ -95,6 +96,10 @@ from maestro.verifier.diff import build_scope_patch, compute_identity
 from maestro.verifier.docker_backend import build_verifier_backend
 from maestro.verifier.envelope import build_envelope
 from maestro.verifier.judge import ClaudeDiffJudge, TaskVerificationContext
+from maestro.verifier.preflight import (
+    VerifierPreflightError,
+    run_verifier_docker_preflight,
+)
 from maestro.verifier.prompt import profile_sha256
 
 
@@ -847,11 +852,12 @@ class Scheduler:
             check_validation_backends(tasks, self._execution)
         except ValidationBackendError as exc:
             raise SchedulerError(str(exc)) from exc
-        self._check_verifier_model()
+        await self._check_verifier_model()
         self._armed = compute_armed_workdirs(tasks, self._execution)
 
-    def _check_verifier_model(self) -> None:
-        """Resolve the verifier model once at scheduler start (design §4).
+    async def _check_verifier_model(self) -> None:
+        """Resolve the verifier model + (docker-only) run the docker
+        preflight once at scheduler start (design §4, spec §6).
 
         When a `verifier:` block is configured, a missing/typo'd/`retired`/
         unknown model is a fail-loud config error at scheduler start — it
@@ -864,6 +870,22 @@ class Scheduler:
         stays in place for a genuinely runtime fault (e.g. the catalog file
         is deleted mid-run) — this preflight only ensures a *static*
         misconfig is never the first thing to fail per-task.
+
+        `async def` (not sync + `asyncio.run`): this method always runs
+        from inside an already-running event loop — `_arm_workdirs` (async)
+        is awaited from `run()`, which is itself invoked via
+        `asyncio.run(_run_scheduler(...))` in `cli.py`. Calling
+        `asyncio.run()` here would raise "asyncio.run() cannot be called
+        from a running loop", so the docker preflight (also async) is
+        awaited directly instead — no nested event loop is ever created.
+
+        For `verifier.backend == "docker"`, this ALSO runs the eager
+        credential + docker + image + hardened-CLI preflight (spec §6.1)
+        before any task starts: any halt-matrix row is global fail-loud
+        (`SchedulerError`), never a silent gate-disable. No dedicated
+        EventType is emitted for the ok path (would risk the effect-table
+        totality/correlation-projection invariants for a construction-time,
+        non-per-task signal) — the inspected image ID is logged instead.
         """
         if self._verifier is None:
             return
@@ -872,6 +894,23 @@ class Scheduler:
             resolve_verifier_model(self._verifier, catalog)
         except VerifierModelError as exc:
             raise SchedulerError(f"verifier model preflight failed: {exc}") from exc
+        if self._verifier.backend != "docker":
+            return
+        assert self._verifier.docker is not None
+        assert self._verifier_docker_cli is not None
+        try:
+            image_id = await run_verifier_docker_preflight(
+                self._verifier.docker,
+                docker=self._verifier_docker_cli,
+                env=os.environ,
+            )
+        except VerifierPreflightError as exc:
+            raise SchedulerError(f"verifier docker preflight failed: {exc}") from exc
+        logger.info(
+            "verifier docker preflight ok: image_id=%s image=%s",
+            image_id,
+            self._verifier.docker.image,
+        )
 
     async def _reconstruct_reservations(self) -> None:
         """Rebuild held reservations after a restart (recovery).
