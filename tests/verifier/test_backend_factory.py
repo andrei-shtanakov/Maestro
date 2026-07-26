@@ -1,4 +1,3 @@
-
 import pytest
 
 from maestro.execution.local import LocalBackend
@@ -18,7 +17,9 @@ def test_local_returns_passed_backend(tmp_path):
     passed = _Sentinel()
     cfg = VerifierConfig(backend="local", model="m")
     out = build_verifier_backend(
-        cfg, local_backend=passed, exec_root=tmp_path  # type: ignore[arg-type]
+        cfg,
+        local_backend=passed,
+        exec_root=tmp_path,  # type: ignore[arg-type]
     )
     assert out is passed  # never a fresh LocalBackend
 
