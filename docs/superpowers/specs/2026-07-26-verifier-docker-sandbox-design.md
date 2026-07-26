@@ -56,8 +56,10 @@ Durable lifecycle / recovery / probe stay the **existing** mechanism — no seco
 
 - **Only `ANTHROPIC_API_KEY`.** The name is **not configurable** in this slice — a
   config-named var would silently become arbitrary-secret passthrough.
-- **Mandatory when `verifier.backend: docker`:** absent → preflight config error, the
-  scheduler does not start (before the first task).
+- **Mandatory when `verifier.backend: docker`:** it must be **present and non-empty, with
+  no NUL / `\r` / `\n`** (those would corrupt the `KEY=value` env-file or smuggle extra
+  lines). Absent / empty / control-char-bearing → preflight config error, the scheduler
+  does not start (before the first task).
 - **Stripped from the container:** host `HOME`, `USER`, all `CLAUDE_*`, all `GH_*`
   (already denylisted), all host env, all credential/config directories.
 - **No credential file and no `~/.claude` mounted.**
@@ -145,7 +147,10 @@ The hardening flags are **not config fields** — they cannot be turned off.
 
 ```python
 def build_verifier_backend(
-    verifier_cfg: VerifierConfig, *, docker_cli: DockerCli | None = None
+    verifier_cfg: VerifierConfig,
+    *,
+    local_backend: ExecutionBackend,
+    docker_cli: DockerCli | None = None,
 ) -> ExecutionBackend
 ```
 
@@ -153,15 +158,19 @@ Used by **both** dispatch (`scheduler._run_verifier`) and recovery
 (`_recover_verifying_tasks`), guaranteeing they construct an identical backend (same
 `backend_id`, same isolator, same `accepts_ref` identity):
 
-- `verifier_cfg.backend == "local"` → an ordinary `LocalBackend`, id `"local"`
-  (today's behavior, unchanged);
+- `verifier_cfg.backend == "local"` → returns the **passed** `local_backend` verbatim
+  (production supplies `self._backends.resolve("local")`), so today's `local` seam is
+  **behavior-identical** and any injected/fake local backend is honored — the factory
+  never builds its own `LocalBackend`;
 - `verifier_cfg.backend == "docker"` → `LocalBackend(VerifierDockerIsolator(...),
-  backend_id="verifier-docker", docker=<cli>)`, sharing the injected `DockerCli`, its
-  `probe()` and `accepts_ref()`.
+  backend_id="verifier-docker", docker=<docker_cli>)`, sharing the passed `DockerCli`,
+  its `probe()` and `accepts_ref()`.
 
-The factory **never silently creates its own `DockerCli`** — in tests dispatch and
-recovery must be able to inject one shared fake, or recovery fakes would be bypassed.
-(A `None` `docker_cli` builds a real one only in production.)
+The factory **never silently creates either a hidden local backend or a hidden
+`DockerCli`** — in tests dispatch and recovery must be able to inject one shared fake, or
+recovery/local fakes would be bypassed. Production composition explicitly passes the real
+`local_backend` and the real `DockerCli`; a `None` `docker_cli` is built into a real one
+**only** on the production docker path.
 
 ---
 
@@ -200,23 +209,22 @@ class VerifierDockerConfig(BaseModel):
     # hardening flags are NOT fields — baked, not disableable.
 ```
 
-**Validation (tuning must never disable isolation — ratified refinement).** Overridable
-defaults may not be turned into "unlimited":
+**Validation (tuning must never disable isolation — ratified refinement).** These bounds
+are part of the **security contract**, not an implementation detail: no value may express
+"no limit." A Docker size string is **normalized to bytes before the range check**; a
+decimal accepts only a **finite** number (no exponent, `NaN`, or `Infinity`).
 
 - `image`: must match `^[^@\s]+@sha256:[0-9a-f]{64}$` (digest-pinned; a bare tag is
   rejected).
 - `user`: must match `^\d+:\d+$`; UID `!= 0` **and** GID `!= 0` (strict non-root).
-- `memory`: a positive Docker size (`^\d+(b|k|m|g)$`, case-insensitive), with a sane
-  **upper bound** (e.g. ≤ `8g`); zero / empty / `0` rejected.
-- `cpus`: a positive decimal `> 0` with an upper bound (e.g. ≤ `8`); `0` / negative
+- `memory`: a positive Docker size, normalized to bytes, in **`128m .. 8g`** inclusive;
+  zero / empty / negative / unparseable rejected.
+- `cpus`: a finite positive decimal in **`0.1 .. 8`** inclusive; `0` / negative /
+  non-finite / exponent rejected.
+- `pids_limit`: an int in **`16 .. 4096`** inclusive; `0` and `-1` (docker's "unlimited")
   rejected.
-- `pids_limit`: a bounded positive int (e.g. `1..4096`); `0` and `-1` (docker's
-  "unlimited") rejected.
-- `tmpfs_size`: a positive Docker size with a **minimum** sufficient for the CLI (e.g.
-  ≥ `16m`) and a bounded maximum (e.g. ≤ `1g`).
-
-Exact bounds are finalized in the plan; the invariant is: **no value may express
-"no limit."**
+- `tmpfs_size`: a positive Docker size, normalized to bytes, in **`16m .. 1g`** inclusive
+  (`16m` floor is the CLI minimum).
 
 ---
 
@@ -269,7 +277,7 @@ block → **no Docker preflight at all** (today's cheap in-process model check u
 
 | condition | outcome |
 |---|---|
-| `ANTHROPIC_API_KEY` absent from env | config/preflight error, no start |
+| `ANTHROPIC_API_KEY` absent / empty / contains NUL·CR·LF | config/preflight error, no start |
 | Docker unreachable | halt |
 | image digest absent locally | halt (**no auto-pull**) |
 | `claude` missing / `claude --version` non-zero | halt |
@@ -307,15 +315,37 @@ dropped — it forces an explicit threat-model decision.
 
 Two seams change; the shared probe boundary and fail-closed semantics are preserved.
 
-### 7.1 Open-handle filter flip
+### 7.1 One-time split of `open_handles` (single owner for the whole lifecycle)
 
-The general open-handle recovery loop is kept off verification handles today only because
-it filters `backend_id == "local"` (`recovery.py:218-221`). That is a historical
-heuristic. **Replace it outright** with `execution_phase == "verification"** — a
-persistent semantic discriminator. (A union of the two would leave competing
-classifications and could again wrongly exclude an ordinary `local` task handle.) All
-`execution_phase == "verification"` handles are excluded from the general loop
-**regardless of backend id**.
+The general open-handle path is kept off verification handles today only because it
+filters `backend_id == "local"` (`recovery.py:218-221`) — a historical heuristic.
+**Replace it outright** with the persistent semantic discriminator
+`execution_phase == "verification"`. (A union of the two would leave competing
+classifications and could again wrongly exclude an ordinary `local` task handle.)
+
+The flip must be applied **once, immediately after `open_handles` is read**, and cover
+**every** general consumer — not only task/validation recovery but also the terminal-
+handle GC. Today `recover()` passes the original `open_handles` to
+`_gc_terminal_handles()`; without the split, a `verifier-docker` `terminal`/`collected`
+row would be (1) reconciled by `_recover_verifying_tasks`, then (2) handed to the general
+GC, which (3) cannot resolve `verifier-docker` through the general `BackendResolver` —
+breaking both the single-owner claim and the "exactly once" guard test.
+
+```python
+verification_handles = [h for h in open_handles if h["execution_phase"] == "verification"]
+general_handles      = [h for h in open_handles if h["execution_phase"] != "verification"]
+```
+
+- task/validation recovery **and** `_gc_terminal_handles()` receive **only**
+  `general_handles`;
+- `_recover_verifying_tasks()` **owns** `verification_handles` for the whole lifecycle —
+  including their `terminal`/`collected` GC — resolving the backend through the verifier
+  factory, never the general resolver;
+- the exact per-task DB lookup (`get_execution_handle(... execution_phase="verification")`)
+  remains the fallback for `local` verification handles, which
+  `get_open_execution_handles()` still does not surface (it filters `backend_id ==
+  "local"`); the `verifier-docker` rows it *does* surface are removed from every general
+  consumer by the split above.
 
 ### 7.2 `_recover_verifying_tasks` is the sole owner of verification recovery
 
@@ -349,9 +379,11 @@ hidden client that would bypass recovery fakes in tests.
 - **Unit — factory:** `local` → `LocalBackend` id `local`; `docker` → id `verifier-docker`
   with the injected `DockerCli`; verifier-docker absent from the general resolver registry.
 - **Recovery guard test (required):** every open verification handle is processed
-  **exactly once** by phase-specific recovery and **never** by the general loop —
-  parametrized over `local`, `verifier-docker`, and an **unknown/future** backend id
-  (which must route NEEDS_REVIEW with the handle preserved).
+  **exactly once** by phase-specific recovery and **never** by the general open-handle
+  loop **nor by `_gc_terminal_handles()`** (assert the split — a `verifier-docker`
+  `terminal`/`collected` row reaches neither general consumer) — parametrized over
+  `local`, `verifier-docker`, and an **unknown/future** backend id (which must route
+  NEEDS_REVIEW with the handle preserved).
 - **Preflight matrix:** each §6.1 halt row (missing key, docker down, image absent, CLI
   missing/non-zero, hardening incompatible) → scheduler start raises/halts; `local`/absent
   → preflight not invoked.
