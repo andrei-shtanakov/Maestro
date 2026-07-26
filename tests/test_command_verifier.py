@@ -467,3 +467,52 @@ async def test_wrong_rework_attempt_is_protocol_error(
     assert result.outcome is VerdictValue.ERROR
     assert result.protocol_error is not None
     assert "rework_attempt" in result.protocol_error
+
+
+def test_build_request_passes_through_home_and_user(
+    tmp_path: Path, worktree: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The verifier subprocess env carries PATH/HOME/USER passthrough plus
+    the five MAESTRO_* echo vars — CLI toolchains invoked as the verifier
+    command (e.g. `claude`) locate user config/keychain identity via
+    HOME/USER, and this env never reaches the author.
+    """
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("HOME", "/Users/tester")
+    monkeypatch.setenv("USER", "tester")
+    script = _write_script(tmp_path, [{"verdict": "PASS"}])
+    ctx = _ctx(worktree, _staging(tmp_path))
+    verifier = CommandVerifier(
+        _spec(script), _criteria(), "artifact.txt", LocalBackend()
+    )
+
+    req = verifier._build_request(ctx, tmp_path / "staged.criteria", "exec-1")
+
+    assert req.env["PATH"] == "/usr/bin"
+    assert req.env["HOME"] == "/Users/tester"
+    assert req.env["USER"] == "tester"
+    assert req.env["MAESTRO_PROFILE_SHA256"] == ctx.profile_sha256
+    assert req.env["MAESTRO_VERIFIED_SOURCE_COMMIT"] == ctx.verified_source_commit
+    assert req.env["MAESTRO_VERIFIED_SOURCE_TREE"] == ctx.verified_source_tree
+    assert req.env["MAESTRO_WORKSTREAM_ID"] == ctx.workstream_id
+    assert req.env["MAESTRO_REWORK_ATTEMPT"] == str(ctx.rework_attempt)
+
+
+def test_build_request_omits_home_and_user_when_absent(
+    tmp_path: Path, worktree: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When HOME/USER aren't set in the parent env, they're omitted rather
+    than fabricated as empty strings."""
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.delenv("USER", raising=False)
+    script = _write_script(tmp_path, [{"verdict": "PASS"}])
+    ctx = _ctx(worktree, _staging(tmp_path))
+    verifier = CommandVerifier(
+        _spec(script), _criteria(), "artifact.txt", LocalBackend()
+    )
+
+    req = verifier._build_request(ctx, tmp_path / "staged.criteria", "exec-1")
+
+    assert "HOME" not in req.env
+    assert "USER" not in req.env
