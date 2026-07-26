@@ -122,3 +122,15 @@ class ReservationRegistry:
 
     def holds(self, owner: str) -> bool:
         return owner in self._held
+
+    def any_held_for_workdir(self, workdir: Path) -> bool:
+        """Side-effect-free: is ANY reservation currently held on `workdir`?
+
+        Used by callers that would otherwise short-circuit past
+        `try_acquire` (e.g. a task off an armed workdir with no verifier
+        gate of its own): once anything is held on this workdir, every task
+        sharing it must go through `try_acquire` so an overlap is actually
+        checked, rather than silently colliding with an existing hold.
+        """
+        canonical = canonical_workdir(workdir)
+        return any(r.workdir == canonical for r in self._held.values())

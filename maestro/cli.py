@@ -53,6 +53,7 @@ from maestro.config import load_orchestrator_config
 from maestro.coordination.arbiter_client import ArbiterClient, ArbiterClientConfig
 from maestro.coordination.routing import RoutingStrategy, make_routing_strategy
 from maestro.dag import DAG
+from maestro.database import verifier_requeue_block_reason
 from maestro.decomposer import ProjectDecomposer, resolve_spec_gen_settings
 from maestro.event_log import create_event_logger
 from maestro.git import GitManager
@@ -514,6 +515,8 @@ async def _run_scheduler(
                             f"[green]Recovery complete[/green]\n"
                             f"RUNNING → READY: {stats.running_recovered}\n"
                             f"VALIDATING → READY: {stats.validating_recovered}\n"
+                            f"VERIFYING → NEEDS_REVIEW: "
+                            f"{stats.verifying_recovered}\n"
                             f"Total recovered: {stats.total_recovered}\n"
                             f"Already done: {stats.tasks_done}",
                             title="State Recovery",
@@ -600,6 +603,7 @@ async def _run_scheduler(
             arbiter_mode=arbiter_mode,
             arbiter_enabled=arbiter_cfg is not None and arbiter_cfg.enabled,
             execution=config.execution,
+            verifier=config.verifier,
         )
         if arbiter_cfg is not None:
             scheduler._abandon_outcome_after_s = arbiter_cfg.abandon_outcome_after_s
@@ -712,6 +716,22 @@ async def _retry_task(db_path: Path, task_id: str) -> None:
             )
             err_console.print(
                 f"Task must be in one of: {', '.join(s.value for s in retryable_statuses)}"
+            )
+            raise typer.Exit(1)
+
+        # Requeue handle-fence (Task 11, spec §8): the shared
+        # `verifier_requeue_block_reason` fence (also used by the
+        # dashboard's `POST /api/tasks/{task_id}/retry`) fails this closed
+        # while a verifier-originated NEEDS_REVIEW's
+        # `execution_phase='verification'` handle is still open (not yet
+        # reconciled to `cleaned` by recovery/GC) — the judge subprocess it
+        # represents may still be alive.
+        block_reason = await verifier_requeue_block_reason(db, task)
+        if block_reason is not None:
+            err_console.print(f"[red]Cannot retry task:[/red] {block_reason}.")
+            err_console.print(
+                "Wait for recovery/GC to close it (or investigate the "
+                "judge process) before retrying."
             )
             raise typer.Exit(1)
 
@@ -1750,7 +1770,9 @@ def costs_command(
     NOTE: this aggregates the whole database, which may span several runs
     (one DB survives --resume); it is a database-wide summary, not a run total.
     Costs of unpriced harnesses with no self-reported cost are shown as
-    UNKNOWN, never as $0.
+    UNKNOWN, never as $0. Shows TOTAL plus breakdowns by harness, by task,
+    by execution phase (task/validation/verification), and by model (rows
+    with no recorded model group under "UNKNOWN").
 
     Examples:
         maestro costs --db run/maestro.db
@@ -1809,6 +1831,8 @@ def _render_cost_report(report: "CostReport") -> None:
     console.print(_table("Cost — database-wide TOTAL", "Scope", [report.total]))
     console.print(_table("By harness", "Harness", report.by_harness))
     console.print(_table("By task", "Task", report.by_task))
+    console.print(_table("By phase", "Phase", report.by_phase))
+    console.print(_table("By model", "Model", report.by_model))
 
 
 @app.callback()

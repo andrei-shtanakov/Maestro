@@ -1,9 +1,10 @@
 """State recovery module for Maestro orchestrator.
 
 This module provides recovery mechanisms for handling scheduler crashes
-and restarts. It can detect orphaned tasks (stuck in RUNNING or VALIDATING
-state from a crashed scheduler) and transition them back to READY for
-re-execution.
+and restarts. It can detect orphaned tasks (stuck in RUNNING, VALIDATING,
+or VERIFYING state from a crashed scheduler) and transition them back to
+READY (RUNNING/VALIDATING) or to NEEDS_REVIEW (VERIFYING — fail-closed,
+no auto re-run; see `_recover_verifying_tasks`) for re-execution/review.
 """
 
 import logging
@@ -52,6 +53,10 @@ class RecoveryStatistics:
         tasks_done: Number of tasks already completed (not re-executed).
         tasks_pending: Number of tasks still pending execution.
         recovery_time: Timestamp when recovery was performed.
+        verifying_recovered: Number of tasks routed NEEDS_REVIEW from a
+            stranded VERIFYING state (Task 11, spec §8 — fail-closed, no
+            auto re-run). Defaults to 0 so existing callers/tests that
+            construct `RecoveryStatistics` without this field keep working.
     """
 
     running_recovered: int
@@ -60,6 +65,7 @@ class RecoveryStatistics:
     tasks_done: int
     tasks_pending: int
     recovery_time: datetime
+    verifying_recovered: int = 0
 
     def __str__(self) -> str:
         """Return human-readable summary of recovery statistics."""
@@ -67,6 +73,7 @@ class RecoveryStatistics:
             f"Recovery completed at {self.recovery_time.isoformat()}",
             f"  RUNNING → READY: {self.running_recovered} task(s)",
             f"  VALIDATING → READY: {self.validating_recovered} task(s)",
+            f"  VERIFYING → NEEDS_REVIEW: {self.verifying_recovered} task(s)",
             f"  Total recovered: {self.total_recovered} task(s)",
             f"  Already done: {self.tasks_done} task(s)",
             f"  Pending: {self.tasks_pending} task(s)",
@@ -78,11 +85,13 @@ class StateRecovery:
     """Handles state recovery after scheduler crashes or restarts.
 
     When the scheduler is killed (SIGKILL) or crashes unexpectedly, tasks
-    may be left in RUNNING or VALIDATING state with no process actually
-    executing them. This class provides methods to:
+    may be left in RUNNING, VALIDATING, or VERIFYING state with no process
+    actually executing them. This class provides methods to:
 
-    1. Detect orphaned tasks (RUNNING/VALIDATING with no active process)
-    2. Transition them back to READY for re-execution
+    1. Detect orphaned tasks (RUNNING/VALIDATING/VERIFYING with no active
+       process)
+    2. Transition them back to READY for re-execution (RUNNING/VALIDATING)
+       or to NEEDS_REVIEW (VERIFYING — fail-closed, no auto re-run, spec §8)
     3. Report recovery statistics
 
     Usage:
@@ -134,6 +143,12 @@ class StateRecovery:
         states (DONE, ABANDONED) are not affected. `terminal`-state handles
         (any entity) are swept for ownership-checked GC as a side effect —
         see `_gc_terminal_handles`.
+
+        Tasks found in VERIFYING are handled differently (Task 11, spec
+        §8): ALWAYS routed to NEEDS_REVIEW, unconditionally — a stranded
+        verifier gate has no resumable checkpoint and the judge subprocess
+        may still be alive, so there is no auto re-run in this slice. See
+        `_recover_verifying_tasks`.
 
         Args:
             routing: Optional RoutingStrategy. When supplied, arbiter
@@ -194,6 +209,17 @@ class StateRecovery:
         validating_handles = {**task_phase, **validation_phase}
         validating_recovered = await self._recover_validating_tasks(validating_handles)
 
+        # Recover VERIFYING tasks: fail-closed, no auto re-run (spec §8) —
+        # every task found here always routes to NEEDS_REVIEW. Unlike
+        # task_phase/validation_phase above, the verification handle is
+        # looked up per-task via `get_execution_handle` rather than from
+        # `open_handles`: the verifier gate always runs on the `"local"`
+        # backend (`_run_verifier_gate` resolves `"local"` unconditionally),
+        # and `get_open_execution_handles` filters out `backend_id ==
+        # 'local'` rows entirely (see its docstring) — the exact-key lookup
+        # is the one that still finds it.
+        verifying_recovered = await self._recover_verifying_tasks()
+
         # Best-effort GC of leftover containers for settled entities.
         await self._gc_terminal_handles(open_handles)
 
@@ -210,7 +236,10 @@ class StateRecovery:
         return RecoveryStatistics(
             running_recovered=running_recovered,
             validating_recovered=validating_recovered,
-            total_recovered=running_recovered + validating_recovered,
+            verifying_recovered=verifying_recovered,
+            total_recovered=(
+                running_recovered + validating_recovered + verifying_recovered
+            ),
             tasks_done=done_count,
             tasks_pending=pending_count,
             recovery_time=datetime.now(UTC),
@@ -277,6 +306,100 @@ class StateRecovery:
             recovered += 1
 
         return recovered
+
+    async def _recover_verifying_tasks(self) -> int:
+        """Recover tasks stuck in VERIFYING state (Task 11, spec §8).
+
+        Fail-closed, no auto re-run: every task found here is routed
+        straight to NEEDS_REVIEW (VERIFYING has a direct edge to
+        NEEDS_REVIEW; see the `TaskStatus` state diagram) — a stranded
+        verifier gate has no resumable checkpoint, and the judge subprocess
+        (always the `"local"` backend, per `_run_verifier_gate`) may still
+        be alive.
+
+        The task's `execution_phase='verification'` handle is looked up by
+        exact key via `Database.get_execution_handle` (mirrors the
+        VALIDATING branch's phase-preferring handle selection, generalized
+        to a backend that `get_open_execution_handles` never surfaces —
+        see `recover()`'s docstring) using `attempt=task.retry_count + 1`,
+        the same attempt number `_run_verifier_gate` mints the handle with
+        (retry_count is not bumped between minting the handle and either
+        outcome reaching NEEDS_REVIEW). When found, it is reconciled via
+        `_reconcile_verifying_handle` — closed immediately if provably
+        safe, left open otherwise for the terminal-handle GC sweep or an
+        operator to resolve.
+
+        Returns:
+            Number of tasks routed to NEEDS_REVIEW.
+        """
+        verifying_tasks = await self._db.get_tasks_by_status(TaskStatus.VERIFYING)
+
+        for task in verifying_tasks:
+            row = await self._db.get_execution_handle(
+                entity_kind="task",
+                entity_id=task.id,
+                execution_phase="verification",
+                attempt=task.retry_count + 1,
+            )
+            if row is not None:
+                await self._reconcile_verifying_handle(row)
+
+            message = (
+                "recovery: task stranded in VERIFYING at scheduler restart "
+                "— fail-closed, no auto re-run (spec §8)"
+            )
+            logger.warning(
+                "recovery: task '%s' stranded in VERIFYING — routing to "
+                "NEEDS_REVIEW (fail-closed, no auto re-run)",
+                task.id,
+            )
+            await self._db.update_task_status(
+                task.id, TaskStatus.NEEDS_REVIEW, error_message=message
+            )
+
+        return len(verifying_tasks)
+
+    async def _reconcile_verifying_handle(self, row: dict[str, Any]) -> None:
+        """Close a leaked verification handle when provably safe.
+
+        Never influences task-status routing — `_recover_verifying_tasks`
+        always ends in NEEDS_REVIEW regardless of this outcome.
+
+        - `terminal`/`collected`: `finalize_handle`'s `wait()` already
+          confirmed the judge subprocess exited before either state is
+          reached, so it is safe to mark `cleaned` directly (mirrors
+          `_close_handle`'s terminal->cleaned step; no probe needed).
+        - `prepared`/`running`: probed via the same isolation-aware
+          `backend.probe()` boundary as `_route_open_handle_to_review`. Any
+          resolve/`accepts_ref`/probe failure, or a live result, leaves the
+          handle open; only a confirmed-dead probe closes it.
+        - any other state (already `cleaned`, or unrecognized): no-op.
+        """
+        state = row["state"]
+        if state in ("terminal", "collected"):
+            await self._db.mark_execution_state(
+                row["execution_id"], "cleaned", allowed_from=[state]
+            )
+            return
+        if state not in ("prepared", "running"):
+            return
+
+        try:
+            backend = self._backends.resolve(row["backend_id"])
+        except ExecutionConfigError:
+            return
+
+        ref = handle_ref_from_row(row)
+        if not backend.accepts_ref(ref):
+            return
+
+        try:
+            result = await backend.probe(ref)
+        except Exception:
+            return
+
+        if not result.needs_review:
+            await self._close_handle(row["execution_id"])
 
     async def _route_open_handle_to_review(
         self, task: Task, task_handles: dict[str, dict[str, Any]]
@@ -624,17 +747,19 @@ class StateRecovery:
         """Get count of tasks that need recovery.
 
         Returns:
-            Number of tasks in RUNNING or VALIDATING state.
+            Number of tasks in RUNNING, VALIDATING, or VERIFYING state.
         """
         running = await self._db.get_tasks_by_status(TaskStatus.RUNNING)
         validating = await self._db.get_tasks_by_status(TaskStatus.VALIDATING)
-        return len(running) + len(validating)
+        verifying = await self._db.get_tasks_by_status(TaskStatus.VERIFYING)
+        return len(running) + len(validating) + len(verifying)
 
     async def needs_recovery(self) -> bool:
         """Check if any tasks need recovery.
 
         Returns:
-            True if there are tasks in RUNNING or VALIDATING state.
+            True if there are tasks in RUNNING, VALIDATING, or VERIFYING
+            state.
         """
         return await self.get_orphaned_task_count() > 0
 

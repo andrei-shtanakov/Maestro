@@ -1,0 +1,83 @@
+# =============================================================================
+# Maestro Task Scheduler — Adversarial Verifier Gate (Mode-1, opt-in)
+# =============================================================================
+#
+# Demonstrates the opt-in `verifier:` block: once present, any task whose
+# `validation_cmd` passes AND that has a non-empty `scope` is routed through
+# a third phase before DONE:
+#
+#   VALIDATING -> VERIFYING -> DONE           (judge verdict: PASS)
+#                            -> FAILED/READY  (judge verdict: FAIL, retried
+#                                              with findings folded into the
+#                                              retry context, same as any
+#                                              other validation failure)
+#                            -> NEEDS_REVIEW  (judge ERROR: bad envelope,
+#                                              judge-process crash, oversize/
+#                                              binary diff, no resolvable
+#                                              verifier model — fail-closed,
+#                                              never softened to FAIL)
+#
+# The judge is an adversarial LLM ("claude -p ... --output-format json")
+# that reviews the task's scope-bounded diff against its own prompt/criteria
+# — it never receives the harness's normal system prompt or tools. It runs
+# read-only (no collect, scratch cwd): "policy isolation", not OS isolation.
+#
+# Tasks WITHOUT `scope` or `validation_cmd` are unaffected even with a
+# `verifier:` block present — the gate needs both to have anything to judge.
+# A project with no `verifier:` block at all keeps today's
+# `VALIDATING -> DONE` behavior byte-for-byte (zero-config default).
+#
+# Prerequisites:
+#   - `claude` CLI on PATH and already authenticated (the judge subprocess
+#     runs with `inherit_env=False` — only PATH is forwarded, so it relies
+#     on the CLI's own logged-in session, not an env-var API key)
+#   - A model catalog configured (`$ATP_CATALOG`, or `maestro models init`) —
+#     `resolve_verifier_model` validates `verifier.model` against it and
+#     refuses to run with an unknown/retired model
+#   - Pick a CHEAP model for the judge; it is a fixed per-task cost on top
+#     of the main harness run (see `maestro costs`, which breaks out
+#     verifier spend separately via `by_phase`/`by_model`)
+#
+# Usage:
+#   uv run maestro run examples/with-verifier.yaml
+#
+# =============================================================================
+
+project: my-app
+repo: ~/projects/my-app
+max_concurrent: 2
+
+defaults:
+  timeout_minutes: 30
+  max_retries: 2
+  agent_type: claude_code
+
+git:
+  base_branch: main
+  auto_push: true
+  branch_prefix: "agent/"
+
+# Opt-in adversarial verifier gate. `runner: claude` is the only supported
+# runner this slice; `model` can also be left unset here and supplied via
+# $MAESTRO_VERIFIER_MODEL at run time instead (same precedence, config wins
+# when both are set). This precedence is deliberately isolated from the main
+# harness's model resolution — it never reads $MAESTRO_<HARNESS>_MODEL and
+# never falls back to a catalog default, so the judge can't silently end up
+# on an expensive main model.
+verifier:
+  runner: claude
+  model: claude-haiku-4-5
+  timeout_seconds: 60
+  max_diff_bytes: 100000
+  backend: local
+
+tasks:
+  - id: implement-rate-limiter
+    title: "Add a token-bucket rate limiter"
+    prompt: |
+      Add a token-bucket rate limiter middleware in src/api/rate_limit.py
+      that caps each client IP to 100 requests/minute, returning 429 with a
+      Retry-After header once the bucket is empty. Wire it into the FastAPI
+      app in src/api/main.py.
+    scope: ["src/api/rate_limit.py", "src/api/main.py", "tests/test_rate_limit.py"]
+    validation_cmd: "uv run pytest tests/test_rate_limit.py -q"

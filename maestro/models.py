@@ -30,9 +30,11 @@ class TaskStatus(StrEnum):
     """Task execution status with valid state transitions.
 
     State machine:
-        PENDING → READY → RUNNING → VALIDATING → DONE
-                    │        │           │
-                    │        │           └→ FAILED → READY (retry)
+        PENDING → READY → RUNNING → VALIDATING → VERIFYING → DONE
+                    │        │           │          │
+                    │        │           │          └→ FAILED → READY (retry)
+                    │        │           │              │
+                    │        │           └→ VERIFYING ──┴→ NEEDS_REVIEW → READY
                     │        │               │
                     │        └→ FAILED ──────┴→ NEEDS_REVIEW → READY
                     │                                │
@@ -48,6 +50,7 @@ class TaskStatus(StrEnum):
     AWAITING_APPROVAL = "awaiting_approval"
     RUNNING = "running"
     VALIDATING = "validating"
+    VERIFYING = "verifying"
     DONE = "done"
     FAILED = "failed"
     NEEDS_REVIEW = "needs_review"
@@ -61,7 +64,8 @@ class TaskStatus(StrEnum):
             cls.READY: {cls.RUNNING, cls.AWAITING_APPROVAL},
             cls.AWAITING_APPROVAL: {cls.READY, cls.ABANDONED},
             cls.RUNNING: {cls.VALIDATING, cls.FAILED, cls.NEEDS_REVIEW},
-            cls.VALIDATING: {cls.DONE, cls.FAILED},
+            cls.VALIDATING: {cls.VERIFYING, cls.DONE, cls.FAILED, cls.NEEDS_REVIEW},
+            cls.VERIFYING: {cls.DONE, cls.FAILED, cls.NEEDS_REVIEW},
             cls.FAILED: {cls.READY, cls.NEEDS_REVIEW},
             cls.NEEDS_REVIEW: {cls.READY, cls.ABANDONED},
             cls.DONE: set(),
@@ -623,6 +627,13 @@ class Task(BaseModel):
             "uses NULL as 'delivery still pending'."
         ),
     )
+    verifier_baseline_sha: str | None = Field(
+        default=None,
+        description=(
+            "Git sha the verifier gate used as its baseline for this task's "
+            "diff; None until the verifier gate first runs."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_retry_count(self) -> Self:
@@ -797,6 +808,35 @@ class DefaultsConfig(BaseModel):
     )
 
 
+class VerifierConfig(BaseModel):
+    """Opt-in adversarial LLM verifier-gate config (verifier-gate Mode-1).
+
+    Absent (`None` on `ProjectConfig.verifier`) keeps today's behavior
+    byte-for-byte: no `VERIFYING` phase, `VALIDATING -> DONE` directly.
+    `backend` is pinned to `"local"` for this slice — read-only is policy
+    isolation (scratch cwd, no collect, envelope on stdin), never OS
+    isolation; rejecting any other value at construction time keeps that
+    claim honest. Model resolution is intentionally NOT done here — see
+    `maestro.verifier.config.resolve_verifier_model`, which is isolated from
+    the main `resolve_model` precedence (never reads `MAESTRO_<H>_MODEL` or a
+    catalog default, only `verifier.model` then `MAESTRO_VERIFIER_MODEL`).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    runner: Literal["claude"] = "claude"
+    model: str | None = Field(
+        default=None,
+        description=(
+            "Verifier model id. None defers to $MAESTRO_VERIFIER_MODEL at "
+            "resolution time; never falls back to a catalog default."
+        ),
+    )
+    timeout_seconds: int = Field(default=120, ge=1)
+    max_diff_bytes: int = Field(default=100_000, ge=1)
+    backend: Literal["local"] = "local"
+
+
 class ProjectConfig(BaseModel):
     """Project configuration model for YAML parsing.
 
@@ -831,6 +871,13 @@ class ProjectConfig(BaseModel):
         description=(
             "Execution backends config; None keeps zero-config local/bare "
             "execution (old behavior)."
+        ),
+    )
+    verifier: VerifierConfig | None = Field(
+        default=None,
+        description=(
+            "Opt-in adversarial LLM verifier gate; None keeps "
+            "VALIDATING -> DONE with no VERIFYING phase (old behavior)."
         ),
     )
 
@@ -926,6 +973,17 @@ class TaskCost(BaseModel):
         ),
     )
     attempt: int = Field(default=1, ge=1, description="Retry attempt number")
+    execution_phase: str = Field(
+        default="task",
+        description=(
+            "Which execution phase this cost belongs to "
+            "(task|validation|verification); default 'task'"
+        ),
+    )
+    model: str | None = Field(
+        default=None,
+        description="Model identifier used for this attempt, when known",
+    )
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
         description="Record creation timestamp",

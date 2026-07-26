@@ -454,6 +454,7 @@ class TestOrchestratorResumeFlag:
             return SimpleNamespace(
                 running_recovered=0,
                 validating_recovered=0,
+                verifying_recovered=0,
                 total_recovered=0,
                 tasks_done=0,
             )

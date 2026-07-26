@@ -86,7 +86,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     routed_agent_type TEXT,
     arbiter_decision_id TEXT,
     arbiter_route_reason TEXT,
-    arbiter_outcome_reported_at TIMESTAMP
+    arbiter_outcome_reported_at TIMESTAMP,
+    -- Verifier gate (idea #6): baseline sha the verifier diffed against
+    verifier_baseline_sha TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_dependencies (
@@ -126,6 +128,8 @@ CREATE TABLE IF NOT EXISTS task_costs (
     reported_cost_usd REAL,
     attempt INTEGER DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    execution_phase TEXT NOT NULL DEFAULT 'task',
+    model TEXT,
     FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
 );
 
@@ -319,6 +323,7 @@ def _row_to_task(row: aiosqlite.Row) -> Task:
         arbiter_outcome_reported_at=_parse_datetime(row["arbiter_outcome_reported_at"]),
         backend=row["backend"],
         validation_backend=row["validation_backend"],
+        verifier_baseline_sha=row["verifier_baseline_sha"],
     )
 
 
@@ -333,6 +338,8 @@ def _row_to_task_cost(row: aiosqlite.Row) -> TaskCost:
         estimated_cost_usd=row["estimated_cost_usd"],
         reported_cost_usd=row["reported_cost_usd"],
         attempt=row["attempt"],
+        execution_phase=row["execution_phase"],
+        model=row["model"],
         created_at=_parse_datetime(row["created_at"]) or datetime.now(UTC),
     )
 
@@ -495,6 +502,16 @@ class Database:
                 15,
                 "execution_phase_verification",
                 self._migrate_execution_phase_verification,
+            ),
+            (
+                16,
+                "tasks_verifier_baseline_sha",
+                self._migrate_tasks_verifier_baseline_sha,
+            ),
+            (
+                17,
+                "task_costs_phase_model",
+                self._migrate_task_costs_phase_model,
             ),
         ]
 
@@ -854,6 +871,44 @@ class Database:
                 "TEXT NOT NULL DEFAULT 'local'"
             )
 
+    async def _migrate_tasks_verifier_baseline_sha(self) -> None:
+        """Migration 16: add `verifier_baseline_sha` to `tasks` (nullable).
+
+        Records the git sha the verifier gate used as its diff baseline.
+        Pre-existing rows get NULL (the verifier gate has not yet run for
+        them). Idempotent via PRAGMA table_info, same shape as
+        `_migrate_tasks_validation_backend`.
+        """
+        assert self._connection is not None
+        cursor = await self._connection.execute("PRAGMA table_info(tasks)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "verifier_baseline_sha" not in columns:
+            await self._connection.execute(
+                "ALTER TABLE tasks ADD COLUMN verifier_baseline_sha TEXT"
+            )
+
+    async def _migrate_task_costs_phase_model(self) -> None:
+        """Migration 17: add `execution_phase` + `model` to `task_costs`.
+
+        Discriminates which execution phase (task|validation|verification)
+        a cost record belongs to, and records the model used, when known.
+        Pre-existing rows default to `execution_phase='task'`, `model=NULL`.
+        Idempotent via PRAGMA table_info, same shape as
+        `_migrate_tasks_validation_backend`.
+        """
+        assert self._connection is not None
+        cursor = await self._connection.execute("PRAGMA table_info(task_costs)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "execution_phase" not in columns:
+            await self._connection.execute(
+                "ALTER TABLE task_costs ADD COLUMN execution_phase "
+                "TEXT NOT NULL DEFAULT 'task'"
+            )
+        if "model" not in columns:
+            await self._connection.execute(
+                "ALTER TABLE task_costs ADD COLUMN model TEXT"
+            )
+
     async def _migrate_workstreams_verification_columns(self) -> None:
         """Migration 13: add Stage B verification columns to `workstreams`.
 
@@ -1149,8 +1204,8 @@ class Database:
                     task_type, language, complexity,
                     result_summary, error_message, created_at, started_at, completed_at,
                     routed_agent_type, arbiter_decision_id, arbiter_route_reason,
-                    arbiter_outcome_reported_at, backend
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    arbiter_outcome_reported_at, backend, verifier_baseline_sha
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.id,
@@ -1182,6 +1237,7 @@ class Database:
                     task.arbiter_route_reason,
                     _format_datetime(task.arbiter_outcome_reported_at),
                     task.backend,
+                    task.verifier_baseline_sha,
                 ),
             )
         except sqlite3.IntegrityError as e:
@@ -1320,7 +1376,7 @@ class Database:
                 started_at = ?, completed_at = ?,
                 routed_agent_type = ?, arbiter_decision_id = ?,
                 arbiter_route_reason = ?, arbiter_outcome_reported_at = ?,
-                backend = ?
+                backend = ?, verifier_baseline_sha = ?
             WHERE id = ?
             """,
             (
@@ -1351,6 +1407,7 @@ class Database:
                 task.arbiter_route_reason,
                 _format_datetime(task.arbiter_outcome_reported_at),
                 task.backend,
+                task.verifier_baseline_sha,
                 task.id,
             ),
         )
@@ -1403,6 +1460,43 @@ class Database:
             ),
         )
         await self._connection.commit()
+
+    async def update_task_verifier_baseline(
+        self, task_id: str, baseline_sha: str
+    ) -> bool:
+        """Persist the verifier gate's baseline sha for a task — write-once.
+
+        `WHERE verifier_baseline_sha IS NULL` makes this a write-once guard
+        at the DB level: once a task's baseline is recorded (at its first
+        dispatch, design §5), a later call for the same task — e.g. a retry
+        re-dispatch — is a silent no-op rather than clobbering the original
+        baseline the verifier gate's diffs are pinned to.
+
+        Args:
+            task_id: ID of the task to record the baseline for.
+            baseline_sha: The commit sha (`git rev-parse HEAD` of the task's
+                workdir at first dispatch) to record.
+
+        Returns:
+            True if this call set the baseline (row was NULL and got
+            written), False if a baseline was already recorded (no-op).
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            """
+            UPDATE tasks SET verifier_baseline_sha = ?
+            WHERE id = ? AND verifier_baseline_sha IS NULL
+            """,
+            (baseline_sha, task_id),
+        )
+        await self._connection.commit()
+        return cursor.rowcount > 0
 
     async def mark_outcome_reported(
         self,
@@ -1941,6 +2035,46 @@ class Database:
         row = await cursor.fetchone()
         return dict(row) if row is not None else None
 
+    async def get_open_verification_handle(self, task_id: str) -> dict[str, Any] | None:
+        """Return a task's open (non-`cleaned`) verification handle, if any.
+
+        Used by the Mode-1 `NEEDS_REVIEW -> READY` requeue fence (`maestro
+        retry`, Task 11) to detect a verifier-originated review whose
+        `execution_phase='verification'` handle has not yet been reconciled
+        to `cleaned` — re-queuing must fail closed until it has. Unlike
+        `get_open_execution_handles`, this is NOT filtered by `backend_id
+        != 'local'` (the verifier gate always runs on `"local"`) and is not
+        keyed by a specific `attempt` — any non-cleaned verification handle
+        for this task, regardless of attempt, blocks the requeue.
+
+        Returns:
+            The most recent matching row, or `None` if the task has no
+            verification handle at all, or all of them are `cleaned`.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            """
+            SELECT execution_id, entity_kind, entity_id, attempt, backend_id,
+                   transport_ref, state, created_at, finished_at,
+                   remote_host, remote_dir, status_marker, collected_at,
+                   execution_phase
+            FROM execution_handles
+            WHERE entity_kind = 'task' AND entity_id = ?
+              AND execution_phase = 'verification' AND state != 'cleaned'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (task_id,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
     # =========================================================================
     # Query by Status
     # =========================================================================
@@ -2396,8 +2530,9 @@ class Database:
             """
             INSERT INTO task_costs (
                 task_id, agent_type, input_tokens, output_tokens,
-                estimated_cost_usd, reported_cost_usd, attempt, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                estimated_cost_usd, reported_cost_usd, attempt, created_at,
+                execution_phase, model
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 cost.task_id,
@@ -2408,6 +2543,8 @@ class Database:
                 cost.reported_cost_usd,
                 cost.attempt,
                 _format_datetime(cost.created_at),
+                cost.execution_phase,
+                cost.model,
             ),
         )
         await self._connection.commit()
@@ -3048,6 +3185,45 @@ async def create_database(db_path: str | Path) -> Database:
     # Database.connect() auto-runs initialize_schema(); no separate call needed.
     await db.connect()
     return db
+
+
+async def verifier_requeue_block_reason(db: Database, task: Task) -> str | None:
+    """Return why re-queuing `task` from NEEDS_REVIEW must be rejected, or
+    `None` if the re-queue is allowed.
+
+    The ONE shared fail-closed fence (Task 11 fix) for every
+    `NEEDS_REVIEW -> READY` re-queue path — `maestro retry` (the CLI's
+    `_retry_task`) and the dashboard's `POST /api/tasks/{task_id}/retry`
+    both call this instead of each re-implementing the check, so a future
+    third re-queue path cannot forget it either. A no-op (returns `None`)
+    for any status other than NEEDS_REVIEW — this fence only concerns a
+    verifier-originated review.
+
+    A verifier-originated NEEDS_REVIEW must not be re-queued while its
+    `execution_phase='verification'` handle is still open (not yet
+    reconciled to `cleaned` by recovery/GC): the judge subprocess it
+    represents may still be alive, and silently re-running the task over
+    it would defeat the gate's fail-closed guarantee. A task with no
+    verification handle at all (the ordinary non-verifier NEEDS_REVIEW
+    path) is unaffected.
+
+    Args:
+        db: Database to query.
+        task: The task being considered for re-queue (already fetched by
+            the caller).
+
+    Returns:
+        A human-readable rejection reason, or `None` if re-queuing is safe.
+    """
+    if task.status != TaskStatus.NEEDS_REVIEW:
+        return None
+    handle = await db.get_open_verification_handle(task.id)
+    if handle is None:
+        return None
+    return (
+        f"its verification handle ({handle['execution_id']!r}, state "
+        f"{handle['state']!r}) has not been reconciled yet"
+    )
 
 
 _REQUIRED_TASK_COST_COLUMNS = frozenset(

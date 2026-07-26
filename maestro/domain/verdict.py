@@ -162,3 +162,138 @@ def evaluate_handshake(
     return HandshakeResult(
         outcome=document.verdict, protocol_error=None, document=document
     )
+
+
+# === Task-side verdict primitives (§5, Stage A, Task Handshake) ===
+
+
+class TaskVerdictIdentity(BaseModel):
+    """Task-shaped identity — provider-computed, never model-supplied (§5).
+
+    No `workstream_id`/`rework_attempt` (those are Mode-2). `verified_scope_sha256`
+    is the honest scope-state pin (NOT a git tree — non-overlapping tasks may
+    legally touch other paths in parallel).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    task_id: str
+    verification_run_id: str
+    verification_attempt: int = Field(ge=1)
+    artifact: str
+    artifact_sha256: str
+    criteria_sha256: str
+    profile_sha256: str
+    verified_source_commit: str
+    verified_scope_sha256: str
+
+
+class TaskVerdictDocument(BaseModel):
+    """Task-shaped verdict document."""
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_version: Literal[2]
+    identity: TaskVerdictIdentity
+    verdict: VerdictValue
+    findings: list[Finding] = Field(default_factory=list)
+
+
+class TaskIdentityExpectations(BaseModel):
+    """The provider-computed identity the sealed document must carry (§6 binding)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    task_id: str
+    verification_run_id: str
+    verification_attempt: int
+    artifact: str
+    artifact_sha256: str
+    criteria_sha256: str
+    profile_sha256: str
+    verified_source_commit: str
+    verified_scope_sha256: str
+
+
+class TaskHandshakeResult(BaseModel):
+    """Task analogue of HandshakeResult — carries a TaskVerdictDocument."""
+
+    model_config = ConfigDict(frozen=True)
+
+    outcome: VerdictValue
+    protocol_error: str | None = None
+    document: TaskVerdictDocument | None = None
+    raw_result_envelope: str | None = Field(
+        default=None,
+        description=(
+            "Raw stdout of the judge CLI process — the `claude -p "
+            "--output-format json` result envelope (`{'type': 'result', "
+            "'result': ..., 'usage': {...}, 'total_cost_usd': ...}`) — "
+            "captured whenever the judge process ran to completion on the "
+            "transport layer (regardless of PASS/FAIL/ERROR verdict). "
+            "`cost_tracker.parse_claude_code_log` already knows how to "
+            "read `usage`/`total_cost_usd` from this exact shape; the "
+            "scheduler uses it to write a verification-phase TaskCost "
+            "row. None on a transport failure (timeout or non-zero exit) "
+            "— any output captured in that case is untrusted and not "
+            "surfaced, so cost is UNKNOWN, never $0."
+        ),
+    )
+
+
+def _task_error(message: str) -> TaskHandshakeResult:
+    return TaskHandshakeResult(
+        outcome=VerdictValue.ERROR, protocol_error=message, document=None
+    )
+
+
+def evaluate_task_document(
+    json_path: Path, expected: TaskIdentityExpectations
+) -> TaskHandshakeResult:
+    """Validate the sealed task verdict document (provider binding, §6): file
+    present + parseable + schema-valid + identity == provider-computed identity.
+    Returns the payload verdict (PASS/FAIL) or ERROR. NO exit-code comparison
+    (§3 transport/semantic split — the Claude CLI exits 0 on any answer)."""
+    if not json_path.is_file():
+        return _task_error(f"verdict file missing: {json_path}")
+    try:
+        document = TaskVerdictDocument.model_validate(json.loads(json_path.read_text()))
+    except (ValueError, ValidationError, OSError) as exc:
+        return _task_error(f"verdict file invalid: {exc}")
+    ident = document.identity
+    mismatches = [
+        name
+        for name, got, want in (
+            ("task_id", ident.task_id, expected.task_id),
+            (
+                "verification_run_id",
+                ident.verification_run_id,
+                expected.verification_run_id,
+            ),
+            (
+                "verification_attempt",
+                ident.verification_attempt,
+                expected.verification_attempt,
+            ),
+            ("artifact", ident.artifact, expected.artifact),
+            ("artifact_sha256", ident.artifact_sha256, expected.artifact_sha256),
+            ("criteria_sha256", ident.criteria_sha256, expected.criteria_sha256),
+            ("profile_sha256", ident.profile_sha256, expected.profile_sha256),
+            (
+                "verified_source_commit",
+                ident.verified_source_commit,
+                expected.verified_source_commit,
+            ),
+            (
+                "verified_scope_sha256",
+                ident.verified_scope_sha256,
+                expected.verified_scope_sha256,
+            ),
+        )
+        if got != want
+    ]
+    if mismatches:
+        return _task_error(f"identity mismatch: {', '.join(mismatches)}")
+    return TaskHandshakeResult(
+        outcome=document.verdict, protocol_error=None, document=document
+    )

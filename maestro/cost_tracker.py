@@ -79,11 +79,13 @@ class CostGroup:
 
 @dataclass(frozen=True)
 class CostReport:
-    """Aggregated cost report: total, by harness, by task."""
+    """Aggregated cost report: total, by harness, by task, by phase, by model."""
 
     total: CostGroup
     by_harness: list[CostGroup]
     by_task: list[CostGroup]
+    by_phase: list[CostGroup]
+    by_model: list[CostGroup]
 
 
 class _Acc:
@@ -124,23 +126,33 @@ class _Acc:
 
 
 def summarize_costs(costs: list[TaskCost]) -> CostReport:
-    """Database-wide cost summary: TOTAL + per-harness + per-task.
+    """Database-wide cost summary: TOTAL + per-harness + per-task + per-phase
+    + per-model.
 
     Known/unknown per row is decided by `effective_cost` (SSOT). `known_cost_usd`
     is a known subtotal; unknown attempts/tasks are reported alongside, never
     folded into the dollar figure. Tokens are summed over all supplied rows.
+    A row with no recorded `model` (pre-T4 rows, or a harness that never
+    filled it in) groups under the `"UNKNOWN"` label rather than being
+    dropped, so the by-model totals still cover every row.
     """
     total = _Acc()
     by_harness: dict[str, _Acc] = {}
     by_task: dict[str, _Acc] = {}
+    by_phase: dict[str, _Acc] = {}
+    by_model: dict[str, _Acc] = {}
     for cost in costs:
         total.add(cost)
         by_harness.setdefault(cost.agent_type.value, _Acc()).add(cost)
         by_task.setdefault(cost.task_id, _Acc()).add(cost)
+        by_phase.setdefault(cost.execution_phase, _Acc()).add(cost)
+        by_model.setdefault(cost.model or "UNKNOWN", _Acc()).add(cost)
     return CostReport(
         total=total.freeze("TOTAL"),
         by_harness=[acc.freeze(k) for k, acc in sorted(by_harness.items())],
         by_task=[acc.freeze(k) for k, acc in sorted(by_task.items())],
+        by_phase=[acc.freeze(k) for k, acc in sorted(by_phase.items())],
+        by_model=[acc.freeze(k) for k, acc in sorted(by_model.items())],
     )
 
 
