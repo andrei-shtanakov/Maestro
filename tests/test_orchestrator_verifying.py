@@ -497,6 +497,103 @@ async def test_error_budget_exhausted_then_reverify_to_pass(
 
 
 # =============================================================================
+# H-6 ex-post approval resume must re-enter VERIFYING under a domain profile
+# =============================================================================
+
+
+def _ex_post_marker(sha: str) -> str:
+    from maestro.gates import APPROVAL_MARKER_PREFIX
+
+    return (
+        "gates: human.owner_approval required (tier=high); re-queue to "
+        f"approve. {APPROVAL_MARKER_PREFIX} phase=ex_post sha={sha}"
+    )
+
+
+async def test_ex_post_resume_domain_active_reenters_verifying_and_passes(
+    tmp_path: Path, worktree: Path, db: Database
+) -> None:
+    """The hole golden run 3 exposed: an ex-post gate approval used to jump
+    straight to the MERGING tail, bypassing domain verification entirely. A
+    domain workstream parked NEEDS_REVIEW (gate block) with an operator
+    approval recorded, then re-queued to READY, must now resume THROUGH
+    VERIFYING — never straight to the merge tail.
+    """
+    sha = _run_git(["rev-parse", "HEAD"], worktree).strip()
+    script = _write_script(tmp_path, [{"verdict": "PASS"}])
+    config = _config(worktree, _profile(script))
+    orch, _ws_mgr, _dec = _make_orch(db, worktree, config)
+    await _create_workstream(
+        db,
+        WorkstreamStatus.NEEDS_REVIEW,
+        error_message=_ex_post_marker(sha),
+    )
+    assert (await db.get_workstream(WORKSTREAM_ID)).verification_attempt == 0
+
+    # Operator approval: records the (ex_post, sha) approval AND re-queues
+    # NEEDS_REVIEW -> READY in one transaction, exactly as `maestro
+    # workstream-approve` does.
+    await db.approve_workstream_with_gate_record(WORKSTREAM_ID, "ex_post", sha)
+    approvals = await db.list_gate_approvals(WORKSTREAM_ID)
+    assert ("ex_post", sha) in approvals
+
+    await orch._spawn_workstream(WORKSTREAM_ID)
+
+    ws = await db.get_workstream(WORKSTREAM_ID)
+    assert ws.status is WorkstreamStatus.DONE
+    run_id = ws.verification_run_id
+    assert run_id is not None
+
+    # Verification actually ran: exactly one PASS attempt, materialized.
+    rows = await db.list_verification_attempts(run_id)
+    assert len(rows) == 1
+    assert rows[0].verdict == "PASS"
+    assert rows[0].materialized is True
+
+    # Evidence commit landed on the branch (proof MERGING was reached
+    # THROUGH VERIFYING, not around it).
+    commits = _evidence_commits(worktree, run_id)
+    assert len(commits) == 1
+
+    # The consumed marker is gone (its job — skip re-gating — is done).
+    assert ws.error_message is None
+
+
+async def test_ex_post_resume_domain_active_fail_routes_to_rework_not_merging(
+    tmp_path: Path, worktree: Path, db: Database
+) -> None:
+    """Same setup, but the verifier says FAIL: must route back to READY
+    tagged for rework (the loop takes over), never to MERGING.
+    """
+    sha = _run_git(["rev-parse", "HEAD"], worktree).strip()
+    script = _write_script(tmp_path, [{"verdict": "FAIL"}])
+    config = _config(worktree, _profile(script, rework_budget=1))
+    orch, _ws_mgr, _dec = _make_orch(db, worktree, config)
+    await _create_workstream(
+        db,
+        WorkstreamStatus.NEEDS_REVIEW,
+        error_message=_ex_post_marker(sha),
+    )
+    await db.approve_workstream_with_gate_record(WORKSTREAM_ID, "ex_post", sha)
+
+    await orch._spawn_workstream(WORKSTREAM_ID)
+
+    ws = await db.get_workstream(WORKSTREAM_ID)
+    assert ws.status is WorkstreamStatus.READY
+    assert ws.resume_reason == "verification_rework"
+    assert ws.rework_attempt == 1
+    run_id = ws.verification_run_id
+    assert run_id is not None
+
+    rows = await db.list_verification_attempts(run_id)
+    assert [r.verdict for r in rows] == ["FAIL"]
+    assert rows[0].materialized is False
+    # No evidence commit — FAIL never reaches finalization/MERGING.
+    assert _evidence_commits(worktree, run_id) == []
+    assert ws.error_message is None
+
+
+# =============================================================================
 # Zero-change: domain=None
 # =============================================================================
 
