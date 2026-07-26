@@ -47,6 +47,7 @@ from maestro.database import ConcurrentModificationError, Database, TaskNotFound
 from maestro.domain.verdict import TaskHandshakeResult, VerdictValue
 from maestro.event_log import Event, EventType, HoldThrottle, get_event_logger
 from maestro.execution.backend import ExecutionBackend, TaskHandle
+from maestro.execution.docker_cli import DockerCli
 from maestro.execution.exec_config import ExecutionConfig
 from maestro.execution.finalize import FinalizationResult, ensure_finalize_task
 from maestro.execution.models import CollectPolicy, ExecutionRequest
@@ -91,6 +92,7 @@ from maestro.validator import (
 )
 from maestro.verifier.config import VerifierModelError, resolve_verifier_model
 from maestro.verifier.diff import build_scope_patch, compute_identity
+from maestro.verifier.docker_backend import build_verifier_backend
 from maestro.verifier.envelope import build_envelope
 from maestro.verifier.judge import ClaudeDiffJudge, TaskVerificationContext
 from maestro.verifier.prompt import profile_sha256
@@ -318,6 +320,16 @@ class Scheduler:
         self._execution = execution or ExecutionConfig()
         self._backends = BackendResolver(self._execution, mode="scheduler")
         self._verifier = verifier
+        # Dedicated root for the verifier judge's own execution scratch
+        # state, derived from the scheduler's DB directory so a durable
+        # docker judge run (Task 6) and its recovery (Task 8) always agree
+        # on the same path without either side hard-coding it.
+        self._verifier_exec_root = Path(self._db.db_path).parent / "verifier-exec"
+        self._verifier_docker_cli = (
+            DockerCli()
+            if (verifier is not None and verifier.backend == "docker")
+            else None
+        )
         self._armed: set[Path] = set()
         self._reservations = ReservationRegistry()
         # Tasks whose (workdir, scope) reservation must be HELD because a
@@ -2068,6 +2080,23 @@ class Scheduler:
         )
         return bool(result.stdout.strip())
 
+    def _verifier_backend(self) -> ExecutionBackend:
+        """Resolve the verifier judge's execution backend (spec §3.4).
+
+        Delegates to the single `build_verifier_backend` factory shared with
+        recovery: `verifier.backend == "local"` returns `self._backends`'
+        resolved local backend unchanged (byte-identical seam); `"docker"`
+        builds the hardened `verifier-docker` backend from
+        `self._verifier_docker_cli` and `self._verifier_exec_root`.
+        """
+        assert self._verifier is not None
+        return build_verifier_backend(
+            self._verifier,
+            local_backend=self._backends.resolve("local"),
+            exec_root=self._verifier_exec_root,
+            docker_cli=self._verifier_docker_cli,
+        )
+
     async def _run_verifier(
         self,
         task_id: str,
@@ -2154,7 +2183,7 @@ class Scheduler:
 
         execution_id = str(uuid.uuid4())
         attempt = task.retry_count + 1
-        backend = self._backends.resolve("local")
+        backend = self._verifier_backend()
         await self._db.start_execution(
             entity_kind="task",
             entity_id=task_id,
@@ -2162,7 +2191,11 @@ class Scheduler:
             running_status=TaskStatus.VERIFYING.value,
             execution_id=execution_id,
             backend_id=backend.id,
-            transport_ref=f"{backend.id}:verify-{execution_id}",
+            transport_ref=(
+                f"docker:maestro-{execution_id}"
+                if backend.id == "verifier-docker"
+                else f"{backend.id}:verify-{execution_id}"
+            ),
             attempt=attempt,
             execution_phase="verification",
         )

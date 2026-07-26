@@ -18,8 +18,8 @@ def test_local_returns_passed_backend(tmp_path):
     cfg = VerifierConfig(backend="local", model="m")
     out = build_verifier_backend(
         cfg,
-        local_backend=passed,
-        exec_root=tmp_path,  # type: ignore[arg-type]
+        local_backend=passed,  # type: ignore[arg-type]
+        exec_root=tmp_path,
     )
     assert out is passed  # never a fresh LocalBackend
 
