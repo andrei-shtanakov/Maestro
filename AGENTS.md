@@ -107,6 +107,13 @@ uv run maestro merge-logs <pipeline-dir>
 | `scaffold.py` | `maestro init` — generates commented `project.yaml` with git-derived autofill |
 | `spec_runner.py` | Integration boundary with external spec-runner subprocess |
 | `correlation.py` | WorkCorrelation v1 reference implementation |
+| `logging_bridge.py` | Routes stdlib `logging` records into the obs JSONL pipeline (`setup_logging()` — use this, not raw `obs.init_logging`, at entry points) |
+| `transitions.py` | Declarative status-transition → side-effect mapping and dispatcher |
+| `gates.py` | Gates-in-DAG runtime: guard hooks on workstream transition edges (ex-ante / ex-post) |
+| `gate_approvals.py` | Approval-marker primitives (durable approval memory, H-6) |
+| `scope_gate.py` | Pure scope-containment matcher (`find_escapes`) — no git/FS/DB |
+| `changed_paths.py` | Git changed-paths source for the scope gate (workstream's own commits since branch point) |
+| `merge_logs.py` | `maestro merge-logs` — time-sorts per-pid JSONL into `merged.jsonl`; tolerates partial runs |
 
 **Multi-process orchestration:**
 
@@ -127,6 +134,8 @@ uv run maestro merge-logs <pipeline-dir>
 | `notifications/` | Desktop notifications (macOS/Linux) |
 | `dashboard/` | Web UI with DAG visualization (Mermaid.js) + SSE updates |
 | `schemas/` | JSON-schema generation for config/contract artifacts |
+| `execution/` | Transport-agnostic run contract + backends (local, Docker, SSH) with recovery/reservations |
+| `resources/` | Packaged data files (TOML), shipped via `[tool.setuptools.package-data]` |
 | `_vendor/` | Vendored observability lib (`obs.py`) — structlog spans, trace propagation |
 
 ### State machines
@@ -210,5 +219,5 @@ This repo is `maestro`. Neighbour repos (`../arbiter/`, `../spec-runner/`, etc.)
 | CLI | Typer + Rich |
 | Workspace isolation | git worktree |
 | PR creation | gh CLI |
-| Subtask execution | spec-runner (external PyPI package) |
+| Subtask execution | spec-runner — external subprocess from the sibling repo, not an import; expected version pinned in `maestro/spec_runner.py::SPEC_RUNNER_REQUIRED_VERSION` |
 | Observability | structlog (vendored `_vendor/obs.py`) |
