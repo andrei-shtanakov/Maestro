@@ -135,6 +135,8 @@ uv run maestro merge-logs <pipeline-dir>
 | `dashboard/` | Web UI with DAG visualization (Mermaid.js) + SSE updates |
 | `schemas/` | JSON-schema generation for config/contract artifacts |
 | `execution/` | Transport-agnostic run contract + backends (local, Docker, SSH) with recovery/reservations |
+| `domain/` | Mode-2 workstream verification (Stage B) — `VerificationProvider` Protocol, verdict contract v2 + handshake, `CommandVerifier`, evidence ledger. Activated by presence of `domain.verification.verifier`; absent = pre-Stage-B path, byte-identical |
+| `verifier/` | Mode-1 task-level verifier gate (config / diff / envelope / prompt / judge) — reuses the `domain/` verdict primitives additively rather than shipping a parallel stack |
 | `resources/` | Packaged data files (TOML), shipped via `[tool.setuptools.package-data]` |
 | `_vendor/` | Vendored observability lib (`obs.py`) — structlog spans, trace propagation |
 
