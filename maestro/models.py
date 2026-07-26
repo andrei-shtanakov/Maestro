@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from maestro.domain.profile import DomainProfile
 from maestro.execution.exec_config import ExecutionConfig
+from maestro.verifier.docker_config import VerifierDockerConfig
 
 
 # Namespace for every file Maestro generates inside a target repo's
@@ -834,7 +835,18 @@ class VerifierConfig(BaseModel):
     )
     timeout_seconds: int = Field(default=120, ge=1)
     max_diff_bytes: int = Field(default=100_000, ge=1)
-    backend: Literal["local"] = "local"
+    backend: Literal["local", "docker"] = "local"
+    docker: VerifierDockerConfig | None = None
+
+    @model_validator(mode="after")
+    def _backend_docker_coherent(self) -> "VerifierConfig":
+        if self.backend == "docker" and self.docker is None:
+            raise ValueError(
+                "verifier.backend='docker' requires a verifier.docker block"
+            )
+        if self.backend == "local" and self.docker is not None:
+            raise ValueError("verifier.docker is set but backend is not 'docker'")
+        return self
 
 
 class ProjectConfig(BaseModel):
