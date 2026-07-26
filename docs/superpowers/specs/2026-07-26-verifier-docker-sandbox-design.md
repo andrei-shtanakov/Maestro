@@ -167,10 +167,11 @@ Used by **both** dispatch (`scheduler._run_verifier`) and recovery
   its `probe()` and `accepts_ref()`.
 
 The factory **never silently creates either a hidden local backend or a hidden
-`DockerCli`** — in tests dispatch and recovery must be able to inject one shared fake, or
-recovery/local fakes would be bypassed. Production composition explicitly passes the real
-`local_backend` and the real `DockerCli`; a `None` `docker_cli` is built into a real one
-**only** on the production docker path.
+`DockerCli`** — in tests dispatch and recovery must inject one shared fake, or
+recovery/local fakes would be bypassed. `docker_cli` is **required on the docker path**
+(`None` there is a programming error → raise `ValueError`); the `local` path ignores it.
+Production composition constructs the real `DockerCli` **outside** and passes it in — so
+there is no "None becomes real" branch to reason about.
 
 ---
 
@@ -313,7 +314,9 @@ dropped — it forces an explicit threat-model decision.
 
 ## 7. Recovery contract
 
-Two seams change; the shared probe boundary and fail-closed semantics are preserved.
+The general/phase-specific split, the two-operation ownership, and the credential crash
+contract change; the shared `backend.probe()` boundary and fail-closed semantics are
+preserved.
 
 ### 7.1 One-time split of `open_handles` (single owner for the whole lifecycle)
 
@@ -327,7 +330,7 @@ The flip must be applied **once, immediately after `open_handles` is read**, and
 **every** general consumer — not only task/validation recovery but also the terminal-
 handle GC. Today `recover()` passes the original `open_handles` to
 `_gc_terminal_handles()`; without the split, a `verifier-docker` `terminal`/`collected`
-row would be (1) reconciled by `_recover_verifying_tasks`, then (2) handed to the general
+row would be (1) reconciled by the phase-specific owner, then (2) handed to the general
 GC, which (3) cannot resolve `verifier-docker` through the general `BackendResolver` —
 breaking both the single-owner claim and the "exactly once" guard test.
 
@@ -338,33 +341,82 @@ general_handles      = [h for h in open_handles if h["execution_phase"] != "veri
 
 - task/validation recovery **and** `_gc_terminal_handles()` receive **only**
   `general_handles`;
-- `_recover_verifying_tasks()` **owns** `verification_handles` for the whole lifecycle —
-  including their `terminal`/`collected` GC — resolving the backend through the verifier
-  factory, never the general resolver;
-- the exact per-task DB lookup (`get_execution_handle(... execution_phase="verification")`)
-  remains the fallback for `local` verification handles, which
-  `get_open_execution_handles()` still does not surface (it filters `backend_id ==
-  "local"`); the `verifier-docker` rows it *does* surface are removed from every general
-  consumer by the split above.
+- `_reconcile_verification_handles()` (§7.2) **owns** `verification_handles` for the whole
+  lifecycle — including their `terminal`/`collected` GC — resolving the backend through the
+  verifier factory, never the general resolver;
+- `local` verification handles are **not** surfaced by `get_open_execution_handles()`
+  (it filters `backend_id == "local"`), so a dedicated **`get_open_verification_handles()`**
+  query (§7.2) returns **all** open `phase=verification` rows regardless of backend and
+  task status — the split above removes the `verifier-docker` rows from every general
+  consumer, and the new query feeds the phase-specific owner below.
 
-### 7.2 `_recover_verifying_tasks` is the sole owner of verification recovery
+### 7.2 Two separate operations: handle reconciliation vs. FSM routing
 
-For each `VERIFYING` task's `execution_phase='verification'` handle:
+Handle reconciliation and task-status routing are **decoupled** — a verification handle
+can be `terminal`/`collected` while its task has already settled to `DONE` or
+`NEEDS_REVIEW` (the gate reconciles the handle only once the judge is provably dead,
+which can lag the task transition). If reconciliation were scoped to
+`get_tasks_by_status(VERIFYING)` (as the gate's `_recover_verifying_tasks` is today), then
+after we exclude all verification handles from general GC these would orphan forever:
 
-1. check the handle's `backend_id` against the **current** `VerifierConfig`;
-2. build the backend via `build_verifier_backend` (the same factory dispatch used);
-3. call **`accepts_ref()` before `probe()`**;
-4. **mismatch / missing config / unknown verifier backend / build-or-probe error / live
-   result** → task routed to **NEEDS_REVIEW**, the handle **left open** (preserved);
-5. a **proven terminal/cleaned** reconciliation closes the handle and opens the guarded
-   `maestro retry` requeue fence per the existing contract.
+- a verification handle in `terminal`/`collected` whose task is already `DONE`;
+- a handle whose task already moved to `NEEDS_REVIEW`;
+- a `local` verification handle of such a settled task — not even surfaced by
+  `get_open_execution_handles()` (the `backend_id != "local"` filter).
 
-Task-status routing itself is unchanged from the gate: a mid-`VERIFYING` crash is always
-fail-closed to NEEDS_REVIEW (never auto-re-run); handle reconciliation only decides when
-the requeue fence may clear.
+So verification recovery is **two** operations:
+
+**(a) `_reconcile_verification_handles()` — owns ALL open `phase=verification` rows**,
+regardless of task status or backend, driven by `get_open_verification_handles()` (§7.1).
+State-specific reconciliation, using `build_verifier_backend(cfg, local_backend=…,
+docker_cli=…)` (never the general resolver):
+
+- `prepared`/`running` → `accepts_ref()` **then** `probe()`; a live result, an
+  `accepts_ref` reject, or any resolve/probe error → **preserve the handle open**;
+- `terminal`/`collected` → **ownership-checked** container GC (the shared
+  `DockerTaskHandle`/`docker_recovery.labels_match` path), then mark `cleaned`;
+- unknown backend id / config mismatch / missing `VerifierConfig` / probe or GC error →
+  **preserve open** (fail-closed);
+- **task status never affects ownership cleanup** — a handle is reconciled on its own
+  monotonic state, not the task's.
+
+**(b) `_recover_verifying_tasks()` — ONLY the FSM routing** `VERIFYING → NEEDS_REVIEW`
+for tasks still in `VERIFYING`. Unchanged from the gate: a mid-`VERIFYING` crash is always
+fail-closed to NEEDS_REVIEW (never auto-re-run). It no longer owns handle GC — (a) does —
+so a `proven cleaned` reconciliation in (a) is what opens the guarded `maestro retry`
+requeue fence per the existing contract.
 
 Dispatch and recovery share one **injectable** `DockerCli`; the factory never creates a
 hidden client that would bypass recovery fakes in tests.
+
+### 7.3 Credential-artifact crash contract
+
+Normal cleanup (`DockerTaskHandle.cleanup` → `cleanup_paths`) covers controlled success /
+failure / timeout / cancellation. But a **center crash after `materialize`** leaves the
+0600 env-file holding `ANTHROPIC_API_KEY` on disk, and recovery does not know
+`cleanup_paths` — they live only in the in-memory `PreparedRun`, never in the persisted
+handle. For a security slice this needs an explicit crash contract:
+
+- **Deterministic path.** The verifier temp-dir is `<verifier_exec_root>/maestro-verify-
+  <execution_id>` under a **stable, dedicated root** (derived from the Maestro db-dir, not
+  ambient `TMPDIR`), with the env-file and cidfile inside it. Recovery recomputes this
+  path from the **trusted `execution_id` alone** — never from any persisted, attacker- or
+  drift-influenced path string.
+- **Shrink the live window (primary).** During the live run the env-file is deleted **as
+  soon as container creation is confirmed** (the cidfile appears — proof `docker run`
+  already parsed `--env-file`). The credential is therefore on disk only during the narrow
+  spawn window (materialize → cidfile), not for the judge's whole runtime.
+- **Recovery closes the spawn window (fail-safe).** `_reconcile_verification_handles`
+  recomputes the temp-dir and, after ownership-checked container reconciliation (or proof
+  the spawn aborted — no container and no cidfile), deletes env-file + cidfile + tmp-dir.
+  If a container is **live but not yet proven to have read** the env-file, the secret file
+  is **preserved** (deleting it could race a still-starting judge); it is removed once the
+  container is proven to exist (read complete) or the spawn is proven aborted. Because the
+  path is derived from our own trusted `execution_id`, deletion never targets a foreign
+  file.
+- **Regression test (required):** simulate a crash after `materialize`/launch that leaves
+  the env-file; assert recovery's container GC removes **both** the container **and** the
+  credential artifacts (env-file/cidfile/tmp-dir).
 
 ---
 
@@ -384,6 +436,15 @@ hidden client that would bypass recovery fakes in tests.
   `terminal`/`collected` row reaches neither general consumer) — parametrized over
   `local`, `verifier-docker`, and an **unknown/future** backend id (which must route
   NEEDS_REVIEW with the handle preserved).
+- **Settled-task reconciliation (required):** a `terminal`/`collected` verification handle
+  whose **task is already `DONE`/`NEEDS_REVIEW`** is still reconciled to `cleaned` by
+  `_reconcile_verification_handles` (owns all open `phase=verification` rows regardless of
+  task status), for both `local` and `verifier-docker` — proving the handle never orphans
+  after exclusion from general GC.
+- **Credential-crash regression (required):** a crash after `materialize`/launch leaves
+  the 0600 env-file at the deterministic path; recovery recomputes it from `execution_id`
+  and removes **both** the container **and** the credential artifacts; plus the live-path
+  assertion that the env-file is gone once the cidfile appears.
 - **Preflight matrix:** each §6.1 halt row (missing key, docker down, image absent, CLI
   missing/non-zero, hardening incompatible) → scheduler start raises/halts; `local`/absent
   → preflight not invoked.
