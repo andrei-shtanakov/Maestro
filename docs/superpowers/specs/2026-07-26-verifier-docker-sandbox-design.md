@@ -1,0 +1,381 @@
+# Strict Docker verifier sandbox — design
+
+**Date:** 2026-07-26
+**Status:** approved (brainstorm), pending Codex review → plan
+**Extends:** Mode-1 adversarial verifier gate (PR #107 / `540b090`, fix #108 / `c05b250`)
+**Slice:** give the Mode-1 verifier judge real OS isolation (filesystem + process), closing
+the one consciously-left limitation of the verifier gate.
+
+---
+
+## 1. Goal & scope
+
+The verifier gate MVP shipped **policy isolation**, not OS isolation: the `claude`
+diff-judge runs on the `local` backend in an empty scratch cwd, with `collect=none`,
+the project path never passed, and `inherit_env=False` — but nothing stops the judge
+process from reading the filesystem. `VerifierConfig.backend` is `Literal["local"]`
+today, with the config seam reserved for exactly this slice.
+
+This slice adds `verifier.backend: docker`: the judge runs in a **hardened, mount-less,
+digest-pinned Docker container**. The judge physically cannot see the repository.
+`verifier.backend: local` (the default, and any config that omits the block) stays
+**byte-identical** to today.
+
+**Honest naming.** This is **filesystem/process isolation, NOT network isolation.**
+The container keeps `--network bridge` (the judge must reach the model). `bridge` grants
+**unrestricted container network** — not merely outbound internet, but potentially the
+host gateway and the local network. We name it that way in docs and config comments;
+network confinement is explicitly out of scope for this slice.
+
+**Out of scope:** SSH+Docker verifier (the isolator is local-transport only this slice);
+a second credential mechanism (mounted key files / `~/.claude`); configurable network;
+Mode-2 domain-verification hardening (Stage B is untouched).
+
+---
+
+## 2. Security contract (the threat model, ratified)
+
+The container:
+
+- does **NOT** bind-mount the project worktree (no `-v workdir:/work`);
+- receives the stdin envelope via `docker run -i`;
+- has a `--read-only` root filesystem;
+- gets a writable scratch **tmpfs** at `/scratch`, owned by the effective user, with
+  `--workdir /scratch`;
+- runs as a **mandatory non-root numeric user** (`uid:gid`), never the image `USER`,
+  never a symbolic name; UID 0 forbidden, GID 0 forbidden;
+- runs with `--cap-drop=ALL`, `--security-opt=no-new-privileges`, and
+  memory / CPU / PID limits;
+- receives exactly **one** secret — `ANTHROPIC_API_KEY` — via a 0600 env-file inside a
+  0700 host temp-dir;
+- is pinned to an **immutable image digest** (`image@sha256:…`); no auto-pull.
+
+Durable lifecycle / recovery / probe stay the **existing** mechanism — no second one.
+
+### 2.1 Credential contract (ratified)
+
+- **Only `ANTHROPIC_API_KEY`.** The name is **not configurable** in this slice — a
+  config-named var would silently become arbitrary-secret passthrough.
+- **Mandatory when `verifier.backend: docker`:** absent → preflight config error, the
+  scheduler does not start (before the first task).
+- **Stripped from the container:** host `HOME`, `USER`, all `CLAUDE_*`, all `GH_*`
+  (already denylisted), all host env, all credential/config directories.
+- **No credential file and no `~/.claude` mounted.**
+- Env-file is 0600 inside a 0700 host temp-dir; the **path** may appear in argv, the
+  **value** never does.
+- Env-file cleanup is **guaranteed** on success, failure, timeout, cancellation, and
+  spawn-failure.
+- Preflight verifies the CLI **without an authenticated model call** (no spend, no
+  credential leak). An authenticated end-to-end smoke is a **separate, opt-in,
+  default-off** test.
+- A future credential-provider mechanism is a separate slice; API-key incompatibility,
+  if it ever surfaces, is a fact for that slice — never a reason to pre-allow mounts here.
+
+### 2.2 Synthetic container environment (ratified refinement)
+
+"No host passthrough" does **not** mean the CLI runs without a home. Maestro supplies
+**safe, synthetic** values (not host values), all pointing inside the writable tmpfs:
+
+```
+HOME=/scratch
+TMPDIR=/scratch
+XDG_CONFIG_HOME=/scratch/.config
+XDG_CACHE_HOME=/scratch/.cache
+```
+
+These are Maestro-authored constants, not host passthrough. `ANTHROPIC_API_KEY` remains
+the only credential. Any `ENV` **baked into the digest-pinned image** is considered part
+of the **trusted image artifact** (the digest is the trust anchor).
+
+---
+
+## 3. Architecture (approach 1 — dedicated hardened builder, shared lifecycle)
+
+The judge already runs through the transport-agnostic execution layer
+(`ClaudeDiffJudge` → `ExecutionRequest` → backend), so `ClaudeDiffJudge` needs **no
+change**. Only the *argv/mount/stdin construction* genuinely differs from the general
+`DockerIsolator`; the *durable machinery* is reused verbatim.
+
+### 3.1 Reused verbatim (no fork)
+
+- `DockerTaskHandle` — container lifecycle (stop/kill/rm, ownership-checked cleanup);
+- `DockerCli` — the docker CLI wrapper;
+- `docker_recovery` (`labels_match`, container probe);
+- the durable execution handle + `finalize_handle` + cleanup path;
+- `ClaudeDiffJudge` — already backend-agnostic (`capture_output=False` full-stdout read
+  from `output_log_path`, CLI-envelope unwrap, transport/semantic split).
+
+For recovery to genuinely stay shared, the `VerifierDockerIsolator` hands
+`DockerTaskHandle` the **same canonical label set and cleanup paths** the general
+`DockerIsolator` does.
+
+### 3.2 Verifier-only launch policy (`VerifierDockerIsolator`, new)
+
+A new isolator that builds a hardened, mount-less, stdin-attached argv but wraps the
+result in the **same** `DockerTaskHandle`. Differences from `DockerIsolator`:
+
+| aspect | general `DockerIsolator` | `VerifierDockerIsolator` |
+|---|---|---|
+| workspace | `-v workdir:/work`, `-w /work` | **no mount**, `--workdir /scratch` |
+| scratch | (workdir mount) | `--tmpfs /scratch:rw,nosuid,nodev,noexec,size=<n>,mode=0700,uid=<uid>,gid=<gid>` |
+| stdin | none | `-i` (envelope on stdin) |
+| root fs | writable | `--read-only` |
+| caps | default | `--cap-drop=ALL` |
+| privileges | default | `--security-opt=no-new-privileges` |
+| user | optional | **mandatory** numeric `--user uid:gid` |
+| PID limit | none | `--pids-limit <n>` |
+| env | req.env + trace | synthetic HOME/TMPDIR/XDG_* + trace |
+| secret | secret_env list | exactly `ANTHROPIC_API_KEY` via `--env-file` |
+| network | config | fixed `--network bridge` |
+| image | tag or digest | **digest-only** (`image@sha256:…`) |
+
+The hardening flags are **not config fields** — they cannot be turned off.
+
+### 3.3 Identity separation
+
+- External config says `backend: docker`, but the **internal backend ID is
+  `verifier-docker`**, so the persisted handle can never collide with the general
+  `docker` backend's identity/recovery. The persisted handle is self-sufficient.
+- **`verifier-docker` is NOT registered in `ExecutionConfig.normalized()` or the general
+  `BackendResolver`** — it is never task-selectable. A coding task can never accidentally
+  run mount-less. It is reachable **only** via `VerifierConfig`, through the single
+  factory below.
+
+### 3.4 The single factory
+
+```python
+def build_verifier_backend(
+    verifier_cfg: VerifierConfig, *, docker_cli: DockerCli | None = None
+) -> ExecutionBackend
+```
+
+Used by **both** dispatch (`scheduler._run_verifier`) and recovery
+(`_recover_verifying_tasks`), guaranteeing they construct an identical backend (same
+`backend_id`, same isolator, same `accepts_ref` identity):
+
+- `verifier_cfg.backend == "local"` → an ordinary `LocalBackend`, id `"local"`
+  (today's behavior, unchanged);
+- `verifier_cfg.backend == "docker"` → `LocalBackend(VerifierDockerIsolator(...),
+  backend_id="verifier-docker", docker=<cli>)`, sharing the injected `DockerCli`, its
+  `probe()` and `accepts_ref()`.
+
+The factory **never silently creates its own `DockerCli`** — in tests dispatch and
+recovery must be able to inject one shared fake, or recovery fakes would be bypassed.
+(A `None` `docker_cli` builds a real one only in production.)
+
+---
+
+## 4. Config surface
+
+### 4.1 `VerifierConfig` (`maestro/models.py`, extended)
+
+```python
+class VerifierConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    runner: Literal["claude"] = "claude"
+    model: str | None = None
+    timeout_seconds: int = Field(default=120, ge=1)
+    max_diff_bytes: int = Field(default=100_000, ge=1)
+    backend: Literal["local", "docker"] = "local"
+    docker: VerifierDockerConfig | None = None
+```
+
+Cross-field validation (`model_validator`):
+- `backend == "docker"` **requires** a `docker` block → else config error;
+- `backend == "local"` with a `docker` block → config error (no dead config that
+  silently does nothing).
+
+### 4.2 `VerifierDockerConfig` (`maestro/verifier/docker_config.py`, new)
+
+```python
+class VerifierDockerConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    image: str                       # MANDATORY, must be image@sha256:<64-hex>
+    user: str                        # MANDATORY, numeric "uid:gid"; uid != 0, gid != 0
+    memory: str = "512m"             # secure default, bounded
+    cpus: str = "1"                  # secure default, bounded
+    pids_limit: int = 128            # secure default, bounded
+    tmpfs_size: str = "64m"          # secure default, bounded
+    # network is NOT a field — fixed to "bridge" this slice.
+    # hardening flags are NOT fields — baked, not disableable.
+```
+
+**Validation (tuning must never disable isolation — ratified refinement).** Overridable
+defaults may not be turned into "unlimited":
+
+- `image`: must match `^[^@\s]+@sha256:[0-9a-f]{64}$` (digest-pinned; a bare tag is
+  rejected).
+- `user`: must match `^\d+:\d+$`; UID `!= 0` **and** GID `!= 0` (strict non-root).
+- `memory`: a positive Docker size (`^\d+(b|k|m|g)$`, case-insensitive), with a sane
+  **upper bound** (e.g. ≤ `8g`); zero / empty / `0` rejected.
+- `cpus`: a positive decimal `> 0` with an upper bound (e.g. ≤ `8`); `0` / negative
+  rejected.
+- `pids_limit`: a bounded positive int (e.g. `1..4096`); `0` and `-1` (docker's
+  "unlimited") rejected.
+- `tmpfs_size`: a positive Docker size with a **minimum** sufficient for the CLI (e.g.
+  ≥ `16m`) and a bounded maximum (e.g. ≤ `1g`).
+
+Exact bounds are finalized in the plan; the invariant is: **no value may express
+"no limit."**
+
+---
+
+## 5. Production launch argv
+
+Built by `VerifierDockerIsolator.prepare` (pure, no I/O), materialized (tmp-dir 0700 +
+env-file 0600) exactly as `DockerIsolator` does:
+
+```
+docker run -i
+  --name maestro-<execution_id>
+  --cidfile <tmp>/cid
+  --read-only
+  --tmpfs /scratch:rw,nosuid,nodev,noexec,size=<tmpfs_size>,mode=0700,uid=<uid>,gid=<gid>
+  --workdir /scratch
+  --cap-drop=ALL
+  --security-opt=no-new-privileges
+  --user <uid>:<gid>
+  --memory <memory> --cpus <cpus> --pids-limit <pids_limit>
+  --network bridge
+  --env-file <tmp>/env                # contains only ANTHROPIC_API_KEY
+  -e HOME=/scratch -e TMPDIR=/scratch
+  -e XDG_CONFIG_HOME=/scratch/.config -e XDG_CACHE_HOME=/scratch/.cache
+  -e <trace-env...>
+  --label maestro.execution_id=<id>
+  --label maestro.entity_kind=task --label maestro.entity_id=<run_id>
+  --label maestro.attempt=<n> --label maestro.backend_id=verifier-docker
+  <image@sha256:...>
+  claude -p <JUDGE_PROMPT> --output-format json --model <resolved_model>
+```
+
+Notes:
+- **No `-v` mount.** The judge sees only the tmpfs; the diff arrives inside the stdin
+  envelope (already frozen upstream by `build_envelope`, Task 6 of the gate).
+- `capture_output=False` (set by `ClaudeDiffJudge._build_request`) is preserved: the
+  attached `docker run` process's stdout is the container's stdout, written in full to
+  `execution.output_log_path` — the full-stdout read + CLI-envelope unwrap keep working.
+- `entity_kind`/`attempt`/labels/cleanup-paths mirror the general `DockerIsolator` so
+  `docker_recovery.labels_match` and `DockerTaskHandle.cleanup` are reused unchanged.
+
+---
+
+## 6. Preflight (approach 2 — eager, global fail-loud halt)
+
+Runs at scheduler start, extending `Scheduler._check_verifier_model`, **only when a
+`verifier:` block is present with `backend == "docker"`**. `backend: local` or an absent
+block → **no Docker preflight at all** (today's cheap in-process model check unchanged).
+
+### 6.1 Halt matrix (every row = hard global fail-loud; scheduler does not start)
+
+| condition | outcome |
+|---|---|
+| `ANTHROPIC_API_KEY` absent from env | config/preflight error, no start |
+| Docker unreachable | halt |
+| image digest absent locally | halt (**no auto-pull**) |
+| `claude` missing / `claude --version` non-zero | halt |
+| hardened flags incompatible with image/runtime | halt |
+| verifier block absent, or `backend: local` | Docker preflight not run |
+
+Silent gate-disable is forbidden: the user explicitly requested the sandbox; continuing
+without it changes run semantics and creates a false sense of protection.
+
+### 6.2 Probe shape
+
+- **Identical security profile, NOT byte-identical argv.** The probe reuses the same
+  `VerifierDockerIsolator`/security-profile builder (`--read-only`, tmpfs+`noexec`,
+  non-root user, cap-drop, no-new-privileges, limits), but:
+  - probe: `--rm` + command `claude --version`;
+  - production: durable `--name`/`--cidfile`/labels, `-i`, `--env-file`, judge command.
+- The probe runs **without `ANTHROPIC_API_KEY` and without the env-file** — a version
+  check must never receive a credential.
+- Probe container gets a **unique name/label** and **guaranteed cleanup even on timeout**.
+- A **short, dedicated preflight timeout** (separate from `verifier.timeout_seconds`).
+- The **inspected image ID** (resolved from the digest) is recorded in the launch/start
+  event for audit.
+
+### 6.3 noexec proof boundary
+
+`claude --version` proves only that the CLI **starts** under `--read-only` + `noexec`
+tmpfs + non-root. It does **not** prove the authenticated code path never lazily unpacks
+an executable into `/scratch`. Full `noexec` proof stays with the **opt-in authenticated
+smoke** (§8). If that smoke ever fails under `noexec`, `noexec` is **not** silently
+dropped — it forces an explicit threat-model decision.
+
+---
+
+## 7. Recovery contract
+
+Two seams change; the shared probe boundary and fail-closed semantics are preserved.
+
+### 7.1 Open-handle filter flip
+
+The general open-handle recovery loop is kept off verification handles today only because
+it filters `backend_id == "local"` (`recovery.py:218-221`). That is a historical
+heuristic. **Replace it outright** with `execution_phase == "verification"** — a
+persistent semantic discriminator. (A union of the two would leave competing
+classifications and could again wrongly exclude an ordinary `local` task handle.) All
+`execution_phase == "verification"` handles are excluded from the general loop
+**regardless of backend id**.
+
+### 7.2 `_recover_verifying_tasks` is the sole owner of verification recovery
+
+For each `VERIFYING` task's `execution_phase='verification'` handle:
+
+1. check the handle's `backend_id` against the **current** `VerifierConfig`;
+2. build the backend via `build_verifier_backend` (the same factory dispatch used);
+3. call **`accepts_ref()` before `probe()`**;
+4. **mismatch / missing config / unknown verifier backend / build-or-probe error / live
+   result** → task routed to **NEEDS_REVIEW**, the handle **left open** (preserved);
+5. a **proven terminal/cleaned** reconciliation closes the handle and opens the guarded
+   `maestro retry` requeue fence per the existing contract.
+
+Task-status routing itself is unchanged from the gate: a mid-`VERIFYING` crash is always
+fail-closed to NEEDS_REVIEW (never auto-re-run); handle reconciliation only decides when
+the requeue fence may clear.
+
+Dispatch and recovery share one **injectable** `DockerCli`; the factory never creates a
+hidden client that would bypass recovery fakes in tests.
+
+---
+
+## 8. Testing
+
+- **Unit — argv builder:** exact-flag assertions for the **production** argv (§5) and the
+  **probe** argv (§6.2), including the tmpfs `mode/uid/gid`, synthetic env, digest image,
+  labels, and cleanup paths. Assert **no `-v` mount** and **no host HOME/USER/CLAUDE_*/GH_*.**
+- **Unit — config validation:** digest form; numeric `uid:gid` with uid≠0/gid≠0;
+  memory/cpus/pids_limit/tmpfs bounds reject "unlimited" and out-of-range; backend/docker
+  cross-field rules.
+- **Unit — factory:** `local` → `LocalBackend` id `local`; `docker` → id `verifier-docker`
+  with the injected `DockerCli`; verifier-docker absent from the general resolver registry.
+- **Recovery guard test (required):** every open verification handle is processed
+  **exactly once** by phase-specific recovery and **never** by the general loop —
+  parametrized over `local`, `verifier-docker`, and an **unknown/future** backend id
+  (which must route NEEDS_REVIEW with the handle preserved).
+- **Preflight matrix:** each §6.1 halt row (missing key, docker down, image absent, CLI
+  missing/non-zero, hardening incompatible) → scheduler start raises/halts; `local`/absent
+  → preflight not invoked.
+- **Integration (docker-gated, skip-if-no-docker):** read-only root actually blocks a
+  write; non-root uid enforced (`id -u` ≠ 0); stdin envelope delivered through `-i`;
+  `claude --version` runs under `noexec`; env-file + container cleaned on success and on
+  timeout; probe container cleaned even on timeout.
+- **Opt-in authenticated smoke (default-off, marker-gated):** a real judge run end-to-end
+  proving the authenticated code path works under `noexec` (the full §6.3 proof).
+
+All docker/integration tests are gated behind a skip-if-no-docker marker; the default
+suite (no Docker) stays green. Per house rule: pytest runs **foreground only**, and any
+test opening a DB closes its connection.
+
+---
+
+## 9. Non-goals / invariants preserved
+
+- `verifier.backend: local` (default) and any config without a `verifier:` block are
+  **byte-identical** to post-#108 behavior — no new phase, no Docker, no preflight.
+- Stage B (Mode-2 domain verification, `maestro/domain/`) is **untouched** (frozen;
+  additive-only rule holds).
+- `ClaudeDiffJudge`, the verdict/provider-binding contract, and the `VERIFYING` FSM are
+  unchanged — this slice only swaps the backend the judge runs on and adds preflight +
+  recovery resolution for the new backend id.
+- The single isolation-aware `backend.probe()` boundary is preserved; no direct
+  `DockerCli` probing outside it.
