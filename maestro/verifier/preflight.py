@@ -16,7 +16,11 @@ import contextlib
 import uuid
 from typing import TYPE_CHECKING
 
-from maestro.verifier.docker_backend import ANTHROPIC_ENV_KEY, _security_flags
+from maestro.verifier.docker_backend import (
+    ANTHROPIC_ENV_KEY,
+    _security_flags,
+    _synthetic_env,
+)
 
 
 if TYPE_CHECKING:
@@ -27,6 +31,7 @@ if TYPE_CHECKING:
 
 _FORBIDDEN_CHARS = ("\x00", "\r", "\n")
 _PROBE_NAME_PREFIX = "maestro-verify-preflight"
+_INSPECT_TIMEOUT_S = 10.0
 
 
 class VerifierPreflightError(RuntimeError):
@@ -79,6 +84,15 @@ async def run_verifier_docker_preflight(
 
     name = f"{_PROBE_NAME_PREFIX}-{uuid.uuid4().hex}"
     uid, gid = cfg.user.split(":")
+    # Reproduce production's runtime env (synthetic HOME/TMPDIR/XDG_* -> the
+    # writable /scratch tmpfs). Without these, `claude --version` could fail
+    # under --read-only (no writable HOME) even though the real judge, which
+    # DOES set them, would succeed — a false-negative preflight halt. These
+    # are Maestro-authored constants, not credentials, so the probe stays
+    # credential-free.
+    synthetic_env_flags: list[str] = []
+    for key, value in _synthetic_env().items():
+        synthetic_env_flags += ["-e", f"{key}={value}"]
     argv = [
         "docker",
         "run",
@@ -88,6 +102,7 @@ async def run_verifier_docker_preflight(
         "--label",
         "maestro.verify_preflight=1",
         *_security_flags(cfg, uid, gid),
+        *synthetic_env_flags,
         cfg.image,
         "claude",
         "--version",
@@ -143,21 +158,32 @@ async def _run_version_probe(
 async def _inspect_image_id(image: str) -> str:
     """`docker image inspect --format {{.Id}}` for the audit log line.
 
-    Best-effort: a failure here would be surprising (the earlier
-    `image_exists` check just confirmed the image is present) but is not
-    itself a halt row, so any non-zero exit yields "" rather than raising.
+    Strictly best-effort: it must NEVER raise or hang (it is not a halt row —
+    the preflight has already passed by the time it runs). Any failure —
+    the docker binary missing (`FileNotFoundError`), a stalled daemon
+    (timeout), or a non-zero exit — yields "" rather than turning an audit
+    step into a hard failure.
     """
-    proc = await asyncio.create_subprocess_exec(
-        "docker",
-        "image",
-        "inspect",
-        "--format",
-        "{{.Id}}",
-        image,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    out, _ = await proc.communicate()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            image,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except Exception:
+        return ""
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=_INSPECT_TIMEOUT_S)
+    except Exception:
+        with contextlib.suppress(Exception):
+            proc.kill()
+            await proc.wait()
+        return ""
     if proc.returncode != 0:
         return ""
     return out.decode("utf-8", "replace").strip()

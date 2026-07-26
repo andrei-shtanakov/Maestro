@@ -174,3 +174,44 @@ async def test_absent_verifier_skips_docker_preflight(monkeypatch):
     sch._verifier = None
 
     await sch._check_verifier_model()  # must return cleanly, no AssertionError
+
+
+async def test_probe_argv_carries_synthetic_env_but_no_credential(monkeypatch):
+    """The `claude --version` probe reproduces production's synthetic runtime
+    env (HOME/TMPDIR/XDG_* -> the writable /scratch tmpfs) so it can't
+    false-halt under --read-only, while never receiving the credential
+    (spec §6.2)."""
+    import maestro.verifier.preflight as preflight
+
+    captured: dict[str, list[str]] = {}
+
+    async def _fake_probe(argv, *, docker, name, timeout_s):
+        captured["argv"] = argv
+
+    async def _fake_inspect(image):
+        return "sha256:deadbeef"
+
+    monkeypatch.setattr(preflight, "_run_version_probe", _fake_probe)
+    monkeypatch.setattr(preflight, "_inspect_image_id", _fake_inspect)
+
+    await run_verifier_docker_preflight(
+        _cfg(),
+        docker=_FakeDocker(),  # type: ignore[arg-type]
+        env={"ANTHROPIC_API_KEY": "sk-x"},
+    )
+
+    argv = captured["argv"]
+    joined = " ".join(argv)
+    # production runtime env is reproduced
+    assert "HOME=/scratch" in argv
+    assert "TMPDIR=/scratch" in argv
+    assert "XDG_CONFIG_HOME=/scratch/.config" in argv
+    assert "XDG_CACHE_HOME=/scratch/.cache" in argv
+    # still hardened, still runs the version probe
+    assert "--read-only" in argv
+    assert argv[-2:] == ["claude", "--version"]
+    # credential-free: no key value, no env-file, no interactive stdin
+    assert "sk-x" not in joined
+    assert "ANTHROPIC_API_KEY" not in joined
+    assert "--env-file" not in argv
+    assert "-i" not in argv
