@@ -1980,12 +1980,26 @@ class Orchestrator:
         """Resume an ex-post-approved workstream at the ex-post edge (H-6).
 
         True only when the worktree still exists AND sits exactly at the
-        approved sha; then the workstream goes READY -> RUNNING (explicitly
-        clearing both pids so recovery never mistakes it for a live orphan)
-        and re-enters the success continuation — ex-post re-evaluates,
-        passes via the approval memory, and the normal MERGING -> PR ->
-        merge -> DONE tail runs. False = caller proceeds with the full
-        respawn (the approval is genuinely void, DESIGN-608).
+        approved sha. What happens next forks on whether domain verification
+        is active (`self._config.domain is not None`, same activation check
+        `_handle_success` uses):
+
+        - Legacy (no domain profile): READY -> RUNNING (explicitly clearing
+          both pids so recovery never mistakes it for a live orphan) and
+          re-enters the success continuation — ex-post re-evaluates, passes
+          via the approval memory, and the normal MERGING -> PR -> merge ->
+          DONE tail runs.
+        - Domain profile active: the operator only approved the *ex-post
+          scope/tier gate*, not the domain verifier — jumping straight to
+          the merge tail would deliver an artifact that was never verified
+          (the §4 invariant is MERGING reachable only through VERIFYING).
+          So instead: READY -> VERIFYING, and `_run_verification` takes over
+          from there (PASS -> finalization -> merge tail; FAIL/ERROR -> their
+          normal rework/reverify/NEEDS_REVIEW routes), exactly as for any
+          other VERIFYING entry.
+
+        False = caller proceeds with the full respawn (the approval is
+        genuinely void, DESIGN-608).
         """
         if not self._workspace_mgr.workspace_exists(workstream.id):
             self._logger.warning(
@@ -2006,6 +2020,44 @@ class Orchestrator:
                 marker.sha[:12],
             )
             return False
+
+        if self._config.domain is not None:
+            # The marker's job — skip re-gating the already-approved ex-post
+            # escape — is done now that we're resuming past the gate into
+            # VERIFYING. Clear it HERE, atomically with the status write,
+            # rather than preserving it to DONE the way the legacy tail
+            # does: unlike the legacy tail (a straight shot to MERGING), the
+            # VERIFYING loop can cycle this workstream back through READY
+            # multiple times (FAIL-with-budget rework, ERROR-budget-exhausted
+            # reverify), and `_spawn_workstream` checks THIS SAME marker+sha
+            # before it ever looks at `resume_reason`. A separate follow-up
+            # write would leave a crash window between the two: transition
+            # lands, process dies before the marker clears, and the next
+            # rework/reverify READY dispatch is hijacked straight back into
+            # this ex-post path — silently skipping the author respawn /
+            # reverify bookkeeping those paths exist for. A single CAS write
+            # closes that window. Also clear `process_pid`/`generation_pid`
+            # here: a gate-blocked workstream can carry stale pids through
+            # NEEDS_REVIEW -> READY (`approve_workstream_with_gate_record`
+            # doesn't touch them), and leaving them set risks recovery
+            # mistaking this VERIFYING entry for a live orphan.
+            await self._transition(
+                workstream.id,
+                WorkstreamStatus.VERIFYING,
+                expected_status=WorkstreamStatus.READY,
+                error_message=None,
+                process_pid=None,
+                generation_pid=None,
+            )
+            self._logger.info(
+                "Resuming workstream '%s' at the ex-post gate into VERIFYING "
+                "(domain profile active, approved sha %s)",
+                workstream.id,
+                marker.sha[:12],
+            )
+            await self._run_verification(workstream.id, workspace)
+            return True
+
         await self._transition(
             workstream.id,
             WorkstreamStatus.RUNNING,
