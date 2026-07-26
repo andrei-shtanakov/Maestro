@@ -1994,6 +1994,35 @@ class Database:
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
+    async def get_open_verification_handles(self) -> list[dict[str, Any]]:
+        """Return all open verification-phase handles (any backend, any task
+        status) — the phase-specific recovery owner's input (spec §7).
+
+        Unlike `get_open_execution_handles` (which filters `backend_id !=
+        'local'`), this returns `execution_phase = 'verification'` rows for
+        every backend, so a `local` verifier handle is never dropped.
+
+        Raises:
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+
+        cursor = await self._connection.execute(
+            """
+            SELECT execution_id, entity_kind, entity_id, attempt, backend_id,
+                   transport_ref, state, created_at, finished_at,
+                   remote_host, remote_dir, status_marker, collected_at,
+                   execution_phase
+            FROM execution_handles
+            WHERE state IN ('prepared', 'running', 'terminal', 'collected')
+              AND execution_phase = 'verification'
+            """
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
     async def get_execution_handle(
         self,
         *,
