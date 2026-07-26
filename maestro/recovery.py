@@ -8,8 +8,11 @@ no auto re-run; see `_recover_verifying_tasks`) for re-execution/review.
 """
 
 import logging
+import shutil
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, cast
 
 from maestro.coordination.arbiter_errors import ArbiterUnavailable
@@ -20,6 +23,7 @@ from maestro.coordination.routing import (
 )
 from maestro.database import Database
 from maestro.event_log import Event, EventType, get_event_logger
+from maestro.execution.backend import ExecutionBackend
 from maestro.execution.docker_cli import DockerCli
 from maestro.execution.docker_recovery import (
     GC_CLEAN_OUTCOMES,
@@ -32,7 +36,14 @@ from maestro.execution.resolver import BackendResolver, ExecutionConfigError
 from maestro.execution.ssh_backend import SshBackend
 from maestro.execution.ssh_launch import decode_transport_ref
 from maestro.execution.ssh_recovery import gc_ssh_terminal
-from maestro.models import Task, TaskOutcome, TaskOutcomeStatus, TaskStatus
+from maestro.models import (
+    Task,
+    TaskOutcome,
+    TaskOutcomeStatus,
+    TaskStatus,
+    VerifierConfig,
+)
+from maestro.verifier.docker_backend import build_verifier_backend
 
 
 logger = logging.getLogger(__name__)
@@ -105,6 +116,7 @@ class StateRecovery:
         db: Database,
         docker: DockerProbe | None = None,
         execution: ExecutionConfig | None = None,
+        verifier: VerifierConfig | None = None,
     ) -> None:
         """Initialize state recovery.
 
@@ -115,18 +127,34 @@ class StateRecovery:
                 Injectable for tests; defaults to a real `DockerCli()`. Also
                 wired into the `BackendResolver` as `local_docker` so a
                 resolved local-docker backend's `probe()` hits this same
-                client instead of a fresh, un-injectable one.
+                client instead of a fresh, un-injectable one. This same
+                client is passed as the `docker_cli` for the verifier-docker
+                backend factory (`_verifier_backend_for`), so verification
+                recovery never spins up a second, un-injectable `DockerCli`.
             execution: Execution-backends config (the `execution:` block)
                 used to resolve each open handle's persisted `backend_id`
                 to its `ExecutionBackend` for probing. `None` keeps the
                 zero-config local/bare path (only `backends["local"]`
                 resolvable).
+            verifier: Opt-in adversarial-verifier-gate config (the
+                `verifier:` block). `None` keeps `_reconcile_verification_
+                handles` fail-closed for any non-local verification
+                handle it finds (no config to build a backend from —
+                preserve, never guess). Required to reconcile a
+                `verifier-docker` `prepared`/`running` handle.
         """
         self._db = db
         self._docker = docker or DockerCli()
         self._backends = BackendResolver(
             execution, mode="scheduler", local_docker=cast("DockerCli", self._docker)
         )
+        self._verifier = verifier
+        # Dedicated root for the verifier judge's execution scratch state,
+        # derived identically to the scheduler (`Scheduler._verifier_exec_
+        # root`) from the DB's own directory — so dispatch and recovery are
+        # guaranteed to agree on the same path without either side
+        # hard-coding or independently passing it in.
+        self._verifier_exec_root = Path(self._db.db_path).parent / "verifier-exec"
 
     async def recover(
         self, routing: RoutingStrategy | None = None
@@ -160,6 +188,21 @@ class StateRecovery:
         """
         open_handles = await self._db.get_open_execution_handles()
 
+        # Split off verification-phase handles ONCE, right up front: they
+        # are owned end-to-end by `_reconcile_verification_handles` (spec
+        # §7) and must never reach the general per-phase loop below NOR
+        # `_gc_terminal_handles` — a `verifier-docker` handle's `backend_id`
+        # is non-local, so it WOULD otherwise flow through both (the bug
+        # this task fixes: the general GC sweep doesn't know the
+        # verifier-docker container-naming/label convention and could
+        # mis-clean it, or leave it stranded outside the phase-specific
+        # state matrix).
+        general_handles = [
+            h
+            for h in open_handles
+            if h.get("execution_phase", "task") != "verification"
+        ]
+
         # Filter to prepared/running/terminal/collected, and split by
         # execution_phase: a task can have both a stale terminal row (prior
         # attempt, cleanup unconfirmed) and a fresh running row (current
@@ -181,7 +224,7 @@ class StateRecovery:
         def _by_phase(phase: str) -> dict[str, dict[str, Any]]:
             candidates = [
                 h
-                for h in open_handles
+                for h in general_handles
                 if h["entity_kind"] == "task"
                 and h["state"] in ("prepared", "running", "terminal", "collected")
                 and h.get("execution_phase", "task") == phase
@@ -209,19 +252,23 @@ class StateRecovery:
         validating_handles = {**task_phase, **validation_phase}
         validating_recovered = await self._recover_validating_tasks(validating_handles)
 
+        # Phase-specific owner of ALL open verification handles (any task
+        # status, any backend) — see `_reconcile_verification_handles`.
+        # Runs independently of task-status routing below: a verification
+        # handle can be open whether its task is still VERIFYING, already
+        # NEEDS_REVIEW, or even DONE/ABANDONED (finalize ran but the handle
+        # cleanup confirmation never landed).
+        await self._reconcile_verification_handles()
+
         # Recover VERIFYING tasks: fail-closed, no auto re-run (spec §8) —
-        # every task found here always routes to NEEDS_REVIEW. Unlike
-        # task_phase/validation_phase above, the verification handle is
-        # looked up per-task via `get_execution_handle` rather than from
-        # `open_handles`: the verifier gate always runs on the `"local"`
-        # backend (`_run_verifier_gate` resolves `"local"` unconditionally),
-        # and `get_open_execution_handles` filters out `backend_id ==
-        # 'local'` rows entirely (see its docstring) — the exact-key lookup
-        # is the one that still finds it.
+        # every task found here always routes to NEEDS_REVIEW. Pure FSM
+        # routing only; handle reconciliation is owned entirely by
+        # `_reconcile_verification_handles` above.
         verifying_recovered = await self._recover_verifying_tasks()
 
         # Best-effort GC of leftover containers for settled entities.
-        await self._gc_terminal_handles(open_handles)
+        # `general_handles` excludes verification-phase rows (owned above).
+        await self._gc_terminal_handles(general_handles)
 
         if routing is not None:
             await recover_arbiter_outcomes(self._db, routing)
@@ -314,20 +361,12 @@ class StateRecovery:
         straight to NEEDS_REVIEW (VERIFYING has a direct edge to
         NEEDS_REVIEW; see the `TaskStatus` state diagram) — a stranded
         verifier gate has no resumable checkpoint, and the judge subprocess
-        (always the `"local"` backend, per `_run_verifier_gate`) may still
-        be alive.
+        may still be alive.
 
-        The task's `execution_phase='verification'` handle is looked up by
-        exact key via `Database.get_execution_handle` (mirrors the
-        VALIDATING branch's phase-preferring handle selection, generalized
-        to a backend that `get_open_execution_handles` never surfaces —
-        see `recover()`'s docstring) using `attempt=task.retry_count + 1`,
-        the same attempt number `_run_verifier_gate` mints the handle with
-        (retry_count is not bumped between minting the handle and either
-        outcome reaching NEEDS_REVIEW). When found, it is reconciled via
-        `_reconcile_verifying_handle` — closed immediately if provably
-        safe, left open otherwise for the terminal-handle GC sweep or an
-        operator to resolve.
+        Pure FSM routing only — this method never looks up or touches the
+        task's verification handle; that ownership belongs entirely to
+        `_reconcile_verification_handles` (spec §7), called independently
+        by `recover()` regardless of task status.
 
         Returns:
             Number of tasks routed to NEEDS_REVIEW.
@@ -335,15 +374,6 @@ class StateRecovery:
         verifying_tasks = await self._db.get_tasks_by_status(TaskStatus.VERIFYING)
 
         for task in verifying_tasks:
-            row = await self._db.get_execution_handle(
-                entity_kind="task",
-                entity_id=task.id,
-                execution_phase="verification",
-                attempt=task.retry_count + 1,
-            )
-            if row is not None:
-                await self._reconcile_verifying_handle(row)
-
             message = (
                 "recovery: task stranded in VERIFYING at scheduler restart "
                 "— fail-closed, no auto re-run (spec §8)"
@@ -359,47 +389,135 @@ class StateRecovery:
 
         return len(verifying_tasks)
 
-    async def _reconcile_verifying_handle(self, row: dict[str, Any]) -> None:
-        """Close a leaked verification handle when provably safe.
+    async def _reconcile_verification_handles(self) -> None:
+        """Own ALL open verification handles regardless of task status/backend.
 
-        Never influences task-status routing — `_recover_verifying_tasks`
-        always ends in NEEDS_REVIEW regardless of this outcome.
+        The single reconciliation owner for `execution_phase='verification'`
+        rows (spec §7.2 state matrix) — split out of `open_handles` and
+        never touched by the general per-phase loop or `_gc_terminal_
+        handles` (see `recover()`). Queries `Database.get_open_verification_
+        handles` (the plural, all-backend query — NOT the singular
+        per-task requeue-fence lookup) so a `local` verifier handle is
+        reconciled here too, not just `verifier-docker`.
 
-        - `terminal`/`collected`: `finalize_handle`'s `wait()` already
-          confirmed the judge subprocess exited before either state is
-          reached, so it is safe to mark `cleaned` directly (mirrors
-          `_close_handle`'s terminal->cleaned step; no probe needed).
-        - `prepared`/`running`: probed via the same isolation-aware
-          `backend.probe()` boundary as `_route_open_handle_to_review`. Any
-          resolve/`accepts_ref`/probe failure, or a live result, leaves the
-          handle open; only a confirmed-dead probe closes it.
-        - any other state (already `cleaned`, or unrecognized): no-op.
+        - `prepared`/`running`: build the matching verifier backend via
+          `_verifier_backend_for`, `accepts_ref()` BEFORE `probe()`; any
+          unresolved backend, rejected ref, or probe error, or a live
+          result, PRESERVES the handle open. Only a confirmed-dead probe
+          closes it.
+        - `terminal`/`collected`, `local` backend: `finalize_handle`'s
+          `wait()` already confirmed the judge subprocess exited before
+          either state is reached, so mark `cleaned` directly — no Docker
+          GC, no container/credential artifact.
+        - `terminal`/`collected`, `verifier-docker` backend:
+          ownership-checked `gc_terminal_handle`, then credential-artifact
+          cleanup (spec §7.3), then `cleaned`. A non-clean GC outcome or
+          any exception PRESERVES the handle (fail-closed) for the next
+          sweep.
         """
+        rows = await self._db.get_open_verification_handles()
+        for row in rows:
+            await self._reconcile_one_verification_handle(row)
+
+    async def _reconcile_one_verification_handle(self, row: dict[str, Any]) -> None:
+        """Reconcile a single open verification-phase handle (see
+        `_reconcile_verification_handles` for the full state matrix)."""
         state = row["state"]
+        backend_id = row["backend_id"]
+
+        if state in ("prepared", "running"):
+            backend = self._verifier_backend_for(row)
+            if backend is None:
+                return  # unknown/mismatch/no-config -> preserve
+            ref = handle_ref_from_row(row)
+            if not backend.accepts_ref(ref):
+                return
+            try:
+                result = await backend.probe(ref)
+            except Exception:
+                return
+            if not result.needs_review:
+                await self._close_handle(row["execution_id"])
+            return
+
         if state in ("terminal", "collected"):
+            if backend_id == "verifier-docker":
+                try:
+                    outcome = await gc_terminal_handle(row, self._docker)
+                except Exception:
+                    return
+                if outcome not in GC_CLEAN_OUTCOMES:
+                    return  # preserve for next sweep
+                self._cleanup_credential_artifacts(row["execution_id"])
+            elif backend_id != "local":
+                # Unknown verification backend (neither local nor
+                # verifier-docker): preserve rather than mark cleaned, mirroring
+                # `_gc_terminal_handles`'s fail-closed stance on unresolvable
+                # backends. Unreachable today (only those two mint verification
+                # handles) — defense-in-depth against a future backend id.
+                return
             await self._db.mark_execution_state(
                 row["execution_id"], "cleaned", allowed_from=[state]
             )
-            return
-        if state not in ("prepared", "running"):
-            return
 
+    def _verifier_backend_for(self, row: dict[str, Any]) -> ExecutionBackend | None:
+        """Resolve the verifier backend for a persisted row.
+
+        `backend_id == "local"` resolves via the plain `BackendResolver`
+        unconditionally — the verifier gate's `"local"` backend IS the
+        general local execution backend, with no verifier-specific sandbox
+        config to drift, so this needs no `VerifierConfig` at all (mirrors
+        pre-Task-8 behavior byte-for-byte: a dead-pid local verification
+        handle is still reconcilable even when the caller passed no
+        `verifier=` — e.g. `maestro run --resume` recovering a task whose
+        project config since dropped its `verifier:` block).
+
+        `backend_id == "verifier-docker"` requires the shared
+        `build_verifier_backend` factory AND a `VerifierConfig` whose
+        `backend` is `"docker"` — config drift (missing config, or config
+        now says `"local"`) means `None` (caller preserves, fail-closed).
+
+        Any other `backend_id`, or a factory/resolve failure, is `None`.
+        """
+        backend_id = row["backend_id"]
+        if backend_id == "local":
+            try:
+                return self._backends.resolve("local")
+            except ExecutionConfigError:
+                return None
+        if backend_id != "verifier-docker":
+            return None
+        if self._verifier is None or self._verifier.backend != "docker":
+            return None
         try:
-            backend = self._backends.resolve(row["backend_id"])
-        except ExecutionConfigError:
-            return
-
-        ref = handle_ref_from_row(row)
-        if not backend.accepts_ref(ref):
-            return
-
-        try:
-            result = await backend.probe(ref)
+            return build_verifier_backend(
+                self._verifier,
+                local_backend=self._backends.resolve("local"),
+                exec_root=self._verifier_exec_root,
+                docker_cli=cast("DockerCli", self._docker),
+            )
         except Exception:
+            return None
+
+    def _cleanup_credential_artifacts(self, execution_id: str) -> None:
+        """Delete the deterministic verifier temp-dir (env-file/cidfile/dir).
+
+        Path-safety (spec §7.3): `execution_id` must parse as a UUID, and
+        the recomputed canonical temp-dir must resolve inside the
+        dedicated verifier exec root, before any destructive operation. A
+        malformed UUID or an out-of-root path is a no-op — this must never
+        delete outside `self._verifier_exec_root`.
+        """
+        try:
+            uuid.UUID(execution_id)
+        except ValueError:
             return
 
-        if not result.needs_review:
-            await self._close_handle(row["execution_id"])
+        root = self._verifier_exec_root.resolve()
+        target = (root / f"maestro-verify-{execution_id}").resolve()
+        if target != root and root not in target.parents:
+            return
+        shutil.rmtree(target, ignore_errors=True)
 
     async def _route_open_handle_to_review(
         self, task: Task, task_handles: dict[str, dict[str, Any]]

@@ -4,6 +4,7 @@
 `materialize` performs the filesystem side effects right before spawn.
 """
 
+import asyncio
 import os
 import shutil
 from collections.abc import Mapping
@@ -41,6 +42,10 @@ class Isolator(Protocol):
 
     def transport_ref(self, prepared: PreparedRun, pid: int) -> str: ...
 
+    async def after_spawn(
+        self, prepared: PreparedRun, proc: asyncio.subprocess.Process
+    ) -> None: ...
+
     def wrap(
         self,
         local: LocalTaskHandle,
@@ -73,6 +78,14 @@ class BareIsolator:
 
     def transport_ref(self, prepared: PreparedRun, pid: int) -> str:  # noqa: ARG002
         return f"local_pid:{pid}"
+
+    async def after_spawn(
+        self,
+        prepared: PreparedRun,  # noqa: ARG002
+        proc: asyncio.subprocess.Process,  # noqa: ARG002
+    ) -> None:
+        """No-op: this isolator has no post-spawn credential handoff."""
+        return None
 
     def wrap(
         self,
@@ -197,6 +210,14 @@ class DockerIsolator:
     def transport_ref(self, prepared: PreparedRun, pid: int) -> str:  # noqa: ARG002
         """Return the docker transport reference for this run's container."""
         return f"docker:{prepared.plan.container_name}"
+
+    async def after_spawn(
+        self,
+        prepared: PreparedRun,  # noqa: ARG002
+        proc: asyncio.subprocess.Process,  # noqa: ARG002
+    ) -> None:
+        """No-op: this isolator has no post-spawn credential handoff."""
+        return None
 
     def wrap(
         self,

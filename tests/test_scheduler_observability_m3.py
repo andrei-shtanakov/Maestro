@@ -45,8 +45,9 @@ def _read_records(tmp_path: Path) -> list[dict]:
 
 
 def _make_scheduler(sched_mod, tmp_path):
+    fake_db = type("FakeDb", (), {"db_path": str(tmp_path / "fake.db")})()
     return sched_mod.Scheduler(
-        db=object(),  # _emit_tick / _route_task never touch db
+        db=fake_db,  # _emit_tick / _route_task never touch db beyond db_path
         dag=DAG([]),
         spawners={},
         config=sched_mod.SchedulerConfig(workdir=tmp_path, log_dir=tmp_path / "logs"),

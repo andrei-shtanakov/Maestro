@@ -1,0 +1,23 @@
+# Strict Docker verifier sandbox (filesystem/process isolation, NOT network
+# isolation — the container keeps unrestricted bridge networking so the judge
+# can reach the model). Requires ANTHROPIC_API_KEY in the environment and a
+# digest-pinned image whose `claude` CLI is installed.
+project: demo
+repo: ~/projects/demo           # Must be an absolute path (/ or ~)
+verifier:
+  runner: claude
+  model: claude-haiku-4-5-20251001
+  backend: docker
+  docker:
+    image: "your.registry/verifier@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    user: "1000:1000"        # mandatory numeric non-root uid:gid
+    memory: "512m"           # 128m..8g
+    cpus: "1"                # 0.1..8
+    pids_limit: 128          # 16..4096
+    tmpfs_size: "64m"        # 16m..1g
+tasks:
+  - id: demo-1
+    title: Example
+    prompt: Make the change.
+    scope: ["src/**"]
+    validation_cmd: "pytest -q"
