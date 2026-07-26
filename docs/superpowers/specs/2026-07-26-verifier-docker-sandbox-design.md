@@ -173,6 +173,37 @@ recovery/local fakes would be bypassed. `docker_cli` is **required on the docker
 Production composition constructs the real `DockerCli` **outside** and passes it in — so
 there is no "None becomes real" branch to reason about.
 
+### 3.5 Post-spawn credential handoff (who deletes the env-file)
+
+The §7.3 invariant "delete the env-file as soon as the cidfile appears" needs a concrete
+lifecycle owner, and today there is **none**: `materialize()` runs *before* spawn,
+`LocalBackend.run()` spawns the process, and `DockerTaskHandle` is constructed only *after*
+spawn — no component has a post-spawn hook. writing-plans must **not** invent a new
+lifecycle architecture; the seam is fixed here as **one additive hook** on the `Isolator`
+protocol:
+
+```python
+async def after_spawn(self, prepared: PreparedRun, proc: LocalProcess) -> None
+```
+
+- `BareIsolator` and the general `DockerIsolator`: **no-op** — behavior byte-unchanged
+  (their env-file, if any, keeps its existing end-of-run `DockerTaskHandle.cleanup`).
+- `VerifierDockerIsolator`: **bounded-wait** for the cidfile to appear, then **immediately
+  `unlink` the env-file** (`docker run --env-file` has consumed the credential by the time
+  the container is created).
+- cidfile never appears within the bound (timeout / early process exit before creation) →
+  **terminate/kill** the addressed container/process, run cleanup, and surface a **launch
+  error** — fail-closed, no handle handed back while a secret is still on disk.
+- a **crash during the wait** is closed by recovery via the deterministic §7.3 path.
+- `LocalBackend.run()` does **not return the handle** until `after_spawn` has completed, so
+  by the time any caller holds a verifier-docker handle the env-file is already gone (or the
+  run has failed closed).
+
+`DockerTaskHandle` therefore stays unchanged — the credential handoff lives entirely in the
+isolator hook plus the `run()` ordering. (The verifier env-file remains in `cleanup_paths`
+too, so the end-of-run/recovery `unlink(missing_ok=True)` is a harmless idempotent no-op
+after the eager delete.)
+
 ---
 
 ## 4. Config surface
@@ -373,8 +404,11 @@ docker_cli=…)` (never the general resolver):
 
 - `prepared`/`running` → `accepts_ref()` **then** `probe()`; a live result, an
   `accepts_ref` reject, or any resolve/probe error → **preserve the handle open**;
-- `terminal`/`collected` → **ownership-checked** container GC (the shared
-  `DockerTaskHandle`/`docker_recovery.labels_match` path), then mark `cleaned`;
+- `terminal`/`collected`, **`local`** backend → mark `cleaned` **directly, no Docker GC**
+  (there is no container and no credential artifact to remove);
+- `terminal`/`collected`, **`verifier-docker`** → **ownership-checked** container GC (the
+  shared `DockerTaskHandle`/`docker_recovery.labels_match` path) **+ credential-artifact
+  cleanup (§7.3)**, then mark `cleaned`;
 - unknown backend id / config mismatch / missing `VerifierConfig` / probe or GC error →
   **preserve open** (fail-closed);
 - **task status never affects ownership cleanup** — a handle is reconciled on its own
@@ -402,6 +436,11 @@ handle. For a security slice this needs an explicit crash contract:
   ambient `TMPDIR`), with the env-file and cidfile inside it. Recovery recomputes this
   path from the **trusted `execution_id` alone** — never from any persisted, attacker- or
   drift-influenced path string.
+- **Path-safety precondition for destructive cleanup.** Before any `unlink`/`rmtree`,
+  recovery validates that `execution_id` is a **well-formed UUID** and that the recomputed
+  **canonical (`realpath`)** temp-dir is **contained within** the dedicated
+  `verifier_exec_root`. A malformed id, or a resolved path outside the root, **aborts the
+  delete** (fail-closed) — destructive cleanup can never escape the verifier root.
 - **Shrink the live window (primary).** During the live run the env-file is deleted **as
   soon as container creation is confirmed** (the cidfile appears — proof `docker run`
   already parsed `--env-file`). The credential is therefore on disk only during the narrow
@@ -428,8 +467,13 @@ handle. For a security slice this needs an explicit crash contract:
 - **Unit — config validation:** digest form; numeric `uid:gid` with uid≠0/gid≠0;
   memory/cpus/pids_limit/tmpfs bounds reject "unlimited" and out-of-range; backend/docker
   cross-field rules.
-- **Unit — factory:** `local` → `LocalBackend` id `local`; `docker` → id `verifier-docker`
-  with the injected `DockerCli`; verifier-docker absent from the general resolver registry.
+- **Unit — factory:** `local` → returns the passed `local_backend`; `docker` → id
+  `verifier-docker` with the injected `DockerCli`, and `docker` with `docker_cli=None`
+  raises; verifier-docker absent from the general resolver registry.
+- **Unit — `after_spawn` hook:** `BareIsolator`/general `DockerIsolator` → no-op (env-file,
+  if any, untouched at spawn); `VerifierDockerIsolator` → unlinks the env-file once the
+  cidfile appears; cidfile absent within the bound → terminate/kill + launch error (handle
+  not returned); `LocalBackend.run()` awaits the hook before returning the handle.
 - **Recovery guard test (required):** every open verification handle is processed
   **exactly once** by phase-specific recovery and **never** by the general open-handle
   loop **nor by `_gc_terminal_handles()`** (assert the split — a `verifier-docker`
