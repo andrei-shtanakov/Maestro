@@ -15,10 +15,14 @@
   `.superpowers/sdd/progress.md`; этот файл их намеренно не дублирует.
 - **Инлайн-теги** (все опциональные; контракт —
   `../_cowork_output/2026-07-26-plan-fields-and-todo-coverage-handoff.md` §3):
-  `@owner:<handle>` · `@blocked_by:<repo>#<slug>` · `@trigger:"<проверяемое условие>"`,
-  в хвост первой строки пункта. Отсутствие тега значит «неизвестно» и это осмысленный
-  ответ — выдумывать триггер там, где его нет, хуже, чем оставить пусто.
+  `@owner:<handle>` · `@blocked_by:<repo>#<slug>` · `@trigger:"<проверяемое условие>"` ·
+  `@id:<node-id>`, в хвост первой строки пункта. Отсутствие тега значит «неизвестно» и это
+  осмысленный ответ — выдумывать триггер там, где его нет, хуже, чем оставить пусто.
   Грепается кросс-репно: `grep -rn "@blocked_by:" */TODO.md`.
+  - `@id` — канонический идентификатор пункта (ADR-ECO-005 PF-2B): строчная грамматика
+    `[a-z0-9][a-z0-9._-]{0,63}` (напр. `r-03b`, не `R-03b`), из него строится URI
+    `todo://maestro/<id>`. Переходно `@blocked_by` принимает и legacy `<repo>#<slug>`,
+    и канонический `todo://<repo>/<id>`.
 - **Не переформулируй текст существующего открытого пункта.** Robin (`robin-runtime`)
   опознаёт пункт по нормализованному тексту первой строки; с robin-runtime#27 теги
   исключены из ключа, поэтому *дописать* тег безопасно, а *переписать* формулировку —
@@ -95,7 +99,7 @@
 
 Дальнейший трек ведётся в Linear (Maestro / Arbiter проекты, team Labs). Ниже — snapshot на 2026-04-17.
 
-- [ ] **R-03b** (LABS-TBD): Mode 2 (`maestro orchestrate`) workstream-level routing. Gate: ≥1 неделя стабильного Mode-1 dogfood после v0.2.0 @owner:andrei @trigger:"≥1 неделя стабильного Mode-1 dogfood после v0.2.0"
+- [ ] **R-03b** (LABS-TBD): Mode 2 (`maestro orchestrate`) workstream-level routing. Gate: ≥1 неделя стабильного Mode-1 dogfood после v0.2.0 @owner:andrei @trigger:"≥1 неделя стабильного Mode-1 dogfood после v0.2.0" @id:r-03b
 - [x] **R-05 contract-level** (commit `f1f7d26`, 2026-04-25): 4 e2e теста против реального `arbiter-mcp` бинарника в `tests/test_arbiter_real_subprocess.py`. Auto-skip без бинарника; `MAESTRO_ARBITER_BIN` override. Покрывает: decision_id i64, int→str coercion, route→report_outcome round-trip, distinct rowids.
 - [x] **R-05 CI job** (2026-05-07): новый `arbiter-e2e` job в `.github/workflows/ci.yml` — sibling-checkout Maestro + arbiter (`andrei-shtanakov/arbiter`), `cargo build --release --bin arbiter-mcp` под Swatinem cache, прогон `tests/test_arbiter_real_subprocess.py` с `MAESTRO_ARBITER_BIN`. Ref-strategy: PR/push на pinned `ARBITER_PINNED_SHA=d1a8ecd` (arbiter#9 fix), weekly schedule (Mon 06:00 UTC) на `master` для drift-check. Локальный smoke: 4/4 теста зелёные.
 - [x] **R-05 scheduler-driven e2e** (2026-05-07): `tests/test_scheduler_arbiter_real_subprocess.py` — 2 теста скрещивают real arbiter-mcp + Scheduler full cycle + MagicMock spawner. (1) ASSIGN happy-path: real arbiter routes → mock exit 0 → outcome reported back to real arbiter → DONE; проверяет int→str round-trip decision_id через TEXT-колонку. (2) Retry-gating с real rowids: exit 1 → ADVISORY reset → второй route real arbiter mint'ит fresh i64 ≠ первого. HOLD/REJECT покрыты в `test_scheduler_arbiter_integration.py` через FakeArbiter — дублирование через real subprocess не оправдано (требует seed'инга cost/failure history)
