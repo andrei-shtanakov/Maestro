@@ -385,3 +385,13 @@ ls .github/workflows/
       live-orphan branch leaves the stale pid (process_pid / generation_pid) on
       the NEEDS_REVIEW row — clear it for BOTH states together (harmless to
       recovery, but cleaner for REST/dashboard).
+
+---
+
+## mcp SDK v2 migration (deferred, blocked on upstream)
+
+- [ ] mcp SDK v2: blocked on upstream — fastmcp (≤3.4.5) pins mcp<2.0.
+      @trigger: fastmcp release notes announce mcp>=2 support.
+      Then: lift both pins together, re-run test_mcp_server.py, and check the
+      fastmcp 3→v2-based changelog for Client/transport API changes.
+      Context: prograph-vault/authored/notes/2026-08-04-mcp-v2-migration-plan.md
