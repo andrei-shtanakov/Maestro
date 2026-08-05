@@ -226,6 +226,38 @@
 
 ---
 
+## Входящие 2026-08 — battle-testing pilot (inbox #121–#125, приняты 2026-08-05)
+
+> Источник: findings-maestro-2026-08 (kapelle S2). Все пять приняты под исходными
+> слогами; порядок исполнения: #121 → #125 + DB-docs → дизайн #122 → #124 → #123.
+
+- [ ] **#121 preflight: подавить scope-overlap при упорядочивающем пути** (P1) @owner:andrei @id:preflight-overlap-depends-edge
+      Учитывать не только прямое `depends_on`, а любой упорядочивающий путь в DAG:
+      при его наличии overlap — максимум info, без совета добавить уже существующее ребро.
+- [ ] **#122 scope gate: конвенция harness-owned paths** (P0 на проектирование) @owner:andrei @id:scope-gate-harness-owned-paths
+      spec-runner ≥2.15 коммитит `spec/.gitignore` → ex-post гейт шлёт зелёный
+      workstream в NEEDS_REVIEW. Решение НЕ фиксировать заранее (whitelist / pre-created
+      gitignore / spec-runner-side fix / baseline / content-aware / versioned
+      compatibility-rule) — сначала сравнительный дизайн; fail-closed семантику гейта
+      сохранить. Counterpart: spec-runner#96. @blocked_by:spec-runner#harness-owned-gitignore
+- [ ] **#123 честный знаменатель прогресса воркстрима** (P2) @owner:andrei @id:workstream-progress-honest-total
+      Инварианты: финальный refresh перед DONE, невозможность «DONE 4/5», явное
+      отображение skipped/no-op. Не заводить второй парсер maestro-tasks.md, если
+      spec-runner может отдать устойчивый машинный JSON (counterpart: spec-runner#97).
+- [ ] **#124 `maestro workstream-rework <id>`** (P1, отдельный feature-трек) @owner:andrei @id:workstream-rework-command
+      До реализации — описать state machine: допустимые исходные состояния, append-only
+      evidence прошлой попытки, новый attempt/decomposition identity, транзакционный
+      сброс, идемпотентность после сбоя, аудит причины/инициатора. Не скрытая
+      разновидность approve. Докс-примечание про `~/.maestro/maestro.db` — в PR #125.
+- [ ] **#125 канон конфига для dual-mode репо (docs)** (P1) @owner:andrei @id:dual-mode-config-canon
+      Mode-2 docs: project.yaml — SSOT, генерируемый `spec-runner.config.yaml` не
+      трекается, для прямых spec-runner-запусков — локальная untracked-копия; указатель
+      из warning `spec-runner-config-tracked`. Зафиксировать как текущее ограничение
+      interoperability, не идеальный дизайн. Вместе с фиксом примеров `--db maestro.db`
+      → фактический default `~/.maestro/maestro.db` (бонус из #124).
+
+---
+
 ## Бэклог идей из research-дайджеста (2026-07-22)
 
 > Источник: `../prograph-vault/authored/notes/2026-07-22-ideas-from-ai-repos-research.md`
