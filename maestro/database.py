@@ -205,7 +205,41 @@ CREATE TABLE IF NOT EXISTS workstreams (
     verification_attempt INTEGER NOT NULL DEFAULT 0,
     verification_error_attempt INTEGER NOT NULL DEFAULT 0,
     rework_attempt INTEGER NOT NULL DEFAULT 0,
-    resume_reason TEXT
+    resume_reason TEXT,
+    -- Operator rework (#124)
+    operator_rework_count INTEGER NOT NULL DEFAULT 0,
+    operator_rework_seq INTEGER,
+    recovery_ambiguity TEXT
+);
+
+CREATE TABLE IF NOT EXISTS workstream_reworks (
+    workstream_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    initiated_at TIMESTAMP NOT NULL,
+    initiator TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    instructions TEXT,
+    prior_status TEXT NOT NULL,
+    prior_error_message TEXT,
+    prior_head_sha TEXT NOT NULL,
+    liveness_evidence TEXT,
+    refresh_config_path TEXT,
+    refresh_config_hash TEXT,
+    old_description TEXT,
+    new_description TEXT,
+    old_scope TEXT,
+    new_scope TEXT,
+    PRIMARY KEY (workstream_id, seq),
+    FOREIGN KEY (workstream_id) REFERENCES workstreams(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS workstream_ambiguity_resolutions (
+    workstream_id TEXT NOT NULL,
+    resolved_at TIMESTAMP NOT NULL,
+    initiator TEXT NOT NULL,
+    statement TEXT NOT NULL,
+    marker_json TEXT NOT NULL,
+    FOREIGN KEY (workstream_id) REFERENCES workstreams(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS workstream_dependencies (
@@ -381,6 +415,9 @@ def _row_to_workstream(row: aiosqlite.Row) -> Workstream:
         verification_error_attempt=row["verification_error_attempt"],
         rework_attempt=row["rework_attempt"],
         resume_reason=row["resume_reason"],
+        operator_rework_count=row["operator_rework_count"] or 0,
+        operator_rework_seq=row["operator_rework_seq"],
+        recovery_ambiguity=row["recovery_ambiguity"],
         depends_on=[],  # Populated separately
     )
 
@@ -512,6 +549,11 @@ class Database:
                 17,
                 "task_costs_phase_model",
                 self._migrate_task_costs_phase_model,
+            ),
+            (
+                18,
+                "workstream_rework",
+                self._migrate_workstream_rework,
             ),
         ]
 
@@ -908,6 +950,76 @@ class Database:
             await self._connection.execute(
                 "ALTER TABLE task_costs ADD COLUMN model TEXT"
             )
+
+    async def _migrate_workstream_rework(self) -> None:
+        """Migration 18: operator rework columns + audit tables (#124).
+
+        Three additive `workstreams` columns (`operator_rework_count`,
+        `operator_rework_seq`, `recovery_ambiguity`) plus the append-only
+        `workstream_reworks` and `workstream_ambiguity_resolutions`
+        tables. Idempotent via PRAGMA table_info / IF NOT EXISTS.
+        """
+        assert self._connection is not None
+        cursor = await self._connection.execute("PRAGMA table_info(workstreams)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+
+        migrations = [
+            (
+                "operator_rework_count",
+                "ALTER TABLE workstreams ADD COLUMN operator_rework_count "
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "operator_rework_seq",
+                "ALTER TABLE workstreams ADD COLUMN operator_rework_seq INTEGER",
+            ),
+            (
+                "recovery_ambiguity",
+                "ALTER TABLE workstreams ADD COLUMN recovery_ambiguity TEXT",
+            ),
+        ]
+        for column, ddl in migrations:
+            if column not in columns:
+                await self._connection.execute(ddl)
+
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS workstream_reworks (
+                workstream_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                initiated_at TIMESTAMP NOT NULL,
+                initiator TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                instructions TEXT,
+                prior_status TEXT NOT NULL,
+                prior_error_message TEXT,
+                prior_head_sha TEXT NOT NULL,
+                liveness_evidence TEXT,
+                refresh_config_path TEXT,
+                refresh_config_hash TEXT,
+                old_description TEXT,
+                new_description TEXT,
+                old_scope TEXT,
+                new_scope TEXT,
+                PRIMARY KEY (workstream_id, seq),
+                FOREIGN KEY (workstream_id) REFERENCES workstreams(id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS workstream_ambiguity_resolutions (
+                workstream_id TEXT NOT NULL,
+                resolved_at TIMESTAMP NOT NULL,
+                initiator TEXT NOT NULL,
+                statement TEXT NOT NULL,
+                marker_json TEXT NOT NULL,
+                FOREIGN KEY (workstream_id) REFERENCES workstreams(id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
 
     async def _migrate_workstreams_verification_columns(self) -> None:
         """Migration 13: add Stage B verification columns to `workstreams`.
@@ -2697,11 +2809,13 @@ class Database:
                     error_message, retry_count, max_retries,
                     created_at, started_at, completed_at,
                     verification_run_id, verification_attempt,
-                    verification_error_attempt, rework_attempt, resume_reason
+                    verification_error_attempt, rework_attempt, resume_reason,
+                    operator_rework_count, operator_rework_seq,
+                    recovery_ambiguity
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -2728,6 +2842,9 @@ class Database:
                     workstream.verification_error_attempt,
                     workstream.rework_attempt,
                     workstream.resume_reason,
+                    workstream.operator_rework_count,
+                    workstream.operator_rework_seq,
+                    workstream.recovery_ambiguity,
                 ),
             )
         except sqlite3.IntegrityError as e:
