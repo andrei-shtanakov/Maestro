@@ -237,12 +237,18 @@
       Сделано (PR #127, merge `3e4d148`): новая severity `info` в обеих ярусах
       (статическая эвристика + точное FS-пересечение), транзитивная достижимость
       `_ordered_pairs` (cycle-safe), `--strict` info не эскалирует; issue закрыт.
-- [ ] **#122 scope gate: конвенция harness-owned paths** (P0 на проектирование) @owner:andrei @id:scope-gate-harness-owned-paths
+- [x] **#122 scope gate: конвенция harness-owned paths** (P0 на проектирование) @owner:andrei @id:scope-gate-harness-owned-paths
       spec-runner ≥2.15 коммитит `spec/.gitignore` → ex-post гейт шлёт зелёный
       workstream в NEEDS_REVIEW. Решение НЕ фиксировать заранее (whitelist / pre-created
       gitignore / spec-runner-side fix / baseline / content-aware / versioned
       compatibility-rule) — сначала сравнительный дизайн; fail-closed семантику гейта
       сохранить. Counterpart: spec-runner#96. @blocked_by:spec-runner#harness-owned-gitignore
+      Сделано (PR #130, merge `ce20464`): counterpart spec-runner#96 оказался уже
+      закрыт (v2.16.0 не коммитит harness-owned `spec/.gitignore`), поэтому выбран
+      вариант A сравнительного дизайна — preflight version gate `>= 2.16.0`,
+      fail-closed до создания worktree, scope gate не тронут. Дизайн:
+      `docs/superpowers/specs/2026-08-05-spec-runner-version-gate-design.md`;
+      issue закрыт. ⚠️ локальный spec-runner 2.15.0 требует апгрейда.
 - [ ] **#123 честный знаменатель прогресса воркстрима** (P2) @owner:andrei @id:workstream-progress-honest-total
       Инварианты: финальный refresh перед DONE, невозможность «DONE 4/5», явное
       отображение skipped/no-op. Не заводить второй парсер maestro-tasks.md, если
