@@ -392,6 +392,100 @@ class TestRefreshValidation:
             validate_refresh(make_ws(), path)
 
 
+async def _git_worktree(tmp_path) -> str:
+    """A real git repo with one commit, usable as a workstream worktree."""
+    import subprocess
+
+    repo = tmp_path / "wt"
+    repo.mkdir()
+    for cmd in (
+        ["git", "init", "-b", "main"],
+        ["git", "config", "user.email", "t@t"],
+        ["git", "config", "user.name", "t"],
+    ):
+        subprocess.run(cmd, cwd=repo, check=True, capture_output=True)
+    (repo / "f.txt").write_text("x")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True
+    )
+    return str(repo)
+
+
+class TestCliHelpers:
+    @pytest.mark.anyio
+    async def test_rework_happy_path(self, db, tmp_path) -> None:
+        from maestro.cli import _rework_workstream
+
+        wt = await _git_worktree(tmp_path)
+        await db.create_workstream(
+            make_ws(workspace_path=wt, error_message="gate blocked")
+        )
+        seq = await _rework_workstream(
+            db, "ws-1", reason="rejected", instructions="fix it", refresh_from=None
+        )
+        assert seq == 1
+        ws = await db.get_workstream("ws-1")
+        assert ws.status is WorkstreamStatus.READY
+        assert ws.resume_reason == "operator_rework"
+        row = await db.get_workstream_rework("ws-1", 1)
+        assert row is not None
+        assert row["prior_error_message"] == "gate blocked"
+        assert len(row["prior_head_sha"]) == 40
+
+    @pytest.mark.anyio
+    async def test_rework_refuses_running(self, db, tmp_path) -> None:
+        from maestro.cli import _rework_workstream
+        from maestro.rework import ReworkRefused
+
+        wt = await _git_worktree(tmp_path)
+        await db.create_workstream(
+            make_ws(status=WorkstreamStatus.RUNNING, workspace_path=wt)
+        )
+        with pytest.raises(ReworkRefused, match="not reworkable"):
+            await _rework_workstream(
+                db, "ws-1", reason="r", instructions=None, refresh_from=None
+            )
+
+    @pytest.mark.anyio
+    async def test_rework_refuses_sentinel_marker_with_hint(
+        self, db, tmp_path
+    ) -> None:
+        from maestro.cli import _rework_workstream
+        from maestro.rework import ReworkRefused
+
+        wt = await _git_worktree(tmp_path)
+        marker = json.dumps({"kind": "spawn_uncertain", "pid": None})
+        await db.create_workstream(
+            make_ws(workspace_path=wt, recovery_ambiguity=marker)
+        )
+        with pytest.raises(ReworkRefused, match="workstream-resolve-ambiguity"):
+            await _rework_workstream(
+                db, "ws-1", reason="r", instructions=None, refresh_from=None
+            )
+
+    @pytest.mark.anyio
+    async def test_rework_refuses_missing_worktree(self, db) -> None:
+        from maestro.cli import _rework_workstream
+        from maestro.rework import ReworkRefused
+
+        await db.create_workstream(make_ws(workspace_path=None))
+        with pytest.raises(ReworkRefused, match="worktree"):
+            await _rework_workstream(
+                db, "ws-1", reason="r", instructions=None, refresh_from=None
+            )
+
+    @pytest.mark.anyio
+    async def test_resolve_helper_roundtrip(self, db) -> None:
+        from maestro.cli import _resolve_ambiguity
+
+        marker = json.dumps({"kind": "spawn_uncertain", "pid": None})
+        await db.create_workstream(make_ws(recovery_ambiguity=marker))
+        await _resolve_ambiguity(db, "ws-1", statement="verified: nothing runs")
+        ws = await db.get_workstream("ws-1")
+        assert ws.recovery_ambiguity is None
+
+
 class TestAddendum:
     def test_instructions_render(self) -> None:
         from maestro.rework import build_operator_rework_addendum
