@@ -498,6 +498,8 @@ class TestTrackedSpecRunnerConfigWarning:
         issues = preflight._check_tracked_spec_runner_config(repo)
         assert [i.code for i in issues] == ["spec-runner-config-tracked"]
         assert issues[0].severity == "warning"
+        # #125: the warning must point at the documented dual-mode pattern.
+        assert "Dual-mode repos" in issues[0].message
 
     def test_untracked_or_absent_is_silent(self, tmp_path) -> None:
         from maestro import preflight
