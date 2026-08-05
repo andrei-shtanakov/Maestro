@@ -1,0 +1,283 @@
+# `maestro workstream-rework` — state-machine design (issue #124)
+
+Date: 2026-08-05
+Status: approved (revision 2; owner review passed 2026-08-05 at `ae6d7a9`.
+Implementation is a separate PR)
+Issue: #124 `workstream-rework-command` (battle-testing pilot, S2 TASK-006 —
+three review rounds, two improvised raw-DB reworks)
+
+## Problem
+
+When an ex-post-blocked (or otherwise stuck) workstream should be REWORKED —
+new instructions, re-execution — rather than approved, there is no supported
+operation. `workstream-approve` merges as-is; the Stage B rework/respawn
+path fires only on a verification FAIL, never on a gate block. The pilot's
+improvisation against the DB showed the sharp edges:
+
+- `status='failed'` does NOT rework: on resume the orchestrator merely
+  re-evaluates the ex-post gate on the unchanged HEAD;
+- actual rework required `status='pending'` (forcing re-decomposition from
+  an updated description) plus manually clearing the worktree's spec-runner
+  state files — stale done-entries would otherwise mask the regenerated
+  subtasks.
+
+## Key discovery
+
+The heavy machinery already exists. The READY-processing path in
+`orchestrator.py` dispatches on `resume_reason`; the `RESUME_REWORK` branch
+re-enters DECOMPOSING **in the same worktree** (same branch, same lineage),
+re-runs `setup_spec_runner` — which already idempotently unlinks every
+stale spec-runner state file (`workspace.py`, prefixed and unprefixed
+variants) — and regenerates the spec with an addendum appended to the
+description. The pilot's manual state-file cleanup is already built into
+the re-decomposition path on current master.
+
+The design therefore adds **no new statuses and no new transition edges**.
+It gives the operator a sanctioned entrance into the existing path.
+
+## Decision summary (owner, 2026-08-05)
+
+- Both input channels: mandatory `--reason`, optional
+  `--refresh-from <project.yaml>`.
+- `--reason` (audit) and the next-attempt prompt are semantically separate:
+  a distinct optional `--instructions` flag feeds the addendum; `--reason`
+  never enters the prompt.
+- Separate `operator_rework_count` column; the automatic Stage B
+  `rework_attempt` / `rework_budget` are untouched.
+- All seven constraints below are part of the accepted design.
+
+Revision 2 (2026-08-05, after owner review of revision 1): pid-NULL alone
+is NOT a sufficient liveness check — recovery parks live-orphan/uncertain
+workstreams in NEEDS_REVIEW with both pids cleared (blocker; see the
+Liveness proof section); the reset is one single CAS UPDATE, not a CAS
+plus a second row write; the attempt↔instructions linkage is an explicit
+`operator_rework_seq` key, not a latest-audit-row heuristic; the
+`--refresh-from` hash covers the exact bytes that were parsed.
+
+## CLI contract
+
+```
+maestro workstream-rework <workstream-id>
+    --reason "<text>"              # mandatory: immutable audit explanation
+    [--instructions "<text>"]      # optional: addendum for the next attempt
+    [--refresh-from <project.yaml>]  # optional: re-read description/scope
+    [--db <path>]
+```
+
+- `--reason` is the operator's immutable explanation of the decision. It is
+  recorded in the audit row and is **never** used as a prompt instruction.
+- `--instructions` is the author-facing channel: it becomes the rework
+  addendum appended to the description at spec regeneration (symmetric to
+  `build_rework_addendum` for verification FAILs). Omitted → no addendum;
+  the change then has to be carried by `--refresh-from`.
+- `--refresh-from <config>` re-reads **only the workstream with the same
+  ID** from the given project.yaml and updates `description` and `scope`.
+  Topological fields — `depends_on`, priority, base branch, anything that
+  alters the DAG — are **refused**: changing them requires re-validating
+  the whole DAG, which is not a local rework.
+
+## State machine
+
+No new states, no new edges. The command performs `NEEDS_REVIEW -> READY`
+or `FAILED -> READY` (both edges already valid) and sets
+`resume_reason='operator_rework'`.
+
+Allowed source states — exactly two:
+
+| Source | Allowed | Note |
+| --- | --- | --- |
+| NEEDS_REVIEW | yes | gate block, budget exhaustion; a recovery-origin row additionally requires the liveness proof below |
+| FAILED | yes | retry-exhausted failures |
+| PENDING / DECOMPOSING / READY / RUNNING / VERIFYING / MERGING / PR_CREATED | no | in-flight or not-yet-attempted |
+| DONE / ABANDONED | no | terminal; rework-after-DONE is a different feature |
+
+Fail-closed refusals (no DB change, no audit row):
+
+- source status not in {NEEDS_REVIEW, FAILED};
+- the liveness proof (next section) does not positively establish that no
+  process of the previous attempt can still be running;
+- worktree missing, or its HEAD cannot be reliably determined (nothing to
+  rework / no trustworthy prior state to record);
+- `--refresh-from` names a config without this workstream ID, or the
+  refreshed entry changes a forbidden (topological) field;
+- refreshed scope fails re-validation (see below);
+- a second invocation after a successful transition (the row is READY —
+  not an allowed source).
+
+## Liveness proof (blocker fix, revision 2)
+
+`process_pid IS NULL AND generation_pid IS NULL` is **necessary but not
+sufficient**. The startup-recovery paths that park a live-orphan or
+spawn-uncertain workstream in NEEDS_REVIEW deliberately clear BOTH pid
+fields (`orchestrator.py`, live-orphan and possibly-live-handle branches)
+— today the only trace that a process may still be running is a log line.
+A pid-NULL check alone would let the command start a new author on top of
+a live one.
+
+The command must therefore **positively prove** no process of the previous
+attempt can still be running. Three conditions, all required:
+
+1. Both pid fields are NULL (necessary, insufficient on its own).
+2. **No unresolved open execution handle.** Every open execution handle
+   recorded for the workstream is resolved through the existing
+   isolation-aware `ExecutionBackend.probe()` — the same fail-closed
+   boundary recovery uses. Only a proven-terminal probe result unblocks;
+   an unknown, unreachable, or still-live result refuses the rework.
+3. **No unresolved recovery-ambiguity marker.** Prerequisite
+   (implementation requirement of this feature): the recovery transitions
+   that park a live-orphan / spawn-uncertain / possibly-live-handle
+   workstream in NEEDS_REVIEW must record a durable
+   **recovery-ambiguity marker** preserving the suspect evidence (the
+   orphan pid or handle reference) instead of dropping it into the log.
+   When the marker is present, `workstream-rework` re-probes the preserved
+   pid/process-group (or handle): proven dead → proceed, with the probe
+   result recorded in the audit row; alive or unverifiable → refuse with
+   an instruction to clean up first. A marker whose evidence can no longer
+   be checked (e.g. pid recycled cannot be ruled out on this platform's
+   probe) is a refusal, not a pass.
+
+`workstream-approve` semantics are unchanged by this feature; the
+liveness proof above is a requirement of `workstream-rework` only.
+
+Implementation-plan note (owner, at approval): the durable
+recovery-ambiguity marker needs an exact storage location, evidence
+schema, and resolution procedure in the implementation plan. In
+particular, the **spawning-sentinel** case may carry no pid/handle at
+all — such a marker stays blocked until a separate explicit
+cleanup/resolution and must never resolve to an automatic
+"no process found".
+
+## Validation before the transaction
+
+Order matters: everything fallible happens **before** the DB transaction,
+so a refused rework leaves zero trace in the accepted lineage (operator
+output only — no audit record of a rework that did not happen).
+
+1. Load the workstream row; check the source status and run the full
+   liveness proof (previous section). Status and pids are re-confirmed
+   inside the transaction; the probe results feed the audit row.
+2. Resolve the worktree; read `prior_head_sha` (`git rev-parse HEAD`).
+   Unreadable → fail closed.
+3. If `--refresh-from`: read the config file **once**; the audit hash is
+   computed over those exact bytes, and the config is parsed from the same
+   bytes (no second read after validation — a re-read could hash a file
+   that differs from what was validated). Find the same-ID workstream,
+   verify only `description`/`scope` differ (topology refusal otherwise),
+   run the new scope through the normal normalization and the preflight
+   overlap validation against the other workstreams of the config. Any
+   error → refuse, nothing written.
+
+## Transactional reset
+
+One DB transaction containing exactly **one write to the workstream row**
+and one audit insert (revision 2: there is no separate "then update the
+row" step — a second write would reopen the race the CAS closes):
+
+1. **Single CAS UPDATE**: one conditional UPDATE that atomically sets ALL
+   new field values —
+   `status=READY`, `resume_reason='operator_rework'`,
+   `operator_rework_count = <prior> + 1`,
+   `operator_rework_seq = <prior> + 1`,
+   `error_message=NULL` (clears the H-6 approval marker),
+   `verification_run_id=NULL` (a new attempt is a new run),
+   refreshed `description`/`scope` when applicable —
+   guarded by `WHERE id = ? AND status = <previously read source status>
+   AND process_pid IS NULL AND generation_pid IS NULL AND
+   operator_rework_count = <previously read count>`.
+   Zero rows affected → the world changed under the operator → the
+   transaction rolls back, nothing is recorded, the command refuses
+   (fail closed). The `operator_rework_count` guard also makes the audit
+   `seq` computed below race-free.
+2. **Audit INSERT** (same transaction) into the new append-only
+   `workstream_reworks` table, with `seq = <prior count> + 1` — the same
+   value the CAS wrote into `operator_rework_seq`:
+   - `workstream_id`, `seq`, `initiated_at`, `initiator` (OS user);
+   - `reason` (mandatory), `instructions` (nullable);
+   - rejected context: `prior_status`, `prior_error_message` (the block
+     verdict/marker text in full), `prior_head_sha`;
+   - the liveness-proof evidence (probe results / resolved
+     recovery-ambiguity marker), when a probe ran;
+   - refresh evidence when `--refresh-from` was used: config path, the
+     hash over the exact bytes that were parsed, old and new
+     `description`, old and new `scope`.
+   Rows are never updated or deleted.
+
+Explicitly NOT written: anything in `gate_approvals`. Rework is not an
+approval — the new work produces a new SHA and the ex-post gate evaluates
+it from scratch; old SHA-pinned approvals are inert by construction and
+must not be applied to the new attempt.
+
+## Resume dispatch
+
+- The READY handler's `resume_reason` dispatch becomes **exhaustive**.
+  The complete set of allowed values is: `verification_reverify`,
+  `verification_rework`, `operator_rework`, and NULL (a plain,
+  non-resume READY). Any other value is an **error** (fail-closed to
+  NEEDS_REVIEW), never a silent plain resume.
+- `operator_rework` follows the existing re-decomposition path: same
+  worktree, same branch, `setup_spec_runner` cleans stale harness state
+  idempotently, spec regenerates. The addendum is built from the audit
+  row addressed **explicitly** by the workstream's `operator_rework_seq`
+  column (set by the same CAS that granted the transition) — never by a
+  "latest row" heuristic, not from the verification ledger, and never
+  from `reason`. The attempt↔instructions linkage is thereby provable
+  from the DB alone: `(workstream_id, operator_rework_seq)` is the key.
+- The reason/instructions must survive until the new attempt exists: the
+  addendum is loaded from the audit table (durable) at DECOMPOSING time
+  via that key, not carried in memory — a crash between the transition
+  and spec generation loses nothing, and crash recovery does not depend
+  on the assumption that the newest audit row belongs to the current
+  READY.
+- Crash after commit, before resume: the row is a consistent
+  READY+`operator_rework`; the next `maestro orchestrate --resume` picks
+  it up. File-state cleanup is owned by the (idempotent) decompose path,
+  so no partial file mutation can be stranded by the CLI.
+
+## Counter and visibility
+
+- `operator_rework_count` is **not** limited by any automatic budget:
+  unbounded explicit operator rework is an administrative capability.
+- It must not be invisible: `maestro workstreams` displays the count, and
+  both the CLI (on invocation) and the status display emit a warning once
+  the count reaches a threshold (default 3) — "N operator reworks; consider
+  whether this workstream needs redesign instead".
+- Stage B's `rework_attempt` and `rework_budget` are untouched by this
+  command in both directions.
+
+## Acceptance criteria (design-level)
+
+- NEEDS_REVIEW and FAILED transition to READY; all other states are
+  refused.
+- Live or sentinel pids block the command (fail closed).
+- A recovery-origin NEEDS_REVIEW (live-orphan / spawn-uncertain /
+  possibly-live handle — pids already cleared by recovery) is blocked
+  until the liveness proof passes: probe proves terminal, or the
+  recovery-ambiguity marker is resolved. Unknown/unavailable probe →
+  refusal.
+- The reset is a single CAS UPDATE (all fields in one statement, guarded
+  on status + both pids + prior count) plus one audit INSERT in the same
+  transaction — no second workstream write exists.
+- The addendum for a given attempt is loaded by the explicit
+  `(workstream_id, operator_rework_seq)` key, not by a latest-row
+  heuristic.
+- A second invocation after a successful transition is refused.
+- A crash after commit is safely picked up by resume.
+- Stale spec-runner state is cleaned by the existing idempotent path — the
+  command itself performs no file mutations.
+- The audit table is append-only and preserves the rejected context
+  (prior status, prior error/verdict text, prior HEAD SHA; refresh
+  evidence with config path+hash and old/new description/scope).
+- No approval is created; old SHA-pinned approvals are not applied to the
+  new attempt.
+- A refreshed scope passes normalization + overlap re-validation before
+  anything is written; a failed refresh leaves no trace in the lineage.
+- Automatic `rework_attempt` and its budget are unchanged.
+- Unknown `resume_reason` values are an error, not a plain resume.
+
+## Out of scope
+
+- Implementation (separate PR).
+- Rework of DONE/ABANDONED workstreams (revert semantics).
+- Editing topological fields (`depends_on`, priority, base branch) — a
+  config change plus full re-validation, not a rework.
+- Any change to gate semantics or the Stage B rework budget.
