@@ -94,6 +94,36 @@ uv run maestro workspaces                # List active worktrees
 `maestro orchestrate` also runs this preflight automatically as a fail-fast
 gate before spawning any workstream.
 
+### Dual-mode repos: direct spec-runner runs + Maestro
+
+Maestro owns `spec-runner.config.yaml` inside each worktree: it regenerates
+the file from `project.yaml`'s `spec_runner` block on every workstream
+launch. That makes `project.yaml` the single source of truth for worktree
+configs — and it means the target repo must **not** track its own
+`spec-runner.config.yaml`. A tracked copy gets overwritten inside the
+worktree, and the overwrite then surfaces ex-post as a scope violation
+(preflight warns about this: `spec-runner-config-tracked`).
+
+For a repo that is *also* driven by spec-runner directly (outside Maestro),
+the canonical setup is:
+
+1. Untrack the file — `git rm --cached spec-runner.config.yaml` — and add it
+   to `.gitignore`.
+2. Keep a local, untracked copy of `spec-runner.config.yaml` for direct
+   `spec-runner` runs.
+3. Treat `project.yaml` as the SSOT for everything Maestro-driven.
+
+This is the current interoperability contract between the two tools, not a
+final design — a shared convention may replace it later.
+
+### Where the state DB lives
+
+All state-reading commands (`status`, `workstreams`, `retry`, `approve`,
+`costs`, ...) default to `~/.maestro/maestro.db`, and `maestro run` /
+`maestro orchestrate` write there by default too. Pass `--db <path>` on both
+sides when you want a reproducible, per-project DB instead of the shared
+default.
+
 ## Examples
 
 | File | Description |

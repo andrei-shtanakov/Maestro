@@ -22,19 +22,23 @@ Maestro is an AI Agent Orchestrator with two operation modes:
 ## Development Commands
 
 ```bash
+# DB path: every command below defaults to ~/.maestro/maestro.db (writers AND
+# readers). Pass --db <path> on both sides only for a per-project/isolated DB —
+# `--db maestro.db` (repo-local) works only if the run was started the same way.
+
 # === Task Scheduler (original mode) ===
 uv run maestro run <config.yaml>
 uv run maestro run config.yaml --resume  # Resume after crash
-uv run maestro status --db maestro.db
-uv run maestro retry <task-id> --db maestro.db
+uv run maestro status
+uv run maestro retry <task-id>
 uv run maestro stop                          # Stop the running scheduler
-uv run maestro approve <task-id> --db maestro.db  # Approve an AWAITING_APPROVAL task
+uv run maestro approve <task-id>             # Approve an AWAITING_APPROVAL task
 
 # === Multi-Process Orchestrator (new mode) ===
 uv run maestro orchestrate <project.yaml>   # Run orchestrator
-uv run maestro workstreams --db maestro.db       # Show workstreams status
-uv run maestro workstream-approve <workstream-id> --db maestro.db  # Approve a NEEDS_REVIEW workstream — records the durable gate approval (phase+sha) and re-queues
-uv run maestro check-scope <workstream-id> --base <base-branch> --db maestro.db  # deterministic scope containment (exit 1 on escape)
+uv run maestro workstreams                   # Show workstreams status
+uv run maestro workstream-approve <workstream-id>  # Approve a NEEDS_REVIEW workstream — records the durable gate approval (phase+sha) and re-queues
+uv run maestro check-scope <workstream-id> --base <base-branch>  # deterministic scope containment (exit 1 on escape)
 uv run maestro workspaces <project.yaml>     # List active worktrees
 
 # === Mode-2 config authoring ===
@@ -55,7 +59,7 @@ uv run maestro benchmark swe-mini --agent opencode --json        # Machine outpu
 
 # === Log utilities ===
 uv run maestro merge-logs <pipeline-dir>     # Time-sort per-pid JSONL into merged.jsonl
-uv run maestro costs --db maestro.db   # database-wide cost summary (read-only; TOTAL / by-harness / by-task; unpriced = UNKNOWN, not $0)
+uv run maestro costs                   # database-wide cost summary (read-only; TOTAL / by-harness / by-task; unpriced = UNKNOWN, not $0)
 
 # === Tests ===
 uv run pytest
