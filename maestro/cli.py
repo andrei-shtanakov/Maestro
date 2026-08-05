@@ -423,8 +423,9 @@ def _display_summary(tasks: list) -> None:
 
 def _print_validation_report(report: ValidationReport) -> None:
     """Render preflight issues and a summary line."""
+    colors = {"error": "red", "warning": "yellow", "info": "cyan"}
     for issue in report.issues:
-        color = "red" if issue.severity == "error" else "yellow"
+        color = colors[issue.severity]
         location = (
             f" {', '.join(issue.workstream_ids)}:" if issue.workstream_ids else ""
         )
@@ -433,9 +434,16 @@ def _print_validation_report(report: ValidationReport) -> None:
             f"{escape(f'[{issue.code}]')}{escape(location)} "
             f"{escape(issue.message)}"
         )
-    n_err, n_warn = len(report.errors), len(report.warnings)
+    n_err, n_warn, n_info = (
+        len(report.errors),
+        len(report.warnings),
+        len(report.infos),
+    )
     style = "red" if n_err else ("yellow" if n_warn else "green")
-    console.print(f"[{style}]{n_err} errors, {n_warn} warnings[/{style}]")
+    summary = f"{n_err} errors, {n_warn} warnings"
+    if n_info:
+        summary += f", {n_info} info"
+    console.print(f"[{style}]{summary}[/{style}]")
 
 
 async def _run_scheduler(

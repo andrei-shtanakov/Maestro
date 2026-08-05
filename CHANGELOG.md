@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+- **Preflight scope-overlap no longer flags DAG-ordered workstreams as a
+  merge-conflict risk (#121).** When a `depends_on` path (direct or
+  transitive) already orders two workstreams, they never run concurrently,
+  so their scope overlap is reported at a new `info` severity — without the
+  misleading "add a depends_on edge" advice — instead of `warning`. Info
+  findings never fail `maestro validate --strict`. Genuinely parallel
+  overlaps keep the warning unchanged.
+
 ### Added
 - **`maestro workstream-approve <id>` (gates v1.1, H-5):** the sanctioned
   operator re-queue for gate-blocked workstreams — NEEDS_REVIEW → READY with

@@ -122,6 +122,96 @@ class TestStaticChecks:
         assert report.issues == []
 
 
+class TestOrderedOverlapDowngrade:
+    """Issue #121: overlap between DAG-ordered workstreams is info, not warning.
+
+    Dependent workstreams never run concurrently, so their scope overlap
+    carries no merge-conflict risk; the finding stays visible as info but
+    must not advise adding the edge that is already there.
+    """
+
+    def test_parallel_pair_stays_warning(self) -> None:
+        config = make_config(
+            [
+                ws("a", ["src/**"], []),
+                ws("b", ["src/auth/**"], []),
+            ]
+        )
+        report = validate_project(config, check_fs=False)
+        overlap = [i for i in report.issues if i.code == "scope-overlap"]
+        assert len(overlap) == 1
+        assert overlap[0].severity == "warning"
+
+    def test_direct_edge_downgrades_static_overlap_to_info(self) -> None:
+        config = make_config(
+            [
+                ws("a", ["src/**"], []),
+                ws("b", ["src/auth/**"], ["a"]),
+            ]
+        )
+        report = validate_project(config, check_fs=False)
+        overlap = [i for i in report.issues if i.code == "scope-overlap"]
+        assert len(overlap) == 1
+        assert overlap[0].severity == "info"
+        assert "add a depends_on edge" not in overlap[0].message
+        assert report.warnings == []
+
+    def test_transitive_path_downgrades_static_overlap_to_info(self) -> None:
+        config = make_config(
+            [
+                ws("a", ["src/**"], []),
+                ws("mid", ["docs/**"], ["a"]),
+                ws("c", ["src/auth/**"], ["mid"]),
+            ]
+        )
+        report = validate_project(config, check_fs=False)
+        overlap = [i for i in report.issues if i.code == "scope-overlap"]
+        assert len(overlap) == 1
+        assert set(overlap[0].workstream_ids) == {"a", "c"}
+        assert overlap[0].severity == "info"
+
+    def test_cycle_does_not_break_overlap_check(self) -> None:
+        # A cycle is its own error; the overlap pass must still terminate
+        # and treat the (never-concurrent) pair as ordered.
+        config = make_config(
+            [
+                ws("a", ["src/**"], ["b"]),
+                ws("b", ["src/auth/**"], ["a"]),
+            ]
+        )
+        report = validate_project(config, check_fs=False)
+        assert [i.code for i in report.errors] == ["dag-cycle"]
+        overlap = [i for i in report.issues if i.code == "scope-overlap"]
+        assert len(overlap) == 1
+        assert overlap[0].severity == "info"
+
+    def test_fs_tier_overlap_on_ordered_pair_is_info(self, tmp_path: Path) -> None:
+        # './src/**' vs 'src/**' slips past the static heuristic; the exact
+        # FS tier catches it and must apply the same ordering downgrade.
+        repo = make_git_repo(tmp_path, ["src/main.py"])
+        config = make_config(
+            [
+                ws("a", ["./src/**"], []),
+                ws("b", ["src/**"], ["a"]),
+            ],
+            repo_path=str(repo),
+        )
+        report = validate_project(config)
+        overlap = [i for i in report.issues if i.code == "scope-overlap"]
+        assert len(overlap) == 1
+        assert overlap[0].severity == "info"
+        assert "add a depends_on edge" not in overlap[0].message
+
+    def test_info_not_counted_as_warning_or_error(self) -> None:
+        report = ValidationReport(
+            issues=[ValidationIssue(severity="info", code="scope-overlap", message="i")]
+        )
+        assert report.ok
+        assert report.warnings == []
+        assert report.errors == []
+        assert len(report.infos) == 1
+
+
 class TestFilesystemChecks:
     def test_repo_missing_is_error(self, tmp_path: Path) -> None:
         config = make_config(
