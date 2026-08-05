@@ -102,7 +102,10 @@ async def prove_no_live_process(db: "Database", ws: Workstream) -> str | None:
             "`maestro workstream-resolve-ambiguity`"
         ) from exc
     pid = marker.get("pid")
-    if not isinstance(pid, int):
+    # Strictly-positive real pid only: bool is an int subclass, and a
+    # corrupted marker with pid<=0 would probe "dead" — non-evidence must
+    # refuse, never pass (fail closed).
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         raise ReworkRefused(
             f"workstream '{ws.id}' was parked by recovery with no probeable "
             f"evidence (kind={marker.get('kind')!r}) — verify by hand and "
@@ -191,7 +194,7 @@ def validate_refresh(ws: Workstream, config_path: Path) -> RefreshEvidence | Non
 
 def _parse_config_bytes(data: bytes, source: Path) -> OrchestratorConfig:
     """Parse an OrchestratorConfig from the exact bytes that were hashed."""
-    from maestro.config import resolve_env_vars
+    from maestro.config import ConfigError, resolve_env_vars
 
     try:
         raw = yaml.safe_load(data)
@@ -202,7 +205,7 @@ def _parse_config_bytes(data: bytes, source: Path) -> OrchestratorConfig:
     try:
         resolved = resolve_env_vars(raw, source)
         return OrchestratorConfig(**resolved)
-    except (ValidationError, Exception) as exc:  # ConfigError from env resolve
+    except (ValidationError, ConfigError) as exc:
         raise ReworkRefused(f"invalid config {source}: {exc}") from exc
 
 

@@ -296,6 +296,21 @@ class TestLivenessProof:
             await prove_no_live_process(db, await db.get_workstream("ws-1"))
 
     @pytest.mark.anyio
+    async def test_nonpositive_marker_pid_refuses(self, db, monkeypatch) -> None:
+        # A corrupted/hand-edited marker with pid<=0 must never read as
+        # "proven dead" — it is non-evidence, resolvable only explicitly.
+        import maestro.rework as rework_mod
+        from maestro.rework import ReworkRefused, prove_no_live_process
+
+        monkeypatch.setattr(rework_mod, "_is_pid_alive", lambda _pid: False)
+        for bad_pid in (0, -1, True):
+            marker = json.dumps({"kind": "live_orphan", "pid": bad_pid})
+            ws_id = f"ws-{bad_pid}"
+            await db.create_workstream(make_ws(id_=ws_id, recovery_ambiguity=marker))
+            with pytest.raises(ReworkRefused, match="resolve"):
+                await prove_no_live_process(db, await db.get_workstream(ws_id))
+
+    @pytest.mark.anyio
     async def test_open_handle_refuses(self, db) -> None:
         from maestro.rework import ReworkRefused, prove_no_live_process
 
