@@ -525,8 +525,9 @@ def _check_tracked_spec_runner_config(repo: Path) -> list[ValidationIssue]:
                     "target repo tracks its own spec-runner.config.yaml; "
                     "Maestro will overwrite it inside each worktree (the "
                     "overwrite is ex-post-visible as a scope violation). "
-                    "Untrack the file and keep a local untracked copy for "
-                    "direct spec-runner runs — see 'Dual-mode repos' in the "
+                    "Untrack the file (git rm --cached, then add it to "
+                    ".gitignore) and keep a local untracked copy for direct "
+                    "spec-runner runs — see 'Dual-mode repos' in the "
                     "Maestro README."
                 ),
             )
