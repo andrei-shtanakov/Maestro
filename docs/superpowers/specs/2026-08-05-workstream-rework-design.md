@@ -37,7 +37,7 @@ It gives the operator a sanctioned entrance into the existing path.
 ## Decision summary (owner, 2026-08-05)
 
 - Both input channels: mandatory `--reason`, optional
-  `--refresh-from project.yaml`.
+  `--refresh-from <project.yaml>`.
 - `--reason` (audit) and the next-attempt prompt are semantically separate:
   a distinct optional `--instructions` flag feeds the addendum; `--reason`
   never enters the prompt.
@@ -51,7 +51,7 @@ It gives the operator a sanctioned entrance into the existing path.
 maestro workstream-rework <workstream-id>
     --reason "<text>"              # mandatory: immutable audit explanation
     [--instructions "<text>"]      # optional: addendum for the next attempt
-    [--refresh-from project.yaml]  # optional: re-read description/scope
+    [--refresh-from <project.yaml>]  # optional: re-read description/scope
     [--db <path>]
 ```
 
@@ -146,10 +146,11 @@ must not be applied to the new attempt.
 
 ## Resume dispatch
 
-- The READY handler's `resume_reason` dispatch becomes **exhaustive**:
-  `verification_reverify` | `verification_rework` | `operator_rework` |
-  None are the known values; anything else is an **error** (fail-closed to
-  NEEDS_REVIEW), not a silent plain resume.
+- The READY handler's `resume_reason` dispatch becomes **exhaustive**.
+  The complete set of allowed values is: `verification_reverify`,
+  `verification_rework`, `operator_rework`, and NULL (a plain,
+  non-resume READY). Any other value is an **error** (fail-closed to
+  NEEDS_REVIEW), never a silent plain resume.
 - `operator_rework` follows the existing re-decomposition path: same
   worktree, same branch, `setup_spec_runner` cleans stale harness state
   idempotently, spec regenerates. The addendum is built from the
