@@ -1,8 +1,8 @@
 # `maestro workstream-rework` — state-machine design (issue #124)
 
 Date: 2026-08-05
-Status: proposed (revision 2 after owner review; implementation is a
-separate PR)
+Status: approved (revision 2; owner review passed 2026-08-05 at `ae6d7a9`.
+Implementation is a separate PR)
 Issue: #124 `workstream-rework-command` (battle-testing pilot, S2 TASK-006 —
 three review rounds, two improvised raw-DB reworks)
 
@@ -138,6 +138,14 @@ attempt can still be running. Three conditions, all required:
 
 `workstream-approve` semantics are unchanged by this feature; the
 liveness proof above is a requirement of `workstream-rework` only.
+
+Implementation-plan note (owner, at approval): the durable
+recovery-ambiguity marker needs an exact storage location, evidence
+schema, and resolution procedure in the implementation plan. In
+particular, the **spawning-sentinel** case may carry no pid/handle at
+all — such a marker stays blocked until a separate explicit
+cleanup/resolution and must never resolve to an automatic
+"no process found".
 
 ## Validation before the transaction
 
