@@ -2992,6 +2992,8 @@ class Database:
             "verification_error_attempt",
             "rework_attempt",
             "resume_reason",
+            "operator_rework_seq",
+            "recovery_ambiguity",
         }
         for field_name, value in extra_fields.items():
             if field_name in allowed:

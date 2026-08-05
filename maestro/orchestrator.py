@@ -151,6 +151,23 @@ def _is_pid_alive(pid: int) -> bool:
     return True
 
 
+def _ambiguity_marker(kind: str, pid: int | None) -> str:
+    """Durable recovery-ambiguity marker JSON (#124).
+
+    kind: 'live_orphan' | 'spawn_uncertain' | 'live_handle'. ``pid`` is the
+    preserved probeable evidence; None means "no probeable evidence" — such
+    a marker is resolvable ONLY via `maestro workstream-resolve-ambiguity`,
+    never by an automatic probe.
+    """
+    return json.dumps(
+        {
+            "kind": kind,
+            "pid": None if pid == _SPAWNING_SENTINEL else pid,
+            "parked_at": datetime.now(UTC).isoformat(),
+        }
+    )
+
+
 def _maybe_live_orphan(pid: int | None) -> bool:
     """True if the recorded pid indicates a possibly-live orphan: the spawning
     sentinel (a spawn was in progress at the crash) or a still-alive real pid.
@@ -535,6 +552,7 @@ class Orchestrator:
                             expected_status=WorkstreamStatus.FAILED,
                             process_pid=None,
                             generation_pid=None,
+                            recovery_ambiguity=_ambiguity_marker("live_handle", None),
                         )
                         self._stats.failed += 1
                     elif live_orphan:
@@ -565,6 +583,12 @@ class Orchestrator:
                             expected_status=WorkstreamStatus.FAILED,
                             process_pid=None,
                             generation_pid=None,
+                            recovery_ambiguity=_ambiguity_marker(
+                                "spawn_uncertain"
+                                if orphan_pid == _SPAWNING_SENTINEL
+                                else "live_orphan",
+                                orphan_pid,
+                            ),
                         )
                         # Parked for review — signal via exit code + summary,
                         # matching _handle_failure's NEEDS_REVIEW accounting.

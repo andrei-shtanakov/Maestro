@@ -69,4 +69,5 @@ class TestMigration18:
         ws = await db.get_workstream("ws-1")
         assert ws.operator_rework_count == 2
         assert ws.operator_rework_seq == 2
+        assert ws.recovery_ambiguity is not None
         assert json.loads(ws.recovery_ambiguity)["pid"] == 7
