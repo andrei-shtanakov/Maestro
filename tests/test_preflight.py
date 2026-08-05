@@ -528,6 +528,9 @@ class TestSpecRunnerVersionGate:
         issues = preflight._check_spec_runner_version()
         assert [i.code for i in issues] == ["spec-runner-version-unsupported"]
         assert issues[0].severity == "error"
+        # The failure mode must be distinguishable from a missing binary.
+        assert "unrecognized" in issues[0].message
+        assert "something unexpected" in issues[0].message
 
     def test_dev_version_is_not_guessed(self, monkeypatch) -> None:
         from maestro import preflight
@@ -546,6 +549,19 @@ class TestSpecRunnerVersionGate:
         issues = preflight._check_spec_runner_version()
         assert [i.code for i in issues] == ["spec-runner-version-unsupported"]
         assert issues[0].severity == "error"
+        assert "not found" in issues[0].message
+
+    def test_timeout_is_blocked(self, monkeypatch) -> None:
+        from maestro import preflight
+
+        def raise_timeout(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, 30)
+
+        monkeypatch.setattr(preflight.subprocess, "run", raise_timeout)
+        issues = preflight._check_spec_runner_version()
+        assert [i.code for i in issues] == ["spec-runner-version-unsupported"]
+        assert issues[0].severity == "error"
+        assert "timed out" in issues[0].message
 
     def test_nonzero_exit_is_blocked(self, monkeypatch) -> None:
         from maestro import preflight
@@ -553,6 +569,7 @@ class TestSpecRunnerVersionGate:
         self._fake_version(monkeypatch, "spec-runner 2.16.0\n", returncode=1)
         issues = preflight._check_spec_runner_version()
         assert [i.code for i in issues] == ["spec-runner-version-unsupported"]
+        assert "exited with code 1" in issues[0].message
 
     def test_override_downgrades_to_warning(self, monkeypatch) -> None:
         from maestro import preflight
