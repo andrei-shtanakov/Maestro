@@ -31,7 +31,7 @@ from maestro.models import (
 from maestro.scope_gate import find_escapes, normalize
 
 
-Severity = Literal["error", "warning"]
+Severity = Literal["error", "warning", "info"]
 
 
 class ValidationBackendError(Exception):
@@ -97,6 +97,11 @@ class ValidationReport(BaseModel):
         return [i for i in self.issues if i.severity == "warning"]
 
     @property
+    def infos(self) -> list[ValidationIssue]:
+        """Informational findings; never block, even under --strict."""
+        return [i for i in self.issues if i.severity == "info"]
+
+    @property
     def ok(self) -> bool:
         """True when no errors are present (warnings allowed)."""
         return not self.errors
@@ -118,12 +123,15 @@ def validate_project(
     """
     issues: list[ValidationIssue] = []
     overlap_pairs: set[frozenset[str]] = set()
+    ordered_pairs = _ordered_pairs(config.workstreams)
 
     if config.workstreams:
         issues.extend(_check_dangling_deps(config.workstreams))
         issues.extend(_check_cycles(config.workstreams))
         issues.extend(_check_scope_empty(config.workstreams))
-        issues.extend(_check_overlap_static(config.workstreams, overlap_pairs))
+        issues.extend(
+            _check_overlap_static(config.workstreams, overlap_pairs, ordered_pairs)
+        )
 
     if config.domain is not None:
         issues.extend(_check_domain(config, config.domain))
@@ -140,7 +148,11 @@ def validate_project(
             )
             issues.extend(
                 _check_scope_fs(
-                    config.workstreams, repo, overlap_pairs, expected_outputs
+                    config.workstreams,
+                    repo,
+                    overlap_pairs,
+                    expected_outputs,
+                    ordered_pairs=ordered_pairs,
                 )
             )
         if not repo_issues:
@@ -214,22 +226,57 @@ def _check_scope_empty(
     ]
 
 
+def _ordered_pairs(workstreams: list[WorkstreamConfig]) -> set[frozenset[str]]:
+    """Pairs connected by a depends_on path, in either direction.
+
+    Ordered workstreams never run concurrently, so a scope overlap between
+    them carries no merge-conflict risk (issue #121). Unknown dep ids are
+    ignored here — they are reported separately as dangling-dep errors —
+    and the traversal is cycle-safe.
+    """
+    deps = {w.id: {d for d in w.depends_on if d != w.id} for w in workstreams}
+    pairs: set[frozenset[str]] = set()
+    for start in deps:
+        seen: set[str] = set()
+        stack = [d for d in deps[start] if d in deps]
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            stack.extend(d for d in deps[current] if d in deps)
+        pairs.update(frozenset({start, ancestor}) for ancestor in seen - {start})
+    return pairs
+
+
+_ORDERED_OVERLAP_NOTE = (
+    "The workstreams are ordered by a depends_on path and never run "
+    "concurrently, so the shared paths are informational only."
+)
+
+
 def _check_overlap_static(
     workstreams: list[WorkstreamConfig],
     seen_pairs: set[frozenset[str]],
+    ordered_pairs: set[frozenset[str]],
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     for warning in ProjectDecomposer.validate_non_overlap(workstreams):
         pair = frozenset({warning.workstream_a, warning.workstream_b})
         seen_pairs.add(pair)
+        ordered = pair in ordered_pairs
         issues.append(
             ValidationIssue(
-                severity="warning",
+                severity="info" if ordered else "warning",
                 code="scope-overlap",
                 workstream_ids=sorted(pair),
                 message=(
-                    f"{warning}. Overlapping scopes risk merge conflicts; "
-                    "split the scopes or add a depends_on edge."
+                    f"{warning}. {_ORDERED_OVERLAP_NOTE}"
+                    if ordered
+                    else (
+                        f"{warning}. Overlapping scopes risk merge conflicts; "
+                        "split the scopes or add a depends_on edge."
+                    )
                 ),
             )
         )
@@ -390,6 +437,8 @@ def _check_scope_fs(
     repo: Path,
     seen_pairs: set[frozenset[str]],
     expected_outputs: dict[str, list[str]] | None = None,
+    *,
+    ordered_pairs: set[frozenset[str]] | None = None,
 ) -> list[ValidationIssue]:
     """Check for non-matching glob patterns and exact scope overlaps.
 
@@ -451,16 +500,24 @@ def _check_scope_fs(
             common = files_by_ws[a.id] & files_by_ws[b.id]
             if common:
                 sample = ", ".join(sorted(common)[:5])
+                shared = (
+                    f"Scopes of '{a.id}' and '{b.id}' match the same "
+                    f"existing files (e.g. {sample})."
+                )
+                ordered = pair in (ordered_pairs or set())
                 issues.append(
                     ValidationIssue(
-                        severity="warning",
+                        severity="info" if ordered else "warning",
                         code="scope-overlap",
                         workstream_ids=sorted(pair),
                         message=(
-                            f"Scopes of '{a.id}' and '{b.id}' match the same "
-                            f"existing files (e.g. {sample}). Overlapping "
-                            "scopes risk merge conflicts; split the scopes "
-                            "or add a depends_on edge."
+                            f"{shared} {_ORDERED_OVERLAP_NOTE}"
+                            if ordered
+                            else (
+                                f"{shared} Overlapping scopes risk merge "
+                                "conflicts; split the scopes or add a "
+                                "depends_on edge."
+                            )
                         ),
                     )
                 )
