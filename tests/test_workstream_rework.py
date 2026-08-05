@@ -109,6 +109,8 @@ class TestRecordRework:
         assert ws.operator_rework_seq == 1
         assert ws.error_message is None
         assert ws.verification_run_id is None
+        # Stage B rework budget untouched by operator rework.
+        assert ws.rework_attempt == 0
         row = await db.get_workstream_rework("ws-1", 1)
         assert row is not None
         assert row["reason"] == "reviewer rejected the diff"
@@ -622,6 +624,25 @@ class TestResumeDispatch:
         assert len(decomposer.generate_spec_calls) == 1
         description = decomposer.generate_spec_calls[0].description
         assert description == "original description"
+
+
+class TestVisibility:
+    def test_workstreams_table_shows_rework_count(self, capsys) -> None:
+        from maestro.cli import _display_workstreams_table
+
+        _display_workstreams_table(
+            [make_ws(operator_rework_count=3)], "Workstreams Status"
+        )
+        out = capsys.readouterr().out
+        assert "Reworks" in out
+        assert "3" in out
+
+    def test_workstreams_table_hides_column_when_zero(self, capsys) -> None:
+        from maestro.cli import _display_workstreams_table
+
+        _display_workstreams_table([make_ws()], "Workstreams Status")
+        out = capsys.readouterr().out
+        assert "Reworks" not in out
 
 
 class TestAddendum:

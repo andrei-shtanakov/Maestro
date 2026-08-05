@@ -1275,11 +1275,17 @@ def _display_workstreams_table(workstreams: list, title: str = "Workstreams") ->
         show_header=True,
         header_style="bold",
     )
+    # Operator reworks (#124) are unbounded but must not be invisible:
+    # the column appears once any workstream has one, yellow at threshold.
+    show_reworks = any(getattr(z, "operator_rework_count", 0) > 0 for z in workstreams)
+
     table.add_column("ID", style="cyan", no_wrap=True)
     table.add_column("Title", style="white")
     table.add_column("Status", no_wrap=True)
     table.add_column("Branch", style="dim")
     table.add_column("Progress", justify="center")
+    if show_reworks:
+        table.add_column("Reworks", justify="center")
     table.add_column("PR", style="blue", max_width=30)
 
     for z in workstreams:
@@ -1289,14 +1295,19 @@ def _display_workstreams_table(workstreams: list, title: str = "Workstreams") ->
         if len(pr_text) > 30:
             pr_text = pr_text[-27:] + "..."
 
-        table.add_row(
+        row = [
             z.id,
             z.title,
             status_text,
             z.branch,
             z.subtask_progress or "-",
-            pr_text,
-        )
+        ]
+        if show_reworks:
+            count = getattr(z, "operator_rework_count", 0)
+            rework_style = "yellow" if count >= _REWORK_WARN_THRESHOLD else "dim"
+            row.append(Text(str(count) if count else "-", style=rework_style))
+        row.append(pr_text)
+        table.add_row(*row)
 
     console.print(table)
 

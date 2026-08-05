@@ -3,6 +3,24 @@
 ## Unreleased
 
 ### Added
+- **`maestro workstream-rework <id>` (#124).** Sanctioned operator rework
+  for a gate-blocked/failed workstream: `NEEDS_REVIEW/FAILED -> READY`
+  with `resume_reason='operator_rework'` into the existing
+  re-decomposition path (same worktree, same lineage, idempotent harness
+  state cleanup). Mandatory `--reason` (audit-only, never enters the
+  prompt), optional `--instructions` (next-attempt addendum, keyed by an
+  explicit audit seq) and `--refresh-from <project.yaml>`
+  (description/scope only, re-validated before anything is written;
+  topology fields refused). Fail-closed liveness proof: pid-NULL alone is
+  insufficient — open execution handles and the new durable
+  recovery-ambiguity marker (written by startup recovery when parking
+  possibly-live workstreams) block the command until proven terminal or
+  explicitly resolved via the new `maestro workstream-resolve-ambiguity`.
+  One CAS UPDATE + append-only audit row per rework (migration 18);
+  nothing is ever written to `gate_approvals`; the Stage B rework budget
+  is untouched. Unknown `resume_reason` values now fail closed to
+  NEEDS_REVIEW instead of silently plain-resuming. `maestro workstreams`
+  shows an operator-rework counter (warning-styled from 3).
 - **Preflight spec-runner version gate (#122).** Mode 2 now requires
   spec-runner >= 2.16.0, enforced fail-closed by `maestro validate` and the
   `maestro orchestrate` preflight before any worktree is created: older
