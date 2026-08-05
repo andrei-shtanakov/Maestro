@@ -229,16 +229,18 @@ def catalog_env(monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture(autouse=True)
 def _stub_spec_runner_help(monkeypatch: pytest.MonkeyPatch) -> None:
     """validate_project(check_fs=True) shells out to `spec-runner run
-    --help` (H-7 contract guard). Stub it to a passing response so the
-    suite doesn't depend on a locally installed spec-runner binary/version.
-    Other subprocess.run calls (e.g. real `git` invocations made directly
-    by tests) pass through untouched. Tests that want to exercise the
-    contract guard itself override this via their own monkeypatch.setattr
-    call, which wins because it runs later in the same test.
+    --help` (H-7 contract guard) and `spec-runner --version` (#122 version
+    gate). Stub both to passing responses so the suite doesn't depend on a
+    locally installed spec-runner binary/version. Other subprocess.run
+    calls (e.g. real `git` invocations made directly by tests) pass
+    through untouched. Tests that want to exercise a guard itself override
+    this via their own monkeypatch.setattr call, which wins because it
+    runs later in the same test.
     """
     import subprocess
 
     from maestro import preflight
+    from maestro.spec_runner import SPEC_RUNNER_REQUIRED_VERSION
 
     real_run = subprocess.run
 
@@ -246,6 +248,13 @@ def _stub_spec_runner_help(monkeypatch: pytest.MonkeyPatch) -> None:
         if cmd[:3] == ["spec-runner", "run", "--help"]:
             return subprocess.CompletedProcess(
                 cmd, 0, stdout="usage: ... --spec-prefix SPEC_PREFIX ...", stderr=""
+            )
+        if cmd[:2] == ["spec-runner", "--version"]:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=f"spec-runner {SPEC_RUNNER_REQUIRED_VERSION}\n",
+                stderr="",
             )
         return real_run(cmd, **kwargs)
 

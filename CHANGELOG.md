@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+- **Preflight spec-runner version gate (#122).** Mode 2 now requires
+  spec-runner >= 2.16.0, enforced fail-closed by `maestro validate` and the
+  `maestro orchestrate` preflight before any worktree is created: older
+  versions (2.15.x) commit the harness-owned `spec/.gitignore` into task
+  commits, which the ex-post scope gate flags as a scope escape. A version
+  below the minimum, unparseable `spec-runner --version` output, or a
+  missing binary all block with `spec-runner-version-unsupported`;
+  `MAESTRO_SPEC_RUNNER_ALLOW_UNVERIFIED=1` (for unpublished local builds)
+  downgrades the block to a warning. The scope gate itself is unchanged —
+  `spec/.gitignore` deliberately stays visible to changed-paths.
+
 ### Fixed
 - **Preflight scope-overlap no longer flags DAG-ordered workstreams as a
   merge-conflict risk (#121).** When a `depends_on` path (direct or

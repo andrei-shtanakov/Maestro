@@ -480,6 +480,134 @@ class TestSpecRunnerContractGuard:
         assert issues[0].severity == "error"
 
 
+class TestSpecRunnerVersionGate:
+    """#122: spec-runner < 2.16.0 may commit the harness-owned
+    spec/.gitignore into task commits; preflight blocks fail-closed
+    before any worktree exists."""
+
+    @staticmethod
+    def _fake_version(monkeypatch, stdout: str, returncode: int = 0) -> None:
+        from maestro import preflight
+
+        def fake_run(cmd, **kwargs):
+            assert cmd == ["spec-runner", "--version"]
+            return subprocess.CompletedProcess(
+                cmd, returncode, stdout=stdout, stderr=""
+            )
+
+        monkeypatch.setattr(preflight.subprocess, "run", fake_run)
+
+    def test_2_15_x_is_blocked(self, monkeypatch) -> None:
+        from maestro import preflight
+
+        self._fake_version(monkeypatch, "spec-runner 2.15.0\n")
+        issues = preflight._check_spec_runner_version()
+        assert [i.code for i in issues] == ["spec-runner-version-unsupported"]
+        assert issues[0].severity == "error"
+        assert "2.15.0" in issues[0].message  # found version
+        assert "2.16.0" in issues[0].message  # required version
+        assert "spec/.gitignore" in issues[0].message  # reason
+        assert "upgrade" in issues[0].message.lower()  # remedy
+
+    def test_minimum_version_passes(self, monkeypatch) -> None:
+        from maestro import preflight
+
+        self._fake_version(monkeypatch, "spec-runner 2.16.0\n")
+        assert preflight._check_spec_runner_version() == []
+
+    def test_newer_version_passes(self, monkeypatch) -> None:
+        from maestro import preflight
+
+        self._fake_version(monkeypatch, "spec-runner 3.0.1\n")
+        assert preflight._check_spec_runner_version() == []
+
+    def test_malformed_output_is_blocked(self, monkeypatch) -> None:
+        from maestro import preflight
+
+        self._fake_version(monkeypatch, "something unexpected\n")
+        issues = preflight._check_spec_runner_version()
+        assert [i.code for i in issues] == ["spec-runner-version-unsupported"]
+        assert issues[0].severity == "error"
+        # The failure mode must be distinguishable from a missing binary.
+        assert "unrecognized" in issues[0].message
+        assert "something unexpected" in issues[0].message
+
+    def test_dev_version_is_not_guessed(self, monkeypatch) -> None:
+        from maestro import preflight
+
+        self._fake_version(monkeypatch, "spec-runner 2.16.0.dev1\n")
+        issues = preflight._check_spec_runner_version()
+        assert [i.code for i in issues] == ["spec-runner-version-unsupported"]
+
+    def test_missing_binary_is_blocked(self, monkeypatch) -> None:
+        from maestro import preflight
+
+        def raise_fnf(cmd, **kw):
+            raise FileNotFoundError("spec-runner")
+
+        monkeypatch.setattr(preflight.subprocess, "run", raise_fnf)
+        issues = preflight._check_spec_runner_version()
+        assert [i.code for i in issues] == ["spec-runner-version-unsupported"]
+        assert issues[0].severity == "error"
+        assert "not found" in issues[0].message
+
+    def test_timeout_is_blocked(self, monkeypatch) -> None:
+        from maestro import preflight
+
+        def raise_timeout(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, 30)
+
+        monkeypatch.setattr(preflight.subprocess, "run", raise_timeout)
+        issues = preflight._check_spec_runner_version()
+        assert [i.code for i in issues] == ["spec-runner-version-unsupported"]
+        assert issues[0].severity == "error"
+        assert "timed out" in issues[0].message
+
+    def test_nonzero_exit_is_blocked(self, monkeypatch) -> None:
+        from maestro import preflight
+
+        self._fake_version(monkeypatch, "spec-runner 2.16.0\n", returncode=1)
+        issues = preflight._check_spec_runner_version()
+        assert [i.code for i in issues] == ["spec-runner-version-unsupported"]
+        assert "exited with code 1" in issues[0].message
+
+    def test_override_downgrades_to_warning(self, monkeypatch) -> None:
+        from maestro import preflight
+
+        self._fake_version(monkeypatch, "spec-runner 2.15.0\n")
+        monkeypatch.setenv("MAESTRO_SPEC_RUNNER_ALLOW_UNVERIFIED", "1")
+        issues = preflight._check_spec_runner_version()
+        assert [i.code for i in issues] == ["spec-runner-version-unsupported"]
+        assert issues[0].severity == "warning"
+
+    def test_gitignore_stays_visible_to_changed_paths(self) -> None:
+        # The convention's Maestro half: spec/.gitignore is NOT an
+        # orchestrator-managed artifact — the scope gate must see it.
+        from maestro.changed_paths import _orchestrator_managed
+
+        assert _orchestrator_managed("spec/.gitignore") is False
+
+
+class TestSpecRunnerVersionParse:
+    def test_plain_version(self) -> None:
+        from maestro.spec_runner import parse_spec_runner_version
+
+        assert parse_spec_runner_version("spec-runner 2.16.0\n") == (2, 16, 0)
+
+    def test_whitespace_tolerated(self) -> None:
+        from maestro.spec_runner import parse_spec_runner_version
+
+        assert parse_spec_runner_version("  spec-runner 2.16.3  \n") == (2, 16, 3)
+
+    def test_rejects_suffixes_and_garbage(self) -> None:
+        from maestro.spec_runner import parse_spec_runner_version
+
+        assert parse_spec_runner_version("spec-runner 2.16.0rc1") is None
+        assert parse_spec_runner_version("spec-runner 2.16.0+local") is None
+        assert parse_spec_runner_version("2.16.0") is None
+        assert parse_spec_runner_version("") is None
+
+
 class TestTrackedSpecRunnerConfigWarning:
     def test_tracked_config_warns(self, tmp_path) -> None:
         from maestro import preflight

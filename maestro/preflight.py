@@ -10,6 +10,7 @@ Used by the `maestro validate` CLI command and by `maestro orchestrate`
 as a fail-fast preflight.
 """
 
+import os
 import subprocess
 from fnmatch import fnmatch
 from pathlib import Path
@@ -29,6 +30,10 @@ from maestro.models import (
     WorkstreamConfig,
 )
 from maestro.scope_gate import find_escapes, normalize
+from maestro.spec_runner import (
+    SPEC_RUNNER_REQUIRED_VERSION,
+    parse_spec_runner_version,
+)
 
 
 Severity = Literal["error", "warning", "info"]
@@ -157,6 +162,7 @@ def validate_project(
             )
         if not repo_issues:
             issues.extend(_check_tracked_spec_runner_config(repo))
+        issues.extend(_check_spec_runner_version())
         issues.extend(_check_spec_runner_contract())
         if config.gates is not None:
             issues.extend(_check_gates(config.gates))
@@ -522,6 +528,71 @@ def _check_scope_fs(
                     )
                 )
     return issues
+
+
+def _check_spec_runner_version() -> list[ValidationIssue]:
+    """#122 gate: the installed spec-runner must be >= 2.16.0.
+
+    Older versions (2.15.x) commit the harness-owned spec/.gitignore into
+    task commits (fixed upstream in spec-runner#96), which the ex-post
+    scope gate flags as a scope escape — green workstreams land in
+    NEEDS_REVIEW through no agent's choice. Fail-closed: a version below
+    the minimum, unparseable output, or any failure to obtain the version
+    blocks before a worktree exists. Setting
+    MAESTRO_SPEC_RUNNER_ALLOW_UNVERIFIED=1 (documented escape hatch for
+    unpublished local builds) downgrades the block to a warning — never
+    to silence.
+    """
+    required = SPEC_RUNNER_REQUIRED_VERSION
+    detail: str
+    try:
+        result = subprocess.run(
+            ["spec-runner", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except FileNotFoundError:
+        detail = "the spec-runner binary was not found on PATH"
+    except subprocess.TimeoutExpired:
+        detail = "`spec-runner --version` timed out after 30s"
+    except OSError as exc:
+        detail = f"`spec-runner --version` failed to run: {exc}"
+    else:
+        if result.returncode != 0:
+            detail = f"`spec-runner --version` exited with code {result.returncode}"
+        else:
+            parsed = parse_spec_runner_version(result.stdout)
+            if parsed is not None:
+                required_tuple = tuple(int(n) for n in required.split("."))
+                if parsed >= required_tuple:
+                    return []
+                detail = "found version " + ".".join(str(n) for n in parsed)
+            else:
+                lines = result.stdout.splitlines()
+                first_line = lines[0] if lines else ""
+                detail = f"unrecognized `spec-runner --version` output: {first_line!r}"
+    severity: Severity = (
+        "warning"
+        if os.environ.get("MAESTRO_SPEC_RUNNER_ALLOW_UNVERIFIED") == "1"
+        else "error"
+    )
+    return [
+        ValidationIssue(
+            severity=severity,
+            code="spec-runner-version-unsupported",
+            workstream_ids=[],
+            message=(
+                f"the installed spec-runner is incompatible ({detail}; "
+                f"required >= {required}). Versions before {required} may "
+                "commit the harness-owned spec/.gitignore into task "
+                "commits, which the ex-post scope gate flags as a scope "
+                "escape. Upgrade spec-runner (e.g. `uv tool upgrade "
+                "spec-runner`)."
+            ),
+        )
+    ]
 
 
 def _check_spec_runner_contract() -> list[ValidationIssue]:

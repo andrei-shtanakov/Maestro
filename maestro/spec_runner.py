@@ -12,6 +12,7 @@ the state file themselves so format changes stay isolated to this module.
 
 import json
 import logging
+import re
 import sqlite3
 from pathlib import Path
 
@@ -30,11 +31,32 @@ logger = logging.getLogger(__name__)
 # parses `.executor-state.{db,json}`, AND delegates spec generation to
 # `spec-runner plan --full` (C4) against this version's contract: the
 # `--full` / `--from-file` / `--no-interactive` flags and the
-# `spec/{requirements,design,tasks}.md` output layout. This constant is a
-# DOC pin — it is not asserted at runtime (a runtime version gate is a
-# separate hardening ticket). Bumping requires reviewing the contract tests
-# and any format changes.
-SPEC_RUNNER_REQUIRED_VERSION = "2.0.0"
+# `spec/{requirements,design,tasks}.md` output layout. Enforced at runtime
+# by the preflight version gate (`preflight._check_spec_runner_version`,
+# issue #122): 2.16.0 is the first version that keeps the harness-owned
+# `spec/.gitignore` out of auto-commits (spec-runner#96) — older versions
+# put it into the workstream diff, which the ex-post scope gate flags as a
+# scope escape. Bumping requires reviewing the contract tests and any
+# format changes.
+SPEC_RUNNER_REQUIRED_VERSION = "2.16.0"
+
+_VERSION_OUTPUT_RE = re.compile(r"^\s*spec-runner (\d+)\.(\d+)\.(\d+)\s*$")
+
+
+def parse_spec_runner_version(output: str) -> tuple[int, int, int] | None:
+    """Parse `spec-runner --version` output into a (major, minor, patch) tuple.
+
+    Strict by design (issue #122): only the ordinary CLI format
+    ``spec-runner X.Y.Z`` (first line, surrounding whitespace tolerated) is
+    accepted. Dev/rc/local suffixes and anything else return None — the
+    version gate must not guess what an unknown build contains.
+    """
+    first_line = output.splitlines()[0] if output.splitlines() else ""
+    match = _VERSION_OUTPUT_RE.match(first_line)
+    if match is None:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
 
 # Filenames inside the workspace's `spec/` directory. SQLite is the canonical
 # format since spec-runner 2.0; JSON is kept as a read-only fallback so old
