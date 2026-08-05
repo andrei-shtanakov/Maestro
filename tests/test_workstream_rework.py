@@ -392,7 +392,7 @@ class TestRefreshValidation:
             validate_refresh(make_ws(), path)
 
 
-async def _git_worktree(tmp_path) -> str:
+def _git_worktree(tmp_path) -> str:
     """A real git repo with one commit, usable as a workstream worktree."""
     import subprocess
 
@@ -417,7 +417,7 @@ class TestCliHelpers:
     async def test_rework_happy_path(self, db, tmp_path) -> None:
         from maestro.cli import _rework_workstream
 
-        wt = await _git_worktree(tmp_path)
+        wt = _git_worktree(tmp_path)
         await db.create_workstream(
             make_ws(workspace_path=wt, error_message="gate blocked")
         )
@@ -438,7 +438,7 @@ class TestCliHelpers:
         from maestro.cli import _rework_workstream
         from maestro.rework import ReworkRefused
 
-        wt = await _git_worktree(tmp_path)
+        wt = _git_worktree(tmp_path)
         await db.create_workstream(
             make_ws(status=WorkstreamStatus.RUNNING, workspace_path=wt)
         )
@@ -448,13 +448,11 @@ class TestCliHelpers:
             )
 
     @pytest.mark.anyio
-    async def test_rework_refuses_sentinel_marker_with_hint(
-        self, db, tmp_path
-    ) -> None:
+    async def test_rework_refuses_sentinel_marker_with_hint(self, db, tmp_path) -> None:
         from maestro.cli import _rework_workstream
         from maestro.rework import ReworkRefused
 
-        wt = await _git_worktree(tmp_path)
+        wt = _git_worktree(tmp_path)
         marker = json.dumps({"kind": "spawn_uncertain", "pid": None})
         await db.create_workstream(
             make_ws(workspace_path=wt, recovery_ambiguity=marker)
@@ -484,6 +482,146 @@ class TestCliHelpers:
         await _resolve_ambiguity(db, "ws-1", statement="verified: nothing runs")
         ws = await db.get_workstream("ws-1")
         assert ws.recovery_ambiguity is None
+
+
+class TestResumeDispatch:
+    """READY dispatch is exhaustive; operator_rework re-decomposes with the
+    addendum keyed by (workstream_id, operator_rework_seq)."""
+
+    def _make_orch(self, db, tmp_path):
+        import subprocess
+        from unittest.mock import MagicMock
+
+        from maestro.models import OrchestratorConfig
+        from maestro.orchestrator import Orchestrator
+        from tests.fakes.fake_execution_backend import FakeTaskHandle
+
+        worktree = tmp_path / "wt"
+        if not (worktree / ".git").exists():
+            worktree.mkdir(exist_ok=True)
+            for cmd in (
+                ["git", "init", "-b", "main"],
+                ["git", "config", "user.email", "t@t"],
+                ["git", "config", "user.name", "t"],
+            ):
+                subprocess.run(cmd, cwd=worktree, check=True, capture_output=True)
+            (worktree / "f.txt").write_text("x")
+            subprocess.run(
+                ["git", "add", "."], cwd=worktree, check=True, capture_output=True
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "init"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+            )
+
+        class _WsMgr:
+            def workspace_exists(self, workstream_id: str) -> bool:
+                return True
+
+            def get_workspace_path(self, workstream_id: str):
+                return worktree
+
+            def create_workspace(self, workstream_id: str, branch: str):
+                return worktree
+
+            def setup_spec_runner(self, workspace, config) -> None:
+                pass
+
+            def cleanup_workspace(self, workstream_id: str) -> None:
+                pass
+
+        class _Decomposer:
+            def __init__(self) -> None:
+                self.generate_spec_calls: list[Any] = []
+
+            async def generate_spec(
+                self, workstream_config, workspace, *, on_pid=None
+            ) -> None:
+                self.generate_spec_calls.append(workstream_config)
+
+        class _Backend:
+            id = "local"
+
+            async def healthcheck(self):
+                from maestro.execution.models import BackendHealth
+
+                return BackendHealth(reachable=True)
+
+            async def can_run(self, req):
+                from maestro.execution.models import CapabilityResult
+
+                return CapabilityResult(ok=True)
+
+            async def run(self, req):
+                return FakeTaskHandle(exit_code=0, pid=4321)
+
+        config = OrchestratorConfig(
+            project="test",
+            repo_url="https://github.com/user/test",
+            repo_path=str(worktree),
+            workspace_base=str(tmp_path),
+            base_branch="main",
+            auto_pr=False,
+            max_concurrent=1,
+            workstreams=[],
+        )
+        decomposer = _Decomposer()
+        orch = Orchestrator(
+            db=db,
+            workspace_mgr=_WsMgr(),  # type: ignore[arg-type]
+            decomposer=decomposer,  # type: ignore[arg-type]
+            pr_manager=MagicMock(),
+            config=config,
+            log_dir=tmp_path / "logs",
+        )
+        orch._backends._cache["local"] = _Backend()  # type: ignore[assignment]
+        return orch, decomposer
+
+    @pytest.mark.anyio
+    async def test_unknown_resume_reason_fails_closed(self, db, tmp_path) -> None:
+        orch, decomposer = self._make_orch(db, tmp_path)
+        await db.create_workstream(
+            make_ws(status=WorkstreamStatus.READY, resume_reason="garbage")
+        )
+        await orch._spawn_workstream("ws-1")
+        ws = await db.get_workstream("ws-1")
+        assert ws.status is WorkstreamStatus.NEEDS_REVIEW
+        assert decomposer.generate_spec_calls == []
+
+    @pytest.mark.anyio
+    async def test_operator_rework_appends_instructions_addendum(
+        self, db, tmp_path
+    ) -> None:
+        orch, decomposer = self._make_orch(db, tmp_path)
+        await db.create_workstream(
+            make_ws(workspace_path=str(tmp_path / "wt"), error_message="blocked")
+        )
+        # Sanctioned path: the CAS sets READY + reason + seq.
+        await _record(db, instructions="split the migration")
+        await orch._spawn_workstream("ws-1")
+        assert len(decomposer.generate_spec_calls) == 1
+        description = decomposer.generate_spec_calls[0].description
+        assert "original description" in description
+        assert "split the migration" in description
+        assert "Operator rework instructions" in description
+        # reason is audit-only and never enters the prompt
+        assert "reviewer rejected the diff" not in description
+        ws = await db.get_workstream("ws-1")
+        assert ws.resume_reason is None  # cleared once the attempt exists
+
+    @pytest.mark.anyio
+    async def test_operator_rework_without_instructions_plain_description(
+        self, db, tmp_path
+    ) -> None:
+        orch, decomposer = self._make_orch(db, tmp_path)
+        await db.create_workstream(make_ws(workspace_path=str(tmp_path / "wt")))
+        await _record(db, instructions=None)
+        await orch._spawn_workstream("ws-1")
+        assert len(decomposer.generate_spec_calls) == 1
+        description = decomposer.generate_spec_calls[0].description
+        assert description == "original description"
 
 
 class TestAddendum:
