@@ -8,7 +8,11 @@ exhaustive READY resume dispatch.
 """
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 import pytest
 
@@ -208,3 +212,199 @@ class TestRecordRework:
             await db.resolve_recovery_ambiguity(
                 "ws-1", statement="s", initiator="andrei"
             )
+
+
+class TestResumeConstants:
+    def test_known_resume_reasons(self) -> None:
+        from maestro.domain.resume import (
+            KNOWN_RESUME_REASONS,
+            RESUME_OPERATOR_REWORK,
+        )
+
+        assert RESUME_OPERATOR_REWORK == "operator_rework"
+        assert {
+            "verification_rework",
+            "verification_reverify",
+            "operator_rework",
+        } == KNOWN_RESUME_REASONS
+
+
+class TestLivenessProof:
+    @pytest.mark.anyio
+    async def test_pids_null_no_marker_no_handles_passes(self, db) -> None:
+        from maestro.rework import prove_no_live_process
+
+        await db.create_workstream(make_ws())
+        evidence = await prove_no_live_process(db, await db.get_workstream("ws-1"))
+        assert evidence is None
+
+    @pytest.mark.anyio
+    async def test_nonnull_pid_refuses(self, db) -> None:
+        from maestro.rework import ReworkRefused, prove_no_live_process
+
+        await db.create_workstream(make_ws(process_pid=123))
+        with pytest.raises(ReworkRefused):
+            await prove_no_live_process(db, await db.get_workstream("ws-1"))
+
+    @pytest.mark.anyio
+    async def test_sentinel_generation_pid_refuses(self, db) -> None:
+        from maestro import orchestrator as orch_mod
+        from maestro.rework import ReworkRefused, prove_no_live_process
+
+        await db.create_workstream(make_ws(generation_pid=orch_mod._SPAWNING_SENTINEL))
+        with pytest.raises(ReworkRefused):
+            await prove_no_live_process(db, await db.get_workstream("ws-1"))
+
+    @pytest.mark.anyio
+    async def test_marker_with_dead_pid_passes_with_evidence(
+        self, db, monkeypatch
+    ) -> None:
+        import maestro.rework as rework_mod
+        from maestro.rework import prove_no_live_process
+
+        monkeypatch.setattr(rework_mod, "_is_pid_alive", lambda _pid: False)
+        marker = json.dumps({"kind": "live_orphan", "pid": 4242, "parked_at": "t"})
+        await db.create_workstream(make_ws(recovery_ambiguity=marker))
+        evidence = await prove_no_live_process(db, await db.get_workstream("ws-1"))
+        assert evidence is not None
+        parsed = json.loads(evidence)
+        assert parsed["pid"] == 4242
+        assert parsed["alive"] is False
+
+    @pytest.mark.anyio
+    async def test_marker_with_live_pid_refuses(self, db, monkeypatch) -> None:
+        import maestro.rework as rework_mod
+        from maestro.rework import ReworkRefused, prove_no_live_process
+
+        monkeypatch.setattr(rework_mod, "_is_pid_alive", lambda _pid: True)
+        marker = json.dumps({"kind": "live_orphan", "pid": 4242, "parked_at": "t"})
+        await db.create_workstream(make_ws(recovery_ambiguity=marker))
+        with pytest.raises(ReworkRefused):
+            await prove_no_live_process(db, await db.get_workstream("ws-1"))
+
+    @pytest.mark.anyio
+    async def test_sentinel_marker_always_refuses(self, db, monkeypatch) -> None:
+        import maestro.rework as rework_mod
+        from maestro.rework import ReworkRefused, prove_no_live_process
+
+        monkeypatch.setattr(rework_mod, "_is_pid_alive", lambda _pid: False)
+        marker = json.dumps({"kind": "spawn_uncertain", "pid": None, "parked_at": "t"})
+        await db.create_workstream(make_ws(recovery_ambiguity=marker))
+        with pytest.raises(ReworkRefused, match="resolve"):
+            await prove_no_live_process(db, await db.get_workstream("ws-1"))
+
+    @pytest.mark.anyio
+    async def test_open_handle_refuses(self, db) -> None:
+        from maestro.rework import ReworkRefused, prove_no_live_process
+
+        await db.create_workstream(make_ws(status=WorkstreamStatus.READY))
+        await db.start_execution(
+            entity_kind="workstream",
+            entity_id="ws-1",
+            expected_status=WorkstreamStatus.READY.value,
+            running_status=WorkstreamStatus.RUNNING.value,
+            execution_id="exec-1",
+            backend_id="docker",
+            transport_ref="docker:maestro-exec-1",
+            attempt=1,
+        )
+        # Park it the way recovery would, pids cleared.
+        await db.update_workstream_status(
+            "ws-1", WorkstreamStatus.FAILED, process_pid=None
+        )
+        await db.update_workstream_status("ws-1", WorkstreamStatus.NEEDS_REVIEW)
+        with pytest.raises(ReworkRefused, match="handle"):
+            await prove_no_live_process(db, await db.get_workstream("ws-1"))
+
+
+class TestRefreshValidation:
+    def _write_config(self, tmp_path, description: str, scope: list[str]) -> "Path":
+        import yaml as yaml_mod
+
+        cfg = {
+            "project": "test",
+            "repo_url": "https://github.com/user/test",
+            "repo_path": "/nonexistent",
+            "workspace_base": "/tmp/maestro-ws/test",
+            "workstreams": [
+                {
+                    "id": "ws-1",
+                    "title": "ws-1",
+                    "description": description,
+                    "scope": scope,
+                    "depends_on": [],
+                },
+                {
+                    "id": "ws-2",
+                    "title": "ws-2",
+                    "description": "sibling",
+                    "scope": ["docs/**"],
+                    "depends_on": [],
+                },
+            ],
+        }
+        path = tmp_path / "project.yaml"
+        path.write_text(yaml_mod.safe_dump(cfg))
+        return path
+
+    def test_description_change_produces_evidence(self, tmp_path) -> None:
+        import hashlib
+
+        from maestro.rework import validate_refresh
+
+        path = self._write_config(tmp_path, "updated description", [])
+        evidence = validate_refresh(make_ws(), path)
+        assert evidence is not None
+        assert evidence.new_description == "updated description"
+        assert evidence.old_description == "original description"
+        assert evidence.config_hash == hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def test_unchanged_returns_none(self, tmp_path) -> None:
+        from maestro.rework import validate_refresh
+
+        path = self._write_config(tmp_path, "original description", [])
+        assert validate_refresh(make_ws(), path) is None
+
+    def test_topology_change_refuses(self, tmp_path) -> None:
+        import yaml as yaml_mod
+
+        from maestro.rework import ReworkRefused, validate_refresh
+
+        path = self._write_config(tmp_path, "updated", [])
+        cfg = yaml_mod.safe_load(path.read_text())
+        cfg["workstreams"][0]["depends_on"] = ["ws-2"]
+        path.write_text(yaml_mod.safe_dump(cfg))
+        with pytest.raises(ReworkRefused, match="depends_on"):
+            validate_refresh(make_ws(), path)
+
+    def test_missing_id_refuses(self, tmp_path) -> None:
+        from maestro.rework import ReworkRefused, validate_refresh
+
+        path = self._write_config(tmp_path, "u", [])
+        with pytest.raises(ReworkRefused, match="no workstream"):
+            validate_refresh(make_ws(id_="other"), path)
+
+    def test_overlapping_refreshed_scope_refuses(self, tmp_path) -> None:
+        from maestro.rework import ReworkRefused, validate_refresh
+
+        path = self._write_config(tmp_path, "updated", ["docs/**"])
+        with pytest.raises(ReworkRefused, match="overlap"):
+            validate_refresh(make_ws(), path)
+
+
+class TestAddendum:
+    def test_instructions_render(self) -> None:
+        from maestro.rework import build_operator_rework_addendum
+
+        addendum = build_operator_rework_addendum(
+            {"instructions": "split the migration", "reason": "secret"}
+        )
+        assert addendum is not None
+        assert "split the migration" in addendum
+        assert "Operator rework instructions" in addendum
+        assert "secret" not in addendum  # reason never enters the prompt
+
+    def test_no_instructions_no_addendum(self) -> None:
+        from maestro.rework import build_operator_rework_addendum
+
+        assert build_operator_rework_addendum({"instructions": None}) is None
