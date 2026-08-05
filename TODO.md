@@ -231,9 +231,12 @@
 > Источник: findings-maestro-2026-08 (kapelle S2). Все пять приняты под исходными
 > слагами; порядок исполнения: #121 → #125 + DB-docs → дизайн #122 → #124 → #123.
 
-- [ ] **#121 preflight: подавить scope-overlap при упорядочивающем пути** (P1) @owner:andrei @id:preflight-overlap-depends-edge
+- [x] **#121 preflight: подавить scope-overlap при упорядочивающем пути** (P1) @owner:andrei @id:preflight-overlap-depends-edge
       Учитывать не только прямое `depends_on`, а любой упорядочивающий путь в DAG:
       при его наличии overlap — максимум info, без совета добавить уже существующее ребро.
+      Сделано (PR #127, merge `3e4d148`): новая severity `info` в обеих ярусах
+      (статическая эвристика + точное FS-пересечение), транзитивная достижимость
+      `_ordered_pairs` (cycle-safe), `--strict` info не эскалирует; issue закрыт.
 - [ ] **#122 scope gate: конвенция harness-owned paths** (P0 на проектирование) @owner:andrei @id:scope-gate-harness-owned-paths
       spec-runner ≥2.15 коммитит `spec/.gitignore` → ex-post гейт шлёт зелёный
       workstream в NEEDS_REVIEW. Решение НЕ фиксировать заранее (whitelist / pre-created
@@ -249,12 +252,16 @@
       evidence прошлой попытки, новый attempt/decomposition identity, транзакционный
       сброс, идемпотентность после сбоя, аудит причины/инициатора. Не скрытая
       разновидность approve. Докс-примечание про `~/.maestro/maestro.db` — в PR #125.
-- [ ] **#125 канон конфига для dual-mode репо (docs)** (P1) @owner:andrei @id:dual-mode-config-canon
+- [x] **#125 канон конфига для dual-mode репо (docs)** (P1) @owner:andrei @id:dual-mode-config-canon
       Mode-2 docs: project.yaml — SSOT, генерируемый `spec-runner.config.yaml` не
       трекается, для прямых spec-runner-запусков — локальная untracked-копия; указатель
       из warning `spec-runner-config-tracked`. Зафиксировать как текущее ограничение
       interoperability, не идеальный дизайн. Вместе с фиксом примеров `--db maestro.db`
       → фактический default `~/.maestro/maestro.db` (бонус из #124).
+      Сделано (PR #128, merge `f600655`): README-секция «Dual-mode repos» + «Where the
+      state DB lives», warning самодостаточен (git rm --cached + .gitignore), примеры
+      в CLAUDE.md без `--db maestro.db`; issue закрыт. Докс-часть #124 этим закрыта,
+      сам #124 (rework-команда) остаётся открытым feature-треком.
 
 ---
 
