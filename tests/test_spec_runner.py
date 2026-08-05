@@ -32,8 +32,15 @@ from maestro.spec_runner import (
 
 class TestVersionPin:
     def test_required_version_is_pinned(self) -> None:
-        """Changing this fails loudly — force a contract re-review."""
-        assert SPEC_RUNNER_REQUIRED_VERSION == "2.0.0"
+        """Changing this fails loudly — force a contract re-review.
+
+        2.0.0 -> 2.16.0 reviewed 2026-08-05 (issue #122, design doc
+        docs/superpowers/specs/2026-08-05-spec-runner-version-gate-design.md):
+        2.16.0 keeps the harness-owned spec/.gitignore out of auto-commits
+        (spec-runner#96); the state/plan contract this module reads is
+        unchanged between 2.0 and 2.16.
+        """
+        assert SPEC_RUNNER_REQUIRED_VERSION == "2.16.0"
 
 
 # ---------------------------------------------------------------------------

@@ -9,7 +9,7 @@ uv add maestro
 uv run maestro run examples/hello.yaml
 ```
 
-Requirements: Python 3.12+, [uv](https://docs.astral.sh/uv/), git. Mode 2 also needs [gh CLI](https://cli.github.com/).
+Requirements: Python 3.12+, [uv](https://docs.astral.sh/uv/), git. Mode 2 also needs [gh CLI](https://cli.github.com/) and [spec-runner](https://github.com/andrei-shtanakov/spec-runner) >= 2.16.0.
 
 **A model source is required.** Maestro no longer bakes in a default model, so
 one of the following must be true or the run fails loud: set `$ATP_CATALOG` to
@@ -115,6 +115,19 @@ the canonical setup is:
 
 This is the current interoperability contract between the two tools, not a
 final design — a shared convention may replace it later.
+
+**Spec-runner version:** Mode 2 requires spec-runner **>= 2.16.0** and
+preflight enforces this fail-closed before any worktree is created. Older
+versions (2.15.x) commit the harness-owned `spec/.gitignore` into task
+commits, which the ex-post scope gate flags as a scope escape — green
+workstreams end up in NEEDS_REVIEW through no agent's choice. The supported
+path is upgrading; declaring `spec/.gitignore` in every workstream's scope
+or `maestro workstream-approve` after the block is an emergency path for
+legacy 2.15.x only. For local development against an *unpublished*
+spec-runner build, set `MAESTRO_SPEC_RUNNER_ALLOW_UNVERIFIED=1` to downgrade
+the version check to a warning (the `--spec-prefix` capability probe stays
+mandatory). A `spec/.gitignore` deliberately tracked by the user remains a
+user file and is checked by the normal scope rules.
 
 ### Where the state DB lives
 
