@@ -285,7 +285,7 @@
 
 ## Входящие 2026-08, волна 2 (inbox #137, принят 2026-08-06)
 
-- [ ] **#137 ex-post gate: pluggable `approver_cmd` hook** (P1, сначала дизайн-спека) @owner:andrei @id:expost-approver-cmd
+- [x] **#137 ex-post gate: pluggable `approver_cmd` hook** (P1, сначала дизайн-спека) @owner:andrei @id:expost-approver-cmd
       Хук-команда по образцу CommandVerifier: получает review-контекст
       `{workstream, phase, sha, reason, diff}`, возвращает вердикт по строгому
       run-keyed контракту (как verdict v2). PASS → `workstream-approve` с
@@ -317,6 +317,14 @@
       allowlist убран из v1; `maestro.gate-verdict-record/v1` явно отделён от
       steward-контракта). Осталась реализация отдельным PR (миграция 20,
       контракт §5, guards §6, PASS-path §7.2, lifecycle §8, тесты §10).
+      Реализация сделана (PR #145, merge `280c74e`): `maestro/approver.py`
+      (контракт + bounded-раннер), миграция 20 (actor/approval_run_id,
+      `gate_approver_runs`, `gate_block_contexts`), обвязка оркестратора
+      (persist-at-block, guards-как-observations, sentinel до create_task,
+      PASS-path с cost-check/rechecks/CAS, drain на shutdown), `not_run` +
+      schema-дискриминатор в evidence; 66 новых тестов, 3 Copilot-фикса
+      (await stdin-фидера, short-circuit already_attempted, читаемость
+      bounded-read). Issue #137 закрыта. ВОЛНА 2 INBOX ЗАКРЫТА ПОЛНОСТЬЮ.
 
 ## Нотификации и post-PR (порядок утверждён 2026-08-06)
 
