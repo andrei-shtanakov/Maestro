@@ -97,6 +97,13 @@ durable state and unfinished work"**:
 | `0` complete | removable (removed by default) | **kept** — a future bot round / new head resumes from it |
 | `2` needs_human | **kept** — a human may need to inspect/fix in place | kept |
 | `1` infra_error | kept if local commits or dirty evidence exist; a clean workspace may be recreated | kept |
+
+A workspace kept dirty after `infra_error` intentionally FAILS the
+clean-checkout precondition on the next invocation (§3.1) — the
+operator must either commit the changes (turning them into a
+recognized commit-based continuation) or discard them with the audited
+`--discard-local`. The retention exists to preserve evidence, not to
+bypass the precondition.
 | PR closed/merged | removed by `--gc` only, after verifying remote state | removed by `--gc` |
 
 `--gc` is the only path that deletes durable state, and only after
@@ -122,6 +129,7 @@ CREATE TABLE post_pr_review_runs (
     exit_code           INTEGER,
     outcome             TEXT CHECK (outcome IN
                           ('complete','needs_human','infra_error')),
+    reason              TEXT,                      -- e.g. 'interrupted'; detail under outcome
     report_json         TEXT,                      -- spec-runner --json, verbatim-validated
     workspace_path      TEXT,
     spec_runner_version TEXT
@@ -130,8 +138,10 @@ CREATE TABLE post_pr_review_runs (
 
 - A row is inserted (`started_at`, no `finished_at`) **before** the
   spec-runner invocation — the crash sentinel; startup of the next
-  `maestro review-pr` call finalizes orphaned rows as
-  `infra_error / interrupted` (spec-runner's own state remains the
+  `maestro review-pr` call finalizes orphaned rows with
+  `outcome='infra_error', reason='interrupted'` — interruption is a
+  *reason* under the `infra_error` outcome, never a distinct outcome
+  value (spec-runner's own state remains the
   authority on review progress — an interrupted Maestro row never
   blocks re-invocation, the per-PR lock does that while alive).
 - A new bot round (new head SHA) is simply a new audit row. `DONE`
@@ -178,8 +188,9 @@ exit code `3` — it never spawns a second spec-runner.
 
 User-tunable review limits (`max_rounds`, `max_comments`,
 `max_changed_lines`, `max_cost_usd`, `max_wall_minutes`,
-`allowed_bots`) flow through the **existing `config_overlay`**
-mechanism — no new Maestro surface. But Maestro force-sets, after the
+`allowed_bots`) flow through the **existing
+`SpecRunnerConfig.extra_executor_config`** deep-merge overlay — no new
+Maestro surface. But Maestro force-sets, after the
 overlay merge (harness-owned, user values ignored with a warning):
 
 - the review-workspace `project_root`;
