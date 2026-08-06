@@ -328,13 +328,24 @@
       (в `PR_CREATED` ведут три пути, уведомляет только тот, что реально
       создал PR; пустая строка от `_get_existing_pr_url` = отсутствие URL,
       фикс по Copilot-ревью). TDD, 246 смежных тестов зелёные.
-- [ ] **Webhook-канал нотификаций** (P1, отдельный PR) @owner:andrei @id:webhook-notification-channel
+- [x] **Webhook-канал нотификаций** (P1, отдельный PR) @owner:andrei @id:webhook-notification-channel
       Конфиг обещает `webhook_url`/telegram-поля, runtime не даёт. Generic
       webhook: JSON schema/version, timeout, bounded retry; ошибка доставки
       non-blocking для оркестрации, но durable-visible; секреты не попадают
       в события/логи. Telegram-поля: сначала deprecated, удалить в следующем
       breaking/config-schema окне. Webhook — доставка события, НЕ исполнитель
       review loop и не durable workflow engine.
+      Сделано (PR #141, merge `ee4127e`): конверт `maestro.notification/v1`
+      (event_id=ULID стабилен через retry + Idempotency-Key, occurred_at,
+      per-event allowlist — message не уходит никогда), managed bounded
+      queue + worker с drain-deadline в shutdown обоих CLI-путей, retry
+      408/429(+Retry-After cap)/5xx/transport в wall-clock бюджете,
+      redirects off; URL не попадает в логи, включая INFO-строки самого
+      httpx (per-instance фильтр). Семантика записана: at-least-once в
+      живом процессе + graceful shutdown, best-effort через hard crash;
+      durable outbox — возможный follow-up за тем же швом очереди.
+      telegram-поля deprecated. httpx — прямая зависимость. Попутно:
+      регенерация схем подобрала июльский дрейф VerifierConfig. 23+9 тестов.
 - [ ] **`post_pr_command` — тонкий мост к spec-runner review-pr** (P2, после webhook и spec-runner#102) @owner:andrei @id:post-pr-command
       Maestro создаёт свои PR, но review-bot-циклом не владеет: отдельный
       opt-in хук на границе PR_CREATED, вызывающий resumable
