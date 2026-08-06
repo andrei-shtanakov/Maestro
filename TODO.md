@@ -317,11 +317,17 @@
 > post_pr_command → 6) дизайн service install после стабилизации автономных
 > операций.
 
-- [ ] **Notification на PR_CREATED** (P1, маленький PR) @owner:andrei @id:notify-pr-created
+- [x] **Notification на PR_CREATED** (P1, маленький PR) @owner:andrei @id:notify-pr-created
       Событие и централизованный переход уже есть, PR URL сохранён — добавить
       `NotificationEvent` + строку в `WORKSTREAM_EFFECTS`. URL передавать
       структурированным полем / гарантированным payload-ом перехода, не
       перечитыванием изменяемой DB постфактум.
+      Сделано (PR #139, merge `085c13a`): `WORKSTREAM_PR_CREATED` в таблице
+      эффектов, URL — структурированный payload `fire(..., url=...)` →
+      `Notification.url`; декларативный гейт `notification_requires_url`
+      (в `PR_CREATED` ведут три пути, уведомляет только тот, что реально
+      создал PR; пустая строка от `_get_existing_pr_url` = отсутствие URL,
+      фикс по Copilot-ревью). TDD, 246 смежных тестов зелёные.
 - [ ] **Webhook-канал нотификаций** (P1, отдельный PR) @owner:andrei @id:webhook-notification-channel
       Конфиг обещает `webhook_url`/telegram-поля, runtime не даёт. Generic
       webhook: JSON schema/version, timeout, bounded retry; ошибка доставки
