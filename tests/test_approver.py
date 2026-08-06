@@ -24,6 +24,8 @@ from maestro.approver import (
     run_approver_cmd,
     validate_verdict,
 )
+from maestro.database import Database
+from maestro.models import Workstream, WorkstreamStatus
 
 
 ECHO = EchoFields(
@@ -339,3 +341,160 @@ async def test_runner_outcome_is_frozen() -> None:
     outcome = CmdOutcome(stdout=None, stderr_tail="", error="x")
     with pytest.raises(AttributeError):
         outcome.error = "y"  # type: ignore[misc]
+
+
+# =============================================================================
+# DB layer: migration 20 + APIs (§7)
+# =============================================================================
+
+
+@pytest.fixture
+async def db(tmp_path: Path):
+    d = Database(tmp_path / "approver.db")
+    await d.connect()
+    yield d
+    await d.close()
+
+
+_MARKER = "gates: … | gates:approval-required phase=ex_post sha=" + "a" * 40
+
+
+def _needs_review_ws(zid: str = "ws-006") -> Workstream:
+    return Workstream(
+        id=zid,
+        title="W",
+        description="d",
+        branch=f"feature/{zid}",
+        status=WorkstreamStatus.NEEDS_REVIEW,
+        error_message=_MARKER,
+    )
+
+
+async def test_block_context_insert_or_ignore(db: Database) -> None:
+    await db.record_gate_block_context("ws-006", "ex_post", "a" * 40, '{"v": 1}')
+    # second write for the same key never rewrites the snapshot
+    await db.record_gate_block_context("ws-006", "ex_post", "a" * 40, '{"v": 2}')
+    assert await db.get_gate_block_context("ws-006", "ex_post", "a" * 40) == '{"v": 1}'
+    assert await db.get_gate_block_context("ws-006", "ex_post", "b" * 40) is None
+
+
+async def test_approver_run_unique_per_sha(db: Database) -> None:
+    ok = await db.insert_approver_run_started("01A", "ws-006", "ex_post", "a" * 40)
+    assert ok is True
+    dup = await db.insert_approver_run_started("01B", "ws-006", "ex_post", "a" * 40)
+    assert dup is False  # one paid evaluation per (ws, phase, sha)
+    assert await db.has_approver_run("ws-006", "ex_post", "a" * 40) is True
+    assert await db.has_approver_run("ws-006", "ex_post", "b" * 40) is False
+
+
+async def test_finalize_approver_run_guarded_on_started(db: Database) -> None:
+    await db.insert_approver_run_started("01A", "ws-006", "ex_post", "a" * 40)
+    assert await db.finalize_approver_run("01A", "error", reason="interrupted")
+    # already terminal: the guard refuses a second finalize
+    assert not await db.finalize_approver_run("01A", "fail", reason="late")
+    runs = await db.list_started_approver_runs()
+    assert runs == []
+
+
+async def test_approver_counts_and_cost_stats(db: Database) -> None:
+    await db.insert_approver_run_started("01A", "ws-006", "ex_post", "a" * 40)
+    await db.finalize_approver_run("01A", "fail", cost_usd=0.5)
+    await db.insert_approver_run_started("01B", "ws-006", "ex_post", "b" * 40)
+    await db.finalize_approver_run("01B", "error", reason="timeout")  # unknown cost
+    await db.insert_approver_run_started("01C", "ws-777", "ex_post", "c" * 40)
+
+    assert await db.count_approver_runs("ws-006") == 2
+    known, has_unknown = await db.approver_cost_stats("ws-006")
+    assert known == 0.5
+    assert has_unknown is True
+    assert await db.count_agent_approvals("ws-006") == 0
+
+
+async def test_list_started_approver_runs(db: Database) -> None:
+    await db.insert_approver_run_started("01A", "ws-006", "ex_post", "a" * 40)
+    started = await db.list_started_approver_runs()
+    assert [(r["approval_run_id"], r["workstream_id"]) for r in started] == [
+        ("01A", "ws-006")
+    ]
+
+
+async def test_approve_workstream_agent_happy_path(db: Database) -> None:
+    await db.create_workstream(_needs_review_ws())
+    await db.insert_approver_run_started("01A", "ws-006", "ex_post", "a" * 40)
+
+    ws = await db.approve_workstream_agent(
+        "ws-006",
+        "ex_post",
+        "a" * 40,
+        approval_run_id="01A",
+        verdict_json='{"verdict": "PASS"}',
+        cost_usd=0.42,
+        expected_error_message=_MARKER,
+    )
+    assert ws.status == WorkstreamStatus.READY
+    assert await db.count_agent_approvals("ws-006") == 1
+    assert ("ex_post", "a" * 40) in await db.list_gate_approvals("ws-006")
+    assert await db.list_started_approver_runs() == []
+
+
+async def test_approve_workstream_agent_cas_on_error_message(db: Database) -> None:
+    await db.create_workstream(_needs_review_ws())
+    await db.insert_approver_run_started("01A", "ws-006", "ex_post", "a" * 40)
+
+    with pytest.raises(ValueError, match="rejected"):
+        await db.approve_workstream_agent(
+            "ws-006",
+            "ex_post",
+            "a" * 40,
+            approval_run_id="01A",
+            verdict_json="{}",
+            cost_usd=None,
+            expected_error_message="something else entirely",
+        )
+    # rollback: no approval, run still started, status untouched
+    assert await db.count_agent_approvals("ws-006") == 0
+    assert len(await db.list_started_approver_runs()) == 1
+    assert (await db.get_workstream("ws-006")).status == WorkstreamStatus.NEEDS_REVIEW
+
+
+async def test_approve_workstream_agent_cas_on_status(db: Database) -> None:
+    ws = _needs_review_ws()
+    ws.status = WorkstreamStatus.READY
+    await db.create_workstream(ws)
+    await db.insert_approver_run_started("01A", "ws-006", "ex_post", "a" * 40)
+
+    with pytest.raises(ValueError):
+        await db.approve_workstream_agent(
+            "ws-006",
+            "ex_post",
+            "a" * 40,
+            approval_run_id="01A",
+            verdict_json="{}",
+            cost_usd=None,
+            expected_error_message=_MARKER,
+        )
+    assert await db.count_agent_approvals("ws-006") == 0
+
+
+async def test_approve_workstream_agent_requires_started_run(db: Database) -> None:
+    await db.create_workstream(_needs_review_ws())
+    await db.insert_approver_run_started("01A", "ws-006", "ex_post", "a" * 40)
+    await db.finalize_approver_run("01A", "error", reason="interrupted")
+
+    with pytest.raises(ValueError):
+        await db.approve_workstream_agent(
+            "ws-006",
+            "ex_post",
+            "a" * 40,
+            approval_run_id="01A",
+            verdict_json="{}",
+            cost_usd=None,
+            expected_error_message=_MARKER,
+        )
+    assert await db.count_agent_approvals("ws-006") == 0
+
+
+async def test_gate_approvals_actor_defaults_human(db: Database) -> None:
+    # the operator path writes no actor explicitly — reads back as human
+    await db.record_gate_approval("ws-006", "ex_post", "a" * 40)
+    assert await db.count_agent_approvals("ws-006") == 0

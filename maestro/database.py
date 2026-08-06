@@ -567,6 +567,11 @@ class Database:
                 "workstreams_subtask_total",
                 self._migrate_workstreams_subtask_total,
             ),
+            (
+                20,
+                "approver_v1",
+                self._migrate_approver_v1,
+            ),
         ]
 
         for version, name, fn in ordered:
@@ -976,6 +981,61 @@ class Database:
             await self._connection.execute(
                 "ALTER TABLE workstreams ADD COLUMN subtask_total INTEGER"
             )
+
+    async def _migrate_approver_v1(self) -> None:
+        """Migration 20: approver_cmd hook (#137, spec revision 4).
+
+        `gate_approvals` gains actor provenance (`actor`, default
+        'human' so existing rows read back correctly) and the attempt
+        link (`approval_run_id`). Two new append-only tables:
+        `gate_approver_runs` (evaluation attempts only — §6 observations
+        never land here; UNIQUE per (ws, phase, sha) = one paid
+        evaluation per SHA) and `gate_block_contexts` (immutable
+        persist-at-block snapshot the request envelope is built from).
+        Idempotent via PRAGMA table_info / IF NOT EXISTS.
+        """
+        assert self._connection is not None
+        cursor = await self._connection.execute("PRAGMA table_info(gate_approvals)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "actor" not in columns:
+            await self._connection.execute(
+                "ALTER TABLE gate_approvals ADD COLUMN actor TEXT NOT NULL "
+                "DEFAULT 'human'"
+            )
+        if "approval_run_id" not in columns:
+            await self._connection.execute(
+                "ALTER TABLE gate_approvals ADD COLUMN approval_run_id TEXT"
+            )
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gate_approver_runs (
+                approval_run_id TEXT PRIMARY KEY,
+                workstream_id   TEXT NOT NULL,
+                phase           TEXT NOT NULL CHECK (phase IN ('ex_post')),
+                sha             TEXT NOT NULL,
+                state           TEXT NOT NULL CHECK (state IN
+                                  ('started','pass','fail','error')),
+                reason          TEXT,
+                verdict_json    TEXT,
+                cost_usd        REAL,
+                created_at      TIMESTAMP NOT NULL,
+                finished_at     TIMESTAMP,
+                UNIQUE (workstream_id, phase, sha)
+            )
+            """
+        )
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gate_block_contexts (
+                workstream_id TEXT NOT NULL,
+                phase         TEXT NOT NULL CHECK (phase IN ('ex_post')),
+                sha           TEXT NOT NULL,
+                context_json  TEXT NOT NULL,
+                created_at    TIMESTAMP NOT NULL,
+                PRIMARY KEY (workstream_id, phase, sha)
+            )
+            """
+        )
 
     async def _migrate_workstream_rework(self) -> None:
         """Migration 18: operator rework columns + audit tables (#124).
@@ -3342,6 +3402,243 @@ class Database:
                 msg = (
                     f"workstream '{workstream_id}' is {row['status']}, "
                     f"only NEEDS_REVIEW can be approved"
+                )
+                raise ValueError(msg)
+        return await self.get_workstream(workstream_id)
+
+    # ------------------------------------------------------------------
+    # approver_cmd hook (#137, spec revision 4) — migration 20 tables
+    # ------------------------------------------------------------------
+
+    async def record_gate_block_context(
+        self, workstream_id: str, phase: str, sha: str, context_json: str
+    ) -> None:
+        """Persist the immutable block-time snapshot (spec §7.1).
+
+        `INSERT OR IGNORE`: the first write (the gate that actually
+        blocked) wins; nothing ever updates or deletes a snapshot.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        await self._connection.execute(
+            "INSERT OR IGNORE INTO gate_block_contexts "
+            "(workstream_id, phase, sha, context_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                workstream_id,
+                phase,
+                sha,
+                context_json,
+                _format_datetime(datetime.now(UTC)),
+            ),
+        )
+        await self._connection.commit()
+
+    async def get_gate_block_context(
+        self, workstream_id: str, phase: str, sha: str
+    ) -> str | None:
+        """Read the persisted block context, or None (guard §6.3)."""
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        cursor = await self._connection.execute(
+            "SELECT context_json FROM gate_block_contexts "
+            "WHERE workstream_id = ? AND phase = ? AND sha = ?",
+            (workstream_id, phase, sha),
+        )
+        row = await cursor.fetchone()
+        return None if row is None else row["context_json"]
+
+    async def insert_approver_run_started(
+        self, approval_run_id: str, workstream_id: str, phase: str, sha: str
+    ) -> bool:
+        """Write the crash-sentinel attempt row BEFORE spawning (spec §8).
+
+        Returns False when an attempt for this (workstream, phase, sha)
+        already exists — one paid evaluation per SHA (guard §6.10); the
+        caller records an `already_attempted` observation instead.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        try:
+            await self._connection.execute(
+                "INSERT INTO gate_approver_runs "
+                "(approval_run_id, workstream_id, phase, sha, state, created_at) "
+                "VALUES (?, ?, ?, ?, 'started', ?)",
+                (
+                    approval_run_id,
+                    workstream_id,
+                    phase,
+                    sha,
+                    _format_datetime(datetime.now(UTC)),
+                ),
+            )
+        except aiosqlite.IntegrityError:
+            return False
+        await self._connection.commit()
+        return True
+
+    async def finalize_approver_run(
+        self,
+        approval_run_id: str,
+        state: str,
+        *,
+        reason: str | None = None,
+        verdict_json: str | None = None,
+        cost_usd: float | None = None,
+    ) -> bool:
+        """Finalize a started attempt (fail/error paths; pass uses the txn).
+
+        Guarded on `state='started'` so a terminal attempt can never be
+        rewritten; returns False when nothing matched.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        cursor = await self._connection.execute(
+            "UPDATE gate_approver_runs SET state = ?, reason = ?, "
+            "verdict_json = ?, cost_usd = ?, finished_at = ? "
+            "WHERE approval_run_id = ? AND state = 'started'",
+            (
+                state,
+                reason,
+                verdict_json,
+                cost_usd,
+                _format_datetime(datetime.now(UTC)),
+                approval_run_id,
+            ),
+        )
+        await self._connection.commit()
+        return cursor.rowcount > 0
+
+    async def has_approver_run(self, workstream_id: str, phase: str, sha: str) -> bool:
+        """True when an evaluation attempt exists for this (ws, phase, sha)."""
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        cursor = await self._connection.execute(
+            "SELECT 1 FROM gate_approver_runs "
+            "WHERE workstream_id = ? AND phase = ? AND sha = ?",
+            (workstream_id, phase, sha),
+        )
+        return await cursor.fetchone() is not None
+
+    async def count_approver_runs(self, workstream_id: str) -> int:
+        """Execution-budget counter: every attempt, any SHA, any outcome."""
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        cursor = await self._connection.execute(
+            "SELECT COUNT(*) AS n FROM gate_approver_runs WHERE workstream_id = ?",
+            (workstream_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None  # COUNT(*) always yields one row
+        return int(row["n"])
+
+    async def count_agent_approvals(self, workstream_id: str) -> int:
+        """Authority-budget counter: approvals recorded with actor='agent'."""
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        cursor = await self._connection.execute(
+            "SELECT COUNT(*) AS n FROM gate_approvals "
+            "WHERE workstream_id = ? AND actor = 'agent'",
+            (workstream_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None  # COUNT(*) always yields one row
+        return int(row["n"])
+
+    async def approver_cost_stats(self, workstream_id: str) -> tuple[float, bool]:
+        """(sum of reported costs, any-attempt-with-unknown-cost) — §6.7.
+
+        `started` rows are excluded from the unknown check (their cost
+        is pending, not unreported); a terminal row with NULL cost makes
+        the remaining budget unprovable → fail-closed at the guard.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        cursor = await self._connection.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) AS known, "
+            "SUM(CASE WHEN state != 'started' AND cost_usd IS NULL "
+            "THEN 1 ELSE 0 END) AS unknown "
+            "FROM gate_approver_runs WHERE workstream_id = ?",
+            (workstream_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None  # aggregate query always yields one row
+        return float(row["known"] or 0.0), bool(row["unknown"])
+
+    async def list_started_approver_runs(self) -> list[dict[str, str]]:
+        """In-flight sentinel rows — startup finalizes them fail-closed (§8.2)."""
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        cursor = await self._connection.execute(
+            "SELECT approval_run_id, workstream_id, phase, sha "
+            "FROM gate_approver_runs WHERE state = 'started'"
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def approve_workstream_agent(
+        self,
+        workstream_id: str,
+        phase: str,
+        sha: str,
+        *,
+        approval_run_id: str,
+        verdict_json: str,
+        cost_usd: float | None,
+        expected_error_message: str | None,
+    ) -> Workstream:
+        """Agent-actor PASS transaction (spec §7.2) — ONE transaction.
+
+        Finalize the started attempt → record the approval with
+        actor='agent' → flip NEEDS_REVIEW -> READY, CAS-guarded on both
+        the status and the exact prior `error_message` re-read by the
+        caller. Any guard miss raises ValueError and rolls the whole
+        transaction back (the started row survives for a separate
+        `stale_after_evaluation` finalize).
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        now = _format_datetime(datetime.now(UTC))
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                "UPDATE gate_approver_runs SET state = 'pass', "
+                "verdict_json = ?, cost_usd = ?, finished_at = ? "
+                "WHERE approval_run_id = ? AND state = 'started'",
+                (verdict_json, cost_usd, now, approval_run_id),
+            )
+            if cursor.rowcount == 0:
+                msg = (
+                    f"agent approval rejected: attempt '{approval_run_id}' "
+                    "is not in state 'started'"
+                )
+                raise ValueError(msg)
+            await conn.execute(
+                "INSERT OR IGNORE INTO gate_approvals "
+                "(workstream_id, phase, sha, approved_at, actor, approval_run_id) "
+                "VALUES (?, ?, ?, ?, 'agent', ?)",
+                (workstream_id, phase, sha, now, approval_run_id),
+            )
+            cursor = await conn.execute(
+                "UPDATE workstreams SET status = 'ready' "
+                "WHERE id = ? AND status = 'needs_review' "
+                "AND error_message IS ?",
+                (workstream_id, expected_error_message),
+            )
+            if cursor.rowcount == 0:
+                msg = (
+                    f"agent approval rejected: workstream '{workstream_id}' "
+                    "moved (status or error_message changed since the "
+                    "pre-transaction recheck)"
                 )
                 raise ValueError(msg)
         return await self.get_workstream(workstream_id)
