@@ -20,6 +20,7 @@ from maestro.approver import (
     BlockContext,
     CmdOutcome,
     EchoFields,
+    _read_bounded,
     build_request_envelope,
     run_approver_cmd,
     validate_verdict,
@@ -538,3 +539,35 @@ def test_gates_config_approver_optional() -> None:
     gates2 = GatesConfig(approver=ApproverConfig(cmd=["./a.sh"]))
     assert gates2.approver is not None
     assert gates2.approver.cmd == ["./a.sh"]
+
+
+# =============================================================================
+# _read_bounded: exact memory bound (Copilot review, PR #145)
+# =============================================================================
+
+
+class _FakeReader:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = list(chunks)
+
+    async def read(self, _n: int) -> bytes:
+        return self._chunks.pop(0) if self._chunks else b""
+
+
+async def test_read_bounded_retains_exactly_limit_on_overflow() -> None:
+    data, overflowed = await _read_bounded(_FakeReader([b"x" * 8, b"y" * 6]), 10)  # type: ignore[arg-type]
+    assert overflowed is True
+    assert len(data) == 10
+    assert data == b"x" * 8 + b"y" * 2
+
+
+async def test_read_bounded_exact_limit_is_not_overflow() -> None:
+    data, overflowed = await _read_bounded(_FakeReader([b"x" * 10]), 10)  # type: ignore[arg-type]
+    assert overflowed is False
+    assert data == b"x" * 10
+
+
+async def test_read_bounded_under_limit() -> None:
+    data, overflowed = await _read_bounded(_FakeReader([b"ab", b"cd"]), 10)  # type: ignore[arg-type]
+    assert overflowed is False
+    assert data == b"abcd"

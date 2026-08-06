@@ -474,3 +474,25 @@ async def test_drain_cancels_on_requested_shutdown(tmp_path: Path) -> None:
         await asyncio.wait_for(orch._drain_approver_tasks(), timeout=5)
     finally:
         await db.close()
+
+
+async def test_already_attempted_short_circuits_before_diff(
+    tmp_path: Path, worktree: Path
+) -> None:
+    """Copilot (PR #145): once observed, later passes must not re-run git diff."""
+    cfg = _approver_cfg(tmp_path, _FAIL_SCRIPT)
+    orch, db = await _make_orch(tmp_path, approver=cfg)
+    try:
+        sha = _git(worktree, "rev-parse", "HEAD")
+        await db.create_workstream(_blocked_ws(sha, worktree))
+        await _seed_context(db, sha)
+
+        await _run_scheduled(orch)  # attempt happens (FAIL)
+        await _run_scheduled(orch)  # observation: already_attempted
+
+        diff_spy = AsyncMock(return_value=("", None))
+        orch._produce_approver_diff = diff_spy  # type: ignore[method-assign]
+        await _run_scheduled(orch)  # third pass: short-circuit, no diff
+        diff_spy.assert_not_awaited()
+    finally:
+        await db.close()

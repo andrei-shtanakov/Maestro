@@ -2455,6 +2455,11 @@ class Orchestrator:
             self._approver_observe(ws.id, "", "not_gate_block")
             return
         sha = marker.sha
+        # Short-circuit: `already_attempted` is permanent for this SHA by
+        # construction — once observed, later loop passes must not re-run
+        # the guard chain (notably the git diff) for it.
+        if (ws.id, sha, "already_attempted") in self._approver_observed:
+            return
         # Guard 3: the envelope is built ONLY from the persisted context.
         context_json = await self._db.get_gate_block_context(ws.id, "ex_post", sha)
         context: BlockContext | None = None

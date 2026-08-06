@@ -224,11 +224,12 @@ async def _read_bounded(stream: asyncio.StreamReader, limit: int) -> tuple[bytes
         chunk = await stream.read(65536)
         if not chunk:
             return b"".join(chunks), False
-        total += len(chunk)
-        if total > limit:
-            chunks.append(chunk[: limit - total])  # keep exactly `limit`
+        if total + len(chunk) > limit:
+            keep = limit - total  # retain exactly `limit` bytes overall
+            chunks.append(chunk[:keep])
             return b"".join(chunks), True
         chunks.append(chunk)
+        total += len(chunk)
 
 
 def _kill_group(process: asyncio.subprocess.Process) -> None:
@@ -305,7 +306,12 @@ async def run_approver_cmd(
                 )
             return CmdOutcome(stdout=stdout, stderr_tail=tail, error=None)
         finally:
+            # Cancel AND await: a child that stopped reading stdin can
+            # leave the feeder blocked in drain(); an unawaited cancel
+            # would leak a pending task ("Task was destroyed…").
             feed.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await feed
 
     try:
         return await asyncio.wait_for(_run(), timeout=timeout_seconds)
