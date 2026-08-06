@@ -457,7 +457,7 @@ operator.
 
 Every observation and every attempt appends `GateVerdictRecord`s to
 `logs/<ULID>/gate_verdicts.jsonl` with `gate_id="agent.approver"` —
-verdict `waived` (observation) / `pass` / `fail` / `error`, note
+verdict `not_run` (observation) / `pass` / `fail` / `error`, note
 carrying the summary, skip reason, or truncated stderr tail (§5.4). The
 existing record shape is reused; no new evidence format.
 
