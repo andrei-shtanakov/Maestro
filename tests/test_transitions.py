@@ -153,6 +153,17 @@ async def test_url_gated_notification_skipped_without_url():
     assert len(rec.events) == 1  # the event log entry still fires
 
 
+async def test_url_gate_treats_empty_string_as_absent():
+    # PRManager can yield "" (PR exists but URL lookup failed) — a gated
+    # notification without a usable link must not fire.
+    rec = _Rec()
+    d = _disp(rec)
+    s = TransitionSubject("workstream", "w", "W", WorkstreamStatus.PR_CREATED)
+    await d.fire(s, frm=WorkstreamStatus.MERGING, url="")
+    assert not rec.notifs
+    assert len(rec.events) == 1
+
+
 async def test_override_beats_entry_table():
     rec = _Rec()
     d = _disp(rec)

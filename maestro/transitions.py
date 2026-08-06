@@ -161,7 +161,8 @@ class TransitionDispatcher:
         swallowed (other sinks still fire), except `asyncio.CancelledError`,
         which always propagates. `url` is a structured notification payload
         (e.g. the created PR URL); an effect with
-        `notification_requires_url` notifies only when it is provided.
+        `notification_requires_url` notifies only when it is non-empty
+        (PRManager can yield "" when a PR exists but its URL lookup failed).
         """
         if frm == subject.status:  # not a transition
             return
@@ -173,7 +174,7 @@ class TransitionDispatcher:
             await self._run(self._log, subject, effect, message, details)
         # 3) notification
         if effect.notification is not None and (
-            not effect.notification_requires_url or url is not None
+            not effect.notification_requires_url or url
         ):
             await self._run(self._notify, subject, effect, message, url)
 
