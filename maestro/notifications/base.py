@@ -30,6 +30,9 @@ class NotificationEvent(StrEnum):
     WORKSTREAM_COMPLETED = "workstream_completed"
     WORKSTREAM_NEEDS_REVIEW = "workstream_needs_review"
     WORKSTREAM_PR_CREATED = "workstream_pr_created"
+    POST_PR_REVIEW_COMPLETE = "post_pr_review_complete"
+    POST_PR_REVIEW_NEEDS_HUMAN = "post_pr_review_needs_human"
+    POST_PR_REVIEW_ERROR = "post_pr_review_error"
 
 
 @dataclass
@@ -154,6 +157,9 @@ class Notification:
             NotificationEvent.WORKSTREAM_COMPLETED: "Workstream Completed",
             NotificationEvent.WORKSTREAM_NEEDS_REVIEW: "Workstream Needs Review",
             NotificationEvent.WORKSTREAM_PR_CREATED: "PR Created",
+            NotificationEvent.POST_PR_REVIEW_COMPLETE: "PR Review Complete",
+            NotificationEvent.POST_PR_REVIEW_NEEDS_HUMAN: "PR Review Needs You",
+            NotificationEvent.POST_PR_REVIEW_ERROR: "PR Review Failed",
         }
         fallback = "Task" if self.entity_kind == "task" else "Workstream"
         return f"Maestro: {event_titles.get(self.event, f'{fallback} Update')}"

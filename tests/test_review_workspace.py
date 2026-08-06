@@ -301,3 +301,108 @@ def test_cleanup_keeps_workspace_on_non_success(
     cleanup_after_run(repo_path=local_repo, paths=paths, exit_code=exit_code)
     assert paths.workspace.exists()
     assert paths.state_dir.exists()
+
+
+# =============================================================================
+# fetch_pr_meta (§3.1 step 1) — GitHub API via `gh`
+# =============================================================================
+
+
+def test_fetch_pr_meta_parses_gh_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+
+    from maestro import review_workspace
+
+    payload = {
+        "state": "OPEN",
+        "isDraft": False,
+        "headRefName": "feature/pr",
+        "headRefOid": "a" * 40,
+        "headRepository": {"name": "r"},
+        "headRepositoryOwner": {"login": "o"},
+    }
+
+    def _fake_run(cmd, **kwargs):
+        class _R:
+            returncode = 0
+            stdout = _json.dumps(payload)
+            stderr = ""
+
+        return _R()
+
+    monkeypatch.setattr(review_workspace.subprocess, "run", _fake_run)
+    meta = review_workspace.fetch_pr_meta(
+        PrRef(owner="o", repo="r", number=7, canonical_url="u")
+    )
+    assert meta.head_ref == "feature/pr"
+    assert meta.head_sha == "a" * 40
+    assert meta.is_open is True
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"state": "CLOSED", "isDraft": False},
+        {"state": "OPEN", "isDraft": True},
+        {"state": "MERGED", "isDraft": False},
+    ],
+)
+def test_fetch_pr_meta_refuses_closed_or_draft(
+    monkeypatch: pytest.MonkeyPatch, payload: dict
+) -> None:
+    import json as _json
+
+    from maestro import review_workspace
+
+    full = {
+        "headRefName": "feature/pr",
+        "headRefOid": "a" * 40,
+        "headRepository": {"name": "r"},
+        "headRepositoryOwner": {"login": "o"},
+        **payload,
+    }
+
+    def _fake_run(cmd, **kwargs):
+        class _R:
+            returncode = 0
+            stdout = _json.dumps(full)
+            stderr = ""
+
+        return _R()
+
+    monkeypatch.setattr(review_workspace.subprocess, "run", _fake_run)
+    with pytest.raises(PreconditionError):
+        review_workspace.fetch_pr_meta(
+            PrRef(owner="o", repo="r", number=7, canonical_url="u")
+        )
+
+
+def test_fetch_pr_meta_refuses_wrong_head_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json as _json
+
+    from maestro import review_workspace
+
+    payload = {
+        "state": "OPEN",
+        "isDraft": False,
+        "headRefName": "feature/pr",
+        "headRefOid": "a" * 40,
+        "headRepository": {"name": "fork"},
+        "headRepositoryOwner": {"login": "someone-else"},
+    }
+
+    def _fake_run(cmd, **kwargs):
+        class _R:
+            returncode = 0
+            stdout = _json.dumps(payload)
+            stderr = ""
+
+        return _R()
+
+    monkeypatch.setattr(review_workspace.subprocess, "run", _fake_run)
+    with pytest.raises(PreconditionError, match="head repository"):
+        review_workspace.fetch_pr_meta(
+            PrRef(owner="o", repo="r", number=7, canonical_url="u")
+        )

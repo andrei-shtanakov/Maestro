@@ -42,6 +42,8 @@ uv run maestro workstream-rework <workstream-id> --reason "<why>" [--instruction
 uv run maestro workstream-resolve-ambiguity <workstream-id> --statement "<how verified>"  # Resolve a recovery-ambiguity marker after manual cleanup (unblocks rework)
 uv run maestro check-scope <workstream-id> --base <base-branch>  # deterministic scope containment (exit 1 on escape)
 uv run maestro workspaces <project.yaml>     # List active worktrees
+uv run maestro review-pr <project.yaml> <workstream-id>  # Drive spec-runner's review-bot loop over that workstream's PR (needs spec-runner >= 2.21.0; exits 0 complete / 1 infra / 2 needs-human / 3 already-running)
+uv run maestro review-pr <project.yaml> --all            # Same, sequentially over every workstream PR
 
 # === Mode-2 config authoring ===
 uv run maestro init                          # Scaffold project.yaml from cwd

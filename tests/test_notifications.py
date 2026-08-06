@@ -99,7 +99,7 @@ class TestNotificationEvent:
 
     def test_event_count(self) -> None:
         """Test that all expected events are defined."""
-        assert len(NotificationEvent) == 10
+        assert len(NotificationEvent) == 13
 
 
 # =============================================================================

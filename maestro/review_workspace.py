@@ -15,6 +15,7 @@ takes the idempotency guarantee — or unpushed fix commits — with it.
 from __future__ import annotations
 
 import fcntl
+import json
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -31,9 +32,11 @@ if TYPE_CHECKING:
 __all__ = [
     "AlreadyRunning",
     "PrLock",
+    "PrMeta",
     "PreconditionError",
     "ReviewPaths",
     "cleanup_after_run",
+    "fetch_pr_meta",
     "materialize",
     "recover_push",
 ]
@@ -116,6 +119,76 @@ class PrLock:
             fcntl.flock(self._handle, fcntl.LOCK_UN)
             self._handle.close()
             self._handle = None
+
+
+@dataclass(frozen=True)
+class PrMeta:
+    """PR facts Maestro verifies before every invocation (spec §3.1)."""
+
+    head_ref: str
+    head_sha: str
+    is_open: bool
+
+
+def fetch_pr_meta(ref: PrRef) -> PrMeta:
+    """Read PR state/draft/head from the GitHub API — fail-closed (§3.1).
+
+    PR identity is verified here, on Maestro's side: spec-runner takes
+    the URL as a positional argument and re-reads the metadata itself,
+    and `ExecutorConfig` has no expected-repo/PR/head fields to force.
+
+    Raises:
+        PreconditionError: gh failure, closed/merged/draft PR, or a head
+            branch that lives in a different repository (fork PRs are
+            out of scope for the fix path).
+    """
+    result = subprocess.run(
+        [
+            "gh",
+            "pr",
+            "view",
+            str(ref.number),
+            "--repo",
+            ref.owner_repo,
+            "--json",
+            "state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        msg = f"`gh pr view` failed for {ref.canonical_url}: {result.stderr.strip()}"
+        raise PreconditionError(msg)
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        msg = f"unparseable `gh pr view` output for {ref.canonical_url}: {exc}"
+        raise PreconditionError(msg) from exc
+
+    state = str(payload.get("state", "")).upper()
+    if state != "OPEN":
+        msg = f"PR {ref.canonical_url} is {state or 'in an unknown state'} — not open"
+        raise PreconditionError(msg)
+    if payload.get("isDraft"):
+        msg = f"PR {ref.canonical_url} is a draft — review is fail-closed on drafts"
+        raise PreconditionError(msg)
+
+    head_owner = (payload.get("headRepositoryOwner") or {}).get("login")
+    head_repo = (payload.get("headRepository") or {}).get("name")
+    if head_owner != ref.owner or head_repo != ref.repo:
+        msg = (
+            f"PR {ref.canonical_url} head repository is "
+            f"{head_owner}/{head_repo}, expected {ref.owner_repo} — "
+            "cross-repository (fork) heads are out of scope"
+        )
+        raise PreconditionError(msg)
+
+    return PrMeta(
+        head_ref=str(payload["headRefName"]),
+        head_sha=str(payload["headRefOid"]),
+        is_open=True,
+    )
 
 
 def _git(repo: Path, *args: str) -> str:
