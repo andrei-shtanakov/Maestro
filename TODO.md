@@ -308,6 +308,15 @@
       transport envelope зафиксировать в спеке как reuse note / non-goal.
       Подключение review-цикла к Maestro-PR — будущий тонкий `post_pr_command`
       (см. секцию «Нотификации и post-PR» ниже), не этот хук.
+      Дизайн-этап пройден (PR #143, merge `b41703b`): спека
+      `docs/superpowers/specs/2026-08-06-expost-approver-cmd-design.md`,
+      Status approved (4 ревизии владельца; ключевое: хук = автоматизированный
+      оператор через существующий approve-API; observations ≠ attempts —
+      kill-switch обратим; persist-at-block `gate_block_contexts`; post-verdict
+      cost authority check + stale-SHA recheck + CAS; bounded I/O; механический
+      allowlist убран из v1; `maestro.gate-verdict-record/v1` явно отделён от
+      steward-контракта). Осталась реализация отдельным PR (миграция 20,
+      контракт §5, guards §6, PASS-path §7.2, lifecycle §8, тесты §10).
 
 ## Нотификации и post-PR (порядок утверждён 2026-08-06)
 
