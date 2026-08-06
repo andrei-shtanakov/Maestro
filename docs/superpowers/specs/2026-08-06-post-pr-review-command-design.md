@@ -1,6 +1,7 @@
 # `maestro review-pr` — post-PR review wrapper command — design
 
-**Status:** proposed (revision 2)
+**Status:** approved (revision 3, owner approval 2026-08-06 — editorial
+revision after the "почти APPROVED" verdict at `3943d12`)
 **Date:** 2026-08-06
 **Track:** notify/post-PR step 5 (owner order 2026-08-06); TODO
 `@id:post-pr-command`; upstream counterpart spec-runner#102 SHIPPED
@@ -11,7 +12,8 @@ re-invocation, `--json` report).
 wrapper command, orchestrator untouched; no new `WorkstreamStatus`;
 fresh workspace materialization is admissible ONLY over durable
 external state + retention of unfinished work; durable per-PR lock;
-append-only audit table; design-only PR before implementation.
+an immutable-after-finalization run-record audit table; design-only PR
+before implementation.
 **Revision 2 (owner review):** Maestro-owned push-recovery for the
 failed-push continuation (spec-runner's mutating phase requires strict
 `local_head == remote head_sha`); machine-report dependency made
@@ -145,7 +147,7 @@ bypass the precondition.
 confirming via the GitHub API that the PR is closed or merged. No TTL
 auto-cleanup in v1 (a GC sweep is explicit and auditable).
 
-## 5. Audit: append-only `post_pr_review_runs` (migration 21)
+## 5. Audit: immutable-after-finalization `post_pr_review_runs` (migration 21)
 
 One field on `workstreams` is not enough — the history of runs must
 survive. New run-record table — **immutable after finalization**
@@ -231,16 +233,31 @@ User-tunable review limits (`max_rounds`, `max_comments`,
 `max_changed_lines`, `max_cost_usd`, `max_wall_minutes`,
 `allowed_bots`) flow through the **existing
 `SpecRunnerConfig.extra_executor_config`** deep-merge overlay — no new
-Maestro surface. But Maestro force-sets, after the
-overlay merge (harness-owned, user values ignored with a warning):
+Maestro surface. Maestro force-sets, after the overlay merge
+(harness-owned, user values ignored with a warning):
 
 - the review-workspace `project_root`;
 - the **absolute** `state_file` (§3) — a user override here would
   silently destroy resumability;
-- Mode-2 review invariants (`post_pr: off` — the stage inside
-  spec-runner's own flow must not double-fire when Maestro drives the
-  loop externally);
-- the expected PR identity.
+- `review_pr.post_pr: off` — the stage inside spec-runner's own flow
+  must not double-fire when Maestro drives the loop externally.
+
+**PR identity is NOT a config invariant (revision 2)** — `ExecutorConfig`
+has no expected-repo/PR/head fields, and spec-runner re-reads the
+metadata itself. Instead: Maestro passes the full **canonical PR URL as
+the positional argument**, and verifies repo, PR number, and head
+repo/ref/SHA itself before every invocation (§3.1).
+
+### 7.1 Machine-report dependency (revision 2 — BLOCKING)
+
+`report_json` requires `spec-runner review-pr --json` to emit **exactly
+one JSON document on stdout with all diagnostics on stderr**. As shipped
+in 2.20.0, some limit paths print diagnostics to stdout before the
+final JSON, so verbatim capture is not a reliable machine interface.
+Filed as **spec-runner#116** (`slug: review-pr-json-purity`); the
+implementation PR pins the minimum spec-runner version carrying that
+fix (the same preflight version-gate machinery as #122) and this
+feature does not ship before it.
 
 ## 8. Non-goals
 
@@ -262,6 +279,15 @@ overlay merge (harness-owned, user values ignored with a warning):
 - Durable state: absolute `state_file` passed; state survives worktree
   removal; forced config keys win over user overlay (with warning);
   `post_pr` forced off.
+- **Push recovery (§3.1.4):** remote SHA unchanged → plain push →
+  metadata refresh → exact `remote head == local HEAD` → spec-runner
+  invoked; remote moved in a race, or the push is rejected →
+  spec-runner is NOT invoked, run finalized `infra_error`, workspace
+  kept.
+- **Version prerequisite (§7.1):** a spec-runner version predating the
+  #116 fix is blocked by preflight (no invocation, no run row); a
+  supported version yields exactly one JSON document on stdout, which
+  is validated (parsed) before landing in `report_json`.
 - Retention matrix (§4) per exit code, incl. exit-1-with-local-commits
   kept vs clean recreated; `--gc` removes only after remote
   closed/merged confirmation and never touches open PRs.
