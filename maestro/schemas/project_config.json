@@ -475,7 +475,7 @@
             }
           ],
           "default": null,
-          "description": "Telegram bot token",
+          "description": "DEPRECATED (non-functional; use webhook_url)",
           "title": "Telegram Token"
         },
         "telegram_chat_id": {
@@ -488,7 +488,7 @@
             }
           ],
           "default": null,
-          "description": "Telegram chat ID",
+          "description": "DEPRECATED (non-functional; use webhook_url)",
           "title": "Telegram Chat Id"
         },
         "webhook_url": {
@@ -501,7 +501,7 @@
             }
           ],
           "default": null,
-          "description": "Webhook URL for notifications",
+          "description": "Webhook URL for notifications (POSTs the versioned maestro.notification/v1 JSON envelope)",
           "title": "Webhook Url"
         }
       },
@@ -704,8 +704,8 @@
           "title": "Backend"
         },
         "validation_backend": {
-          "default": "local",
-          "description": "Backend for the post-task validation run: 'local' | 'same' (the task's backend) | a named backend. Non-local targets must resolve to transport.type == local; SSH targets fail preflight.",
+          "default": "same",
+          "description": "Backend for the post-task validation run: 'same' (the default \u2014 the task's own backend, so validation runs in the same environment the task ran in) | 'local' | a named backend. Non-local targets run durably; SSH targets are supported.",
           "title": "Validation Backend",
           "type": "string"
         }
@@ -731,6 +731,105 @@
       ],
       "title": "TaskType",
       "type": "string"
+    },
+    "VerifierConfig": {
+      "additionalProperties": false,
+      "description": "Opt-in adversarial LLM verifier-gate config (verifier-gate Mode-1).\n\nAbsent (`None` on `ProjectConfig.verifier`) keeps today's behavior\nbyte-for-byte: no `VERIFYING` phase, `VALIDATING -> DONE` directly.\n`backend` is pinned to `\"local\"` for this slice \u2014 read-only is policy\nisolation (scratch cwd, no collect, envelope on stdin), never OS\nisolation; rejecting any other value at construction time keeps that\nclaim honest. Model resolution is intentionally NOT done here \u2014 see\n`maestro.verifier.config.resolve_verifier_model`, which is isolated from\nthe main `resolve_model` precedence (never reads `MAESTRO_<H>_MODEL` or a\ncatalog default, only `verifier.model` then `MAESTRO_VERIFIER_MODEL`).",
+      "properties": {
+        "runner": {
+          "const": "claude",
+          "default": "claude",
+          "title": "Runner",
+          "type": "string"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Verifier model id. None defers to $MAESTRO_VERIFIER_MODEL at resolution time; never falls back to a catalog default.",
+          "title": "Model"
+        },
+        "timeout_seconds": {
+          "default": 120,
+          "minimum": 1,
+          "title": "Timeout Seconds",
+          "type": "integer"
+        },
+        "max_diff_bytes": {
+          "default": 100000,
+          "minimum": 1,
+          "title": "Max Diff Bytes",
+          "type": "integer"
+        },
+        "backend": {
+          "default": "local",
+          "enum": [
+            "local",
+            "docker"
+          ],
+          "title": "Backend",
+          "type": "string"
+        },
+        "docker": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VerifierDockerConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "VerifierConfig",
+      "type": "object"
+    },
+    "VerifierDockerConfig": {
+      "additionalProperties": false,
+      "description": "Tuning for the hardened verifier container (bounds are contract).",
+      "properties": {
+        "image": {
+          "title": "Image",
+          "type": "string"
+        },
+        "user": {
+          "title": "User",
+          "type": "string"
+        },
+        "memory": {
+          "default": "512m",
+          "title": "Memory",
+          "type": "string"
+        },
+        "cpus": {
+          "default": "1",
+          "title": "Cpus",
+          "type": "string"
+        },
+        "pids_limit": {
+          "default": 128,
+          "title": "Pids Limit",
+          "type": "integer"
+        },
+        "tmpfs_size": {
+          "default": "64m",
+          "title": "Tmpfs Size",
+          "type": "string"
+        }
+      },
+      "required": [
+        "image",
+        "user"
+      ],
+      "title": "VerifierDockerConfig",
+      "type": "object"
     }
   },
   "description": "Project configuration model for YAML parsing.\n\nThis is the root configuration model that represents the entire YAML\nconfiguration file including project settings, defaults, and task list.",
@@ -822,6 +921,18 @@
       ],
       "default": null,
       "description": "Execution backends config; None keeps zero-config local/bare execution (old behavior)."
+    },
+    "verifier": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/VerifierConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Opt-in adversarial LLM verifier gate; None keeps VALIDATING -> DONE with no VERIFYING phase (old behavior)."
     }
   },
   "required": [
