@@ -276,6 +276,12 @@ async def test_drain_deadline_bounds_shutdown(
     gate.set()
 
 
+async def test_short_backoffs_rejected_at_construction() -> None:
+    """Too few backoffs would IndexError mid-delivery and drop the event."""
+    with pytest.raises(ValueError, match="backoffs"):
+        WebhookNotifier(URL, backoffs=(1.0,))
+
+
 async def test_send_after_close_is_rejected() -> None:
     handler = _Recorder([httpx.Response(200)])
     notifier = _notifier(handler)

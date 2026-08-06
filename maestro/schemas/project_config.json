@@ -734,7 +734,7 @@
     },
     "VerifierConfig": {
       "additionalProperties": false,
-      "description": "Opt-in adversarial LLM verifier-gate config (verifier-gate Mode-1).\n\nAbsent (`None` on `ProjectConfig.verifier`) keeps today's behavior\nbyte-for-byte: no `VERIFYING` phase, `VALIDATING -> DONE` directly.\n`backend` is pinned to `\"local\"` for this slice \u2014 read-only is policy\nisolation (scratch cwd, no collect, envelope on stdin), never OS\nisolation; rejecting any other value at construction time keeps that\nclaim honest. Model resolution is intentionally NOT done here \u2014 see\n`maestro.verifier.config.resolve_verifier_model`, which is isolated from\nthe main `resolve_model` precedence (never reads `MAESTRO_<H>_MODEL` or a\ncatalog default, only `verifier.model` then `MAESTRO_VERIFIER_MODEL`).",
+      "description": "Opt-in adversarial LLM verifier-gate config (verifier-gate Mode-1).\n\nAbsent (`None` on `ProjectConfig.verifier`) keeps today's behavior\nbyte-for-byte: no `VERIFYING` phase, `VALIDATING -> DONE` directly.\n`backend` selects the judge's isolation: `\"local\"` (default) is policy\nisolation only (scratch cwd, no collect, envelope on stdin), never OS\nisolation; `\"docker\"` (with a `docker:` block) runs the judge in a\nlocked-down container \u2014 filesystem/process isolation, though not\nnetwork isolation. Model resolution is intentionally NOT done here \u2014 see\n`maestro.verifier.config.resolve_verifier_model`, which is isolated from\nthe main `resolve_model` precedence (never reads `MAESTRO_<H>_MODEL` or a\ncatalog default, only `verifier.model` then `MAESTRO_VERIFIER_MODEL`).",
       "properties": {
         "runner": {
           "const": "claude",

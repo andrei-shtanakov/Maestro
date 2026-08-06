@@ -824,10 +824,11 @@ class VerifierConfig(BaseModel):
 
     Absent (`None` on `ProjectConfig.verifier`) keeps today's behavior
     byte-for-byte: no `VERIFYING` phase, `VALIDATING -> DONE` directly.
-    `backend` is pinned to `"local"` for this slice — read-only is policy
-    isolation (scratch cwd, no collect, envelope on stdin), never OS
-    isolation; rejecting any other value at construction time keeps that
-    claim honest. Model resolution is intentionally NOT done here — see
+    `backend` selects the judge's isolation: `"local"` (default) is policy
+    isolation only (scratch cwd, no collect, envelope on stdin), never OS
+    isolation; `"docker"` (with a `docker:` block) runs the judge in a
+    locked-down container — filesystem/process isolation, though not
+    network isolation. Model resolution is intentionally NOT done here — see
     `maestro.verifier.config.resolve_verifier_model`, which is isolated from
     the main `resolve_model` precedence (never reads `MAESTRO_<H>_MODEL` or a
     catalog default, only `verifier.model` then `MAESTRO_VERIFIER_MODEL`).

@@ -133,10 +133,20 @@ class WebhookNotifier(NotificationChannel):
             url: Webhook endpoint (may embed a token — never logged).
             transport: Optional httpx transport override (tests).
             queue_maxsize: Bound of the in-memory delivery queue.
-            backoffs: Per-retry base delays (len == MAX_ATTEMPTS - 1).
+            backoffs: Per-retry base delays (len >= MAX_ATTEMPTS - 1).
             jitter_seconds: Max uniform jitter added to each backoff.
             drain_deadline: Seconds `aclose()` waits for the queue to drain.
+
+        Raises:
+            ValueError: If `backoffs` has fewer than MAX_ATTEMPTS - 1
+                entries (it would IndexError mid-delivery otherwise).
         """
+        if len(backoffs) < MAX_ATTEMPTS - 1:
+            msg = (
+                f"backoffs needs at least {MAX_ATTEMPTS - 1} entries "
+                f"(one per retry), got {len(backoffs)}"
+            )
+            raise ValueError(msg)
         self._url = url
         self._client = httpx.AsyncClient(
             timeout=ATTEMPT_TIMEOUT_SECONDS,
