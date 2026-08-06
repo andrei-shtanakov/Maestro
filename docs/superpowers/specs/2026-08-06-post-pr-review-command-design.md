@@ -97,6 +97,7 @@ durable state and unfinished work"**:
 | `0` complete | removable (removed by default) | **kept** — a future bot round / new head resumes from it |
 | `2` needs_human | **kept** — a human may need to inspect/fix in place | kept |
 | `1` infra_error | kept if local commits or dirty evidence exist; a clean workspace may be recreated | kept |
+| PR closed/merged | removed by `--gc` only, after verifying remote state | removed by `--gc` |
 
 A workspace kept dirty after `infra_error` intentionally FAILS the
 clean-checkout precondition on the next invocation (§3.1) — the
@@ -104,7 +105,6 @@ operator must either commit the changes (turning them into a
 recognized commit-based continuation) or discard them with the audited
 `--discard-local`. The retention exists to preserve evidence, not to
 bypass the precondition.
-| PR closed/merged | removed by `--gc` only, after verifying remote state | removed by `--gc` |
 
 `--gc` is the only path that deletes durable state, and only after
 confirming via the GitHub API that the PR is closed or merged. No TTL
