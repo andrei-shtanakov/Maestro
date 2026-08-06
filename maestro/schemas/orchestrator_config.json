@@ -523,7 +523,7 @@
             }
           ],
           "default": null,
-          "description": "Telegram bot token",
+          "description": "DEPRECATED (non-functional; use webhook_url)",
           "title": "Telegram Token"
         },
         "telegram_chat_id": {
@@ -536,7 +536,7 @@
             }
           ],
           "default": null,
-          "description": "Telegram chat ID",
+          "description": "DEPRECATED (non-functional; use webhook_url)",
           "title": "Telegram Chat Id"
         },
         "webhook_url": {
@@ -549,7 +549,7 @@
             }
           ],
           "default": null,
-          "description": "Webhook URL for notifications",
+          "description": "Webhook URL for notifications (POSTs the versioned maestro.notification/v1 JSON envelope)",
           "title": "Webhook Url"
         }
       },

@@ -3,6 +3,26 @@
 ## Unreleased
 
 ### Added
+- **Webhook notification channel.** A configured `notifications.webhook_url`
+  now POSTs a versioned JSON envelope (`maestro.notification/v1`) on
+  lifecycle notifications, delivered by a managed bounded queue with a
+  background worker: bounded retries (3 attempts inside a wall-clock
+  budget; 408/429/5xx/transport errors retry, `Retry-After` honored but
+  capped; other 4xx permanent; redirects disabled), graceful-shutdown
+  drain with a deadline, and visible overflow/undelivered accounting.
+  Semantics: at-least-once within a live process and graceful shutdown;
+  best-effort across a hard crash (a durable outbox is a possible
+  follow-up behind the same queue seam). Security: per-event field
+  allowlist (`message` is never forwarded; `url` only for PR-created),
+  `event_id` stable across retries and sent as `Idempotency-Key`, and the
+  webhook URL never reaches logs — including httpx's own request lines,
+  which are filtered. `httpx` becomes a direct dependency.
+
+### Deprecated
+- **`notifications.telegram_token` / `telegram_chat_id`.** Never wired to a
+  runtime channel; setting them now logs a deprecation warning. Use
+  `webhook_url` (e.g. via a small relay). The fields will be removed in a
+  future config-schema window.
 - **PR-created notification.** Entering `PR_CREATED` with an actual PR now
   fires a desktop notification carrying the PR URL. The URL travels as a
   structured transition payload (`Notification.url`) — never re-read from

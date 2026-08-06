@@ -26,6 +26,7 @@ dependencies = [
     # vulnerable mcp within fastmcp's window.
     # <2 mirrors fastmcp's own ceiling (fastmcp<=3.4.5 requires mcp<2.0);
     # lift both together when fastmcp ships SDK-v2 support.
+    "httpx>=0.28.1",
     "mcp>=1.28.1,<2",
     "pydantic>=2.12.5",
     "pyjwt>=2.13.0",

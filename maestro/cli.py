@@ -33,6 +33,7 @@ from maestro import (
     ConfigError,
     CycleError,
     Database,
+    NotificationManager,
     StateRecovery,
     TaskNotFoundError,
     create_database,
@@ -482,6 +483,7 @@ async def _run_scheduler(
     # Create or connect to database
     db = await create_database(db_path)
     lock_fd: int | None = None
+    notifications: NotificationManager | None = None
 
     # R-03: pick routing strategy. StaticRouting if cfg.arbiter is None or
     # disabled; ArbiterRouting (with its subprocess) when enabled.
@@ -668,6 +670,9 @@ async def _run_scheduler(
     finally:
         if routing is not None:
             await routing.aclose()
+        if notifications is not None:
+            # Bounded drain of queued notification deliveries (webhook).
+            await notifications.aclose()
         await db.close()
         if lock_fd is not None:
             _release_pid_lock(lock_fd)
@@ -1380,6 +1385,7 @@ async def _run_orchestrator(
     create_event_logger(log_dir)
 
     lock_fd: int | None = None
+    notifications: NotificationManager | None = None
 
     try:
         # Initialize components
@@ -1471,6 +1477,9 @@ async def _run_orchestrator(
             raise typer.Exit(1)
 
     finally:
+        if notifications is not None:
+            # Bounded drain of queued notification deliveries (webhook).
+            await notifications.aclose()
         await db.close()
         if lock_fd is not None:
             _release_pid_lock(lock_fd)
