@@ -363,7 +363,7 @@
       durable outbox — возможный follow-up за тем же швом очереди.
       telegram-поля deprecated. httpx — прямая зависимость. Попутно:
       регенерация схем подобрала июльский дрейф VerifierConfig. 23+9 тестов.
-- [ ] **`post_pr_command` — тонкий мост к spec-runner review-pr** (P2, после webhook и spec-runner#102) @owner:andrei @id:post-pr-command @blocked_by:spec-runner#review-pr-json-purity
+- [x] **`post_pr_command` — тонкий мост к spec-runner review-pr** (P2, после webhook и spec-runner#102) @owner:andrei @id:post-pr-command
       Maestro создаёт свои PR, но review-bot-циклом не владеет: отдельный
       opt-in хук на границе PR_CREATED, вызывающий resumable
       `spec-runner review-pr <PR>`. Не approver_cmd и не notify_cmd. Сейчас
@@ -383,6 +383,15 @@
       аудит (миграция 21). Реализация **заблокирована** на spec-runner#116
       (`--json` purity: ровно один JSON-документ на stdout) — версия будет
       запинена через preflight version-gate.
+      Блокер снят: spec-runner#116 закрыт (v2.21.0). Сделано (PR #149, merge
+      `fea2992`): команда `maestro review-pr <config> <ws>|--all|--gc`,
+      миграция 21 (`post_pr_review_runs`, immutable-after-finalization с CAS),
+      review-workspace с durable state вне checkout, Maestro-owned
+      push-recovery (ls-remote проверка + обычный fast-forward push, force
+      нигде), per-PR flock (exit 3), retention по exit-коду, `--gc` только
+      после подтверждённого closed/merged, version-gate >= 2.21.0, три
+      notification-события; 74 теста. Этим закрыт весь трек «Нотификации и
+      post-PR», кроме дизайна service install (P3).
 - [ ] **Дизайн `maestro service install`** (P3, после стабилизации автономных операций) @owner:andrei @id:service-install-design
       Отдельный operational track, НЕ связывать с #137. Launchd/systemd-генератор
       сам по себе не решает: single-instance locking, resume после crash, stale
