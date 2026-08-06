@@ -1,5 +1,94 @@
 {
   "$defs": {
+    "ApproverConfig": {
+      "additionalProperties": false,
+      "description": "approver_cmd hook config (#137, spec \u00a74). Opt-in inside `gates:`.\n\nAn ex-post gate block normally waits for a human\n`maestro workstream-approve`; with this block configured, an external\ncommand (independent critics; consensus policy lives in the command)\nmay approve instead \u2014 through the same single-authority approval\nAPI, recorded with `actor='agent'`. Fail-closed at every step: any\ntimeout/error/protocol violation leaves the workstream in\nNEEDS_REVIEW for the operator. The environment variable\n`MAESTRO_APPROVER_DISABLED=1` is an operational kill-switch on top\nof `enabled`.",
+      "properties": {
+        "cmd": {
+          "description": "argv list executed without a shell; envelope on stdin",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Cmd",
+          "type": "array"
+        },
+        "timeout_seconds": {
+          "default": 600,
+          "description": "Whole-command wall clock",
+          "exclusiveMinimum": 0,
+          "title": "Timeout Seconds",
+          "type": "number"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Config kill-switch",
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "max_auto_approvals": {
+          "default": 2,
+          "description": "AUTHORITY budget: agent approvals per workstream",
+          "minimum": 0,
+          "title": "Max Auto Approvals",
+          "type": "integer"
+        },
+        "max_evaluations": {
+          "default": 5,
+          "description": "EXECUTION budget: attempts per workstream, any SHA/outcome",
+          "minimum": 0,
+          "title": "Max Evaluations",
+          "type": "integer"
+        },
+        "max_escaped_paths": {
+          "default": 20,
+          "description": "More escapes -> straight to human",
+          "minimum": 0,
+          "title": "Max Escaped Paths",
+          "type": "integer"
+        },
+        "max_cost_usd": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Hard fail-closed budget over REPORTED costs; any attempt with unreported cost blocks further auto-runs",
+          "title": "Max Cost Usd"
+        },
+        "max_diff_bytes": {
+          "default": 262144,
+          "description": "Bigger diff -> straight to human",
+          "exclusiveMinimum": 0,
+          "title": "Max Diff Bytes",
+          "type": "integer"
+        },
+        "max_stdout_bytes": {
+          "default": 1048576,
+          "description": "Exceeded -> protocol ERROR",
+          "exclusiveMinimum": 0,
+          "title": "Max Stdout Bytes",
+          "type": "integer"
+        },
+        "max_stderr_bytes": {
+          "default": 262144,
+          "description": "Capture bound; never stored in DB",
+          "exclusiveMinimum": 0,
+          "title": "Max Stderr Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cmd"
+      ],
+      "title": "ApproverConfig",
+      "type": "object"
+    },
     "ArbiterConfig": {
       "additionalProperties": false,
       "description": "Configuration for the Arbiter MCP integration.\n\nValidated on YAML load. `enabled=false` (default) keeps Maestro on the\nzero-config StaticRouting path; no arbiter subprocess ever started.",
@@ -486,6 +575,18 @@
           },
           "title": "Approval Tiers",
           "type": "array"
+        },
+        "approver": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApproverConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional approver_cmd hook (#137): auto-approve ex-post gate blocks via an external critic command; absent = wait for the operator (today's behavior)"
         }
       },
       "title": "GatesConfig",

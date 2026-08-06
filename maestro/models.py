@@ -1582,6 +1582,62 @@ class ExecutorState(BaseModel):
         return label
 
 
+class ApproverConfig(BaseModel):
+    """approver_cmd hook config (#137, spec §4). Opt-in inside `gates:`.
+
+    An ex-post gate block normally waits for a human
+    `maestro workstream-approve`; with this block configured, an external
+    command (independent critics; consensus policy lives in the command)
+    may approve instead — through the same single-authority approval
+    API, recorded with `actor='agent'`. Fail-closed at every step: any
+    timeout/error/protocol violation leaves the workstream in
+    NEEDS_REVIEW for the operator. The environment variable
+    `MAESTRO_APPROVER_DISABLED=1` is an operational kill-switch on top
+    of `enabled`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    cmd: list[str] = Field(
+        min_length=1,
+        description="argv list executed without a shell; envelope on stdin",
+    )
+    timeout_seconds: float = Field(
+        default=600, gt=0, description="Whole-command wall clock"
+    )
+    enabled: bool = Field(default=True, description="Config kill-switch")
+    max_auto_approvals: int = Field(
+        default=2,
+        ge=0,
+        description="AUTHORITY budget: agent approvals per workstream",
+    )
+    max_evaluations: int = Field(
+        default=5,
+        ge=0,
+        description="EXECUTION budget: attempts per workstream, any SHA/outcome",
+    )
+    max_escaped_paths: int = Field(
+        default=20, ge=0, description="More escapes -> straight to human"
+    )
+    max_cost_usd: float | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Hard fail-closed budget over REPORTED costs; any attempt "
+            "with unreported cost blocks further auto-runs"
+        ),
+    )
+    max_diff_bytes: int = Field(
+        default=262144, gt=0, description="Bigger diff -> straight to human"
+    )
+    max_stdout_bytes: int = Field(
+        default=1048576, gt=0, description="Exceeded -> protocol ERROR"
+    )
+    max_stderr_bytes: int = Field(
+        default=262144, gt=0, description="Capture bound; never stored in DB"
+    )
+
+
 class GatesConfig(BaseModel):
     """Gates-in-DAG guard config (WS-006 skeleton, steward DESIGN-611). Opt-in.
 
@@ -1608,6 +1664,14 @@ class GatesConfig(BaseModel):
     approval_tiers: list[str] = Field(
         default=["high", "critical"],
         description="Tiers that require a human owner approval before spawn/merge",
+    )
+    approver: ApproverConfig | None = Field(
+        default=None,
+        description=(
+            "Optional approver_cmd hook (#137): auto-approve ex-post gate "
+            "blocks via an external critic command; absent = wait for the "
+            "operator (today's behavior)"
+        ),
     )
 
 

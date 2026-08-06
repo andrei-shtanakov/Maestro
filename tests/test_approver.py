@@ -25,7 +25,12 @@ from maestro.approver import (
     validate_verdict,
 )
 from maestro.database import Database
-from maestro.models import Workstream, WorkstreamStatus
+from maestro.models import (
+    ApproverConfig,
+    GatesConfig,
+    Workstream,
+    WorkstreamStatus,
+)
 
 
 ECHO = EchoFields(
@@ -498,3 +503,38 @@ async def test_gate_approvals_actor_defaults_human(db: Database) -> None:
     # the operator path writes no actor explicitly — reads back as human
     await db.record_gate_approval("ws-006", "ex_post", "a" * 40)
     assert await db.count_agent_approvals("ws-006") == 0
+
+
+# =============================================================================
+# Config surface (§4)
+# =============================================================================
+
+
+def test_approver_config_defaults() -> None:
+    cfg = ApproverConfig(cmd=["./approve.sh"])
+    assert cfg.timeout_seconds == 600
+    assert cfg.enabled is True
+    assert cfg.max_auto_approvals == 2
+    assert cfg.max_evaluations == 5
+    assert cfg.max_escaped_paths == 20
+    assert cfg.max_cost_usd is None
+    assert cfg.max_diff_bytes == 262144
+    assert cfg.max_stdout_bytes == 1048576
+    assert cfg.max_stderr_bytes == 262144
+
+
+def test_approver_config_rejects_empty_cmd_and_extras() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ApproverConfig(cmd=[])
+    with pytest.raises(ValidationError):
+        ApproverConfig(cmd=["x"], surprise=1)  # type: ignore[call-arg]
+
+
+def test_gates_config_approver_optional() -> None:
+    gates = GatesConfig()
+    assert gates.approver is None  # absent = today's behavior
+    gates2 = GatesConfig(approver=ApproverConfig(cmd=["./a.sh"]))
+    assert gates2.approver is not None
+    assert gates2.approver.cmd == ["./a.sh"]
