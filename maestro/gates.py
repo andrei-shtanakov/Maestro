@@ -79,13 +79,27 @@ _DEFERRED_GATES = {
 
 
 class GateVerdictRecord(BaseModel):
-    """One appended line of logs/<ULID>/gate_verdicts.jsonl (DESIGN-607)."""
+    """One appended line of logs/<ULID>/gate_verdicts.jsonl (DESIGN-607).
 
-    model_config = ConfigDict(extra="forbid")
+    This is Maestro's INTERNAL run-level audit format
+    (`maestro.gate-verdict-record/v1`) — not steward's canonical
+    `contracts/gate-verdicts/v1` findings-bundle. The explicit `schema`
+    discriminator on every line keeps the two from being mistaken for
+    one contract (approver spec §7.3). `not_run` marks an approver
+    observation: the evaluator did not run and the gate still blocks —
+    semantically neutral, never a waiver.
+    """
 
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    record_schema: str = Field(
+        default="maestro.gate-verdict-record/v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
     gate_id: str
     obligation: Literal["mandatory", "advisory"]
-    verdict: Literal["pass", "fail", "waived", "error", "missing"]
+    verdict: Literal["pass", "fail", "waived", "error", "missing", "not_run"]
     tier: str | None = None
     phase: Literal["ex_ante", "ex_post"]
     sha: str | None = None
@@ -394,9 +408,16 @@ class GateKeeper:
             raise RuntimeError(f"git {' '.join(args)} failed: {msg}")
         return stdout.decode()
 
+    def append_records(self, records: list[GateVerdictRecord]) -> None:
+        """Append externally-built records (e.g. approver evidence, #137)."""
+        self._write(records)
+
     def _write(self, records: list[GateVerdictRecord]) -> None:
         self._log_dir.mkdir(parents=True, exist_ok=True)
         path = self._log_dir / "gate_verdicts.jsonl"
         with path.open("a", encoding="utf-8") as handle:
             for rec in records:
-                handle.write(json.dumps(rec.model_dump(exclude_none=True)) + "\n")
+                handle.write(
+                    json.dumps(rec.model_dump(by_alias=True, exclude_none=True))
+                    + "\n"
+                )

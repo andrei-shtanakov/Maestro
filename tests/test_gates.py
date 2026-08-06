@@ -13,6 +13,7 @@ import pytest
 from maestro.gates import (
     APPROVAL_MARKER_PREFIX,
     GateKeeper,
+    GateVerdictRecord,
     parse_approval_marker,
     pipeline_log_dir,
 )
@@ -980,3 +981,53 @@ class TestPreserveApprovalMarker:
 
         assert preserve_approval_marker("err", None) == "err"
         assert preserve_approval_marker("err", "plain failure") == "err"
+
+
+# ------------------------------------------------ approver evidence (#137)
+
+
+def test_verdict_record_accepts_not_run() -> None:
+    """§6: observations use the semantically-neutral not_run, never waived."""
+    rec = GateVerdictRecord(
+        gate_id="agent.approver",
+        obligation="advisory",
+        verdict="not_run",
+        phase="ex_post",
+        ts="2026-08-06T00:00:00+00:00",
+        workstream_id="ws-1",
+        note="disabled",
+    )
+    assert rec.verdict == "not_run"
+
+
+def test_verdict_record_serializes_schema_discriminator() -> None:
+    """§7.3: every line carries the internal-format discriminator so the
+    file is never mistaken for steward's contracts/gate-verdicts/v1."""
+    rec = GateVerdictRecord(
+        gate_id="agent.approver",
+        obligation="advisory",
+        verdict="not_run",
+        phase="ex_post",
+        ts="2026-08-06T00:00:00+00:00",
+        workstream_id="ws-1",
+    )
+    dumped = rec.model_dump(by_alias=True, exclude_none=True)
+    assert dumped["schema"] == "maestro.gate-verdict-record/v1"
+
+
+async def test_append_records_writes_schema_field(tmp_path: Path) -> None:
+    keeper = _make_keeper(tmp_path)
+    rec = GateVerdictRecord(
+        gate_id="agent.approver",
+        obligation="advisory",
+        verdict="not_run",
+        phase="ex_post",
+        ts="2026-08-06T00:00:00+00:00",
+        workstream_id="ws-1",
+        note="stale_sha",
+    )
+    keeper.append_records([rec])
+    jsonl = tmp_path / "logs" / "gate_verdicts.jsonl"
+    lines = [json.loads(line) for line in jsonl.read_text().splitlines()]
+    assert lines[-1]["schema"] == "maestro.gate-verdict-record/v1"
+    assert lines[-1]["verdict"] == "not_run"
