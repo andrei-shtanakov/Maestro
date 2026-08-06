@@ -25,6 +25,8 @@ from maestro.changed_paths import changed_paths_since
 from maestro.database import Database
 from maestro.decomposer import ProjectDecomposer
 from maestro.domain import (
+    KNOWN_RESUME_REASONS,
+    RESUME_OPERATOR_REWORK,
     RESUME_REVERIFY,
     RESUME_REWORK,
     CommandVerifier,
@@ -79,6 +81,7 @@ from maestro.models import (
 )
 from maestro.notifications.manager import NotificationManager
 from maestro.pr_manager import PRManager, PRManagerError
+from maestro.rework import build_operator_rework_addendum
 from maestro.scope_gate import build_scope_escape_reason, find_escapes, normalize
 from maestro.spec_runner import read_executor_state
 from maestro.transitions import TransitionDispatcher
@@ -149,6 +152,23 @@ def _is_pid_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _ambiguity_marker(kind: str, pid: int | None) -> str:
+    """Durable recovery-ambiguity marker JSON (#124).
+
+    kind: 'live_orphan' | 'spawn_uncertain' | 'live_handle'. ``pid`` is the
+    preserved probeable evidence; None means "no probeable evidence" — such
+    a marker is resolvable ONLY via `maestro workstream-resolve-ambiguity`,
+    never by an automatic probe.
+    """
+    return json.dumps(
+        {
+            "kind": kind,
+            "pid": None if pid == _SPAWNING_SENTINEL else pid,
+            "parked_at": datetime.now(UTC).isoformat(),
+        }
+    )
 
 
 def _maybe_live_orphan(pid: int | None) -> bool:
@@ -535,6 +555,7 @@ class Orchestrator:
                             expected_status=WorkstreamStatus.FAILED,
                             process_pid=None,
                             generation_pid=None,
+                            recovery_ambiguity=_ambiguity_marker("live_handle", None),
                         )
                         self._stats.failed += 1
                     elif live_orphan:
@@ -565,6 +586,12 @@ class Orchestrator:
                             expected_status=WorkstreamStatus.FAILED,
                             process_pid=None,
                             generation_pid=None,
+                            recovery_ambiguity=_ambiguity_marker(
+                                "spawn_uncertain"
+                                if orphan_pid == _SPAWNING_SENTINEL
+                                else "live_orphan",
+                                orphan_pid,
+                            ),
                         )
                         # Parked for review — signal via exit code + summary,
                         # matching _handle_failure's NEEDS_REVIEW accounting.
@@ -1461,11 +1488,31 @@ class Orchestrator:
         ):
             return
 
-        # Stage B resume dispatch (before DECOMPOSING — a resume never
-        # re-decomposes). REVERIFY re-enters the verification loop over the
-        # untouched worktree; REWORK is the ONLY path that respawns the author,
-        # and it does so with the FAIL findings appended to the spec-gen
-        # description (§7 declassification channel).
+        # Resume dispatch (before DECOMPOSING). Exhaustive over
+        # KNOWN_RESUME_REASONS (#124): an unknown value is an error routed
+        # fail-closed to NEEDS_REVIEW, never a silent plain resume.
+        # REVERIFY re-enters the verification loop over the untouched
+        # worktree; verification REWORK and operator rework respawn the
+        # author via re-decomposition, each with its own addendum channel
+        # (§7 declassification for FAIL findings; the audit row's
+        # `instructions`, keyed by operator_rework_seq, for the operator).
+        if (
+            workstream.resume_reason is not None
+            and workstream.resume_reason not in KNOWN_RESUME_REASONS
+        ):
+            self._logger.error(
+                "Workstream '%s' carries unknown resume_reason %r — "
+                "failing closed to NEEDS_REVIEW",
+                workstream_id,
+                workstream.resume_reason,
+            )
+            await self._transition(
+                workstream_id,
+                WorkstreamStatus.NEEDS_REVIEW,
+                expected_status=workstream.status,
+                message=(f"unknown resume_reason {workstream.resume_reason!r}"),
+            )
+            return
         rework_addendum: str | None = None
         if workstream.resume_reason == RESUME_REVERIFY:
             workspace = self._workspace_mgr.get_workspace_path(workstream_id)
@@ -1478,9 +1525,14 @@ class Orchestrator:
             )
             await self._run_verification(workstream_id, workspace)
             return
-        is_rework_resume = workstream.resume_reason == RESUME_REWORK
-        if is_rework_resume:
+        is_rework_resume = workstream.resume_reason in (
+            RESUME_REWORK,
+            RESUME_OPERATOR_REWORK,
+        )
+        if workstream.resume_reason == RESUME_REWORK:
             rework_addendum = await self._load_rework_addendum(workstream)
+        elif workstream.resume_reason == RESUME_OPERATOR_REWORK:
+            rework_addendum = await self._load_operator_rework_addendum(workstream)
 
         # Transition to DECOMPOSING; write the spawning sentinel up front — it
         # marks a spawn-in-progress AND overwrites any stale prior generation
@@ -2662,6 +2714,24 @@ class Orchestrator:
             workspace_path, "log", "-F", "--grep", trailer, "--format=%H"
         )
         return bool(out.strip())
+
+    async def _load_operator_rework_addendum(
+        self, workstream: Workstream
+    ) -> str | None:
+        """Addendum keyed explicitly by (id, operator_rework_seq) (#124).
+
+        Loaded durably from the audit table at DECOMPOSING time — never a
+        latest-row heuristic, never `reason` (audit-only), so a crash
+        between the CAS and spec generation loses nothing.
+        """
+        if workstream.operator_rework_seq is None:
+            return None
+        row = await self._db.get_workstream_rework(
+            workstream.id, workstream.operator_rework_seq
+        )
+        if row is None:
+            return None
+        return build_operator_rework_addendum(row)
 
     async def _load_rework_addendum(self, workstream: Workstream) -> str | None:
         """Build the author-facing rework addendum from the latest FAIL.

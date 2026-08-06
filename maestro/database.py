@@ -11,7 +11,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.request import pathname2url
 
 import aiosqlite
@@ -29,6 +29,10 @@ from maestro.models import (
     Workstream,
     WorkstreamStatus,
 )
+
+
+if TYPE_CHECKING:
+    from maestro.rework import RefreshEvidence
 
 
 class DatabaseError(Exception):
@@ -205,7 +209,41 @@ CREATE TABLE IF NOT EXISTS workstreams (
     verification_attempt INTEGER NOT NULL DEFAULT 0,
     verification_error_attempt INTEGER NOT NULL DEFAULT 0,
     rework_attempt INTEGER NOT NULL DEFAULT 0,
-    resume_reason TEXT
+    resume_reason TEXT,
+    -- Operator rework (#124)
+    operator_rework_count INTEGER NOT NULL DEFAULT 0,
+    operator_rework_seq INTEGER,
+    recovery_ambiguity TEXT
+);
+
+CREATE TABLE IF NOT EXISTS workstream_reworks (
+    workstream_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    initiated_at TIMESTAMP NOT NULL,
+    initiator TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    instructions TEXT,
+    prior_status TEXT NOT NULL,
+    prior_error_message TEXT,
+    prior_head_sha TEXT NOT NULL,
+    liveness_evidence TEXT,
+    refresh_config_path TEXT,
+    refresh_config_hash TEXT,
+    old_description TEXT,
+    new_description TEXT,
+    old_scope TEXT,
+    new_scope TEXT,
+    PRIMARY KEY (workstream_id, seq),
+    FOREIGN KEY (workstream_id) REFERENCES workstreams(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS workstream_ambiguity_resolutions (
+    workstream_id TEXT NOT NULL,
+    resolved_at TIMESTAMP NOT NULL,
+    initiator TEXT NOT NULL,
+    statement TEXT NOT NULL,
+    marker_json TEXT NOT NULL,
+    FOREIGN KEY (workstream_id) REFERENCES workstreams(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS workstream_dependencies (
@@ -381,6 +419,9 @@ def _row_to_workstream(row: aiosqlite.Row) -> Workstream:
         verification_error_attempt=row["verification_error_attempt"],
         rework_attempt=row["rework_attempt"],
         resume_reason=row["resume_reason"],
+        operator_rework_count=row["operator_rework_count"] or 0,
+        operator_rework_seq=row["operator_rework_seq"],
+        recovery_ambiguity=row["recovery_ambiguity"],
         depends_on=[],  # Populated separately
     )
 
@@ -512,6 +553,11 @@ class Database:
                 17,
                 "task_costs_phase_model",
                 self._migrate_task_costs_phase_model,
+            ),
+            (
+                18,
+                "workstream_rework",
+                self._migrate_workstream_rework,
             ),
         ]
 
@@ -908,6 +954,76 @@ class Database:
             await self._connection.execute(
                 "ALTER TABLE task_costs ADD COLUMN model TEXT"
             )
+
+    async def _migrate_workstream_rework(self) -> None:
+        """Migration 18: operator rework columns + audit tables (#124).
+
+        Three additive `workstreams` columns (`operator_rework_count`,
+        `operator_rework_seq`, `recovery_ambiguity`) plus the append-only
+        `workstream_reworks` and `workstream_ambiguity_resolutions`
+        tables. Idempotent via PRAGMA table_info / IF NOT EXISTS.
+        """
+        assert self._connection is not None
+        cursor = await self._connection.execute("PRAGMA table_info(workstreams)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+
+        migrations = [
+            (
+                "operator_rework_count",
+                "ALTER TABLE workstreams ADD COLUMN operator_rework_count "
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "operator_rework_seq",
+                "ALTER TABLE workstreams ADD COLUMN operator_rework_seq INTEGER",
+            ),
+            (
+                "recovery_ambiguity",
+                "ALTER TABLE workstreams ADD COLUMN recovery_ambiguity TEXT",
+            ),
+        ]
+        for column, ddl in migrations:
+            if column not in columns:
+                await self._connection.execute(ddl)
+
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS workstream_reworks (
+                workstream_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                initiated_at TIMESTAMP NOT NULL,
+                initiator TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                instructions TEXT,
+                prior_status TEXT NOT NULL,
+                prior_error_message TEXT,
+                prior_head_sha TEXT NOT NULL,
+                liveness_evidence TEXT,
+                refresh_config_path TEXT,
+                refresh_config_hash TEXT,
+                old_description TEXT,
+                new_description TEXT,
+                old_scope TEXT,
+                new_scope TEXT,
+                PRIMARY KEY (workstream_id, seq),
+                FOREIGN KEY (workstream_id) REFERENCES workstreams(id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS workstream_ambiguity_resolutions (
+                workstream_id TEXT NOT NULL,
+                resolved_at TIMESTAMP NOT NULL,
+                initiator TEXT NOT NULL,
+                statement TEXT NOT NULL,
+                marker_json TEXT NOT NULL,
+                FOREIGN KEY (workstream_id) REFERENCES workstreams(id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
 
     async def _migrate_workstreams_verification_columns(self) -> None:
         """Migration 13: add Stage B verification columns to `workstreams`.
@@ -2697,11 +2813,13 @@ class Database:
                     error_message, retry_count, max_retries,
                     created_at, started_at, completed_at,
                     verification_run_id, verification_attempt,
-                    verification_error_attempt, rework_attempt, resume_reason
+                    verification_error_attempt, rework_attempt, resume_reason,
+                    operator_rework_count, operator_rework_seq,
+                    recovery_ambiguity
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -2728,6 +2846,9 @@ class Database:
                     workstream.verification_error_attempt,
                     workstream.rework_attempt,
                     workstream.resume_reason,
+                    workstream.operator_rework_count,
+                    workstream.operator_rework_seq,
+                    workstream.recovery_ambiguity,
                 ),
             )
         except sqlite3.IntegrityError as e:
@@ -2875,6 +2996,8 @@ class Database:
             "verification_error_attempt",
             "rework_attempt",
             "resume_reason",
+            "operator_rework_seq",
+            "recovery_ambiguity",
         }
         for field_name, value in extra_fields.items():
             if field_name in allowed:
@@ -3198,6 +3321,164 @@ class Database:
                 )
                 raise ValueError(msg)
         return await self.get_workstream(workstream_id)
+
+    async def record_workstream_rework(
+        self,
+        workstream_id: str,
+        *,
+        prior_status: WorkstreamStatus,
+        prior_count: int,
+        prior_marker: str | None,
+        reason: str,
+        instructions: str | None,
+        initiator: str,
+        prior_error_message: str | None,
+        prior_head_sha: str,
+        liveness_evidence: str | None,
+        refresh: "RefreshEvidence | None",
+    ) -> int:
+        """Operator rework as ONE transaction (#124): CAS UPDATE + audit INSERT.
+
+        Exactly one write to the workstream row — a conditional UPDATE that
+        atomically sets status=READY, resume_reason='operator_rework', the
+        incremented count/seq, clears error_message / verification_run_id /
+        recovery_ambiguity, and applies the refreshed description/scope —
+        guarded on the previously read status, both pids NULL, the prior
+        count, and the unchanged recovery-ambiguity marker. Zero rows
+        affected means the world changed under the operator: the
+        transaction rolls back (audit row never lands) and ValueError is
+        raised (fail closed). Never touches `gate_approvals`.
+
+        Returns:
+            The new audit seq (== prior_count + 1).
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        seq = prior_count + 1
+        set_clauses = [
+            "status = 'ready'",
+            "resume_reason = 'operator_rework'",
+            "operator_rework_count = ?",
+            "operator_rework_seq = ?",
+            "error_message = NULL",
+            "verification_run_id = NULL",
+            "recovery_ambiguity = NULL",
+        ]
+        params: list[Any] = [seq, seq]
+        if refresh is not None:
+            set_clauses += ["description = ?", "scope = ?"]
+            params += [refresh.new_description, json.dumps(refresh.new_scope)]
+        params += [workstream_id, prior_status.value, prior_count, prior_marker]
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                f"UPDATE workstreams SET {', '.join(set_clauses)} "
+                "WHERE id = ? AND status = ? "
+                "AND process_pid IS NULL AND generation_pid IS NULL "
+                "AND operator_rework_count = ? AND recovery_ambiguity IS ?",
+                params,
+            )
+            if cursor.rowcount == 0:
+                msg = (
+                    f"workstream '{workstream_id}' state changed under the "
+                    "operator — rework refused"
+                )
+                raise ValueError(msg)
+            await conn.execute(
+                "INSERT INTO workstream_reworks ("
+                "workstream_id, seq, initiated_at, initiator, reason, "
+                "instructions, prior_status, prior_error_message, "
+                "prior_head_sha, liveness_evidence, refresh_config_path, "
+                "refresh_config_hash, old_description, new_description, "
+                "old_scope, new_scope"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    workstream_id,
+                    seq,
+                    _format_datetime(datetime.now(UTC)),
+                    initiator,
+                    reason,
+                    instructions,
+                    prior_status.value,
+                    prior_error_message,
+                    prior_head_sha,
+                    liveness_evidence,
+                    refresh.config_path if refresh else None,
+                    refresh.config_hash if refresh else None,
+                    refresh.old_description if refresh else None,
+                    refresh.new_description if refresh else None,
+                    json.dumps(refresh.old_scope) if refresh else None,
+                    json.dumps(refresh.new_scope) if refresh else None,
+                ),
+            )
+        return seq
+
+    async def get_workstream_rework(
+        self, workstream_id: str, seq: int
+    ) -> dict[str, Any] | None:
+        """One audit row by its explicit (workstream_id, seq) key, or None."""
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        cursor = await self._connection.execute(
+            "SELECT * FROM workstream_reworks WHERE workstream_id = ? AND seq = ?",
+            (workstream_id, seq),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    async def resolve_recovery_ambiguity(
+        self, workstream_id: str, *, statement: str, initiator: str
+    ) -> None:
+        """Explicitly resolve a recovery-ambiguity marker (#124), audited.
+
+        One transaction: the resolution row (preserving the marker JSON)
+        plus a CAS clear of the marker. A missing workstream, an absent
+        marker, or a marker that changed under the operator all raise
+        ValueError and leave nothing recorded.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                "SELECT recovery_ambiguity FROM workstreams WHERE id = ?",
+                (workstream_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                msg = f"Workstream with ID '{workstream_id}' not found"
+                raise WorkstreamNotFoundError(msg)
+            marker = row["recovery_ambiguity"]
+            if marker is None:
+                msg = (
+                    f"workstream '{workstream_id}' has no recovery-ambiguity "
+                    "marker to resolve"
+                )
+                raise ValueError(msg)
+            await conn.execute(
+                "INSERT INTO workstream_ambiguity_resolutions ("
+                "workstream_id, resolved_at, initiator, statement, marker_json"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (
+                    workstream_id,
+                    _format_datetime(datetime.now(UTC)),
+                    initiator,
+                    statement,
+                    marker,
+                ),
+            )
+            update = await conn.execute(
+                "UPDATE workstreams SET recovery_ambiguity = NULL "
+                "WHERE id = ? AND recovery_ambiguity = ?",
+                (workstream_id, marker),
+            )
+            if update.rowcount == 0:
+                msg = (
+                    f"workstream '{workstream_id}' marker changed under the "
+                    "operator — resolution refused"
+                )
+                raise ValueError(msg)
 
 
 # Convenience function for creating and initializing a database

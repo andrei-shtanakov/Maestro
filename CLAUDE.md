@@ -38,6 +38,8 @@ uv run maestro approve <task-id>             # Approve an AWAITING_APPROVAL task
 uv run maestro orchestrate <project.yaml>   # Run orchestrator
 uv run maestro workstreams                   # Show workstreams status
 uv run maestro workstream-approve <workstream-id>  # Approve a NEEDS_REVIEW workstream — records the durable gate approval (phase+sha) and re-queues
+uv run maestro workstream-rework <workstream-id> --reason "<why>" [--instructions "<next attempt>"] [--refresh-from project.yaml]  # Rework (NOT approve): NEEDS_REVIEW/FAILED -> READY into re-decomposition; fail-closed liveness proof; audited
+uv run maestro workstream-resolve-ambiguity <workstream-id> --statement "<how verified>"  # Resolve a recovery-ambiguity marker after manual cleanup (unblocks rework)
 uv run maestro check-scope <workstream-id> --base <base-branch>  # deterministic scope containment (exit 1 on escape)
 uv run maestro workspaces <project.yaml>     # List active worktrees
 

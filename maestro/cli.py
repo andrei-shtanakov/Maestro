@@ -1275,11 +1275,17 @@ def _display_workstreams_table(workstreams: list, title: str = "Workstreams") ->
         show_header=True,
         header_style="bold",
     )
+    # Operator reworks (#124) are unbounded but must not be invisible:
+    # the column appears once any workstream has one, yellow at threshold.
+    show_reworks = any(getattr(z, "operator_rework_count", 0) > 0 for z in workstreams)
+
     table.add_column("ID", style="cyan", no_wrap=True)
     table.add_column("Title", style="white")
     table.add_column("Status", no_wrap=True)
     table.add_column("Branch", style="dim")
     table.add_column("Progress", justify="center")
+    if show_reworks:
+        table.add_column("Reworks", justify="center")
     table.add_column("PR", style="blue", max_width=30)
 
     for z in workstreams:
@@ -1289,14 +1295,19 @@ def _display_workstreams_table(workstreams: list, title: str = "Workstreams") ->
         if len(pr_text) > 30:
             pr_text = pr_text[-27:] + "..."
 
-        table.add_row(
+        row = [
             z.id,
             z.title,
             status_text,
             z.branch,
             z.subtask_progress or "-",
-            pr_text,
-        )
+        ]
+        if show_reworks:
+            count = getattr(z, "operator_rework_count", 0)
+            rework_style = "yellow" if count >= _REWORK_WARN_THRESHOLD else "dim"
+            row.append(Text(str(count) if count else "-", style=rework_style))
+        row.append(pr_text)
+        table.add_row(*row)
 
     console.print(table)
 
@@ -1636,6 +1647,197 @@ def workstream_approve_command(
         )
     console.print(
         f"Resume with: maestro orchestrate <project.yaml> --db {db_path} --resume"
+    )
+
+
+async def _rework_workstream(
+    db: "Database",
+    workstream_id: str,
+    *,
+    reason: str,
+    instructions: str | None,
+    refresh_from: Path | None,
+) -> int:
+    """Operator rework (#124): validation, liveness proof, then the CAS.
+
+    Everything fallible runs BEFORE the DB transaction, so a refusal
+    leaves zero trace. Returns the new audit seq (== the new
+    operator_rework_count).
+    """
+    import getpass
+
+    from maestro.models import WorkstreamStatus
+    from maestro.rework import (
+        ReworkRefused,
+        prove_no_live_process,
+        read_head_sha,
+        validate_refresh,
+    )
+
+    ws = await db.get_workstream(workstream_id)
+    if ws.status not in (WorkstreamStatus.NEEDS_REVIEW, WorkstreamStatus.FAILED):
+        raise ReworkRefused(
+            f"workstream '{workstream_id}' is {ws.status.value} — "
+            "not reworkable (only NEEDS_REVIEW and FAILED are)"
+        )
+    evidence = await prove_no_live_process(db, ws)
+    if not ws.workspace_path:
+        raise ReworkRefused(
+            f"workstream '{workstream_id}' has no worktree recorded — nothing to rework"
+        )
+    prior_head_sha = await read_head_sha(Path(ws.workspace_path))
+    refresh = validate_refresh(ws, refresh_from) if refresh_from else None
+    return await db.record_workstream_rework(
+        workstream_id,
+        prior_status=ws.status,
+        prior_count=ws.operator_rework_count,
+        prior_marker=ws.recovery_ambiguity,
+        reason=reason,
+        instructions=instructions,
+        initiator=getpass.getuser(),
+        prior_error_message=ws.error_message,
+        prior_head_sha=prior_head_sha,
+        liveness_evidence=evidence,
+        refresh=refresh,
+    )
+
+
+async def _resolve_ambiguity(
+    db: "Database", workstream_id: str, *, statement: str
+) -> None:
+    """Explicit recovery-ambiguity resolution (#124), audited."""
+    import getpass
+
+    await db.resolve_recovery_ambiguity(
+        workstream_id, statement=statement, initiator=getpass.getuser()
+    )
+
+
+_REWORK_WARN_THRESHOLD = 3
+
+
+@app.command("workstream-rework")
+def workstream_rework_command(
+    workstream_id: Annotated[str, typer.Argument(help="Workstream ID to rework")],
+    reason: Annotated[
+        str,
+        typer.Option(
+            "--reason",
+            help="Immutable audit explanation (never used as a prompt)",
+        ),
+    ],
+    instructions: Annotated[
+        str | None,
+        typer.Option(
+            "--instructions",
+            help="Instructions appended to the next attempt's description",
+        ),
+    ] = None,
+    refresh_from: Annotated[
+        Path | None,
+        typer.Option(
+            "--refresh-from",
+            help="Re-read this workstream's description/scope from a project.yaml",
+        ),
+    ] = None,
+    db: Annotated[
+        Path | None,
+        typer.Option("--db", "-d", help="Path to SQLite database file"),
+    ] = None,
+) -> None:
+    """Rework a NEEDS_REVIEW/FAILED workstream: re-decompose in the same
+    worktree with new instructions. NOT an approval — the ex-post gate
+    re-evaluates the new work from scratch.
+
+    Examples:
+        maestro workstream-rework my-ws --reason "review rejected the diff" \\
+            --instructions "split the migration into two steps"
+    """
+    from maestro.rework import ReworkRefused
+
+    db_path = db or DEFAULT_DB_PATH
+
+    async def _run() -> int:
+        from maestro.database import Database
+
+        database = Database(db_path)
+        await database.connect()
+        try:
+            return await _rework_workstream(
+                database,
+                workstream_id,
+                reason=reason,
+                instructions=instructions,
+                refresh_from=refresh_from,
+            )
+        finally:
+            await database.close()
+
+    try:
+        seq = asyncio.run(_run())
+    except (ReworkRefused, ValueError) as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(
+        f"[green]Workstream '{workstream_id}' queued for rework "
+        f"(-> READY, operator rework #{seq}).[/green]"
+    )
+    if seq >= _REWORK_WARN_THRESHOLD:
+        console.print(
+            f"[yellow]{seq} operator reworks on this workstream; consider "
+            "whether it needs redesign instead.[/yellow]"
+        )
+    console.print(
+        f"Resume with: maestro orchestrate <project.yaml> --db {db_path} --resume"
+    )
+
+
+@app.command("workstream-resolve-ambiguity")
+def workstream_resolve_ambiguity_command(
+    workstream_id: Annotated[str, typer.Argument(help="Workstream ID")],
+    statement: Annotated[
+        str,
+        typer.Option(
+            "--statement",
+            help="How the absence of a live process was verified",
+        ),
+    ],
+    db: Annotated[
+        Path | None,
+        typer.Option("--db", "-d", help="Path to SQLite database file"),
+    ] = None,
+) -> None:
+    """Resolve a recovery-ambiguity marker after manual cleanup (#124).
+
+    Recovery parks possibly-live workstreams in NEEDS_REVIEW with a durable
+    marker; when the marker carries no probeable pid (spawn-uncertain /
+    live-handle) `workstream-rework` refuses until this explicit, audited
+    resolution.
+
+    Examples:
+        maestro workstream-resolve-ambiguity my-ws \\
+            --statement "checked ps/docker on the runner: nothing left"
+    """
+    db_path = db or DEFAULT_DB_PATH
+
+    async def _run() -> None:
+        from maestro.database import Database
+
+        database = Database(db_path)
+        await database.connect()
+        try:
+            await _resolve_ambiguity(database, workstream_id, statement=statement)
+        finally:
+            await database.close()
+
+    try:
+        asyncio.run(_run())
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(
+        f"[green]Recovery-ambiguity marker on '{workstream_id}' resolved "
+        "(audited).[/green]"
     )
 
 

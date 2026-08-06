@@ -6,6 +6,7 @@ PR body formatting, and shutdown behavior.
 """
 
 import contextlib
+import json
 from collections.abc import Generator
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -1758,6 +1759,11 @@ class TestStartupRecovery:
             assert count == 1
             w = await db.get_workstream("w")
             assert w.status == WorkstreamStatus.NEEDS_REVIEW
+            # #124: possibly-live handle park carries a no-pid marker.
+            assert w.recovery_ambiguity is not None
+            marker = json.loads(w.recovery_ambiguity)
+            assert marker["kind"] == "live_handle"
+            assert marker["pid"] is None
             assert orch._stats.failed == 1
         finally:
             await db.close()
@@ -1874,6 +1880,11 @@ class TestStartupRecovery:
             # Parked for review -> counted as failed (exit code + summary).
             assert orch._stats.failed == 1
             assert w.process_pid is None  # parked-row cleanup
+            # #124: durable recovery-ambiguity marker preserves the evidence.
+            assert w.recovery_ambiguity is not None
+            marker = json.loads(w.recovery_ambiguity)
+            assert marker["kind"] == "live_orphan"
+            assert marker["pid"] == 4242
         finally:
             await db.close()
 
@@ -1907,6 +1918,11 @@ class TestStartupRecovery:
             assert orch._stats.failed == 1
             assert w.process_pid is None  # parked-row cleanup
             assert w.generation_pid is None
+            # #124: sentinel park carries a no-evidence marker (pid None).
+            assert w.recovery_ambiguity is not None
+            marker = json.loads(w.recovery_ambiguity)
+            assert marker["kind"] == "spawn_uncertain"
+            assert marker["pid"] is None
         finally:
             await db.close()
 

@@ -15,7 +15,12 @@ from maestro.domain.profile import (
     profile_sha256,
     render_argv,
 )
-from maestro.domain.resume import RESUME_REVERIFY, RESUME_REWORK
+from maestro.domain.resume import (
+    KNOWN_RESUME_REASONS,
+    RESUME_OPERATOR_REWORK,
+    RESUME_REVERIFY,
+    RESUME_REWORK,
+)
 from maestro.domain.verdict import (
     EchoExpectations,
     Finding,
@@ -34,6 +39,8 @@ from maestro.domain.verifier import (
 
 __all__ = [
     "ALLOWED_PLACEHOLDERS",
+    "KNOWN_RESUME_REASONS",
+    "RESUME_OPERATOR_REWORK",
     "RESUME_REVERIFY",
     "RESUME_REWORK",
     "CommandVerifier",

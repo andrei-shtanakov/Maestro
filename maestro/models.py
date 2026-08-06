@@ -1242,7 +1242,22 @@ class Workstream(BaseModel):
     rework_attempt: int = Field(default=0, ge=0)
     resume_reason: str | None = Field(
         default=None,
-        description="verification_rework | verification_reverify | None",
+        description=(
+            "verification_rework | verification_reverify | operator_rework | None"
+        ),
+    )
+    operator_rework_count: int = Field(default=0, ge=0)
+    operator_rework_seq: int | None = Field(
+        default=None,
+        description="Audit seq of the operator rework this READY resumes",
+    )
+    recovery_ambiguity: str | None = Field(
+        default=None,
+        description=(
+            "JSON marker written by startup recovery when parking a "
+            "possibly-live workstream in NEEDS_REVIEW; blocks "
+            "workstream-rework until resolved"
+        ),
     )
 
     def can_transition_to(self, target: WorkstreamStatus) -> bool:
