@@ -398,6 +398,15 @@
       worktrees, SQLite ownership, credentials, log rotation, recurring schedule
       vs продолжение существующего run. Сначала durable-команды и идемпотентный
       resume, потом внешний service wrapper.
+      Дизайн-спека написана и смержена (PR #151, merge `a98a4ac`):
+      `docs/superpowers/specs/2026-08-06-service-install-design.md`.
+      Центральное решение — планировщик запускает обёртку `maestro service run`,
+      а не `orchestrate` напрямую (resume/fresh/no-op решает Maestro по БД).
+      Разобраны все семь требований; попутная находка: текущий pid-lock
+      глобальный (один Maestro на машину), для мультипроектного сервиса нужен
+      scoped по (db, project). **Status спеки — `proposed`**: остаются два
+      вопроса из §8 (review-pr внутри тика или отдельным юнитом; выводить ли
+      глобальный lock сразу) — до ответа реализацию не начинать.
 
 ---
 
