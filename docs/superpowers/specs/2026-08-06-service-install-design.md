@@ -73,28 +73,37 @@ without ever noticing the scoped instance, and the two would run
 concurrently. Mutual exclusion has to hold in both directions, so it is
 expressed in the lock modes themselves:
 
-| Mode | `global.lock` | `instance.lock` |
+| Mode | `global.lock` | `<stage>.lock` |
 |---|---|---|
 | legacy (`maestro run` / `orchestrate` invoked the old way) | **exclusive** | — |
 | project-scoped (service path, and eventually everything) | **shared** | **exclusive** |
 
-The consequences fall out of flock semantics, with no extra checks:
+The scoped lock's identity is **(project-key, stage)** — not the project
+alone. Stage separation (§3.2, §8.1) requires an orchestrate tick and a
+review tick of the same project to run concurrently, so a single
+per-project lock would contradict the very design it is meant to serve.
 
-- several *different* projects coexist — they all hold the global lock
-  shared, and their instance locks differ;
-- a second process of the *same* project blocks on that project's
-  exclusive instance lock;
-- a legacy singleton cannot run alongside any scoped instance — its
+The consequences then fall out of flock semantics, with no extra checks:
+
+- the same **(project, stage)** is serialized — a second such tick
+  blocks on that stage's exclusive lock;
+- several *different* projects run in parallel — they all hold the
+  global lock shared, and their stage locks differ;
+- **orchestrate and review of the same project run in parallel** —
+  different stage locks, both shared on global;
+- a legacy singleton cannot run alongside any scoped stage — its
   exclusive request conflicts with the shared holders;
-- a scoped instance cannot start while a legacy run holds the global
-  lock exclusively.
+- no scoped stage can start while a legacy run holds the global lock
+  exclusively.
 
 Layout:
 
 ```
-~/.maestro/locks/global.lock                       # compatibility lock
-~/.maestro/instances/<project-key>/instance.lock   # the real per-project lock
-~/.maestro/instances/<project-key>/maestro.pid     # diagnostics only
+~/.maestro/locks/global.lock                          # compatibility lock
+~/.maestro/instances/<project-key>/orchestrate.lock   # per (project, stage)
+~/.maestro/instances/<project-key>/orchestrate.pid    # diagnostics only
+~/.maestro/instances/<project-key>/review.lock
+~/.maestro/instances/<project-key>/review.pid
 ```
 
 `<project-key>` is derived from (db_path, project) the same way review
@@ -148,7 +157,9 @@ its own lock, so a long review never blocks or delays a product tick:
 
 Its exit is reported as its own tick outcome: `maestro review-pr`'s
 exit 2 means NEEDS_HUMAN on some PR, **not** an orchestration failure,
-so the review tick maps it to exit 0 plus a notification (§5). Review is advisory and
+so the review tick maps it to exit 0 and records
+`outcome='needs_human'` (§5). It sends **no notification of its own** —
+see §4.1 for who owns that. Review is advisory and
 never a DAG-correctness gate — the product tick's decisions do not
 depend on it.
 
@@ -267,6 +278,31 @@ CREATE TABLE service_ticks (
 );
 ```
 
+### 4.1 Notification ownership — exactly one owner per event
+
+`maestro review-pr` already emits `POST_PR_REVIEW_NEEDS_HUMAN` on every
+run (`review_runner.py`, the `_notify` call after finalization). A
+review tick that notified as well would double every alert, so the rule
+is: **the operation owns its notification**.
+
+- **review outcomes** belong to `maestro review-pr`. The service review
+  stage maps the exit code and writes the ledger row — nothing else.
+- **service-level states** belong to the service, because nobody else
+  observes them: `noop_blocked` (§3.2) and infrastructure failures of a
+  tick.
+
+**Prerequisite on `maestro review-pr` (change to shipped code, must
+land before the review stage ships):** its notification is currently
+per-run, so nightly ticks over an unchanged PR would alert every night.
+Dedup belongs to the owner of the outcome, keyed on
+`(repo, pr_number, head_sha, outcome)` — all four already exist in
+`post_pr_review_runs`, so this is a query against the previous
+finalized row for that PR and head, not a new table: notify only when
+there is no prior finalized row with the same key. A new bot round moves
+the head SHA and therefore legitimately alerts again. The rejected
+alternative — a `--suppress-notify` flag with dedup in the service
+ledger — splits one event's identity across two components.
+
 `decision` records what the wrapper chose to do (§3.2), `outcome` what
 came of it — they are not the same axis, and the review stage is exactly
 where they diverge: `decision='review'`, `outcome='needs_human'`,
@@ -290,7 +326,8 @@ something to look at". An orchestrate run that failed workstreams is a
 product problem worth a red unit; `maestro review-pr` returning 2 means
 NEEDS_HUMAN on some PR — advisory, expected, and no orchestration
 failure — so the review tick maps it to exit **0**, records outcome
-`needs_human` in its ledger row, and notifies (deduplicated). Otherwise
+`needs_human` in its ledger row (the notification is `review-pr`'s own,
+§4.1). Otherwise
 a single parked PR would keep the review unit red indefinitely and
 train the operator to ignore it.
 
@@ -327,8 +364,14 @@ fresh decision from the DB. Automatic restarts would stack runs.
   same project run concurrently (distinct locks); each writes its own
   ledger rows and log files; unit names for the two stages do not
   collide; **`review-pr` exit 2 → review tick exit 0** with outcome
-  `needs_human` and one deduplicated notification, while an orchestrate
-  run with failed workstreams still exits 2.
+  `needs_human`, while an orchestrate run with failed workstreams still
+  exits 2.
+- **Notification ownership (§4.1):** a review tick emits no
+  notification of its own (asserted with a capturing notifier); the
+  service still notifies for `noop_blocked` and tick infrastructure
+  failures; and `maestro review-pr` notifies once per
+  `(repo, pr, head_sha, outcome)` — a repeated tick over an unchanged
+  PR is silent, a new head SHA alerts again.
 - Stale sweep: DONE+merged worktree removed; NEEDS_REVIEW, unmerged, and
   dirty worktrees kept and reported; review workspaces never touched;
   `git worktree prune` invoked in the project repo only.
