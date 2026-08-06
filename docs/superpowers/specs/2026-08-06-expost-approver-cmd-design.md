@@ -1,6 +1,6 @@
 # Ex-post gate: pluggable `approver_cmd` hook — design
 
-**Status:** proposed (revision 4)
+**Status:** approved (revision 4, owner approval 2026-08-06 at `b61f45f`)
 **Date:** 2026-08-06
 **Issue:** #137 (`slug: expost-approver-cmd`), battle-testing pilot wave 2
 **Owner decisions incorporated:** issue body (hard requirements from the
@@ -486,8 +486,10 @@ operator.
 Every observation and every attempt appends `GateVerdictRecord`s to
 `logs/<ULID>/gate_verdicts.jsonl` with `gate_id="agent.approver"` —
 verdict `not_run` (observation) / `pass` / `fail` / `error`, note
-carrying the summary, skip reason, or truncated stderr tail (§5.4). The
-existing record shape is reused; no new evidence format.
+carrying the summary, skip reason, or truncated stderr tail (§5.4).
+Existing record family and JSONL transport are retained; the
+implementation adds an explicit additive schema discriminator (see the
+namespace note below).
 
 **Namespace (revision 4).** `GateVerdictRecord` — including the new
 `not_run` value — is Maestro's **internal run-level audit format**,
