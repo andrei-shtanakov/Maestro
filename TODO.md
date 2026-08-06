@@ -253,11 +253,19 @@
       Инварианты: финальный refresh перед DONE, невозможность «DONE 4/5», явное
       отображение skipped/no-op. Не заводить второй парсер maestro-tasks.md, если
       spec-runner может отдать устойчивый машинный JSON (counterpart: spec-runner#97).
-- [ ] **#124 `maestro workstream-rework <id>`** (P1, отдельный feature-трек) @owner:andrei @id:workstream-rework-command
+- [x] **#124 `maestro workstream-rework <id>`** (P1, отдельный feature-трек) @owner:andrei @id:workstream-rework-command
       До реализации — описать state machine: допустимые исходные состояния, append-only
       evidence прошлой попытки, новый attempt/decomposition identity, транзакционный
       сброс, идемпотентность после сбоя, аудит причины/инициатора. Не скрытая
       разновидность approve. Докс-примечание про `~/.maestro/maestro.db` — в PR #125.
+      Сделано в два PR: дизайн (PR #132, merge `89ea3e7`, спека
+      `docs/superpowers/specs/2026-08-05-workstream-rework-design.md`, 2 ревизии
+      с blocker-фиксом liveness proof) и реализация (PR #133, merge `2a0fb02`):
+      миграция 18, durable recovery-ambiguity marker, single-CAS+audit транзакция,
+      `maestro/rework.py` (liveness proof / refresh-валидация / addendum по явному
+      seq-ключу), CLI `workstream-rework` + `workstream-resolve-ambiguity`,
+      исчерпывающий READY-dispatch, колонка Reworks; 38 тестов по acceptance-чеклисту
+      спеки. Issue закрыт.
 - [x] **#125 канон конфига для dual-mode репо (docs)** (P1) @owner:andrei @id:dual-mode-config-canon
       Mode-2 docs: project.yaml — SSOT, генерируемый `spec-runner.config.yaml` не
       трекается, для прямых spec-runner-запусков — локальная untracked-копия; указатель
