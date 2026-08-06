@@ -79,13 +79,27 @@ _DEFERRED_GATES = {
 
 
 class GateVerdictRecord(BaseModel):
-    """One appended line of logs/<ULID>/gate_verdicts.jsonl (DESIGN-607)."""
+    """One appended line of logs/<ULID>/gate_verdicts.jsonl (DESIGN-607).
 
-    model_config = ConfigDict(extra="forbid")
+    This is Maestro's INTERNAL run-level audit format
+    (`maestro.gate-verdict-record/v1`) — not steward's canonical
+    `contracts/gate-verdicts/v1` findings-bundle. The explicit `schema`
+    discriminator on every line keeps the two from being mistaken for
+    one contract (approver spec §7.3). `not_run` marks an approver
+    observation: the evaluator did not run and the gate still blocks —
+    semantically neutral, never a waiver.
+    """
 
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    record_schema: str = Field(
+        default="maestro.gate-verdict-record/v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
     gate_id: str
     obligation: Literal["mandatory", "advisory"]
-    verdict: Literal["pass", "fail", "waived", "error", "missing"]
+    verdict: Literal["pass", "fail", "waived", "error", "missing", "not_run"]
     tier: str | None = None
     phase: Literal["ex_ante", "ex_post"]
     sha: str | None = None
@@ -96,11 +110,19 @@ class GateVerdictRecord(BaseModel):
 
 
 class GateDecision(BaseModel):
-    """Outcome of one guard evaluation."""
+    """Outcome of one guard evaluation.
+
+    `tier`/`flags`/`paths` carry the classification data the approver
+    hook persists at block time (`gate_block_contexts`, #137 §7.1) —
+    additive, unset on classification errors.
+    """
 
     allow: bool
     reason: str | None = None
     records: list[GateVerdictRecord] = Field(default_factory=list)
+    tier: str | None = None
+    flags: list[str] = Field(default_factory=list)
+    paths: list[str] | None = None
 
 
 def pipeline_log_dir() -> Path:
@@ -185,7 +207,11 @@ class GateKeeper:
             "declared_scope": scope,
         }
         classification = await self._classify("--no-fs", payload)
-        return self._decide("ex_post", workstream_id, sha, classification, approvals)
+        decision = self._decide(
+            "ex_post", workstream_id, sha, classification, approvals
+        )
+        decision.paths = paths
+        return decision
 
     # ------------------------------------------------------------ decision
 
@@ -319,8 +345,14 @@ class GateKeeper:
 
         self._write(records)
         if blocked_reason is not None:
-            return GateDecision(allow=False, reason=blocked_reason, records=records)
-        return GateDecision(allow=True, records=records)
+            return GateDecision(
+                allow=False,
+                reason=blocked_reason,
+                records=records,
+                tier=tier,
+                flags=list(flags),
+            )
+        return GateDecision(allow=True, records=records, tier=tier, flags=list(flags))
 
     # ------------------------------------------------------------ steward
 
@@ -394,9 +426,15 @@ class GateKeeper:
             raise RuntimeError(f"git {' '.join(args)} failed: {msg}")
         return stdout.decode()
 
+    def append_records(self, records: list[GateVerdictRecord]) -> None:
+        """Append externally-built records (e.g. approver evidence, #137)."""
+        self._write(records)
+
     def _write(self, records: list[GateVerdictRecord]) -> None:
         self._log_dir.mkdir(parents=True, exist_ok=True)
         path = self._log_dir / "gate_verdicts.jsonl"
         with path.open("a", encoding="utf-8") as handle:
             for rec in records:
-                handle.write(json.dumps(rec.model_dump(exclude_none=True)) + "\n")
+                handle.write(
+                    json.dumps(rec.model_dump(by_alias=True, exclude_none=True)) + "\n"
+                )
