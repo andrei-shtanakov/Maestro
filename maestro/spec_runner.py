@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import sqlite3
+import subprocess
 from pathlib import Path
 
 from maestro.models import (
@@ -65,6 +66,42 @@ def parse_spec_runner_version(output: str) -> tuple[int, int, int] | None:
 # ".executor-maestro-state.db" and ".executor-maestro-state.json".
 SQLITE_STATE_FILENAME = ".executor-state.db"
 JSON_STATE_FILENAME = ".executor-state.json"
+
+
+def read_planned_total(worktree: Path) -> int | None:
+    """Planned subtask count from `spec-runner status --json` (#123).
+
+    Run once in the worktree right after spec generation: spec-runner's own
+    tasks.md parser (the format owner) supplies the honest denominator that
+    the lazily-registering state DB cannot. Purely a display concern —
+    every failure (missing binary, non-zero exit, unparseable output)
+    returns None and the caller falls back to the lazy label.
+    """
+    try:
+        result = subprocess.run(
+            ["spec-runner", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+            cwd=worktree,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("read_planned_total: %s", exc)
+        return None
+    if result.returncode != 0:
+        logger.warning("read_planned_total: status --json exited %s", result.returncode)
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        logger.warning("read_planned_total: unparseable status --json output")
+        return None
+    total = payload.get("total_tasks") if isinstance(payload, dict) else None
+    if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+        return total
+    logger.warning("read_planned_total: no usable total_tasks in output")
+    return None
 
 
 def read_executor_state(spec_dir: Path, prefix: str = "") -> ExecutorState | None:
@@ -147,7 +184,7 @@ def _attach_attempts(
     # Columns added in later spec-runner migrations may be missing; detect them.
     table_info = conn.execute("PRAGMA table_info(attempts)")
     available = {row["name"] for row in table_info.fetchall()}
-    optional = ("input_tokens", "output_tokens", "cost_usd")
+    optional = ("input_tokens", "output_tokens", "cost_usd", "no_op")
     select_cols = [
         "task_id",
         "timestamp",
@@ -179,6 +216,11 @@ def _attach_attempts(
                 if "output_tokens" in available
                 else None,
                 cost_usd=row["cost_usd"] if "cost_usd" in available else None,
+                no_op=(
+                    bool(row["no_op"])
+                    if "no_op" in available and row["no_op"] is not None
+                    else None
+                ),
             )
         )
 

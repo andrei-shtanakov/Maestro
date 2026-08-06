@@ -83,7 +83,7 @@ from maestro.notifications.manager import NotificationManager
 from maestro.pr_manager import PRManager, PRManagerError
 from maestro.rework import build_operator_rework_addendum
 from maestro.scope_gate import build_scope_escape_reason, find_escapes, normalize
-from maestro.spec_runner import read_executor_state
+from maestro.spec_runner import read_executor_state, read_planned_total
 from maestro.transitions import TransitionDispatcher
 from maestro.workspace import WorkspaceManager, ensure_harness_excludes
 
@@ -1594,6 +1594,16 @@ class Orchestrator:
             workstream_config, workspace, on_pid=_on_gen_pid
         )
 
+        # Honest progress denominator (#123): the state DB registers tasks
+        # lazily, so capture the planned total once from spec-runner's own
+        # tasks.md parser right after generation. Display-only — None on
+        # any failure keeps the lazy label.
+        subtask_total = await asyncio.get_running_loop().run_in_executor(
+            None, read_planned_total, workspace
+        )
+        if subtask_total is not None:
+            await self._update_fields(workstream_id, subtask_total=subtask_total)
+
         # Transition to READY then RUNNING
         await self._transition(
             workstream_id,
@@ -1766,6 +1776,11 @@ class Orchestrator:
                 update={
                     "status": WorkstreamStatus.RUNNING,
                     "workspace_path": str(workspace),
+                    "subtask_total": (
+                        subtask_total
+                        if subtask_total is not None
+                        else workstream.subtask_total
+                    ),
                 }
             ),
             handle=handle,
@@ -1989,9 +2004,42 @@ class Orchestrator:
         if state is None:
             return
 
-        # Same-state field patch (still RUNNING) — no dispatch.
+        # Same-state field patch (still RUNNING) — no dispatch. The honest
+        # planned total (#123) supplies the denominator when known.
         await self._update_fields(
-            workstream_id, subtask_progress=state.progress_label()
+            workstream_id,
+            subtask_progress=state.progress_label(
+                total=running.workstream.subtask_total
+            ),
+        )
+
+    async def _final_progress_refresh(
+        self, workstream_id: str, workspace_path: Path
+    ) -> None:
+        """One last progress read after the run finished (#123).
+
+        The mid-run label can be stale (written before the final task
+        completed); refreshing here makes "DONE 4/5" for a no-op success
+        impossible — the label lands as e.g. "5/5 done (1 no-op)". A
+        missing/unreadable state file leaves the last label untouched
+        (display concern, never blocks completion).
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            state = await loop.run_in_executor(
+                None, read_executor_state, workspace_path / "spec", SPEC_PREFIX
+            )
+        except Exception as exc:
+            self._logger.warning(
+                "final progress refresh for '%s' failed: %s", workstream_id, exc
+            )
+            return
+        if state is None:
+            return
+        workstream = await self._db.get_workstream(workstream_id)
+        await self._update_fields(
+            workstream_id,
+            subtask_progress=state.progress_label(total=workstream.subtask_total),
         )
 
     async def _gate_ex_ante(self, workstream_id: str, workstream: Workstream) -> bool:
@@ -2288,6 +2336,10 @@ class Orchestrator:
         Push branch, create PR, cleanup workspace.
         """
         workstream = await self._db.get_workstream(workstream_id)
+
+        # Honest final label BEFORE any terminal transition (#123): a no-op
+        # last task must read "N/N done (1 no-op)", never "DONE N-1/N".
+        await self._final_progress_refresh(workstream_id, workspace_path)
 
         # Deterministic scope containment (always-on, before the optional
         # steward risk gate). Fail-fast on out-of-scope commits.

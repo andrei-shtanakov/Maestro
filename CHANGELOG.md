@@ -3,6 +3,17 @@
 ## Unreleased
 
 ### Added
+- **Honest workstream progress (#123).** The progress denominator no longer
+  grows lazily during a run: the planned subtask total is captured once
+  from `spec-runner status --json` (spec-runner's own tasks.md parser)
+  right after spec generation and persisted (`workstreams.subtask_total`,
+  migration 19). A final progress refresh runs before any terminal
+  transition, and no-op completions (spec-runner >= 2.16, #97) are counted
+  and rendered — a run whose last task was a legitimate no-op now finishes
+  as `5/5 done (1 no-op)` instead of the archaeology-inducing `DONE 4/5`.
+  All of it is display-only and fail-open: any failure to obtain the total
+  or read the final state keeps the previous label and never blocks
+  completion.
 - **`maestro workstream-rework <id>` (#124).** Sanctioned operator rework
   for a gate-blocked/failed workstream: `NEEDS_REVIEW/FAILED -> READY`
   with `resume_reason='operator_rework'` into the existing
