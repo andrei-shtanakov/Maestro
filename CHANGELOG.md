@@ -3,6 +3,26 @@
 ## Unreleased
 
 ### Added
+- **`maestro review-pr` — post-PR review wrapper.** Drives
+  `spec-runner review-pr` (the review-bot loop: verify each comment
+  against the code, TDD-fix the valid ones, reply in threads) over
+  Maestro-created PRs, without owning any of it. A separate
+  operator/cron-invocable command — the orchestrator is untouched and
+  no `WorkstreamStatus` changes (the workstream is already DONE; this
+  is advisory post-delivery cleanup, not a DAG-correctness guarantee).
+  Review workspaces are keyed by (repo, PR) with the spec-runner
+  `state_file` held **outside** the checkout, so removing a finished
+  worktree never destroys the never-reply-twice guarantee or unpushed
+  fix commits; a saved continuation is published by Maestro itself
+  (`--force-with-lease` against the verified expected SHA, never a
+  plain force) so spec-runner's strict head check can pass. Per-PR
+  `flock` (exit 3 = already running, no run row), retention by exit
+  code, `post_pr_review_runs` audit (migration 21, immutable after a
+  CAS finalization), three new notification events, and a preflight
+  gate requiring **spec-runner >= 2.21.0** (the release whose
+  `review-pr --json` emits exactly one JSON document per exit path —
+  spec-runner#116, filed from here). Design:
+  `docs/superpowers/specs/2026-08-06-post-pr-review-command-design.md`.
 - **approver_cmd hook (#137).** Opt-in `gates.approver` block: an ex-post
   gate block parked in NEEDS_REVIEW may now be auto-approved by an
   external critic command — an *automated operator* over the existing

@@ -154,6 +154,36 @@ default.
 
 Add an `arbiter:` section to your project YAML to delegate per-task agent selection to the [Arbiter](https://github.com/andrei-shtanakov/arbiter) policy engine. Advisory mode honors your explicit `agent_type` and feeds the learning loop; authoritative mode lets the arbiter override your choice and gates retries on outcome delivery. When the section is absent, Maestro runs the zero-config static-routing path — no subprocess, no routing overhead. See [`examples/with-arbiter.yaml`](examples/with-arbiter.yaml).
 
+## Post-PR review (optional)
+
+Maestro creates the PR; the review-bot loop belongs to
+[spec-runner](https://github.com/andrei-shtanakov/spec-runner). Once a
+workstream is DONE and its PR is open, drive that loop over it:
+
+```bash
+maestro review-pr project.yaml ws-006   # one PR
+maestro review-pr project.yaml --all    # every workstream PR, sequentially
+```
+
+Each run verifies every review-bot comment against the code, fixes the
+valid ones with tests, replies in the threads, and reports back. Exit
+codes: `0` complete, `1` infrastructure failure, `2` needs a human,
+`3` already running elsewhere. Requires **spec-runner >= 2.21.0**.
+
+Notes:
+
+- **Advisory, post-delivery.** The workstream is already DONE and its
+  feature commit already merged into the base branch, so review fixes
+  move the PR head only — this is cleanup on the PR, not a correctness
+  gate for dependent workstreams.
+- **Resumable and safe to re-run.** State lives outside the review
+  checkout (`~/.maestro/review-state/<repo>/<pr>/`), so re-invocation
+  never re-processes a comment or replies twice; a per-PR lock keeps a
+  cron run and an operator run from colliding.
+- **Nothing is discarded silently.** A workspace with unpushed fix
+  commits is published on the next run; a dirty or force-pushed one is
+  refused until you commit or pass `--discard-local`.
+
 ## Notifications
 
 Desktop notifications (macOS/Linux) are on by default. Adding a `webhook_url`

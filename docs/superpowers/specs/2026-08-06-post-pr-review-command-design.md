@@ -112,10 +112,13 @@ tables.
    refuses to mutate unless strictly `local_head == remote head_sha` —
    so a saved continuation would exit 1 forever if handed over as-is.
    Maestro owns the reconciliation: (a) confirm the remote head still
-   equals the saved expected remote SHA (the ancestor); (b) push the
-   local continuation to the PR branch itself — a **plain push against
-   that verified expected SHA, never force**; (c) re-read the PR
-   metadata; (d) only once `remote head_sha == local HEAD`, proceed.
+   equals the saved expected remote SHA (the ancestor) by re-reading the
+   ref (`git ls-remote`) immediately before publishing; (b) push the
+   local continuation to the PR branch itself — a **plain push, never
+   force** (git refuses anything but a fast-forward, so a remote that
+   moved between (a) and (b) is rejected by git as well); (c) re-read
+   the PR metadata; (d) only once `remote head_sha == local HEAD`,
+   proceed.
    This composes cleanly with spec-runner's own state: the fixes are
    already recorded there and the replies are not yet published, so the
    next `review-pr` call completes the reply phase idempotently without

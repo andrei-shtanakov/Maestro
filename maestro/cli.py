@@ -67,6 +67,21 @@ from maestro.preflight import (
     ValidationReport,
     validate_project,
 )
+from maestro.review_pr import PrRef, parse_pr_url
+from maestro.review_runner import (
+    EXIT_ALREADY_RUNNING,
+    ReviewInvocation,
+    check_spec_runner_version,
+    invoke_spec_runner,
+    run_review,
+)
+from maestro.review_workspace import (
+    ReviewPaths,
+    fetch_pr_meta,
+    gc_pr,
+    materialize,
+    recover_push,
+)
 from maestro.scaffold import ScaffoldError, generate_project_yaml
 from maestro.spawners import (
     AiderSpawner,
@@ -1922,6 +1937,222 @@ def check_scope_command(
             await database.close()
 
     raise typer.Exit(asyncio.run(_run()))
+
+
+@app.command("review-pr")
+def review_pr_command(
+    config: Annotated[
+        Path,
+        typer.Argument(help="Path to project YAML configuration"),
+    ],
+    workstream_id: Annotated[
+        str | None,
+        typer.Argument(help="Workstream whose PR to review (omit with --all)"),
+    ] = None,
+    review_all: Annotated[
+        bool,
+        typer.Option("--all", help="Review every workstream PR (sequential)"),
+    ] = False,
+    gc: Annotated[
+        bool,
+        typer.Option(
+            "--gc",
+            help="Sweep workspaces and durable state of closed/merged PRs",
+        ),
+    ] = False,
+    discard_local: Annotated[
+        bool,
+        typer.Option(
+            "--discard-local",
+            help="Reset a saved local continuation instead of publishing it",
+        ),
+    ] = False,
+    db_path: Annotated[
+        Path | None, typer.Option("--db", help="Path to state database")
+    ] = None,
+) -> None:
+    """Drive the spec-runner review-bot loop over Maestro-created PRs.
+
+    Post-delivery and advisory: the workstream is already DONE and the
+    feature SHA already merged locally, so review fixes move the PR head
+    only. Requires spec-runner >= 2.21.0.
+
+    Exit codes: 0 complete, 1 infrastructure failure, 2 needs human,
+    3 already running (another process holds this PR's lock).
+
+    Examples:
+        maestro review-pr project.yaml ws-006
+        maestro review-pr project.yaml --all
+    """
+    if not review_all and not gc and workstream_id is None:
+        err_console.print("[red]Provide a workstream id, --all, or --gc[/red]")
+        raise typer.Exit(1)
+    asyncio.run(
+        _review_pr(
+            config_path=config,
+            workstream_id=workstream_id,
+            review_all=review_all,
+            gc=gc,
+            discard_local=discard_local,
+            db_path=db_path or DEFAULT_DB_PATH,
+        )
+    )
+
+
+async def _prepare_review_workspace(
+    *,
+    repo_path: Path,
+    paths: ReviewPaths,
+    ref: PrRef,
+    discard_local: bool,
+) -> tuple[Path, str]:
+    """Materialize the workspace and reconcile a saved continuation (spec 3.1)."""
+    meta = fetch_pr_meta(ref)
+    workspace = materialize(
+        repo_path=repo_path,
+        paths=paths,
+        head_ref=meta.head_ref,
+        head_sha=meta.head_sha,
+        discard_local=discard_local,
+    )
+    local_head = _local_head(workspace)
+    if local_head != meta.head_sha:
+        # A continuation: publish it so spec-runner's strict
+        # local_head == remote head_sha check can pass (spec 3.1.4).
+        pushed = recover_push(
+            workspace=workspace,
+            head_ref=meta.head_ref,
+            expected_remote_sha=meta.head_sha,
+        )
+        return workspace, pushed
+    return workspace, meta.head_sha
+
+
+async def _review_pr(
+    *,
+    config_path: Path,
+    workstream_id: str | None,
+    review_all: bool,
+    gc: bool,
+    discard_local: bool,
+    db_path: Path,
+) -> None:
+    project = load_orchestrator_config(config_path)
+    if gc:
+        await _review_pr_gc(project=project, db_path=db_path)
+        return
+    probe = _probe_spec_runner_version()
+    problem = check_spec_runner_version(probe[1], returncode=probe[0])
+    if problem is not None:
+        err_console.print(f"[red]spec-runner unsupported:[/red] {problem}")
+        raise typer.Exit(1)
+
+    db = Database(db_path)
+    await db.connect()
+    notifications = create_notification_manager(project.notifications)
+    try:
+        workstreams = await db.get_all_workstreams()
+        if review_all:
+            candidates = [w for w in workstreams if w.pr_url]
+        else:
+            candidates = [w for w in workstreams if w.id == workstream_id]
+            if not candidates:
+                err_console.print(f"[red]Workstream not found:[/red] {workstream_id}")
+                raise typer.Exit(1)
+            if not candidates[0].pr_url:
+                err_console.print(f"[red]Workstream '{workstream_id}' has no PR[/red]")
+                raise typer.Exit(1)
+
+        seen: set[tuple[str, int]] = set()
+        codes: list[int] = []
+        for workstream in candidates:
+            assert workstream.pr_url is not None
+            try:
+                ref = parse_pr_url(workstream.pr_url)
+            except ValueError as exc:
+                err_console.print(f"[red]{workstream.id}:[/red] {exc}")
+                codes.append(1)
+                continue
+            key = (ref.owner_repo, ref.number)
+            if key in seen:  # distinct workstreams may share one PR
+                continue
+            seen.add(key)
+            paths = ReviewPaths.for_pr(ref)
+            code = await run_review(
+                db=db,
+                workstream_id=workstream.id,
+                pr_url=workstream.pr_url,
+                repo_path=Path(project.repo_path).expanduser(),  # noqa: ASYNC240
+                paths=paths,
+                invocation=ReviewInvocation(invoke_spec_runner),
+                prepare=_prepare_review_workspace,
+                spec_runner_version=probe[1].strip() or None,
+                notifier=notifications,
+                discard_local=discard_local,
+            )
+            codes.append(code)
+            console.print(f"{workstream.id}: {ref.canonical_url} -> exit {code}")
+
+        # Aggregate: infra failure dominates, then needs-human (spec 6.1);
+        # a locked PR (3) is reported but never decides the aggregate.
+        if 1 in codes:
+            raise typer.Exit(1)
+        if 2 in codes:
+            raise typer.Exit(2)
+        if codes and all(c == EXIT_ALREADY_RUNNING for c in codes):
+            raise typer.Exit(EXIT_ALREADY_RUNNING)
+    finally:
+        await notifications.aclose()
+        await db.close()
+
+
+async def _review_pr_gc(*, project: OrchestratorConfig, db_path: Path) -> None:
+    """Sweep review workspaces/state of closed or merged PRs (spec §4)."""
+    db = Database(db_path)
+    await db.connect()
+    try:
+        swept = 0
+        for workstream in await db.get_all_workstreams():
+            if not workstream.pr_url:
+                continue
+            try:
+                ref = parse_pr_url(workstream.pr_url)
+            except ValueError:
+                continue
+            if gc_pr(
+                repo_path=Path(project.repo_path).expanduser(),  # noqa: ASYNC240
+                paths=ReviewPaths.for_pr(ref),
+                ref=ref,
+            ):
+                swept += 1
+                console.print(f"[dim]swept[/dim] {ref.canonical_url}")
+        console.print(f"Swept {swept} finished PR(s)")
+    finally:
+        await db.close()
+
+
+def _probe_spec_runner_version() -> tuple[int, str]:
+    try:
+        result = subprocess.run(
+            ["spec-runner", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 127, ""
+    return result.returncode, result.stdout
+
+
+def _local_head(workspace: Path) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
 
 
 @app.command("workspaces")
