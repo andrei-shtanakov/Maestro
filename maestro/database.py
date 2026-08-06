@@ -572,6 +572,11 @@ class Database:
                 "approver_v1",
                 self._migrate_approver_v1,
             ),
+            (
+                21,
+                "post_pr_review_runs",
+                self._migrate_post_pr_review_runs,
+            ),
         ]
 
         for version, name, fn in ordered:
@@ -1033,6 +1038,38 @@ class Database:
                 context_json  TEXT NOT NULL,
                 created_at    TIMESTAMP NOT NULL,
                 PRIMARY KEY (workstream_id, phase, sha)
+            )
+            """
+        )
+
+    async def _migrate_post_pr_review_runs(self) -> None:
+        """Migration 21: post-PR review run records (`maestro review-pr`).
+
+        Immutable **after finalization**: the sentinel row is written
+        before the spec-runner invocation and updated exactly once by a
+        CAS finalize guarded on `finished_at IS NULL`. A new bot round
+        (new head SHA) is a new row — the history is the contract.
+        """
+        assert self._connection is not None
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS post_pr_review_runs (
+                review_run_id       TEXT PRIMARY KEY,
+                workstream_id       TEXT NOT NULL,
+                pr_url              TEXT NOT NULL,
+                repo                TEXT NOT NULL,
+                pr_number           INTEGER NOT NULL,
+                input_head_sha      TEXT,
+                output_head_sha     TEXT,
+                started_at          TIMESTAMP NOT NULL,
+                finished_at         TIMESTAMP,
+                exit_code           INTEGER,
+                outcome             TEXT CHECK (outcome IN
+                                      ('complete','needs_human','infra_error')),
+                reason              TEXT,
+                report_json         TEXT,
+                workspace_path      TEXT,
+                spec_runner_version TEXT
             )
             """
         )
@@ -3642,6 +3679,103 @@ class Database:
                 )
                 raise ValueError(msg)
         return await self.get_workstream(workstream_id)
+
+    # ------------------------------------------------------------------
+    # post-PR review runs (`maestro review-pr`) — migration 21
+    # ------------------------------------------------------------------
+
+    async def insert_review_run(
+        self,
+        review_run_id: str,
+        *,
+        workstream_id: str,
+        pr_url: str,
+        repo: str,
+        pr_number: int,
+        input_head_sha: str | None,
+        workspace_path: str | None,
+        spec_runner_version: str | None,
+    ) -> None:
+        """Write the crash sentinel BEFORE invoking spec-runner (spec §5)."""
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        await self._connection.execute(
+            "INSERT INTO post_pr_review_runs "
+            "(review_run_id, workstream_id, pr_url, repo, pr_number, "
+            "input_head_sha, workspace_path, spec_runner_version, started_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                review_run_id,
+                workstream_id,
+                pr_url,
+                repo,
+                pr_number,
+                input_head_sha,
+                workspace_path,
+                spec_runner_version,
+                _format_datetime(datetime.now(UTC)),
+            ),
+        )
+        await self._connection.commit()
+
+    async def finalize_review_run(
+        self,
+        review_run_id: str,
+        *,
+        exit_code: int,
+        outcome: str,
+        reason: str | None,
+        report_json: str | None,
+        output_head_sha: str | None,
+    ) -> bool:
+        """Finalize a run record — CAS-guarded on `finished_at IS NULL`.
+
+        Returns False when the row was already finalized: two concurrent
+        recovery passes can never rewrite an outcome (spec §5).
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        cursor = await self._connection.execute(
+            "UPDATE post_pr_review_runs SET finished_at = ?, exit_code = ?, "
+            "outcome = ?, reason = ?, report_json = ?, output_head_sha = ? "
+            "WHERE review_run_id = ? AND finished_at IS NULL",
+            (
+                _format_datetime(datetime.now(UTC)),
+                exit_code,
+                outcome,
+                reason,
+                report_json,
+                output_head_sha,
+                review_run_id,
+            ),
+        )
+        await self._connection.commit()
+        return cursor.rowcount > 0
+
+    async def list_unfinished_review_runs(self) -> list[dict[str, Any]]:
+        """Sentinel rows left by a crash — finalized fail-closed on the next run."""
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        cursor = await self._connection.execute(
+            "SELECT review_run_id, workstream_id, repo, pr_number, workspace_path "
+            "FROM post_pr_review_runs WHERE finished_at IS NULL"
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def list_review_runs(self, workstream_id: str) -> list[dict[str, Any]]:
+        """Review-run history for one workstream, oldest first."""
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        cursor = await self._connection.execute(
+            "SELECT * FROM post_pr_review_runs WHERE workstream_id = ? "
+            "ORDER BY started_at, rowid",
+            (workstream_id,),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
 
     async def record_workstream_rework(
         self,
