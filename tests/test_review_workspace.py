@@ -62,6 +62,9 @@ def local_repo(tmp_path: Path, origin: Path) -> Path:
     )
     _git(clone, "config", "user.email", "t@t")
     _git(clone, "config", "user.name", "t")
+    # Realistic Maestro state: the project checkout sits on the base
+    # branch, never on the PR head (the worktree needs that name free).
+    _git(clone, "checkout", "main")
     return clone
 
 
@@ -162,6 +165,9 @@ def test_materialize_creates_then_restores(
     )
     assert wt == paths.workspace
     assert (wt / "f.txt").exists()
+    # On the PR head BRANCH, not a detached SHA: spec-runner's fix path
+    # commits and pushes from here.
+    assert _git(wt, "rev-parse", "--abbrev-ref", "HEAD") == "feature/pr"
     again = materialize(
         repo_path=local_repo, paths=paths, head_ref="feature/pr", head_sha=head
     )
@@ -406,3 +412,64 @@ def test_fetch_pr_meta_refuses_wrong_head_repository(
         review_workspace.fetch_pr_meta(
             PrRef(owner="o", repo="r", number=7, canonical_url="u")
         )
+
+
+# =============================================================================
+# --gc (§4): the only path that deletes durable state
+# =============================================================================
+
+
+def _stub_pr_state(monkeypatch: pytest.MonkeyPatch, state: str | None) -> None:
+    import json as _json
+
+    from maestro import review_workspace
+
+    real_run = review_workspace.subprocess.run
+
+    def _fake_run(cmd, **kwargs):
+        if "worktree" in cmd:  # let real git handle worktree removal
+            return real_run(cmd, capture_output=True, check=False)
+
+        class _R:
+            returncode = 0 if state is not None else 1
+            stdout = _json.dumps({"state": state}) if state else ""
+            stderr = ""
+
+        return _R()
+
+    monkeypatch.setattr(review_workspace.subprocess, "run", _fake_run)
+
+
+@pytest.mark.parametrize("state", ["CLOSED", "MERGED"])
+def test_gc_removes_state_only_for_finished_prs(
+    local_repo: Path, paths: ReviewPaths, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    from maestro.review_workspace import gc_pr
+
+    head = _remote_head(local_repo)
+    materialize(repo_path=local_repo, paths=paths, head_ref="feature/pr", head_sha=head)
+    ref = PrRef(owner="o", repo="r", number=7, canonical_url="u")
+
+    _stub_pr_state(monkeypatch, state)
+    assert gc_pr(repo_path=local_repo, paths=paths, ref=ref) is True
+    assert not paths.workspace.exists()
+    assert not paths.state_dir.exists()
+
+
+@pytest.mark.parametrize("state", ["OPEN", None])
+def test_gc_leaves_open_or_unverifiable_prs_untouched(
+    local_repo: Path,
+    paths: ReviewPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str | None,
+) -> None:
+    from maestro.review_workspace import gc_pr
+
+    head = _remote_head(local_repo)
+    materialize(repo_path=local_repo, paths=paths, head_ref="feature/pr", head_sha=head)
+    ref = PrRef(owner="o", repo="r", number=7, canonical_url="u")
+
+    _stub_pr_state(monkeypatch, state)
+    assert gc_pr(repo_path=local_repo, paths=paths, ref=ref) is False
+    assert paths.workspace.exists()
+    assert paths.state_dir.exists()

@@ -37,6 +37,8 @@ __all__ = [
     "ReviewPaths",
     "cleanup_after_run",
     "fetch_pr_meta",
+    "gc_pr",
+    "is_pr_finished",
     "materialize",
     "recover_push",
 ]
@@ -184,11 +186,17 @@ def fetch_pr_meta(ref: PrRef) -> PrMeta:
         )
         raise PreconditionError(msg)
 
-    return PrMeta(
-        head_ref=str(payload["headRefName"]),
-        head_sha=str(payload["headRefOid"]),
-        is_open=True,
-    )
+    head_ref = payload.get("headRefName")
+    head_sha = payload.get("headRefOid")
+    if not isinstance(head_ref, str) or not isinstance(head_sha, str):
+        # A truncated or renamed payload must fail closed, not KeyError
+        # out of the guard.
+        msg = (
+            f"`gh pr view` output for {ref.canonical_url} lacks a usable head "
+            f"(headRefName={head_ref!r}, headRefOid={head_sha!r})"
+        )
+        raise PreconditionError(msg)
+    return PrMeta(head_ref=head_ref, head_sha=head_sha, is_open=True)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -256,11 +264,16 @@ def materialize(
 
     if not paths.workspace.exists():
         paths.workspace.parent.mkdir(parents=True, exist_ok=True)
+        # On the head BRANCH (not a detached SHA): spec-runner's fix path
+        # commits and pushes, and `-B` also lets the same branch be
+        # checked out in the project clone.
         _git(
             repo_path,
             "worktree",
             "add",
             "--force",
+            "-B",
+            head_ref,
             str(paths.workspace),
             head_sha,
         )
@@ -300,9 +313,10 @@ def recover_push(*, workspace: Path, head_ref: str, expected_remote_sha: str) ->
 
     spec-runner refuses to mutate unless `local_head == remote head_sha`,
     so a saved continuation would fail forever if handed over as-is.
-    This pushes it with `--force-with-lease=<ref>:<expected>` — a plain
-    fast-forward publish that is *refused* if the remote moved off the
-    verified expected SHA. Never an unconditional force.
+    Two steps, no force of any kind: re-read the remote ref and confirm
+    it still equals the verified expected SHA (a race means someone else
+    moved it), then publish with a plain push — which git itself refuses
+    unless it is a fast-forward.
 
     Returns:
         The new remote head (== local HEAD) on success.
@@ -312,16 +326,16 @@ def recover_push(*, workspace: Path, head_ref: str, expected_remote_sha: str) ->
             rejected — the caller must not invoke spec-runner.
     """
     local_head = _git(workspace, "rev-parse", "HEAD")
+    remote_now = _git(workspace, "ls-remote", "origin", head_ref).split("\t")[0]
+    if remote_now != expected_remote_sha:
+        msg = (
+            f"remote {head_ref} moved from the verified {expected_remote_sha} "
+            f"to {remote_now or '(missing)'} — refusing to publish the local "
+            "continuation; re-run to re-materialize against the new head"
+        )
+        raise PreconditionError(msg)
     result = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(workspace),
-            "push",
-            f"--force-with-lease={head_ref}:{expected_remote_sha}",
-            "origin",
-            f"HEAD:{head_ref}",
-        ],
+        ["git", "-C", str(workspace), "push", "origin", f"HEAD:{head_ref}"],
         capture_output=True,
         text=True,
         check=False,
@@ -333,6 +347,72 @@ def recover_push(*, workspace: Path, head_ref: str, expected_remote_sha: str) ->
         )
         raise PreconditionError(msg)
     return local_head
+
+
+def is_pr_finished(ref: PrRef) -> bool | None:
+    """True when the PR is closed/merged, False when open, None if unknown.
+
+    `--gc` deletes durable state only on a confirmed True — an API
+    hiccup must never look like "closed" (spec §4).
+    """
+    result = subprocess.run(
+        [
+            "gh",
+            "pr",
+            "view",
+            str(ref.number),
+            "--repo",
+            ref.owner_repo,
+            "--json",
+            "state",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        state = str(json.loads(result.stdout).get("state", "")).upper()
+    except json.JSONDecodeError:
+        return None
+    if state in ("CLOSED", "MERGED"):
+        return True
+    if state == "OPEN":
+        return False
+    return None
+
+
+def gc_pr(*, repo_path: Path, paths: ReviewPaths, ref: PrRef) -> bool:
+    """Sweep one PR's workspace AND durable state once it is finished.
+
+    Returns True when anything was removed. Open or unverifiable PRs are
+    left completely untouched — GC is the only path that deletes durable
+    state, and only after a confirmed remote state (spec §4).
+    """
+    if is_pr_finished(ref) is not True:
+        return False
+    removed = False
+    if paths.workspace.exists():
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_path),
+                "worktree",
+                "remove",
+                "--force",
+                str(paths.workspace),
+            ],
+            capture_output=True,
+            check=False,
+        )
+        shutil.rmtree(paths.workspace, ignore_errors=True)
+        removed = True
+    if paths.state_dir.exists():
+        shutil.rmtree(paths.state_dir, ignore_errors=True)
+        removed = True
+    return removed
 
 
 def cleanup_after_run(*, repo_path: Path, paths: ReviewPaths, exit_code: int) -> None:

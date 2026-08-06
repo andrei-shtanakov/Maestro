@@ -78,6 +78,7 @@ from maestro.review_runner import (
 from maestro.review_workspace import (
     ReviewPaths,
     fetch_pr_meta,
+    gc_pr,
     materialize,
     recover_push,
 )
@@ -1952,6 +1953,13 @@ def review_pr_command(
         bool,
         typer.Option("--all", help="Review every workstream PR (sequential)"),
     ] = False,
+    gc: Annotated[
+        bool,
+        typer.Option(
+            "--gc",
+            help="Sweep workspaces and durable state of closed/merged PRs",
+        ),
+    ] = False,
     discard_local: Annotated[
         bool,
         typer.Option(
@@ -1976,14 +1984,15 @@ def review_pr_command(
         maestro review-pr project.yaml ws-006
         maestro review-pr project.yaml --all
     """
-    if not review_all and workstream_id is None:
-        err_console.print("[red]Provide a workstream id or --all[/red]")
+    if not review_all and not gc and workstream_id is None:
+        err_console.print("[red]Provide a workstream id, --all, or --gc[/red]")
         raise typer.Exit(1)
     asyncio.run(
         _review_pr(
             config_path=config,
             workstream_id=workstream_id,
             review_all=review_all,
+            gc=gc,
             discard_local=discard_local,
             db_path=db_path or DEFAULT_DB_PATH,
         )
@@ -2024,10 +2033,14 @@ async def _review_pr(
     config_path: Path,
     workstream_id: str | None,
     review_all: bool,
+    gc: bool,
     discard_local: bool,
     db_path: Path,
 ) -> None:
     project = load_orchestrator_config(config_path)
+    if gc:
+        await _review_pr_gc(project=project, db_path=db_path)
+        return
     probe = _probe_spec_runner_version()
     problem = check_spec_runner_version(probe[1], returncode=probe[0])
     if problem is not None:
@@ -2090,6 +2103,31 @@ async def _review_pr(
             raise typer.Exit(EXIT_ALREADY_RUNNING)
     finally:
         await notifications.aclose()
+        await db.close()
+
+
+async def _review_pr_gc(*, project: OrchestratorConfig, db_path: Path) -> None:
+    """Sweep review workspaces/state of closed or merged PRs (spec §4)."""
+    db = Database(db_path)
+    await db.connect()
+    try:
+        swept = 0
+        for workstream in await db.get_all_workstreams():
+            if not workstream.pr_url:
+                continue
+            try:
+                ref = parse_pr_url(workstream.pr_url)
+            except ValueError:
+                continue
+            if gc_pr(
+                repo_path=Path(project.repo_path).expanduser(),  # noqa: ASYNC240
+                paths=ReviewPaths.for_pr(ref),
+                ref=ref,
+            ):
+                swept += 1
+                console.print(f"[dim]swept[/dim] {ref.canonical_url}")
+        console.print(f"Swept {swept} finished PR(s)")
+    finally:
         await db.close()
 
 
