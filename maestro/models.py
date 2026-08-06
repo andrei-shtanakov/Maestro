@@ -1259,6 +1259,14 @@ class Workstream(BaseModel):
             "workstream-rework until resolved"
         ),
     )
+    subtask_total: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Planned subtask count from spec-runner status --json, captured "
+            "once after spec generation (#123); None = unknown (lazy label)"
+        ),
+    )
 
     def can_transition_to(self, target: WorkstreamStatus) -> bool:
         """Check if transition to target status is valid."""
@@ -1473,6 +1481,13 @@ class ExecutorTaskAttempt(BaseModel):
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
     cost_usd: float | None = Field(default=None, ge=0)
+    no_op: bool | None = Field(
+        default=None,
+        description=(
+            "True when the attempt succeeded with nothing to commit "
+            "(spec-runner >= 2.16, #97); None on older state files"
+        ),
+    )
 
 
 class ExecutorTaskEntry(BaseModel):
@@ -1527,9 +1542,33 @@ class ExecutorState(BaseModel):
             1 for t in self.tasks.values() if t.status == ExecutorTaskStatus.SUCCESS
         )
 
-    def progress_label(self) -> str:
-        """Human-readable progress summary for logs/UI (e.g. `3/10 done`)."""
-        return f"{self.done}/{self.total} done"
+    @property
+    def noop_done(self) -> int:
+        """SUCCESS tasks whose last attempt was an explicit no-op (#123)."""
+        return sum(
+            1
+            for t in self.tasks.values()
+            if t.status == ExecutorTaskStatus.SUCCESS
+            and t.attempts
+            and t.attempts[-1].no_op is True
+        )
+
+    def progress_label(self, total: int | None = None) -> str:
+        """Human-readable progress summary for logs/UI (e.g. `3/10 done`).
+
+        `total` is the honest planned denominator (#123: spec-runner
+        registers tasks lazily, so `len(self.tasks)` under-counts mid-run).
+        The larger of the two is used — the display must never claim fewer
+        tasks than the state already tracks. A non-zero no-op count is
+        rendered so "5/5 done (1 no-op)" is distinguishable from five
+        work-producing tasks.
+        """
+        denominator = max(self.total, total) if total is not None else self.total
+        label = f"{self.done}/{denominator} done"
+        noop = self.noop_done
+        if noop:
+            label += f" ({noop} no-op)"
+        return label
 
 
 class GatesConfig(BaseModel):

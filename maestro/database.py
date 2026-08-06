@@ -213,7 +213,9 @@ CREATE TABLE IF NOT EXISTS workstreams (
     -- Operator rework (#124)
     operator_rework_count INTEGER NOT NULL DEFAULT 0,
     operator_rework_seq INTEGER,
-    recovery_ambiguity TEXT
+    recovery_ambiguity TEXT,
+    -- Honest progress (#123)
+    subtask_total INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS workstream_reworks (
@@ -422,6 +424,7 @@ def _row_to_workstream(row: aiosqlite.Row) -> Workstream:
         operator_rework_count=row["operator_rework_count"] or 0,
         operator_rework_seq=row["operator_rework_seq"],
         recovery_ambiguity=row["recovery_ambiguity"],
+        subtask_total=row["subtask_total"],
         depends_on=[],  # Populated separately
     )
 
@@ -558,6 +561,11 @@ class Database:
                 18,
                 "workstream_rework",
                 self._migrate_workstream_rework,
+            ),
+            (
+                19,
+                "workstreams_subtask_total",
+                self._migrate_workstreams_subtask_total,
             ),
         ]
 
@@ -953,6 +961,20 @@ class Database:
         if "model" not in columns:
             await self._connection.execute(
                 "ALTER TABLE task_costs ADD COLUMN model TEXT"
+            )
+
+    async def _migrate_workstreams_subtask_total(self) -> None:
+        """Migration 19: honest planned-subtask total (#123).
+
+        One additive nullable column; NULL means "unknown" and keeps the
+        pre-#123 lazy progress label. Idempotent via PRAGMA table_info.
+        """
+        assert self._connection is not None
+        cursor = await self._connection.execute("PRAGMA table_info(workstreams)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "subtask_total" not in columns:
+            await self._connection.execute(
+                "ALTER TABLE workstreams ADD COLUMN subtask_total INTEGER"
             )
 
     async def _migrate_workstream_rework(self) -> None:
@@ -2815,11 +2837,11 @@ class Database:
                     verification_run_id, verification_attempt,
                     verification_error_attempt, rework_attempt, resume_reason,
                     operator_rework_count, operator_rework_seq,
-                    recovery_ambiguity
+                    recovery_ambiguity, subtask_total
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -2849,6 +2871,7 @@ class Database:
                     workstream.operator_rework_count,
                     workstream.operator_rework_seq,
                     workstream.recovery_ambiguity,
+                    workstream.subtask_total,
                 ),
             )
         except sqlite3.IntegrityError as e:
@@ -2998,6 +3021,7 @@ class Database:
             "resume_reason",
             "operator_rework_seq",
             "recovery_ambiguity",
+            "subtask_total",
         }
         for field_name, value in extra_fields.items():
             if field_name in allowed:
