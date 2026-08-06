@@ -24,6 +24,12 @@ class StatusEffect:
 
     event: EventType | None = None
     notification: NotificationEvent | None = None
+    # Gate the notification on a `url` payload being present in the fire()
+    # call. Lets a status entered on several paths (e.g. PR_CREATED: PR
+    # created / PR-create error / auto_pr=False convergence) notify only on
+    # the path that actually produced the linked artifact — call sites still
+    # never hand-fire notifications, they only supply payload.
+    notification_requires_url: bool = False
 
 
 TASK_EFFECTS: dict[TaskStatus, StatusEffect] = {
@@ -63,7 +69,11 @@ WORKSTREAM_EFFECTS: dict[WorkstreamStatus, StatusEffect] = {
     ),
     WorkstreamStatus.VERIFYING: StatusEffect(event=EventType.WORKSTREAM_VERIFYING),
     WorkstreamStatus.MERGING: StatusEffect(event=EventType.WORKSTREAM_MERGING),
-    WorkstreamStatus.PR_CREATED: StatusEffect(event=EventType.WORKSTREAM_PR_CREATED),
+    WorkstreamStatus.PR_CREATED: StatusEffect(
+        event=EventType.WORKSTREAM_PR_CREATED,
+        notification=NotificationEvent.WORKSTREAM_PR_CREATED,
+        notification_requires_url=True,
+    ),
     WorkstreamStatus.DONE: StatusEffect(
         event=EventType.WORKSTREAM_DONE,
         notification=NotificationEvent.WORKSTREAM_COMPLETED,
@@ -142,13 +152,16 @@ class TransitionDispatcher:
         frm: TaskStatus | WorkstreamStatus,
         details: dict[str, Any] | None = None,
         message: str | None = None,
+        url: str | None = None,
     ) -> None:
         """Fire the callback, event, and notification sinks for a transition.
 
         A no-op transition (`frm == subject.status`) fires nothing. Each
         sink runs in isolation: a subscriber exception is logged and
         swallowed (other sinks still fire), except `asyncio.CancelledError`,
-        which always propagates.
+        which always propagates. `url` is a structured notification payload
+        (e.g. the created PR URL); an effect with
+        `notification_requires_url` notifies only when it is provided.
         """
         if frm == subject.status:  # not a transition
             return
@@ -159,8 +172,10 @@ class TransitionDispatcher:
         if effect.event is not None:
             await self._run(self._log, subject, effect, message, details)
         # 3) notification
-        if effect.notification is not None:
-            await self._run(self._notify, subject, effect, message)
+        if effect.notification is not None and (
+            not effect.notification_requires_url or url is not None
+        ):
+            await self._run(self._notify, subject, effect, message, url)
 
     async def _run(self, fn: Callable[..., Any], *args: Any) -> None:
         try:
@@ -200,10 +215,14 @@ class TransitionDispatcher:
         )
 
     async def _notify(
-        self, subject: TransitionSubject, effect: StatusEffect, message: str | None
+        self,
+        subject: TransitionSubject,
+        effect: StatusEffect,
+        message: str | None,
+        url: str | None,
     ) -> None:
         if self._notifier is None or effect.notification is None:
             return
         await self._notifier.notify(
-            Notification.from_subject(subject, effect.notification, message)
+            Notification.from_subject(subject, effect.notification, message, url=url)
         )

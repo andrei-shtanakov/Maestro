@@ -27,6 +27,7 @@ def test_transition_subject_holds_either_status():
 def test_status_effect_defaults_empty():
     e = StatusEffect()
     assert e.event is None and e.notification is None
+    assert e.notification_requires_url is False
 
 
 def test_effect_tables_are_total():
@@ -52,8 +53,14 @@ def test_workstream_failed_event_but_no_notification():
     assert e.notification is None  # transient failures don't notify (spec §0)
 
 
-def test_pr_created_has_no_notification():
-    assert WORKSTREAM_EFFECTS[WorkstreamStatus.PR_CREATED].notification is None
+def test_pr_created_notification_gated_on_url():
+    # PR_CREATED is entered on three paths (PR created / PR-create error /
+    # auto_pr=False convergence); only the first carries a URL and only it
+    # should notify — hence the declarative url gate.
+    e = WORKSTREAM_EFFECTS[WorkstreamStatus.PR_CREATED]
+    assert e.event == EventType.WORKSTREAM_PR_CREATED
+    assert e.notification == NotificationEvent.WORKSTREAM_PR_CREATED
+    assert e.notification_requires_url is True
 
 
 def test_override_tables_do_not_collide_across_entities():
@@ -124,6 +131,26 @@ async def test_full_effect_fires_all_three():
     await d.fire(s, frm=TaskStatus.READY)
     assert rec.cb == [("t", "ready", "running")]
     assert len(rec.events) == 1 and len(rec.notifs) == 1
+
+
+async def test_url_payload_reaches_notification():
+    rec = _Rec()
+    d = _disp(rec)
+    s = TransitionSubject("workstream", "w", "W", WorkstreamStatus.PR_CREATED)
+    await d.fire(s, frm=WorkstreamStatus.MERGING, url="https://example.test/pull/7")
+    assert len(rec.notifs) == 1
+    n = rec.notifs[0]
+    assert n.event == NotificationEvent.WORKSTREAM_PR_CREATED
+    assert n.url == "https://example.test/pull/7"
+
+
+async def test_url_gated_notification_skipped_without_url():
+    rec = _Rec()
+    d = _disp(rec)
+    s = TransitionSubject("workstream", "w", "W", WorkstreamStatus.PR_CREATED)
+    await d.fire(s, frm=WorkstreamStatus.MERGING)  # PR error / auto_pr=False paths
+    assert not rec.notifs
+    assert len(rec.events) == 1  # the event log entry still fires
 
 
 async def test_override_beats_entry_table():

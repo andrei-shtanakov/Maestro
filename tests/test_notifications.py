@@ -99,7 +99,7 @@ class TestNotificationEvent:
 
     def test_event_count(self) -> None:
         """Test that all expected events are defined."""
-        assert len(NotificationEvent) == 9
+        assert len(NotificationEvent) == 10
 
 
 # =============================================================================
@@ -171,6 +171,34 @@ class TestNotificationFormatting:
         assert lines[1] == "Status: failed"
         assert lines[2] == "Process exited with code 1"
 
+    def test_format_title_pr_created(self) -> None:
+        """Test title formatting for the PR-created event."""
+        n = Notification(
+            event=NotificationEvent.WORKSTREAM_PR_CREATED,
+            subject_id="w1",
+            subject_title="W",
+            entity_kind="workstream",
+            status=WorkstreamStatus.PR_CREATED,
+            url="https://example.test/pull/7",
+        )
+        assert n.format_title() == "Maestro: PR Created"
+
+    def test_format_body_includes_url(self) -> None:
+        """Test that a structured url lands in the body as its own line."""
+        n = Notification(
+            event=NotificationEvent.WORKSTREAM_PR_CREATED,
+            subject_id="w1",
+            subject_title="W",
+            entity_kind="workstream",
+            status=WorkstreamStatus.PR_CREATED,
+            url="https://example.test/pull/7",
+        )
+        assert "https://example.test/pull/7" in n.format_body().split("\n")
+
+    def test_url_defaults_to_none(self, sample_notification: Notification) -> None:
+        """Test that url is optional and absent from the body by default."""
+        assert sample_notification.url is None
+
     def test_from_task(self, sample_task: Task) -> None:
         """Test creating notification from a Task."""
         notification = Notification.from_task(
@@ -212,14 +240,26 @@ class TestNotificationFormatting:
         assert n.entity_kind == "workstream"
         assert "Workstream" in n.format_title()  # channel never guesses the kind
 
+    def test_from_subject_url_passthrough(self) -> None:
+        """Test that from_subject carries the transition url payload."""
+        s = TransitionSubject(
+            kind="workstream", id="w1", title="W", status=WorkstreamStatus.PR_CREATED
+        )
+        n = Notification.from_subject(
+            s,
+            NotificationEvent.WORKSTREAM_PR_CREATED,
+            url="https://example.test/pull/7",
+        )
+        assert n.url == "https://example.test/pull/7"
+
     def test_from_workstream_adapter_delegates(self) -> None:
         """Test that from_workstream builds a TransitionSubject and delegates."""
         ws = Workstream(id="w1", title="W", description="d", branch="feature/w1")
         n = Notification.from_workstream(ws, NotificationEvent.WORKSTREAM_STARTED)
         assert n.entity_kind == "workstream" and n.subject_id == "w1"
 
-    def test_three_workstream_notification_events_exist(self) -> None:
-        """Test that all three WORKSTREAM_* notification events are defined.
+    def test_workstream_notification_events_exist(self) -> None:
+        """Test that the WORKSTREAM_* notification events are defined.
 
         FAILED is intentionally absent: it's a transient retryable status
         (spec §0), so it fires an event only, never a notification.
@@ -228,6 +268,7 @@ class TestNotificationFormatting:
             "WORKSTREAM_STARTED",
             "WORKSTREAM_COMPLETED",
             "WORKSTREAM_NEEDS_REVIEW",
+            "WORKSTREAM_PR_CREATED",
         ]:
             assert hasattr(NotificationEvent, name)
         assert not hasattr(NotificationEvent, "WORKSTREAM_FAILED")

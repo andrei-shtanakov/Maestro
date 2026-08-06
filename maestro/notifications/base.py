@@ -29,6 +29,7 @@ class NotificationEvent(StrEnum):
     WORKSTREAM_STARTED = "workstream_started"
     WORKSTREAM_COMPLETED = "workstream_completed"
     WORKSTREAM_NEEDS_REVIEW = "workstream_needs_review"
+    WORKSTREAM_PR_CREATED = "workstream_pr_created"
 
 
 @dataclass
@@ -42,6 +43,8 @@ class Notification:
         entity_kind: Whether the subject is a "task" or a "workstream".
         status: Current status of the subject.
         message: Optional additional message or error details.
+        url: Optional link carried as transition payload (e.g. the PR URL) —
+            structured so channels never re-read mutable state to find it.
     """
 
     event: NotificationEvent
@@ -50,6 +53,7 @@ class Notification:
     entity_kind: Literal["task", "workstream"]
     status: TaskStatus | WorkstreamStatus
     message: str | None = None
+    url: str | None = None
 
     @classmethod
     def from_subject(
@@ -57,6 +61,7 @@ class Notification:
         subject: "TransitionSubject",
         event: NotificationEvent,
         message: str | None = None,
+        url: str | None = None,
     ) -> "Notification":
         """Create a notification from an entity-agnostic transition subject.
 
@@ -67,6 +72,7 @@ class Notification:
             subject: The task or workstream subject to notify about.
             event: The notification event type.
             message: Optional additional message.
+            url: Optional link payload (e.g. the created PR URL).
 
         Returns:
             Notification instance.
@@ -78,6 +84,7 @@ class Notification:
             entity_kind=subject.kind,
             status=subject.status,
             message=message,
+            url=url,
         )
 
     @classmethod
@@ -146,6 +153,7 @@ class Notification:
             NotificationEvent.WORKSTREAM_STARTED: "Workstream Started",
             NotificationEvent.WORKSTREAM_COMPLETED: "Workstream Completed",
             NotificationEvent.WORKSTREAM_NEEDS_REVIEW: "Workstream Needs Review",
+            NotificationEvent.WORKSTREAM_PR_CREATED: "PR Created",
         }
         fallback = "Task" if self.entity_kind == "task" else "Workstream"
         return f"Maestro: {event_titles.get(self.event, f'{fallback} Update')}"
@@ -160,6 +168,8 @@ class Notification:
         lines.append(f"Status: {self.status.value}")
         if self.message:
             lines.append(self.message)
+        if self.url:
+            lines.append(self.url)
         return "\n".join(lines)
 
 

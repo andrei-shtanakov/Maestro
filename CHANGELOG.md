@@ -3,6 +3,13 @@
 ## Unreleased
 
 ### Added
+- **PR-created notification.** Entering `PR_CREATED` with an actual PR now
+  fires a desktop notification carrying the PR URL. The URL travels as a
+  structured transition payload (`Notification.url`) — never re-read from
+  the mutable DB after the fact — and the effect stays declarative: a new
+  `notification_requires_url` gate on the transition table means the two
+  PR-less paths into `PR_CREATED` (PR-creation error, `auto_pr: false`
+  convergence) keep firing the event log entry but stay silent.
 - **Honest workstream progress (#123).** The progress denominator no longer
   grows lazily during a run: the planned subtask total is captured once
   from `spec-runner status --json` (spec-runner's own tasks.md parser)
