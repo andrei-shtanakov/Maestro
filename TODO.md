@@ -249,10 +249,16 @@
       fail-closed до создания worktree, scope gate не тронут. Дизайн:
       `docs/superpowers/specs/2026-08-05-spec-runner-version-gate-design.md`;
       issue закрыт. ⚠️ локальный spec-runner 2.15.0 требует апгрейда.
-- [ ] **#123 честный знаменатель прогресса воркстрима** (P2) @owner:andrei @id:workstream-progress-honest-total
+- [x] **#123 честный знаменатель прогресса воркстрима** (P2) @owner:andrei @id:workstream-progress-honest-total
       Инварианты: финальный refresh перед DONE, невозможность «DONE 4/5», явное
       отображение skipped/no-op. Не заводить второй парсер maestro-tasks.md, если
       spec-runner может отдать устойчивый машинный JSON (counterpart: spec-runner#97).
+      Сделано (PR #135, merge `8361252`): counterpart spec-runner#97 закрыт апстримом
+      (attempts.no_op в 2.16.0), а `status --json` уже отдаёт total_tasks — второй
+      парсер не понадобился. Миграция 19 (`subtask_total`), one-shot захват total
+      после генерации спеки, `_final_progress_refresh` перед терминальным переходом,
+      метка `N/N done (K no-op)`; полностью display-only/fail-open; 17 тестов.
+      Issue закрыт. ЭТИМ ЗАКРЫТ ВЕСЬ INBOX-ЦИКЛ #121–#125 (5/5).
 - [x] **#124 `maestro workstream-rework <id>`** (P1, отдельный feature-трек) @owner:andrei @id:workstream-rework-command
       До реализации — описать state machine: допустимые исходные состояния, append-only
       evidence прошлой попытки, новый attempt/decomposition identity, транзакционный
