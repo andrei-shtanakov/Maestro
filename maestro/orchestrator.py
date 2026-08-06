@@ -405,6 +405,7 @@ class Orchestrator:
         expected_status: WorkstreamStatus,
         details: dict[str, object] | None = None,
         message: str | None = None,
+        url: str | None = None,
         **fields: object,
     ) -> Workstream:
         """Write a workstream status transition and dispatch its effects.
@@ -412,7 +413,7 @@ class Orchestrator:
         Mirrors `Scheduler._transition` (spec §4.1): `expected_status` is a
         CAS guard on the write; on success it *is* the true `frm` for the
         dispatcher (a plain re-`get` would be unreliable under concurrent
-        writes). `details`/`message` feed the event/notification only;
+        writes). `details`/`message`/`url` feed the event/notification only;
         `**fields` are DB columns (error_message, pr_url, ...) and never
         leak into the effect.
         """
@@ -424,6 +425,7 @@ class Orchestrator:
             frm=expected_status,
             details=details,
             message=message,
+            url=url,
         )
         return workstream
 
@@ -2406,6 +2408,7 @@ class Orchestrator:
                     workstream_id,
                     WorkstreamStatus.PR_CREATED,
                     expected_status=WorkstreamStatus.MERGING,
+                    url=pr_url,  # notification payload (gate: requires_url)
                     pr_url=pr_url,
                 )
 

@@ -3163,6 +3163,7 @@ class TestOrchestratorTransitionDispatchWiring:
         mock_pr_manager: MagicMock,
         notifier: NotificationManager | None = None,
         on_status_change: StatusChangeCallback | None = None,
+        auto_pr: bool = True,
     ) -> tuple[Orchestrator, "Database"]:
         from maestro.database import Database
 
@@ -3173,6 +3174,7 @@ class TestOrchestratorTransitionDispatchWiring:
             repo_url="https://github.com/t/r",
             repo_path="/tmp/r",
             workspace_base="/tmp/ws",
+            auto_pr=auto_pr,
             workstreams=[],
         )
         orch = Orchestrator(
@@ -3225,6 +3227,75 @@ class TestOrchestratorTransitionDispatchWiring:
             ]
             notified = [call.args[0].event for call in channel.send.await_args_list]
             assert notified == [NotificationEvent.WORKSTREAM_STARTED]
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_pr_created_fires_notification_with_url(
+        self,
+        tmp_path: Path,
+        mock_workspace_mgr: MagicMock,
+        mock_decomposer: MagicMock,
+        mock_pr_manager: MagicMock,
+        captured_events: _CapturingEventLogger,
+    ) -> None:
+        """The delivery tail notifies once per created PR, url as payload."""
+        manager, channel = _capturing_notification_manager()
+        orch, db = await self._orch_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            notifier=manager,
+        )
+        try:
+            ws = self._seed("z1", WorkstreamStatus.RUNNING)
+            await db.create_workstream(ws)
+            orch._merge_into_base = MagicMock()
+
+            await orch._merge_and_pr("z1", ws, expected_status=WorkstreamStatus.RUNNING)
+
+            pr_notifs = [
+                call.args[0]
+                for call in channel.send.await_args_list
+                if call.args[0].event == NotificationEvent.WORKSTREAM_PR_CREATED
+            ]
+            assert len(pr_notifs) == 1
+            assert pr_notifs[0].url == "https://github.com/test/repo/pull/1"
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_auto_pr_false_fires_no_pr_notification(
+        self,
+        tmp_path: Path,
+        mock_workspace_mgr: MagicMock,
+        mock_decomposer: MagicMock,
+        mock_pr_manager: MagicMock,
+        captured_events: _CapturingEventLogger,
+    ) -> None:
+        """auto_pr=False passes through PR_CREATED without a PR — no notify."""
+        manager, channel = _capturing_notification_manager()
+        orch, db = await self._orch_db(
+            tmp_path,
+            mock_workspace_mgr,
+            mock_decomposer,
+            mock_pr_manager,
+            notifier=manager,
+            auto_pr=False,
+        )
+        try:
+            ws = self._seed("z1", WorkstreamStatus.RUNNING)
+            await db.create_workstream(ws)
+            orch._merge_into_base = MagicMock()
+
+            await orch._merge_and_pr("z1", ws, expected_status=WorkstreamStatus.RUNNING)
+
+            mock_pr_manager.push_and_create_pr.assert_not_called()
+            notified = [call.args[0].event for call in channel.send.await_args_list]
+            assert NotificationEvent.WORKSTREAM_PR_CREATED not in notified
+            # the workstream still completes and notifies DONE
+            assert NotificationEvent.WORKSTREAM_COMPLETED in notified
         finally:
             await db.close()
 
