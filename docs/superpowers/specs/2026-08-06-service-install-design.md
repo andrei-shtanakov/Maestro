@@ -75,8 +75,8 @@ The wrapper's decision table, evaluated per tick against the DB:
 | DB state | Decision |
 |---|---|
 | lock held by a live process | `skipped_running`, exit 0 |
-| no workstreams yet | `fresh` — `orchestrate <config>` |
-| non-terminal workstreams exist (READY/RUNNING/…) | `resume` — `orchestrate --resume` |
+| no workstreams yet | `fresh` — `maestro orchestrate <project.yaml> --db <db>` |
+| non-terminal workstreams exist (READY/RUNNING/…) | `resume` — the same invocation plus `--resume` |
 | all terminal, none NEEDS_REVIEW | `noop_complete` — nothing to do, exit 0 |
 | all terminal, some NEEDS_REVIEW | `noop_blocked` — exit 0, notify once per (workstream, sha) |
 
@@ -96,8 +96,9 @@ workstreams stranded by a hard crash (DECOMPOSING/RUNNING/MERGING/
 PR_CREATED → READY; live orphans → NEEDS_REVIEW), migration-18 rework
 markers and migration-20 approver sentinels finalize fail-closed, and
 `maestro review-pr` resumes from spec-runner's own durable state. The
-wrapper's only job is to **choose** `--resume` (table above) instead of
-silently starting a fresh run over a half-finished DAG.
+wrapper's only job is to **choose** whether to pass `--resume` to
+`maestro orchestrate <project.yaml>` (table above) instead of silently
+starting a fresh run over a half-finished DAG.
 
 ### 3.4 Stale worktrees
 
@@ -115,9 +116,23 @@ sweep **before** deciding (never during a live run — the lock is held):
 
 ### 3.5 SQLite ownership
 
-One DB per project (`--db` recorded in the unit, defaulting to
-`~/.maestro/maestro.db`), and the scoped lock (§3.1) is what makes
-"one writer" true. Two additional rules:
+The lock key is **(db_path, project)** (§3.1) — that, not the file
+layout, is what makes "one writer" true; a shared DB holding several
+projects is therefore safe, and a separate DB per project is a
+recommendation, not an invariant.
+
+The default deserves care. `service install` **resolves and records the
+DB path in the unit** (defaulting to the same `~/.maestro/maestro.db`
+that manual `maestro orchestrate` uses) rather than leaving the unit to
+re-resolve a default later. Two reasons: a unit pointing at a *different*
+DB than the operator's manual runs would see an empty database and
+decide `fresh` over an in-progress DAG — the worst possible outcome of
+this whole design; and a future change of the default must never
+silently move a running service to another DB. `install` warns when the
+resolved DB is already used by another installed unit (supported, but
+worth knowing), and `--db` overrides for a per-project file.
+
+Two additional rules:
 
 - the unit runs as the **installing user** (no root, no `sudo`) — a DB
   written once by root is then unusable by the user, a classic and
@@ -156,8 +171,9 @@ v1 makes this explicit rather than magical:
 ### 3.7 Log rotation
 
 Ticks write to `~/.maestro/service-logs/<project-slug>/` — the unit's
-stdout/stderr, one file per tick (`tick-<ULID>.log`), plus a
-`ticks.jsonl` ledger (see §4). Rotation is Maestro's, not logrotate's:
+stdout/stderr, one file per tick (`tick-<ULID>.log`). The tick metadata itself lives in the
+`service_ticks` DB table (§4), not in a sidecar file — the log files are
+raw output only. Rotation is Maestro's, not logrotate's:
 after each tick, files older than `--keep-days` (default 14) **and**
 beyond `--keep-ticks` (default 100) are deleted, most recent kept. The
 per-run obs logs under the project's `logs/<ULID>/` are untouched — they
