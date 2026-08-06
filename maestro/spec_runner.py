@@ -90,7 +90,11 @@ def read_planned_total(worktree: Path) -> int | None:
         logger.warning("read_planned_total: %s", exc)
         return None
     if result.returncode != 0:
-        logger.warning("read_planned_total: status --json exited %s", result.returncode)
+        logger.warning(
+            "read_planned_total: status --json exited %s: %s",
+            result.returncode,
+            result.stderr.strip()[:500],
+        )
         return None
     try:
         payload = json.loads(result.stdout)

@@ -1565,8 +1565,9 @@ class ExecutorState(BaseModel):
         """
         denominator = max(self.total, total) if total is not None else self.total
         label = f"{self.done}/{denominator} done"
-        if self.noop_done:
-            label += f" ({self.noop_done} no-op)"
+        noop = self.noop_done
+        if noop:
+            label += f" ({noop} no-op)"
         return label
 
 
