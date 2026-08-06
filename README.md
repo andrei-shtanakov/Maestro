@@ -154,6 +154,51 @@ default.
 
 Add an `arbiter:` section to your project YAML to delegate per-task agent selection to the [Arbiter](https://github.com/andrei-shtanakov/arbiter) policy engine. Advisory mode honors your explicit `agent_type` and feeds the learning loop; authoritative mode lets the arbiter override your choice and gates retries on outcome delivery. When the section is absent, Maestro runs the zero-config static-routing path — no subprocess, no routing overhead. See [`examples/with-arbiter.yaml`](examples/with-arbiter.yaml).
 
+## Notifications
+
+Desktop notifications (macOS/Linux) are on by default. Adding a `webhook_url`
+under `notifications:` additionally POSTs a versioned JSON envelope on
+lifecycle events (started / completed / needs-review / PR created):
+
+```yaml
+notifications:
+  desktop: true
+  webhook_url: "https://your-receiver.example/maestro"  # may embed a token
+```
+
+```json
+{
+  "schema": "maestro.notification/v1",
+  "event_id": "01K1X...",
+  "event": "workstream_pr_created",
+  "occurred_at": "2026-08-06T12:34:56Z",
+  "subject_id": "ws-001",
+  "subject_title": "Auth refactor",
+  "entity_kind": "workstream",
+  "status": "pr_created",
+  "message": null,
+  "url": "https://github.com/o/r/pull/1"
+}
+```
+
+Contract notes:
+
+- **Delivery semantics:** at-least-once within a live process and graceful
+  shutdown; best-effort across a hard crash (no durable outbox). Retries
+  are bounded (3 attempts, wall-clock budget, `Retry-After` honored within
+  it); `event_id` is stable across retries and sent as the
+  `Idempotency-Key` header, so receivers can deduplicate.
+- **Allowlisted payload:** `message` is never forwarded (it may carry
+  stderr or verifier reasons); `url` is set only for events whose link is
+  the payload (PR created). Redirects are not followed; the webhook URL
+  never appears in Maestro's logs.
+- **Generic receiver, not a Slack/ntfy payload:** Slack Incoming Webhooks
+  and ntfy expect their own formats — point `webhook_url` at your own
+  receiver or a small relay that reformats the envelope for them.
+
+The `telegram_token` / `telegram_chat_id` config fields are deprecated and
+non-functional; they will be removed in a future config-schema window.
+
 ## Supported Agents
 
 | Agent | Key | Notes |

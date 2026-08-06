@@ -201,6 +201,14 @@ class NotificationChannel(ABC):
         """
         ...
 
+    async def aclose(self) -> None:
+        """Release channel resources; default is a no-op.
+
+        Channels with delivery state (e.g. the webhook queue) override
+        this to drain and close; the manager calls it once at shutdown.
+        """
+        return None
+
     @abstractmethod
     async def send(self, notification: Notification) -> bool:
         """Send a notification.

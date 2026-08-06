@@ -9,6 +9,7 @@ import logging
 from maestro.models import NotificationConfig
 from maestro.notifications.base import Notification, NotificationChannel
 from maestro.notifications.desktop import DesktopNotifier
+from maestro.notifications.webhook import WebhookNotifier
 
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,21 @@ class NotificationManager:
                 results[channel.channel_type] = False
         return results
 
+    async def aclose(self) -> None:
+        """Close all channels (drain queues etc.); errors are isolated.
+
+        Called once at graceful shutdown; a failing channel is logged and
+        never blocks closing the others.
+        """
+        for channel in self._channels:
+            try:
+                await channel.aclose()
+            except Exception:
+                logger.exception(
+                    "Failed to close notification channel %s",
+                    channel.channel_type,
+                )
+
 
 def create_notification_manager(
     config: NotificationConfig | None = None,
@@ -92,5 +108,16 @@ def create_notification_manager(
 
     if config.desktop:
         manager.register(DesktopNotifier(enabled=True))
+
+    if config.webhook_url:
+        manager.register(WebhookNotifier(config.webhook_url))
+
+    if config.telegram_token is not None or config.telegram_chat_id is not None:
+        # Never functional; values are secrets — log no field contents.
+        logger.warning(
+            "telegram notification fields are deprecated and non-functional; "
+            "use webhook_url (fields will be removed in a future "
+            "config-schema window)"
+        )
 
     return manager

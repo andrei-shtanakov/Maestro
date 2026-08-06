@@ -10,6 +10,7 @@ from maestro.notifications.manager import (
     NotificationManager,
     create_notification_manager,
 )
+from maestro.notifications.webhook import WebhookNotifier
 
 
 __all__ = [
@@ -19,5 +20,6 @@ __all__ = [
     "NotificationEvent",
     "NotificationManager",
     "Platform",
+    "WebhookNotifier",
     "create_notification_manager",
 ]

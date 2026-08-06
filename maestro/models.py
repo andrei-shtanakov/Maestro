@@ -780,10 +780,20 @@ class NotificationConfig(BaseModel):
     """Notification configuration."""
 
     desktop: bool = Field(default=True, description="Enable desktop notifications")
-    telegram_token: str | None = Field(default=None, description="Telegram bot token")
-    telegram_chat_id: str | None = Field(default=None, description="Telegram chat ID")
+    telegram_token: str | None = Field(
+        default=None,
+        description="DEPRECATED (non-functional; use webhook_url)",
+    )
+    telegram_chat_id: str | None = Field(
+        default=None,
+        description="DEPRECATED (non-functional; use webhook_url)",
+    )
     webhook_url: str | None = Field(
-        default=None, description="Webhook URL for notifications"
+        default=None,
+        description=(
+            "Webhook URL for notifications (POSTs the versioned "
+            "maestro.notification/v1 JSON envelope)"
+        ),
     )
 
     @model_validator(mode="after")

@@ -687,6 +687,86 @@ class TestCreateNotificationManager:
         manager = create_notification_manager(config)
         assert len(manager.channels) == 0
 
+    def test_webhook_url_registers_webhook_channel(self) -> None:
+        """Test that a configured webhook_url adds the webhook channel."""
+        from maestro.models import NotificationConfig
+        from maestro.notifications.webhook import WebhookNotifier
+
+        config = NotificationConfig(
+            desktop=False, webhook_url="https://receiver.test/hook"
+        )
+        manager = create_notification_manager(config)
+        assert len(manager.channels) == 1
+        assert isinstance(manager.channels[0], WebhookNotifier)
+
+    def test_no_webhook_url_keeps_prior_behavior(self) -> None:
+        """Test that absent webhook_url registers no webhook channel."""
+        from maestro.models import NotificationConfig
+        from maestro.notifications.webhook import WebhookNotifier
+
+        config = NotificationConfig(desktop=True)
+        manager = create_notification_manager(config)
+        assert not any(isinstance(c, WebhookNotifier) for c in manager.channels)
+
+    def test_telegram_fields_warn_deprecated(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Test that set telegram fields log a deprecation warning."""
+        import logging
+
+        from maestro.models import NotificationConfig
+
+        config = NotificationConfig(
+            desktop=False, telegram_token="t", telegram_chat_id="c"
+        )
+        with caplog.at_level(logging.WARNING):
+            create_notification_manager(config)
+        assert any("deprecated" in r.message for r in caplog.records)
+        # the token value itself must not be logged
+        assert not any("'t'" in r.getMessage() for r in caplog.records)
+
+
+class TestManagerClose:
+    """Tests for manager/channel shutdown hooks."""
+
+    async def test_base_channel_aclose_default_noop(self) -> None:
+        """Test that NotificationChannel.aclose defaults to a no-op."""
+
+        class Minimal(NotificationChannel):
+            @property
+            def channel_type(self) -> str:
+                return "minimal"
+
+            def is_available(self) -> bool:
+                return True
+
+            async def send(self, notification: Notification) -> bool:
+                return True
+
+        await Minimal().aclose()  # must exist and not raise
+
+    async def test_manager_aclose_closes_channels(self) -> None:
+        """Test that manager.aclose closes every registered channel."""
+        channel = AsyncMock(spec=NotificationChannel)
+        channel.channel_type = "capture"
+        manager = NotificationManager()
+        manager.register(channel)
+        await manager.aclose()
+        channel.aclose.assert_awaited_once()
+
+    async def test_manager_aclose_isolates_channel_errors(self) -> None:
+        """Test that one failing channel does not block closing others."""
+        bad = AsyncMock(spec=NotificationChannel)
+        bad.channel_type = "bad"
+        bad.aclose.side_effect = RuntimeError("boom")
+        good = AsyncMock(spec=NotificationChannel)
+        good.channel_type = "good"
+        manager = NotificationManager()
+        manager.register(bad)
+        manager.register(good)
+        await manager.aclose()  # must not raise
+        good.aclose.assert_awaited_once()
+
 
 # =============================================================================
 # Unit Tests: Package exports
