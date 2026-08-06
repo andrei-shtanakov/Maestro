@@ -363,16 +363,15 @@
       durable outbox — возможный follow-up за тем же швом очереди.
       telegram-поля deprecated. httpx — прямая зависимость. Попутно:
       регенерация схем подобрала июльский дрейф VerifierConfig. 23+9 тестов.
-- [ ] **`post_pr_command` — тонкий мост к spec-runner review-pr** (P2, после webhook и spec-runner#102) @owner:andrei @id:post-pr-command
+- [ ] **`post_pr_command` — тонкий мост к spec-runner review-pr** (P2, после webhook и spec-runner#102) @owner:andrei @id:post-pr-command @blocked_by:spec-runner#review-pr-json-purity
       Maestro создаёт свои PR, но review-bot-циклом не владеет: отдельный
       opt-in хук на границе PR_CREATED, вызывающий resumable
       `spec-runner review-pr <PR>`. Не approver_cmd и не notify_cmd. Сейчас
       PR_CREATED сразу идёт к DONE — синхронное ожидание ревью внутри
       foreground-процесса требует отдельного lifecycle-дизайна; первый вариант
       проще: Maestro публикует PR_CREATED, внешний scheduler запускает review-pr.
-      @blocked_by:spec-runner#review-pr-json-purity
-      Counterpart spec-runner#102 закрыт (M1–M3, v2.18–2.20: `spec-runner
-      review-pr` с внешним caller-контрактом exit 0/1/2 + `--json`).
+      Counterpart spec-runner#102 закрыт (M1–M3, v2.18–2.20: команда
+      `spec-runner review-pr` с внешним caller-контрактом exit 0/1/2 + `--json`).
       Дизайн-этап пройден (PR #147, merge `458039c`), спека
       `docs/superpowers/specs/2026-08-06-post-pr-review-command-design.md`,
       Status approved (3 ревизии владельца). Форма изменилась против исходной
