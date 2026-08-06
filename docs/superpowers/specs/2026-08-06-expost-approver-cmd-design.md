@@ -191,11 +191,14 @@ Strict run-keyed handshake, mirroring verdict v2:
   approved.
 - `verdict` ∈ {PASS, FAIL, ERROR}. The command reporting its own ERROR
   is respected as ERROR.
-- **Independence is enforced on the way back:** `critics` must be
-  non-empty, and no critic's `model` may equal the author's model. A
-  violation is a protocol ERROR (the pilot's hard requirement enforced
-  mechanically, not by convention). Consensus itself is the command's
-  business; Maestro only checks identity and shape.
+- **Independence is enforced on the way back:** for any document
+  returned by `approver_cmd`, `critics` must be non-empty and no
+  critic's `model` may equal the author's model. A violation is a
+  protocol ERROR (the pilot's hard requirement enforced mechanically,
+  not by convention). Consensus itself is the command's business;
+  Maestro only checks identity and shape. (Mechanical-allowlist
+  verdicts are minted by Maestro itself and never pass through this
+  validation — see §6.)
 
 ## 6. Guards: when the hook does NOT run
 
@@ -225,16 +228,21 @@ in `NEEDS_REVIEW` for the human:
    `already_attempted`. One evaluation per SHA; a human (or a new
    commit) breaks the tie.
 
-**Mechanical allowlist (runs after guards 1–4 and 6, before invoking the
-command; the oversize-diff guard does not apply — no diff is sent
-anywhere):** if `escaped_paths` is non-empty and *every* escaped path matches
+**Mechanical allowlist (runs after guards 1–4 and 6, before invoking
+the command):** if the changed-path/escape enumeration succeeded,
+`escaped_paths` is non-empty, and *every* escaped path matches
 `mechanical_allowlist` globs, the hook may approve without invoking a
-critic — recorded as `verdict=PASS`, `critics=[]`,
-`summary=mechanical-allowlist`, and it still consumes the
-`max_auto_approvals` budget and writes the same audit rows. Path-match
-only in v1 (no content awareness); default empty list means the branch
-is dead unless explicitly configured. Anything not fully covered goes to
-the critic path — semantic judgment is never mechanical.
+critic. The verdict record is minted by Maestro itself (never through
+the §5.3 protocol validation): `verdict=PASS`, `critics=[]`,
+`summary=mechanical-allowlist`. It still consumes the
+`max_auto_approvals` budget and writes the same audit rows. Only the
+diff-*size* limit is inapplicable here (no diff content is needed for a
+path match); any failure to enumerate changed paths or escapes is
+fail-closed — the mechanical branch is skipped and the critic path's
+own guards (§6.5) route the case to the human. Path-match only in v1
+(no content awareness); default empty list means the branch is dead
+unless explicitly configured. Anything not fully covered goes to the
+critic path — semantic judgment is never mechanical.
 
 ## 7. Audit: both verdicts, durably
 
@@ -259,7 +267,7 @@ evidence):
       sha             TEXT NOT NULL,
       state           TEXT NOT NULL CHECK (state IN
                         ('started','pass','fail','error','skipped')),
-      skip_reason     TEXT,                      -- guards, §6
+      reason          TEXT,                      -- skip reason (§6) or error cause
       verdict_json    TEXT,                      -- full document, verbatim
       created_at      TEXT NOT NULL,
       finished_at     TEXT,
@@ -297,7 +305,7 @@ approval without its verdict or vice versa.
   orchestrator restarts that lost the in-flight task.
 - **Crash mid-evaluation:** the `started` sentinel row exists without a
   terminal state. On startup this is finalized as
-  `state='error', skip_reason='interrupted'` — **fail-closed to the
+  `state='error', reason='interrupted'` — **fail-closed to the
   human**, never re-run automatically (a critic run costs money and the
   first run's effects are unknown; mirrors the #124 stance that
   ambiguity resolves to a human, not to a retry loop). A new commit
