@@ -363,13 +363,26 @@
       durable outbox — возможный follow-up за тем же швом очереди.
       telegram-поля deprecated. httpx — прямая зависимость. Попутно:
       регенерация схем подобрала июльский дрейф VerifierConfig. 23+9 тестов.
-- [ ] **`post_pr_command` — тонкий мост к spec-runner review-pr** (P2, после webhook и spec-runner#102) @owner:andrei @id:post-pr-command
+- [ ] **`post_pr_command` — тонкий мост к spec-runner review-pr** (P2, после webhook и spec-runner#102) @owner:andrei @id:post-pr-command @blocked_by:spec-runner#review-pr-json-purity
       Maestro создаёт свои PR, но review-bot-циклом не владеет: отдельный
       opt-in хук на границе PR_CREATED, вызывающий resumable
       `spec-runner review-pr <PR>`. Не approver_cmd и не notify_cmd. Сейчас
       PR_CREATED сразу идёт к DONE — синхронное ожидание ревью внутри
       foreground-процесса требует отдельного lifecycle-дизайна; первый вариант
       проще: Maestro публикует PR_CREATED, внешний scheduler запускает review-pr.
+      Counterpart spec-runner#102 закрыт (M1–M3, v2.18–2.20: команда
+      `spec-runner review-pr` с внешним caller-контрактом exit 0/1/2 + `--json`).
+      Дизайн-этап пройден (PR #147, merge `458039c`), спека
+      `docs/superpowers/specs/2026-08-06-post-pr-review-command-design.md`,
+      Status approved (3 ревизии владельца). Форма изменилась против исходной
+      формулировки: не хук на границе PR_CREATED, а отдельная команда
+      `maestro review-pr` (оркестратор не тронут, нового WorkstreamStatus нет),
+      т.к. resumable-state spec-runner живёт в `state_file` внутри checkout —
+      нужен durable state вне worktree, retention незавершённой работы,
+      Maestro-owned push-recovery, per-PR flock и immutable-after-finalization
+      аудит (миграция 21). Реализация **заблокирована** на spec-runner#116
+      (`--json` purity: ровно один JSON-документ на stdout) — версия будет
+      запинена через preflight version-gate.
 - [ ] **Дизайн `maestro service install`** (P3, после стабилизации автономных операций) @owner:andrei @id:service-install-design
       Отдельный operational track, НЕ связывать с #137. Launchd/systemd-генератор
       сам по себе не решает: single-instance locking, resume после crash, stale
