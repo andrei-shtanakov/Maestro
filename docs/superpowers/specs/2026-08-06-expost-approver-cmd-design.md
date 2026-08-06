@@ -1,6 +1,6 @@
 # Ex-post gate: pluggable `approver_cmd` hook — design
 
-**Status:** proposed (revision 2)
+**Status:** proposed (revision 3)
 **Date:** 2026-08-06
 **Issue:** #137 (`slug: expost-approver-cmd`), battle-testing pilot wave 2
 **Owner decisions incorporated:** issue body (hard requirements from the
@@ -16,6 +16,15 @@ subprocess output with canonical-serialization storage; mechanical
 allowlist removed from v1; independence reworded as declared-provenance
 validation; async evaluation lifecycle defined; §11 triggers made
 concrete.
+**Revision 3 (owner re-review):** observation evidence verdict changed
+from `waived` to a new `not_run` value (advisory obligation, structured
+reason — nothing is being waived); durable `gate_block_contexts`
+persisted at block time so the restart trigger builds a faithful
+request (persist-at-block chosen over recompute-on-resume); cost budget
+made fail-closed (`cost_budget_unknown` when any attempt's cost is
+unreported); TOCTOU window around the PASS transaction narrowed via the
+worktree reservation + post-transaction HEAD confirmation, with the
+honest statement that H-6's SHA check is the final barrier.
 
 ## 1. Problem
 
@@ -170,6 +179,11 @@ Notes:
 - The diff is computed by Maestro (scope-bounded, `base_branch..HEAD`)
   and embedded; an oversize or unproducible diff never reaches the
   command (§6). `worktree` is provided for read-only deeper inspection.
+- `tier`, `flags`, `block_reason`, `declared_scope`, `changed_paths`,
+  `escaped_paths`, and `author` come from the durable
+  `gate_block_contexts` snapshot written at block time (§7.1) — the
+  envelope is identical whether the evaluation is triggered immediately
+  or after an orchestrator restart.
 - `author` identifies the workstream's authoring harness/model so the
   command can enforce critic independence; Maestro validates the
   *declared* provenance on the way back (§5.3).
@@ -257,10 +271,15 @@ The subprocess's output is bounded, not just its input:
 
 **Revision 2 core split.** A *skip* is an **observation** — recorded as
 evidence (a `GateVerdictRecord` with `gate_id="agent.approver"`,
-`verdict="waived"`, note = reason, in `logs/<ULID>/gate_verdicts.jsonl`)
-plus a structured event; it occupies **no** durable evaluation slot and
-is deduplicated in-process per `(workstream_id, sha, reason)` so loop
-passes don't spam. An **evaluation attempt** is the durable
+`verdict="not_run"`, `obligation="advisory"`, note = structured reason,
+in `logs/<ULID>/gate_verdicts.jsonl`) plus a structured event; it
+occupies **no** durable evaluation slot and is deduplicated in-process
+per `(workstream_id, sha, reason)` so loop passes don't spam.
+`not_run` is a **new value added to the evidence contract**
+(`GateVerdictRecord.verdict`) by the implementation PR — `waived` would
+be wrong here: nothing is being waived or resolved, the evaluator
+simply did not run and the gate still blocks; a downstream evidence
+consumer must never read a skip as a positive dispensation. An **evaluation attempt** is the durable
 `gate_approver_runs` row (§7), written only after all guards pass and
 the decision to actually run the command has been made. Consequently a
 block that was skipped (approver disabled, budget reached, oversize
@@ -275,34 +294,45 @@ Guards, in order (any failure → observation, workstream stays
    `phase=ex_post` approval marker (recovery parks, rework ambiguity,
    verification failures…) — never evaluated. Recovery-origin
    NEEDS_REVIEW is out of reach by construction.
-3. **Stale SHA:** marker SHA != current worktree HEAD (or worktree
+3. **No block context (revision 3):** the durable
+   `gate_block_contexts` row for `(workstream, phase, sha)` is missing
+   (the block predates this feature, or the row was lost) — reason
+   `no_block_context`. The request envelope is built **only** from the
+   persisted context (§7.1) — never from a partial reconstruction of
+   tier/flags/paths that the gate computed in a process that may no
+   longer exist.
+4. **Stale SHA:** marker SHA != current worktree HEAD (or worktree
    missing) — reason `stale_sha`. A new commit invalidates everything,
    same as for human approvals.
-4. **Authority budget:** `gate_approvals` rows with `actor='agent'` for
+5. **Authority budget:** `gate_approvals` rows with `actor='agent'` for
    this workstream `>= max_auto_approvals` — reason
    `approval_budget_exhausted`. Beyond it a human must approve.
-5. **Execution budget:** `gate_approver_runs` rows for this workstream
+6. **Execution budget:** `gate_approver_runs` rows for this workstream
    (any SHA, any outcome — including `error`) `>= max_evaluations` —
    reason `evaluation_budget_exhausted`. This bounds *spend*: without
    it, each new commit re-arms the hook and a workstream could fund an
    unbounded sequence of paid FAIL/ERROR critic runs. Authority and
    execution budgets are deliberately independent.
-6. **Cost budget** (only when `max_cost_usd` is set): the sum of
-   reported `cost_usd` over this workstream's attempts `>= max_cost_usd`
-   — reason `cost_budget_exhausted`. Attempts that reported no cost
-   count as unknown and are surfaced in the observation note (the bound
-   is then advisory for them — honest limitation, same as `maestro
-   costs`).
-7. **Escape size:** `len(escaped_paths) > max_escaped_paths` — reason
+7. **Cost budget** (only when `max_cost_usd` is set) — **fail-closed
+   (revision 3)**: if any prior attempt for this workstream has
+   `cost_usd IS NULL`, the remaining budget cannot be proven — reason
+   `cost_budget_unknown`, no further auto-runs (the human decides).
+   Otherwise the sum of reported costs `>= max_cost_usd` — reason
+   `cost_budget_exhausted`. A budget that can be silently exceeded by
+   unreported costs would be a warning mislabeled as a budget; with
+   this rule the knob is an actual hard bound over *reported* spend,
+   and a command that wants auto-approval to keep working must report
+   costs. (`max_evaluations` bounds the run *count* regardless.)
+8. **Escape size:** `len(escaped_paths) > max_escaped_paths` — reason
    `too_many_escapes` (the accepted TODO's ">N escapes → human"
    requirement).
-8. **Oversize / unproducible diff:** scope-bounded diff exceeds
+9. **Oversize / unproducible diff:** scope-bounded diff exceeds
    `max_diff_bytes`, or cannot be produced (binary, git error) — reason
    `oversize_diff` / `diff_error`. An unreadable diff never reaches a
    critic.
-9. **Already attempted:** a `gate_approver_runs` row exists for this
-   `(workstream_id, phase, sha)` — reason `already_attempted`. One paid
-   evaluation per SHA; a human (or a new commit) breaks the tie.
+10. **Already attempted:** a `gate_approver_runs` row exists for this
+    `(workstream_id, phase, sha)` — reason `already_attempted`. One paid
+    evaluation per SHA; a human (or a new commit) breaks the tie.
 
 ## 7. Audit: both verdicts, durably
 
@@ -342,6 +372,36 @@ evidence).
   in `verdict_json` in canonical serialization: "both verdicts
   persisted" is satisfied in the DB, not only in run-scoped logs.
 
+- New append-only table `gate_block_contexts` (**revision 3,
+  persist-at-block**) — the durable snapshot of what the gate saw,
+  written in the same flow that parks the workstream (immediately after
+  `_route_gate_block`, for ex-post blocks, regardless of whether the
+  approver is currently enabled — so enabling it later still works):
+
+  ```sql
+  CREATE TABLE gate_block_contexts (
+      workstream_id TEXT NOT NULL,
+      phase         TEXT NOT NULL CHECK (phase IN ('ex_post')),
+      sha           TEXT NOT NULL,
+      context_json  TEXT NOT NULL,   -- tier, flags, block_reason,
+                                     -- declared_scope, changed_paths,
+                                     -- escaped_paths, author provenance
+      created_at    TEXT NOT NULL,
+      PRIMARY KEY (workstream_id, phase, sha)
+  );
+  ```
+
+  Immutable: `INSERT OR IGNORE` — the first write (the gate that
+  actually blocked) wins; nothing updates or deletes rows. The request
+  envelope (§5.1) is built from this row plus a fresh HEAD check —
+  never recomputed ad hoc on resume, so the restart trigger sends the
+  critic exactly what the gate evaluated, not a reconstruction by a
+  process that wasn't there. (The alternative — recompute-on-resume via
+  a second `steward risk-classify` call — was rejected: it doubles the
+  classification surface and any drift between the two runs would need
+  its own reconciliation rules.) A missing row is guard §6.3 — the
+  human handles pre-migration blocks.
+
 ### 7.2 PASS path: post-verdict recheck + CAS (revision 2)
 
 A critic run can take up to `timeout_seconds`; the worktree may change
@@ -368,6 +428,24 @@ rowcount 0) finalizes the attempt as
 `state='error', reason='stale_after_evaluation'` — **no approval, no
 READY**, workstream untouched. The attempt row for SHA-A remains (the
 money was spent); the new SHA arms a fresh evaluation within budgets.
+
+**TOCTOU boundary (revision 3, honest statement).** The recheck-then-CAS
+sequence guards the DB, not Git: between step 4 and the transaction an
+external process can still move the worktree. v1 narrows the window and
+names the residual risk instead of overclaiming:
+
+- the hook holds Maestro's worktree reservation (`(workdir, scope)`
+  lock, `execution/reservations.py`) across the final HEAD check and
+  the PASS transaction, excluding *Maestro-coordinated* writers;
+- after the transaction, HEAD is confirmed once more before the resume
+  is scheduled; a mismatch leaves the workstream parked (returned to
+  `NEEDS_REVIEW` semantics) — the approval row stays, harmlessly and
+  correctly bound to the old SHA-A, which no longer matches anything;
+- an **uncoordinated external git writer cannot be atomized against
+  SQLite** — that is stated as a limitation, not solved. The final
+  barrier remains H-6's own HEAD == marker-SHA check at resume: an
+  approval pinned to SHA-A can never merge SHA-B, so every residual
+  race degrades to "parked for a human", never to a wrong merge.
 
 **FAIL path:** finalize `started -> fail` with the document in
 `verdict_json`; workstream stays `NEEDS_REVIEW`; the human sees the
@@ -444,15 +522,25 @@ PR stage. No change to that boundary is made or needed here.
   over-limit `summary`/`findings`/`critics` → all ERROR → workstream
   stays `NEEDS_REVIEW`, terminal attempt row written, no
   `gate_approvals` row.
-- **Observations vs attempts:** every §6 skip → evidence record +
+- **Observations vs attempts:** every §6 skip → evidence record with
+  `verdict='not_run'`, `obligation='advisory'` (never `waived`) +
   event, **no** `gate_approver_runs` row; disable → block → re-enable →
   same SHA gets evaluated (the kill-switch does not burn the slot);
   observation dedup per (workstream, sha, reason) within a process.
+- **Block context:** parking an ex-post block writes the
+  `gate_block_contexts` row even with the approver disabled; restart
+  trigger builds the envelope from the persisted row (byte-identical to
+  the immediate-trigger envelope for the same block); missing row →
+  `no_block_context` observation, no invocation; `INSERT OR IGNORE`
+  immutability (a second block for the same (ws, phase, sha) never
+  rewrites the snapshot).
 - **Budgets, independently:** authority budget counts only
   `actor='agent'` approvals; execution budget counts all attempts incl.
   `error` across SHAs (N failed evaluations on N commits stop the
-  spend); `max_escaped_paths` boundary; cost budget with reported /
-  absent `cost_usd` (absent = unknown, surfaced, never 0).
+  spend); `max_escaped_paths` boundary; cost budget fail-closed: any
+  attempt with `cost_usd IS NULL` while `max_cost_usd` is set →
+  `cost_budget_unknown`, no further invocations; all-reported sum
+  crossing the bound → `cost_budget_exhausted`.
 - **PASS path:** post-verdict recheck passes → single CAS transaction
   (attempt `pass` + approval `actor='agent'` + `approval_run_id` +
   READY), then H-6 resume reaches MERGING without respawn
@@ -461,6 +549,10 @@ PR stage. No change to that boundary is made or needed here.
   recheck fails → attempt `error/stale_after_evaluation`, no approval,
   no READY, workstream untouched; CAS rowcount-0 path (concurrent
   operator action mid-transaction) behaves identically.
+- **TOCTOU narrowing:** the worktree reservation is held across final
+  HEAD check + PASS transaction (a Maestro-coordinated writer blocks);
+  post-transaction HEAD mismatch → workstream stays parked, approval
+  row remains bound to the old SHA, H-6 refuses the resume.
 - **FAIL path:** stays `NEEDS_REVIEW`, findings visible in
   `verdict_json` and evidence note; human `workstream-approve` still
   works afterwards.
@@ -475,7 +567,9 @@ PR stage. No change to that boundary is made or needed here.
 - **Kill-switches:** config and env — no invocation, `disabled`
   observation only; reversible (see above).
 - **Migration 20:** fresh DB and upgrade path; existing `gate_approvals`
-  rows read back as `actor='human'`; journal tripwire lists updated.
+  rows read back as `actor='human'`; both new tables
+  (`gate_approver_runs`, `gate_block_contexts`) created; journal
+  tripwire lists updated.
 - **Zero-change guarantee:** `gates:` without `approver:` — existing
   gates tests byte-identical; no `gates:` at all — untouched.
 
