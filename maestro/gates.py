@@ -110,11 +110,19 @@ class GateVerdictRecord(BaseModel):
 
 
 class GateDecision(BaseModel):
-    """Outcome of one guard evaluation."""
+    """Outcome of one guard evaluation.
+
+    `tier`/`flags`/`paths` carry the classification data the approver
+    hook persists at block time (`gate_block_contexts`, #137 §7.1) —
+    additive, unset on classification errors.
+    """
 
     allow: bool
     reason: str | None = None
     records: list[GateVerdictRecord] = Field(default_factory=list)
+    tier: str | None = None
+    flags: list[str] = Field(default_factory=list)
+    paths: list[str] | None = None
 
 
 def pipeline_log_dir() -> Path:
@@ -199,7 +207,11 @@ class GateKeeper:
             "declared_scope": scope,
         }
         classification = await self._classify("--no-fs", payload)
-        return self._decide("ex_post", workstream_id, sha, classification, approvals)
+        decision = self._decide(
+            "ex_post", workstream_id, sha, classification, approvals
+        )
+        decision.paths = paths
+        return decision
 
     # ------------------------------------------------------------ decision
 
@@ -333,8 +345,14 @@ class GateKeeper:
 
         self._write(records)
         if blocked_reason is not None:
-            return GateDecision(allow=False, reason=blocked_reason, records=records)
-        return GateDecision(allow=True, records=records)
+            return GateDecision(
+                allow=False,
+                reason=blocked_reason,
+                records=records,
+                tier=tier,
+                flags=list(flags),
+            )
+        return GateDecision(allow=True, records=records, tier=tier, flags=list(flags))
 
     # ------------------------------------------------------------ steward
 
@@ -418,6 +436,5 @@ class GateKeeper:
         with path.open("a", encoding="utf-8") as handle:
             for rec in records:
                 handle.write(
-                    json.dumps(rec.model_dump(by_alias=True, exclude_none=True))
-                    + "\n"
+                    json.dumps(rec.model_dump(by_alias=True, exclude_none=True)) + "\n"
                 )

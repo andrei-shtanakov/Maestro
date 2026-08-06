@@ -3,6 +3,28 @@
 ## Unreleased
 
 ### Added
+- **approver_cmd hook (#137).** Opt-in `gates.approver` block: an ex-post
+  gate block parked in NEEDS_REVIEW may now be auto-approved by an
+  external critic command — an *automated operator* over the existing
+  single-authority approval API, recorded with `actor='agent'` and the
+  full verdict document (every critic's vote) in the new append-only
+  `gate_approver_runs` table (migration 20, which also adds
+  `gate_approvals.actor`/`approval_run_id` and the immutable
+  persist-at-block `gate_block_contexts` snapshot the request envelope
+  is built from). Strict run-keyed contract
+  (`maestro.approval-request/v1` on stdin,
+  `maestro.approval-verdict/v1` on stdout, 4-field echo handshake,
+  declared critic-independence check, bounded stdout/stderr and field
+  limits). Fail-closed everywhere: timeouts, protocol violations,
+  unknown/exceeded cost budgets, stale SHAs and interrupted runs all
+  leave the workstream waiting for the human; a PASS re-queues through
+  the H-6 resume path after a post-verdict recheck + CAS transaction.
+  Guard skips are `not_run` observations (never burning the
+  one-evaluation-per-SHA slot — the kill-switches, `enabled: false` and
+  `MAESTRO_APPROVER_DISABLED=1`, are reversible). Evidence lines in
+  `gate_verdicts.jsonl` now carry an explicit
+  `schema: maestro.gate-verdict-record/v1` discriminator. Design:
+  `docs/superpowers/specs/2026-08-06-expost-approver-cmd-design.md`.
 - **Webhook notification channel.** A configured `notifications.webhook_url`
   now POSTs a versioned JSON envelope (`maestro.notification/v1`) on
   lifecycle notifications, delivered by a managed bounded queue with a

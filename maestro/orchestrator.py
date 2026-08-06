@@ -20,7 +20,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
 
+import ulid
+
 from maestro._vendor.obs import child_env, current_pipeline_id, span
+from maestro.approver import (
+    AuthorInfo,
+    BlockContext,
+    EchoFields,
+    build_request_envelope,
+    run_approver_cmd,
+    validate_verdict,
+)
 from maestro.changed_paths import changed_paths_since
 from maestro.database import Database
 from maestro.decomposer import ProjectDecomposer
@@ -65,6 +75,7 @@ from maestro.gates import (
     ApprovalMarker,
     GateDecision,
     GateKeeper,
+    GateVerdictRecord,
     parse_approval_marker,
     pipeline_log_dir,
     preserve_approval_marker,
@@ -73,6 +84,7 @@ from maestro.git import GitError, MergeConflictError
 from maestro.merge_logs import merge_logs_dir
 from maestro.models import (
     SPEC_PREFIX,
+    ApproverConfig,
     OrchestratorConfig,
     TransitionSubject,
     Workstream,
@@ -391,6 +403,13 @@ class Orchestrator:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._logger = logging.getLogger(__name__)
         self._stats = OrchestratorStats()
+        # approver_cmd hook (#137): in-flight evaluation tasks (dedup by
+        # workstream), per-workstream finalize locks (the in-process half
+        # of the §7.2 TOCTOU narrowing), and the observation dedup set
+        # ((workstream, sha, reason) — §6 skips are logged once).
+        self._approver_tasks: dict[str, asyncio.Task[None]] = {}
+        self._approver_locks: dict[str, asyncio.Lock] = {}
+        self._approver_observed: set[tuple[str, str, str]] = set()
 
     @property
     def is_running(self) -> bool:
@@ -465,8 +484,13 @@ class Orchestrator:
             # (resume path) so the main loop can advance them.
             await self._recover_stranded_workstreams()
 
+            # Step 1c: approver sentinels from a prior crash — fail-closed
+            # to the human, never auto-re-run (#137 §8.2).
+            await self._finalize_interrupted_approver_runs()
+
             # Step 2: Main loop
             await self._main_loop()
+            await self._drain_approver_tasks()
         finally:
             await self._cleanup()
             _pipeline_id = current_pipeline_id()
@@ -1332,6 +1356,11 @@ class Orchestrator:
             # Get completed workstream IDs
             completed_ids = await self._get_completed_ids()
 
+            # approver_cmd (#137): schedule eligible NEEDS_REVIEW blocks
+            # BEFORE the completeness check, so an eligible block becomes
+            # tracked in-flight work instead of letting the run exit.
+            await self._schedule_approver()
+
             # Check if all done
             if await self._all_workstreams_complete():
                 self._logger.info("All workstreams complete")
@@ -1364,6 +1393,8 @@ class Orchestrator:
 
     async def _all_workstreams_complete(self) -> bool:
         """Check if all workstreams are in terminal states."""
+        if self._approver_tasks:
+            return False  # in-flight approver evaluations are active work
         all_z = await self._db.get_all_workstreams()
         terminal = {
             WorkstreamStatus.DONE,
@@ -2274,6 +2305,7 @@ class Orchestrator:
         await self._route_gate_block(
             workstream_id, decision, expected=WorkstreamStatus.FAILED
         )
+        await self._persist_block_context(workstream_id, workstream, decision)
         self._stats.failed += 1
         # Leave the workspace intact so a human can inspect the diff.
         return False
@@ -2295,6 +2327,500 @@ class Orchestrator:
             message=decision.reason,
             error_message=decision.reason,
         )
+
+    # ------------------------------------------------------------------
+    # approver_cmd hook (#137) — automated operator over the approve API
+    # ------------------------------------------------------------------
+
+    async def _persist_block_context(
+        self,
+        workstream_id: str,
+        workstream: Workstream,
+        decision: GateDecision,
+    ) -> None:
+        """Persist-at-block snapshot (spec §7.1) — immutable, first write wins.
+
+        Written for every ex-post block regardless of whether the
+        approver is currently enabled, so enabling it later still works.
+        Display-only failure domain: a persist error is logged, never
+        raised (the block itself already routed to NEEDS_REVIEW).
+        """
+        marker = parse_approval_marker(decision.reason)
+        if marker is None or marker.phase != "ex_post":
+            return  # classification-error blocks carry no marker/sha
+        paths = decision.paths or []
+        try:
+            context = BlockContext(
+                tier=decision.tier,
+                flags=list(decision.flags),
+                block_reason=decision.reason or "",
+                declared_scope=list(workstream.scope),
+                changed_paths=paths,
+                escaped_paths=find_escapes(paths, normalize(workstream.scope)),
+                # Mode-2 v1: no per-workstream model is recorded; a null
+                # model passes the independence comparison vacuously
+                # (spec §5.3, documented limitation).
+                author=AuthorInfo(harness="spec-runner", model=None),
+            )
+            await self._db.record_gate_block_context(
+                workstream_id, "ex_post", marker.sha, context.model_dump_json()
+            )
+        except Exception:
+            self._logger.exception(
+                "Failed to persist gate block context for '%s'", workstream_id
+            )
+
+    def _approver_config(self) -> ApproverConfig | None:
+        gates = self._config.gates
+        if gates is None:
+            return None
+        return gates.approver
+
+    @staticmethod
+    def _approver_disabled(cfg: ApproverConfig) -> bool:
+        return not cfg.enabled or os.environ.get("MAESTRO_APPROVER_DISABLED") == "1"
+
+    def _approver_observe(self, workstream_id: str, sha: str, reason: str) -> None:
+        """Record a §6 skip: `not_run` evidence + log, no attempt slot.
+
+        Deduplicated per (workstream, sha, reason) within this process so
+        main-loop passes don't spam.
+        """
+        key = (workstream_id, sha, reason)
+        if key in self._approver_observed:
+            return
+        self._approver_observed.add(key)
+        self._logger.info(
+            "approver: not run for '%s' (sha=%s): %s", workstream_id, sha, reason
+        )
+        self._append_approver_record(workstream_id, sha or None, "not_run", note=reason)
+
+    def _append_approver_record(
+        self,
+        workstream_id: str,
+        sha: str | None,
+        verdict: Literal["pass", "fail", "error", "not_run"],
+        *,
+        note: str | None,
+    ) -> None:
+        if self._gates is None:
+            return
+        try:
+            self._gates.append_records(
+                [
+                    GateVerdictRecord(
+                        gate_id="agent.approver",
+                        obligation="advisory",
+                        verdict=verdict,
+                        phase="ex_post",
+                        sha=sha,
+                        ts=datetime.now(UTC).isoformat(),
+                        workstream_id=workstream_id,
+                        note=note,
+                    )
+                ]
+            )
+        except Exception:
+            self._logger.exception("Failed to append approver evidence record")
+
+    async def _schedule_approver(self) -> None:
+        """Main-loop pass: evaluate §6 guards, spawn eligible evaluations.
+
+        Covers both the immediate trigger (a block parked this run) and
+        the restart trigger (blocks from a previous process) — the
+        request is built from the persisted context either way.
+        """
+        cfg = self._approver_config()
+        if cfg is None:
+            return
+        blocked = await self._db.get_workstreams_by_status(
+            WorkstreamStatus.NEEDS_REVIEW
+        )
+        for ws in blocked:
+            if ws.id in self._approver_tasks:
+                continue
+            await self._consider_approver_evaluation(ws, cfg)
+
+    async def _consider_approver_evaluation(
+        self, ws: Workstream, cfg: ApproverConfig
+    ) -> None:
+        """Apply the §6 guard chain for one workstream; maybe spawn."""
+        marker = parse_approval_marker(ws.error_message)
+        # Guard 1: kill-switches (reversible — observation, never a slot).
+        if self._approver_disabled(cfg):
+            self._approver_observe(ws.id, marker.sha if marker else "", "disabled")
+            return
+        # Guard 2: only marker-carrying ex-post blocks are ever evaluated.
+        if marker is None or marker.phase != "ex_post":
+            self._approver_observe(ws.id, "", "not_gate_block")
+            return
+        sha = marker.sha
+        # Guard 3: the envelope is built ONLY from the persisted context.
+        context_json = await self._db.get_gate_block_context(ws.id, "ex_post", sha)
+        context: BlockContext | None = None
+        if context_json is not None:
+            try:
+                context = BlockContext.model_validate_json(context_json)
+            except ValueError:
+                context = None
+        if context is None:
+            self._approver_observe(ws.id, sha, "no_block_context")
+            return
+        # Guard 4: stale SHA / missing worktree.
+        if not ws.workspace_path:
+            self._approver_observe(ws.id, sha, "stale_sha")
+            return
+        workspace = Path(ws.workspace_path)
+        head = await self._workspace_head(workspace)
+        if head is None or head != sha:
+            self._approver_observe(ws.id, sha, "stale_sha")
+            return
+        # Guard 5: authority budget.
+        if await self._db.count_agent_approvals(ws.id) >= cfg.max_auto_approvals:
+            self._approver_observe(ws.id, sha, "approval_budget_exhausted")
+            return
+        # Guard 6: execution budget (every attempt, any SHA, any outcome).
+        if await self._db.count_approver_runs(ws.id) >= cfg.max_evaluations:
+            self._approver_observe(ws.id, sha, "evaluation_budget_exhausted")
+            return
+        # Guard 7: cost budget — fail-closed on unproven remainder.
+        if cfg.max_cost_usd is not None:
+            known, has_unknown = await self._db.approver_cost_stats(ws.id)
+            if has_unknown:
+                self._approver_observe(ws.id, sha, "cost_budget_unknown")
+                return
+            if known >= cfg.max_cost_usd:
+                self._approver_observe(ws.id, sha, "cost_budget_exhausted")
+                return
+        # Guard 8: escape size.
+        if len(context.escaped_paths) > cfg.max_escaped_paths:
+            self._approver_observe(ws.id, sha, "too_many_escapes")
+            return
+        # Guard 9: the diff must be producible and within bounds.
+        diff, diff_skip = await self._produce_approver_diff(
+            workspace, max_bytes=cfg.max_diff_bytes
+        )
+        if diff is None:
+            self._approver_observe(ws.id, sha, diff_skip or "diff_error")
+            return
+        # Guard 10: one paid evaluation per (ws, phase, sha) — the
+        # sentinel INSERT is the cross-process arbiter.
+        approval_run_id = str(ulid.new())
+        started = await self._db.insert_approver_run_started(
+            approval_run_id, ws.id, "ex_post", sha
+        )
+        if not started:
+            self._approver_observe(ws.id, sha, "already_attempted")
+            return
+        # Sentinel committed BEFORE create_task (spec §8.1) — no window
+        # where an evaluation is scheduled but unrecorded.
+        self._approver_tasks[ws.id] = asyncio.create_task(
+            self._run_approver_evaluation(
+                approval_run_id=approval_run_id,
+                workstream_id=ws.id,
+                sha=sha,
+                context=context,
+                diff=diff,
+                workspace=workspace,
+                cfg=cfg,
+            )
+        )
+
+    async def _produce_approver_diff(
+        self, workspace: Path, *, max_bytes: int
+    ) -> tuple[str | None, str | None]:
+        """Scope-relevant diff base...HEAD, or (None, skip_reason)."""
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "git",
+                "-C",
+                str(workspace),
+                "diff",
+                "--no-color",
+                f"{self._config.base_branch}...HEAD",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _stderr = await process.communicate()
+        except OSError:
+            return None, "diff_error"
+        if process.returncode != 0:
+            return None, "diff_error"
+        if len(stdout) > max_bytes:
+            return None, "oversize_diff"
+        try:
+            return stdout.decode(), None
+        except UnicodeDecodeError:  # binary content — never reaches a critic
+            return None, "diff_error"
+
+    @staticmethod
+    def _approver_env(approval_run_id: str, workstream_id: str, sha: str) -> dict:
+        """Subprocess env (§5.2): explicit passthrough + echo identity."""
+        env = {
+            key: os.environ[key]
+            for key in ("PATH", "HOME", "USER")
+            if key in os.environ
+        }
+        env.update(
+            {
+                "MAESTRO_APPROVAL_RUN_ID": approval_run_id,
+                "MAESTRO_WORKSTREAM_ID": workstream_id,
+                "MAESTRO_GATE_PHASE": "ex_post",
+                "MAESTRO_GATE_SHA": sha,
+            }
+        )
+        return env
+
+    async def _run_approver_evaluation(
+        self,
+        *,
+        approval_run_id: str,
+        workstream_id: str,
+        sha: str,
+        context: BlockContext,
+        diff: str,
+        workspace: Path,
+        cfg: ApproverConfig,
+    ) -> None:
+        """One evaluation attempt: run the command, apply §7.2 on PASS.
+
+        Every exit path finalizes the sentinel row; the task slot is
+        always released in `finally`.
+        """
+        try:
+            await self._evaluate_approver_once(
+                approval_run_id=approval_run_id,
+                workstream_id=workstream_id,
+                sha=sha,
+                context=context,
+                diff=diff,
+                workspace=workspace,
+                cfg=cfg,
+            )
+        except asyncio.CancelledError:
+            await self._db.finalize_approver_run(
+                approval_run_id, "error", reason="interrupted"
+            )
+            self._append_approver_record(
+                workstream_id, sha, "error", note="interrupted"
+            )
+            raise
+        except Exception:
+            self._logger.exception(
+                "approver evaluation failed internally for '%s'", workstream_id
+            )
+            await self._db.finalize_approver_run(
+                approval_run_id, "error", reason="internal_error"
+            )
+            self._append_approver_record(
+                workstream_id, sha, "error", note="internal_error"
+            )
+        finally:
+            self._approver_tasks.pop(workstream_id, None)
+
+    async def _evaluate_approver_once(
+        self,
+        *,
+        approval_run_id: str,
+        workstream_id: str,
+        sha: str,
+        context: BlockContext,
+        diff: str,
+        workspace: Path,
+        cfg: ApproverConfig,
+    ) -> None:
+        envelope = build_request_envelope(
+            context,
+            approval_run_id=approval_run_id,
+            workstream_id=workstream_id,
+            phase="ex_post",
+            sha=sha,
+            base_branch=self._config.base_branch,
+            diff=diff,
+            worktree=str(workspace),
+            auto_approvals_used=await self._db.count_agent_approvals(workstream_id),
+            evaluations_used=await self._db.count_approver_runs(workstream_id),
+        )
+        outcome = await run_approver_cmd(
+            list(cfg.cmd),
+            json.dumps(envelope).encode(),
+            timeout_seconds=cfg.timeout_seconds,
+            max_stdout_bytes=cfg.max_stdout_bytes,
+            max_stderr_bytes=cfg.max_stderr_bytes,
+            env=self._approver_env(approval_run_id, workstream_id, sha),
+        )
+        if outcome.error is not None or outcome.stdout is None:
+            reason = outcome.error or "no_output"
+            await self._db.finalize_approver_run(
+                approval_run_id, "error", reason=reason
+            )
+            note = reason
+            if outcome.stderr_tail:
+                note = f"{reason}; stderr tail: {outcome.stderr_tail}"
+            self._append_approver_record(workstream_id, sha, "error", note=note)
+            return
+        expected = EchoFields(
+            approval_run_id=approval_run_id,
+            workstream_id=workstream_id,
+            phase="ex_post",
+            sha=sha,
+        )
+        verdict = validate_verdict(
+            outcome.stdout, expected, author_model=context.author.model
+        )
+        if isinstance(verdict, str):  # protocol ERROR — never softened
+            await self._db.finalize_approver_run(
+                approval_run_id, "error", reason=verdict[:500]
+            )
+            self._append_approver_record(
+                workstream_id, sha, "error", note=verdict[:500]
+            )
+            return
+        canonical = verdict.model_dump_json(by_alias=True)
+        if verdict.verdict == "FAIL":
+            await self._db.finalize_approver_run(
+                approval_run_id,
+                "fail",
+                verdict_json=canonical,
+                cost_usd=verdict.cost_usd,
+            )
+            self._append_approver_record(
+                workstream_id, sha, "fail", note=verdict.summary or None
+            )
+            return
+        if verdict.verdict == "ERROR":
+            await self._db.finalize_approver_run(
+                approval_run_id,
+                "error",
+                reason="command reported ERROR",
+                verdict_json=canonical,
+                cost_usd=verdict.cost_usd,
+            )
+            self._append_approver_record(
+                workstream_id, sha, "error", note=verdict.summary or None
+            )
+            return
+        await self._approve_on_pass(
+            approval_run_id=approval_run_id,
+            workstream_id=workstream_id,
+            sha=sha,
+            workspace=workspace,
+            cfg=cfg,
+            verdict_canonical=canonical,
+            cost_usd=verdict.cost_usd,
+        )
+
+    async def _approve_on_pass(
+        self,
+        *,
+        approval_run_id: str,
+        workstream_id: str,
+        sha: str,
+        workspace: Path,
+        cfg: ApproverConfig,
+        verdict_canonical: str,
+        cost_usd: float | None,
+    ) -> None:
+        """Spec §7.2: cost authority check → rechecks → CAS transaction."""
+
+        async def _stale(reason: str) -> None:
+            await self._db.finalize_approver_run(
+                approval_run_id,
+                "error",
+                reason=reason,
+                verdict_json=verdict_canonical,
+                cost_usd=cost_usd,
+            )
+            self._append_approver_record(workstream_id, sha, "error", note=reason)
+
+        # Step 1 (revision 4): the current evaluation's own cost must pass
+        # the bar BEFORE any authority decision.
+        if cfg.max_cost_usd is not None:
+            if cost_usd is None:
+                await _stale("cost_unknown_after_evaluation")
+                return
+            prior_sum, _ = await self._db.approver_cost_stats(workstream_id)
+            if prior_sum + cost_usd > cfg.max_cost_usd:
+                await _stale("cost_budget_exceeded_after_evaluation")
+                return
+        lock = self._approver_locks.setdefault(workstream_id, asyncio.Lock())
+        async with lock:
+            current = await self._db.get_workstream(workstream_id)
+            if current.status != WorkstreamStatus.NEEDS_REVIEW:
+                await _stale("stale_after_evaluation")
+                return
+            marker = parse_approval_marker(current.error_message)
+            if marker is None or marker.phase != "ex_post" or marker.sha != sha:
+                await _stale("stale_after_evaluation")
+                return
+            head = await self._workspace_head(workspace)
+            if head != sha:
+                await _stale("stale_after_evaluation")
+                return
+            try:
+                await self._db.approve_workstream_agent(
+                    workstream_id,
+                    "ex_post",
+                    sha,
+                    approval_run_id=approval_run_id,
+                    verdict_json=verdict_canonical,
+                    cost_usd=cost_usd,
+                    expected_error_message=current.error_message,
+                )
+            except ValueError:
+                await _stale("stale_after_evaluation")
+                return
+        # Post-transaction HEAD confirmation (§7.2 TOCTOU boundary): a
+        # mismatch is harmless — the approval stays bound to the old SHA
+        # and H-6 refuses the resume — but it deserves loud evidence.
+        head_after = await self._workspace_head(workspace)
+        if head_after != sha:
+            self._logger.warning(
+                "approver: worktree of '%s' moved right after approval "
+                "(%s != %s); H-6 will refuse the resume",
+                workstream_id,
+                head_after,
+                sha,
+            )
+        self._logger.info(
+            "approver: PASS for '%s' (sha=%s, run=%s) — re-queued",
+            workstream_id,
+            sha,
+            approval_run_id,
+        )
+        self._append_approver_record(workstream_id, sha, "pass", note=None)
+
+    async def _finalize_interrupted_approver_runs(self) -> None:
+        """Startup (§8.2): started sentinels without a terminal state are
+        finalized fail-closed to the human — never auto-re-run."""
+        for row in await self._db.list_started_approver_runs():
+            await self._db.finalize_approver_run(
+                row["approval_run_id"], "error", reason="interrupted"
+            )
+            self._append_approver_record(
+                row["workstream_id"],
+                row["sha"],
+                "error",
+                note="interrupted (finalized at startup)",
+            )
+            self._logger.warning(
+                "approver: finalized interrupted evaluation '%s' for '%s' "
+                "(fail-closed to human)",
+                row["approval_run_id"],
+                row["workstream_id"],
+            )
+
+    async def _drain_approver_tasks(self) -> None:
+        """Shutdown (§8.1): graceful exit waits for in-flight evaluations
+        (they self-bound via timeout_seconds); a requested shutdown
+        cancels them — the task handler finalizes error/interrupted."""
+        tasks = list(self._approver_tasks.values())
+        if not tasks:
+            return
+        if self._shutdown_requested:
+            for task in tasks:
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _handle_completion(
         self,
