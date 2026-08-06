@@ -283,6 +283,24 @@
       в CLAUDE.md без `--db maestro.db`; issue закрыт. Докс-часть #124 этим закрыта,
       сам #124 (rework-команда) остаётся открытым feature-треком.
 
+## Входящие 2026-08, волна 2 (inbox #137, принят 2026-08-06)
+
+- [ ] **#137 ex-post gate: pluggable `approver_cmd` hook** (P1, сначала дизайн-спека) @owner:andrei @id:expost-approver-cmd
+      Хук-команда по образцу CommandVerifier: получает review-контекст
+      `{workstream, phase, sha, reason, diff}`, возвращает вердикт по строгому
+      run-keyed контракту (как verdict v2). PASS → `workstream-approve` с
+      `actor=agent`, вердикт критика — в evidence при записи в `gate_approvals`.
+      Политика консенсуса живёт в команде, Maestro определяет только контракт.
+      Жёсткие требования пилота: критик ≠ модель автора; полный аудит обоих
+      вердиктов; fail-closed (timeout/error/нечитаемый diff → человек, никогда
+      approve); лимиты (порог размера diff, >N escapes → человек); kill-switch;
+      ADR-ECO-004 I1–I4 — auto-approve только для интеграционной ветки, master
+      остаётся за человеком; механический whitelist отдельно от семантики.
+      Opt-in: нет `approver_cmd` = сегодняшнее поведение (ждать оператора).
+      Как #124 — сначала спека (контракт вердикта, state machine, edge-кейсы),
+      реализация отдельным PR. Counterpart: spec-runner#102 (review-bot comments
+      в tool loop) — тот же архитектурный шов, контракты проектировать совместно.
+
 ---
 
 ## Бэклог идей из research-дайджеста (2026-07-22)
