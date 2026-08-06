@@ -1,6 +1,6 @@
 # Ex-post gate: pluggable `approver_cmd` hook — design
 
-**Status:** proposed (revision 3)
+**Status:** proposed (revision 4)
 **Date:** 2026-08-06
 **Issue:** #137 (`slug: expost-approver-cmd`), battle-testing pilot wave 2
 **Owner decisions incorporated:** issue body (hard requirements from the
@@ -25,6 +25,15 @@ made fail-closed (`cost_budget_unknown` when any attempt's cost is
 unreported); TOCTOU window around the PASS transaction narrowed via the
 worktree reservation + post-transaction HEAD confirmation, with the
 honest statement that H-6's SHA check is the final barrier.
+**Revision 4 (owner re-review 2):** post-verdict cost authority check —
+a PASS whose own cost is unreported, or pushes the reported sum over
+`max_cost_usd`, is finalized as ERROR before any approval (the pre-run
+guard alone checked only *prior* attempts); evidence namespace made
+explicit — `GateVerdictRecord` is Maestro's internal
+`maestro.gate-verdict-record/v1` run-log, **not** steward's canonical
+`contracts/gate-verdicts/v1` (whose extension would be the schema
+owner's decision); "byte-identical envelope" corrected to
+"byte-identical persisted decision context".
 
 ## 1. Problem
 
@@ -182,8 +191,10 @@ Notes:
 - `tier`, `flags`, `block_reason`, `declared_scope`, `changed_paths`,
   `escaped_paths`, and `author` come from the durable
   `gate_block_contexts` snapshot written at block time (§7.1) — the
-  envelope is identical whether the evaluation is triggered immediately
-  or after an orchestrator restart.
+  persisted decision context is byte-identical whether the evaluation
+  is triggered immediately or after an orchestrator restart; the
+  envelope differs only in run identity and counters
+  (`approval_run_id`, `auto_approvals_used`, `evaluations_used`).
 - `author` identifies the workstream's authoring harness/model so the
   command can enforce critic independence; Maestro validates the
   *declared* provenance on the way back (§5.3).
@@ -275,9 +286,10 @@ evidence (a `GateVerdictRecord` with `gate_id="agent.approver"`,
 in `logs/<ULID>/gate_verdicts.jsonl`) plus a structured event; it
 occupies **no** durable evaluation slot and is deduplicated in-process
 per `(workstream_id, sha, reason)` so loop passes don't spam.
-`not_run` is a **new value added to the evidence contract**
-(`GateVerdictRecord.verdict`) by the implementation PR — `waived` would
-be wrong here: nothing is being waived or resolved, the evaluator
+`not_run` is a **new value added to Maestro's internal evidence
+record** (`GateVerdictRecord.verdict`,
+`maestro.gate-verdict-record/v1` — see the namespace note in §7.3) by
+the implementation PR — `waived` would be wrong here: nothing is being waived or resolved, the evaluator
 simply did not run and the gate still blocks; a downstream evidence
 consumer must never read a skip as a positive dispensation. An **evaluation attempt** is the durable
 `gate_approver_runs` row (§7), written only after all guards pass and
@@ -408,13 +420,29 @@ A critic run can take up to `timeout_seconds`; the worktree may change
 underneath it. A PASS verdict for SHA-A must never mutate state after
 the world has moved to SHA-B. Before the PASS transaction, the hook:
 
-1. re-reads the workstream row;
-2. confirms status is still `NEEDS_REVIEW`;
-3. confirms the approval marker is unchanged: `{phase=ex_post, sha=A}`;
-4. re-reads the worktree HEAD and confirms `HEAD == A`;
-5. only then executes the transaction, whose workstream UPDATE is
+1. **cost authority check (revision 4, only when `max_cost_usd` is
+   set):** the pre-run guard (§6.7) saw only *prior* attempts — the
+   current evaluation's own cost arrives with the verdict and must pass
+   the same bar before any authority decision:
+   - the PASS document's `cost_usd` is absent → finalize
+     `error/cost_unknown_after_evaluation` — no approval;
+   - `prior_reported_sum + cost_usd > max_cost_usd` → finalize
+     `error/cost_budget_exceeded_after_evaluation` — no approval.
+   The money is already spent — an absolute pre-spend cap is impossible
+   without pushing the remaining budget into the request (a possible
+   contract extension: `max_cost_usd_remaining` plus the command's duty
+   to stop its critics before crossing it; not in v1). What v1
+   guarantees is narrower and honest: **an automatic authority decision
+   never lands on top of an unproven or already-exceeded budget.**
+   (FAIL/ERROR verdicts grant nothing, so they skip this check; their
+   reported cost still counts toward future sums.)
+2. re-reads the workstream row;
+3. confirms status is still `NEEDS_REVIEW`;
+4. confirms the approval marker is unchanged: `{phase=ex_post, sha=A}`;
+5. re-reads the worktree HEAD and confirms `HEAD == A`;
+6. only then executes the transaction, whose workstream UPDATE is
    CAS-guarded on `status='needs_review' AND error_message = <the exact
-   prior value re-read in step 1>` (rowcount 0 → abort + rollback).
+   prior value re-read in step 2>` (rowcount 0 → abort + rollback).
 
 The transaction (extending `approve_workstream_with_gate_record` with an
 agent-path variant): finalize the `gate_approver_runs` row
@@ -430,7 +458,7 @@ READY**, workstream untouched. The attempt row for SHA-A remains (the
 money was spent); the new SHA arms a fresh evaluation within budgets.
 
 **TOCTOU boundary (revision 3, honest statement).** The recheck-then-CAS
-sequence guards the DB, not Git: between step 4 and the transaction an
+sequence guards the DB, not Git: between step 5 and the transaction an
 external process can still move the worktree. v1 narrows the window and
 names the residual risk instead of overclaiming:
 
@@ -460,6 +488,21 @@ Every observation and every attempt appends `GateVerdictRecord`s to
 verdict `not_run` (observation) / `pass` / `fail` / `error`, note
 carrying the summary, skip reason, or truncated stderr tail (§5.4). The
 existing record shape is reused; no new evidence format.
+
+**Namespace (revision 4).** `GateVerdictRecord` — including the new
+`not_run` value — is Maestro's **internal run-level audit format**,
+named `maestro.gate-verdict-record/v1`. It is *not* steward's canonical
+`contracts/gate-verdicts/v1` (a findings-bundle schema owned by
+steward, where `finding.verdict` admits only `fail|warn`), and adding
+`not_run` here makes no claim on that contract — extending the
+canonical schema is the schema owner's decision, requested through the
+inbox if ever needed. To keep the two formats from being mistaken for
+one contract, the implementation PR adds an explicit
+`schema: "maestro.gate-verdict-record/v1"` field to every appended
+line (additive — consumers that ignore unknown fields are unaffected).
+The filename stays `gate_verdicts.jsonl`: renaming would break existing
+`EvidenceRef kind=gate-verdict` addressing, and the schema field now
+disambiguates content, not the path.
 
 ## 8. Lifecycle, crash-safety, and recovery
 
@@ -529,11 +572,11 @@ PR stage. No change to that boundary is made or needed here.
   observation dedup per (workstream, sha, reason) within a process.
 - **Block context:** parking an ex-post block writes the
   `gate_block_contexts` row even with the approver disabled; restart
-  trigger builds the envelope from the persisted row (byte-identical to
-  the immediate-trigger envelope for the same block); missing row →
-  `no_block_context` observation, no invocation; `INSERT OR IGNORE`
-  immutability (a second block for the same (ws, phase, sha) never
-  rewrites the snapshot).
+  trigger builds the envelope from the persisted row (decision context
+  byte-identical to the immediate trigger; only run identity/counters
+  differ); missing row → `no_block_context` observation, no invocation;
+  `INSERT OR IGNORE` immutability (a second block for the same
+  (ws, phase, sha) never rewrites the snapshot).
 - **Budgets, independently:** authority budget counts only
   `actor='agent'` approvals; execution budget counts all attempts incl.
   `error` across SHAs (N failed evaluations on N commits stop the
@@ -541,6 +584,13 @@ PR stage. No change to that boundary is made or needed here.
   attempt with `cost_usd IS NULL` while `max_cost_usd` is set →
   `cost_budget_unknown`, no further invocations; all-reported sum
   crossing the bound → `cost_budget_exhausted`.
+- **Post-verdict cost authority check:** PASS with `cost_usd: null`
+  while `max_cost_usd` is set → `error/cost_unknown_after_evaluation`,
+  no approval; PASS whose cost pushes the reported sum over the bound →
+  `error/cost_budget_exceeded_after_evaluation`, no approval; FAIL with
+  unreported cost is finalized as `fail` normally (no authority
+  decision) and its unknown cost then trips the §6.7 guard for the next
+  run; with `max_cost_usd` unset, PASS with `cost_usd: null` approves.
 - **PASS path:** post-verdict recheck passes → single CAS transaction
   (attempt `pass` + approval `actor='agent'` + `approval_run_id` +
   READY), then H-6 resume reaches MERGING without respawn
