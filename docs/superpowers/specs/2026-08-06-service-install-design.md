@@ -1,6 +1,7 @@
 # `maestro service` — scheduled autonomous runs — design
 
-**Status:** proposed
+**Status:** approved (revision 2, owner approval 2026-08-06 — both §8
+questions resolved below and folded into the design)
 **Date:** 2026-08-06
 **Track:** notify/post-PR step 6 (owner order 2026-08-06); TODO
 `@id:service-install-design`
@@ -39,9 +40,15 @@ maestro service status <project.yaml>     # unit state + last tick outcome
 
 `install` supports `--schedule "HH:MM"` (daily, the default shape) or
 `--every <minutes>`, `--dry-run` (print the unit, write nothing), and
-`--force` (overwrite an existing unit). Generated units are named
-`com.maestro.<project-slug>` (launchd) / `maestro-<project-slug>`
-(systemd), so several projects coexist.
+`--force` (overwrite an existing unit).
+
+**`--stage orchestrate | review`** (default `orchestrate`) selects which
+kind of tick the unit runs — the two are **independent jobs** with their
+own schedule, lock, ledger rows and logs (§8.1). Units are named
+`com.maestro.<project-slug>.<stage>` (launchd) /
+`maestro-<project-slug>-<stage>` (systemd), so several projects and both
+stages coexist. A review unit is typically scheduled later and less
+often than its product tick.
 
 **Platforms:** macOS launchd (`~/Library/LaunchAgents/…plist`,
 `RunAtLoad=false`) and Linux systemd **user** units (`~/.config/systemd/
@@ -59,14 +66,55 @@ process **per machine**, regardless of project. Two scheduled projects
 whose windows overlap would have the second one exit with "Maestro is
 already running", indistinguishable from a real conflict.
 
-v1 makes the lock **per (db_path, project)**:
-`~/.maestro/locks/<project-slug>-<db-hash>.pid`, same flock mechanics
-(OS-released on death, no stale-lock protocol). The legacy global path
-stays honored for `maestro run`/`orchestrate` invoked the old way, so
-nothing changes for existing users; the service path always uses the
-scoped lock. A tick that cannot take the lock is **not an error**: it
-logs `skipped: already running`, records the tick, and exits **0** —
-otherwise every long run would paint the unit red on the next tick.
+v1 introduces a **two-level flock hierarchy** (revision 2). The naive
+"scoped mode also checks the global lock" is *not* sufficient: a legacy
+process starting **after** a scoped one would take the global lock
+without ever noticing the scoped instance, and the two would run
+concurrently. Mutual exclusion has to hold in both directions, so it is
+expressed in the lock modes themselves:
+
+| Mode | `global.lock` | `instance.lock` |
+|---|---|---|
+| legacy (`maestro run` / `orchestrate` invoked the old way) | **exclusive** | — |
+| project-scoped (service path, and eventually everything) | **shared** | **exclusive** |
+
+The consequences fall out of flock semantics, with no extra checks:
+
+- several *different* projects coexist — they all hold the global lock
+  shared, and their instance locks differ;
+- a second process of the *same* project blocks on that project's
+  exclusive instance lock;
+- a legacy singleton cannot run alongside any scoped instance — its
+  exclusive request conflicts with the shared holders;
+- a scoped instance cannot start while a legacy run holds the global
+  lock exclusively.
+
+Layout:
+
+```
+~/.maestro/locks/global.lock                       # compatibility lock
+~/.maestro/instances/<project-key>/instance.lock   # the real per-project lock
+~/.maestro/instances/<project-key>/maestro.pid     # diagnostics only
+```
+
+`<project-key>` is derived from (db_path, project) the same way review
+workspaces derive theirs: sanitized slug plus a short hash, so two
+projects can never collide on a name. **flock is the authority; the PID
+file is diagnostics** — it exists so `maestro service status` and a
+human can say *which* process holds the lock, and nothing branches on
+its contents. All locks are OS-released on process death, so there is
+no stale-lock protocol anywhere.
+
+A tick that cannot take its lock is **not an error**: it logs
+`skipped: already running`, records the tick, and exits **0** —
+otherwise every long run would paint the unit red on the next tick. The
+same applies to a scoped tick blocked by a legacy run.
+
+**Follow-up (separate change, after the transition window):** drop the
+legacy exclusive-global mode, leave only project-scoped locks, and
+delete `global.lock` once the old entrypoints are no longer supported.
+Recorded here so the compatibility layer does not become permanent by
+default.
 
 ### 3.2 Recurring schedule vs continuing an existing run
 
@@ -88,6 +136,21 @@ seven identical alerts.
 
 The wrapper **never** decides "start a second project run in parallel";
 concurrency inside a run is `max_concurrent`'s job.
+
+The **review stage** (`--stage review`) has its own, shorter table and
+its own lock, so a long review never blocks or delays a product tick:
+
+| State | Decision |
+|---|---|
+| review lock held by a live process | `skipped_running`, exit 0 |
+| no workstream has an open PR | `noop_complete`, exit 0 |
+| open PRs exist | `review` — `maestro review-pr <project.yaml> --all --db <db>` |
+
+Its exit is reported as its own tick outcome: `maestro review-pr`'s
+exit 2 means NEEDS_HUMAN on some PR, **not** an orchestration failure,
+so the review tick maps it to exit 0 plus a notification (§5). Review is advisory and
+never a DAG-correctness gate — the product tick's decisions do not
+depend on it.
 
 ### 3.3 Resume after crash
 
@@ -181,18 +244,22 @@ belong to the run, not the service.
 
 ## 4. Tick ledger (migration 22)
 
-Append-only, one row per tick, so `service status` and a human can see
-what the machine did overnight:
+One row per tick — of **either stage**, which is why `stage` is part of
+the record — so `service status` and a human can see what the machine
+did overnight:
 
 ```sql
 CREATE TABLE service_ticks (
     tick_id       TEXT PRIMARY KEY,       -- ULID
     project       TEXT NOT NULL,
+    stage         TEXT NOT NULL CHECK (stage IN ('orchestrate','review')),
     started_at    TIMESTAMP NOT NULL,
     finished_at   TIMESTAMP,
     decision      TEXT NOT NULL CHECK (decision IN
-                    ('fresh','resume','skipped_running',
+                    ('fresh','resume','review','skipped_running',
                      'noop_complete','noop_blocked')),
+    outcome       TEXT CHECK (outcome IN
+                    ('ok','needs_human','failed','infra_error')),
     exit_code     INTEGER,
     reason        TEXT,
     log_path      TEXT,
@@ -200,18 +267,32 @@ CREATE TABLE service_ticks (
 );
 ```
 
-Same discipline as `post_pr_review_runs`: the row is written before the
-decision is acted on, finalized once by a CAS on `finished_at IS NULL`,
-and immutable afterwards. `maestro service status` prints the unit state
-plus the last N ticks.
+`decision` records what the wrapper chose to do (§3.2), `outcome` what
+came of it — they are not the same axis, and the review stage is exactly
+where they diverge: `decision='review'`, `outcome='needs_human'`,
+`exit_code=0`. Same discipline as `post_pr_review_runs`: the row is
+written before the decision is acted on, finalized once by a CAS on
+`finished_at IS NULL`, and immutable afterwards. `maestro service
+status` prints the unit state plus the last N ticks **of the stage it is
+asked about** (`--stage`, default: both).
 
 ## 5. Exit-code contract (what the service manager sees)
 
 | Exit | Meaning |
 |---|---|
-| 0 | tick handled — including `skipped_running`, `noop_complete`, `noop_blocked` |
+| 0 | tick handled — including `skipped_running`, `noop_complete`, `noop_blocked`, and a **review** tick whose PRs need a human |
 | 1 | infrastructure failure (config unreadable, DB unusable, preflight regression) |
-| 2 | the orchestrate run itself ended with failures needing a human |
+| 2 | an **orchestrate** tick whose run ended with failures needing a human |
+
+The asymmetry in exit 2 is deliberate and follows the same rule as
+`noop_blocked`: **red means something is broken**, not "a human has
+something to look at". An orchestrate run that failed workstreams is a
+product problem worth a red unit; `maestro review-pr` returning 2 means
+NEEDS_HUMAN on some PR — advisory, expected, and no orchestration
+failure — so the review tick maps it to exit **0**, records outcome
+`needs_human` in its ledger row, and notifies (deduplicated). Otherwise
+a single parked PR would keep the review unit red indefinitely and
+train the operator to ignore it.
 
 launchd/systemd retry policy is deliberately **off** (`KeepAlive=false`,
 no `Restart=`): the next scheduled tick is the retry, and it will make a
@@ -233,10 +314,21 @@ fresh decision from the DB. Automatic restarts would stack runs.
 
 - Decision table: each row of §3.2 against a seeded DB, including
   `skipped_running` with a really-held lock and exit 0.
-- Scoped lock: two projects run concurrently (previously impossible);
-  same project twice → second skipped; lock released on process death.
-- Legacy path: `maestro run`/`orchestrate` without the service still use
-  the global pid file — byte-identical behavior.
+- **Lock topology (both directions):** two different projects run
+  concurrently (previously impossible); the same project twice → second
+  skipped; a legacy run blocks a scoped tick; **a legacy run cannot
+  start while a scoped instance holds the shared global lock** (the case
+  a one-way check would miss); every lock released on holder death
+  (kill the holder, re-acquire); the PID file is diagnostics only —
+  corrupting or deleting it changes no decision.
+- Legacy path: `maestro run`/`orchestrate` without the service take the
+  global lock exclusively — behavior unchanged for existing users.
+- **Stage separation:** an orchestrate tick and a review tick of the
+  same project run concurrently (distinct locks); each writes its own
+  ledger rows and log files; unit names for the two stages do not
+  collide; **`review-pr` exit 2 → review tick exit 0** with outcome
+  `needs_human` and one deduplicated notification, while an orchestrate
+  run with failed workstreams still exits 2.
 - Stale sweep: DONE+merged worktree removed; NEEDS_REVIEW, unmerged, and
   dirty worktrees kept and reported; review workspaces never touched;
   `git worktree prune` invoked in the project repo only.
@@ -251,23 +343,28 @@ fresh decision from the DB. Automatic restarts would stack runs.
 - Rotation: `--keep-days`/`--keep-ticks` boundaries; the newest tick log
   is never deleted; project `logs/<ULID>/` untouched.
 - Ledger: sentinel before action, CAS finalize once, `service status`
-  output; migration 22 fresh+upgrade and journal tripwires.
+  output; **stage recorded per row**, and the review divergence
+  (`decision='review'`, `outcome='needs_human'`, `exit_code=0`) stored
+  as such; migration 22 fresh+upgrade and journal tripwires.
 - Zero-change guarantee: no `service` invocation → nothing about
   existing commands changes.
 
-## 8. Open questions for review
+## 8. Resolved (owner decisions, 2026-08-06)
 
-1. **Should `service run` also drive `maestro review-pr`** for PRs the
-   tick created (a second stage inside the tick), or stay strictly
-   "orchestrate only" with review scheduled as its own unit? A separate
-   unit is simpler and keeps failure domains apart; one tick doing both
-   is fewer moving parts for the user. v1 recommendation: **separate
-   unit** (`service install <config> --stage review`), same wrapper,
-   same ledger, different decision table.
-2. **Scoped lock migration.** Keeping the legacy global lock for
-   non-service invocations means two lock regimes coexist. The
-   alternative — moving everything to the scoped lock now — is cleaner
-   but changes behavior for existing users who rely on "one Maestro at a
-   time" as a safety net. v1 recommendation: coexist, with the scoped
-   lock also refusing when the legacy global lock is held (safe
-   superset), and a follow-up to retire the global one.
+Both questions this spec opened are answered; the design above already
+reflects them.
+
+1. **`review-pr` is a separate stage/unit** — `--stage review`, never
+   part of the orchestrate tick (§2, §3.2). The reasons are the
+   deciding ones: different failure domains and retry/backoff; review
+   can run substantially longer than a product tick; its exit 2 means
+   NEEDS_HUMAN rather than an orchestration failure; review is advisory
+   and not a DAG-correctness gate; and separate scheduling keeps its
+   observability from delaying product ticks. One service manager may
+   drive both stages — as **independent jobs with their own lock,
+   status and logs**.
+2. **Coexistence via the shared/exclusive lock hierarchy** (§3.1), not
+   a one-way check, because a legacy process can start after a scoped
+   one. Legacy takes `global.lock` exclusive; scoped takes it shared
+   plus its own exclusive `instance.lock`. Retiring the legacy mode is
+   an explicit follow-up, not an implicit hope.
