@@ -1,6 +1,6 @@
 # `maestro review-pr` — post-PR review wrapper command — design
 
-**Status:** proposed
+**Status:** proposed (revision 2)
 **Date:** 2026-08-06
 **Track:** notify/post-PR step 5 (owner order 2026-08-06); TODO
 `@id:post-pr-command`; upstream counterpart spec-runner#102 SHIPPED
@@ -12,6 +12,16 @@ wrapper command, orchestrator untouched; no new `WorkstreamStatus`;
 fresh workspace materialization is admissible ONLY over durable
 external state + retention of unfinished work; durable per-PR lock;
 append-only audit table; design-only PR before implementation.
+**Revision 2 (owner review):** Maestro-owned push-recovery for the
+failed-push continuation (spec-runner's mutating phase requires strict
+`local_head == remote head_sha`); machine-report dependency made
+explicit — blocked on spec-runner#116 (`--json` stdout purity) with a
+version pin; §7 corrected — PR identity is the positional argument plus
+Maestro-side pre-invocation verification, not a config invariant; audit
+semantics renamed to immutable-after-finalization with CAS-guarded
+sentinel finalization; v1 declared advisory/post-delivery cleanup (not
+a DAG-correctness guarantee); collision-free repo key; `--all` dedup by
+(repo, pr_number); locked PRs get no run row.
 
 ## 1. Problem and boundary
 
@@ -30,6 +40,16 @@ checkout** (spec-runner `config.py:204`). A "fresh temporary worktree,
 always deleted after the call" would destroy that state and, after a
 failed push, the fix commits themselves. Therefore: durable state
 outside the checkout, and retention rules for unfinished work.
+
+**Scope honesty (revision 2): advisory post-delivery cleanup.** The
+command runs after `DONE` — by then Maestro has already merged the
+original feature SHA into the local base branch. Review fixes move the
+*PR head*, not the already-integrated local base, and may therefore
+never reach dependent workstreams' baselines. v1 is explicitly an
+**advisory / post-delivery cleanup** mechanism, not a DAG-correctness
+guarantee; if review comments must ever block downstream work, that is
+the future synchronous pre-merge stage (a separate lifecycle design),
+not this command.
 
 ## 2. Command surface
 
@@ -58,7 +78,9 @@ normal worktree lifecycle ends at DONE; review has its own):
     lock                                           # flock target (§6)
 ```
 
-`<repo>` is the sanitized `owner-name` slug. Maestro passes the
+`<repo>` is a collision-free key: the sanitized `owner-repo` slug
+plus a short hash of the canonical `owner/repo` string (sanitization
+alone could collide, e.g. `a-b/c` vs `a/b-c`). Maestro passes the
 **absolute** `state_file` to spec-runner via the generated config
 (`ExecutorConfig` accepts an absolute path) — spec-runner keeps its own
 idempotency state machine; Maestro never copies or interprets those
@@ -84,8 +106,21 @@ tables.
      audited, and is never the default;
    - the branch belongs to the expected head repository;
    - push permission present (for the fix path).
-4. Invoke `spec-runner review-pr <pr> --json` in the workspace with the
-   forced config (§7).
+4. **Push-recovery for a local continuation (revision 2).** spec-runner
+   refuses to mutate unless strictly `local_head == remote head_sha` —
+   so a saved continuation would exit 1 forever if handed over as-is.
+   Maestro owns the reconciliation: (a) confirm the remote head still
+   equals the saved expected remote SHA (the ancestor); (b) push the
+   local continuation to the PR branch itself — a **plain push against
+   that verified expected SHA, never force**; (c) re-read the PR
+   metadata; (d) only once `remote head_sha == local HEAD`, proceed.
+   This composes cleanly with spec-runner's own state: the fixes are
+   already recorded there and the replies are not yet published, so the
+   next `review-pr` call completes the reply phase idempotently without
+   re-processing comments. A failed recovery push → `infra_error`,
+   workspace kept (§4).
+5. Invoke `spec-runner review-pr <canonical-pr-url> --json` in the
+   workspace with the forced config (§7).
 
 ## 4. Cleanup and retention policy
 
@@ -113,7 +148,9 @@ auto-cleanup in v1 (a GC sweep is explicit and auditable).
 ## 5. Audit: append-only `post_pr_review_runs` (migration 21)
 
 One field on `workstreams` is not enough — the history of runs must
-survive. New append-only table:
+survive. New run-record table — **immutable after finalization**
+(revision 2 wording: the sentinel row IS updated once, by the CAS
+finalization below; a finalized row is never rewritten):
 
 ```sql
 CREATE TABLE post_pr_review_runs (
@@ -137,13 +174,15 @@ CREATE TABLE post_pr_review_runs (
 ```
 
 - A row is inserted (`started_at`, no `finished_at`) **before** the
-  spec-runner invocation — the crash sentinel; startup of the next
-  `maestro review-pr` call finalizes orphaned rows with
+  spec-runner invocation — the crash sentinel. Every finalization
+  (normal or orphan-recovery) is a **CAS UPDATE guarded on
+  `finished_at IS NULL`** — two concurrent recovery passes can never
+  rewrite an outcome. Orphaned rows finalize with
   `outcome='infra_error', reason='interrupted'` — interruption is a
   *reason* under the `infra_error` outcome, never a distinct outcome
-  value (spec-runner's own state remains the
-  authority on review progress — an interrupted Maestro row never
-  blocks re-invocation, the per-PR lock does that while alive).
+  value (spec-runner's own state remains the authority on review
+  progress — an interrupted Maestro row never blocks re-invocation,
+  the per-PR lock does that while alive).
 - A new bot round (new head SHA) is simply a new audit row. `DONE`
   stays untouched.
 - A current-state read-model (latest row per PR) may be surfaced in
@@ -174,15 +213,17 @@ exit code `3` — it never spawns a second spec-runner.
 ### 6.1 `--all` semantics
 
 - Candidates: workstreams with non-empty `pr_url`; open PRs only by
-  default.
+  default; **deduplicated by (repo, pr_number)** — distinct workstream
+  rows can in principle reference one PR, which must yield one run.
 - **Sequential** processing in v1 (bounded concurrency later if ever
   needed).
 - One PR's failure never hides the others' results: every candidate is
   attempted, each gets its own audit row.
 - Aggregated report (table; `--json` for machines) and aggregated exit:
   `1` if any infra_error, else `2` if any needs_human, else `0`.
-  A locked PR counts as skipped (reported, does not affect the
-  aggregate).
+  A locked PR is reported in the JSON as `skipped/already_running`,
+  does not affect the aggregate, and — like every §6 lock refusal —
+  creates **no** `post_pr_review_runs` row (nothing ran).
 
 ## 7. Config: overlay for limits, harness-owned invariants
 
