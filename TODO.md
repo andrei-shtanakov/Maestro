@@ -297,9 +297,51 @@
       ADR-ECO-004 I1–I4 — auto-approve только для интеграционной ветки, master
       остаётся за человеком; механический whitelist отдельно от семантики.
       Opt-in: нет `approver_cmd` = сегодняшнее поведение (ждать оператора).
+      Временной порядок (важно для scope): spec-runner завершился → scope gate →
+      ex-post gate/approver_cmd → domain verification → MERGING → PR → PR_CREATED
+      → локальный merge в base → DONE.
       Как #124 — сначала спека (контракт вердикта, state machine, edge-кейсы),
-      реализация отдельным PR. Counterpart: spec-runner#102 (review-bot comments
-      в tool loop) — тот же архитектурный шов, контракты проектировать совместно.
+      реализация отдельным PR. Scope-граница: approver_cmd работает ДО создания
+      PR (ex-post гейт перед MERGING), поэтому review-bot comments физически вне
+      его области. spec-runner#102 — соседний механизм на более поздней
+      lifecycle-границе (post-PR), не альтернативное место реализации; общий
+      transport envelope зафиксировать в спеке как reuse note / non-goal.
+      Подключение review-цикла к Maestro-PR — будущий тонкий `post_pr_command`
+      (см. секцию «Нотификации и post-PR» ниже), не этот хук.
+
+## Нотификации и post-PR (порядок утверждён 2026-08-06)
+
+> Решение владельца по треку «доведение "появился PR" до пользователя и агента».
+> Полный порядок: 1) notify PR_CREATED → 2) webhook → 3) spec-runner#102
+> (durable review-pr, их сторона) → 4) #137 только decision hook → 5) тонкий
+> post_pr_command → 6) дизайн service install после стабилизации автономных
+> операций.
+
+- [ ] **Notification на PR_CREATED** (P1, маленький PR) @owner:andrei @id:notify-pr-created
+      Событие и централизованный переход уже есть, PR URL сохранён — добавить
+      `NotificationEvent` + строку в `WORKSTREAM_EFFECTS`. URL передавать
+      структурированным полем / гарантированным payload-ом перехода, не
+      перечитыванием изменяемой DB постфактум.
+- [ ] **Webhook-канал нотификаций** (P1, отдельный PR) @owner:andrei @id:webhook-notification-channel
+      Конфиг обещает `webhook_url`/telegram-поля, runtime не даёт. Generic
+      webhook: JSON schema/version, timeout, bounded retry; ошибка доставки
+      non-blocking для оркестрации, но durable-visible; секреты не попадают
+      в события/логи. Telegram-поля: сначала deprecated, удалить в следующем
+      breaking/config-schema окне. Webhook — доставка события, НЕ исполнитель
+      review loop и не durable workflow engine.
+- [ ] **`post_pr_command` — тонкий мост к spec-runner review-pr** (P2, после webhook и spec-runner#102) @owner:andrei @id:post-pr-command
+      Maestro создаёт свои PR, но review-bot-циклом не владеет: отдельный
+      opt-in хук на границе PR_CREATED, вызывающий resumable
+      `spec-runner review-pr <PR>`. Не approver_cmd и не notify_cmd. Сейчас
+      PR_CREATED сразу идёт к DONE — синхронное ожидание ревью внутри
+      foreground-процесса требует отдельного lifecycle-дизайна; первый вариант
+      проще: Maestro публикует PR_CREATED, внешний scheduler запускает review-pr.
+- [ ] **Дизайн `maestro service install`** (P3, после стабилизации автономных операций) @owner:andrei @id:service-install-design
+      Отдельный operational track, НЕ связывать с #137. Launchd/systemd-генератор
+      сам по себе не решает: single-instance locking, resume после crash, stale
+      worktrees, SQLite ownership, credentials, log rotation, recurring schedule
+      vs продолжение существующего run. Сначала durable-команды и идемпотентный
+      resume, потом внешний service wrapper.
 
 ---
 
