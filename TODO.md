@@ -390,9 +390,10 @@
       push-recovery (ls-remote проверка + обычный fast-forward push, force
       нигде), per-PR flock (exit 3), retention по exit-коду, `--gc` только
       после подтверждённого closed/merged, version-gate >= 2.21.0, три
-      notification-события; 74 теста. Этим закрыт весь трек «Нотификации и
-      post-PR», кроме дизайна service install (P3).
-- [ ] **Дизайн `maestro service install`** (P3, после стабилизации автономных операций) @owner:andrei @id:service-install-design
+      notification-события; 74 теста. На момент этого мержа трек «Нотификации
+      и post-PR» был закрыт на 5 из 6 шагов — оставался дизайн service install
+      (P3), закрытый следом (см. пункт ниже).
+- [x] **Дизайн `maestro service install`** (P3, после стабилизации автономных операций) @owner:andrei @id:service-install-design
       Отдельный operational track, НЕ связывать с #137. Launchd/systemd-генератор
       сам по себе не решает: single-instance locking, resume после crash, stale
       worktrees, SQLite ownership, credentials, log rotation, recurring schedule
@@ -407,6 +408,17 @@
       scoped по (db, project). **Status спеки — `proposed`**: остаются два
       вопроса из §8 (review-pr внутри тика или отдельным юнитом; выводить ли
       глобальный lock сразу) — до ответа реализацию не начинать.
+      Оба вопроса решены владельцем; спека ревизии 2 (PR #153, merge `4817459`)
+      со Status approved: отдельный `--stage review` и двухуровневая иерархия
+      flock (legacy — global exclusive; scoped — global shared + exclusive
+      `<stage>.lock`, взаимное исключение в обе стороны). Реализация сделана
+      (PR #154, merge `5df61bc`): пакет `maestro/service/` (locks/decide/
+      sweep/tick/units), миграция 22 (`service_ticks` со stage и раздельными
+      decision/outcome, sentinel+CAS), CLI `maestro service run|install|
+      uninstall|status`, install-preflight с отказом при нерезолвимых
+      бинарниках и учётных данных, дедуп нотификаций в `review-pr` по
+      (repo, pr, head_sha, outcome); ~93 теста. **Этим закрыт весь трек
+      «Нотификации и post-PR» — 6/6.**
 
 ---
 
