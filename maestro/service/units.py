@@ -1,0 +1,243 @@
+"""launchd/systemd unit generation and the install preflight (spec §2, §3.6).
+
+The units are deliberately dumb: they start `maestro service run`, and
+every lifecycle decision lives in the wrapper. What this module *does*
+own is the part that silently breaks unattended runs — the environment.
+launchd/systemd start with no shell profile and often no usable PATH,
+and Maestro's spawners inherit that environment, so "works in my
+terminal, silently fails at 03:00" is the default outcome unless the
+installer refuses to write a unit it knows cannot authenticate.
+"""
+
+from __future__ import annotations
+
+import os
+import plistlib
+import re
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+
+__all__ = [
+    "ENV_FILE_MODE",
+    "PreflightError",
+    "PreflightResult",
+    "UnitSpec",
+    "ensure_env_file",
+    "preflight_environment",
+    "render_launchd",
+    "render_systemd",
+    "unit_name",
+]
+
+ENV_FILE_MODE = 0o600
+
+_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+_ENV_FILE_HEADER = """\
+# Maestro service environment — read by the generated launchd/systemd unit.
+#
+# Put the credentials an unattended run needs here, one KEY=value per
+# line. Scheduled runs get no shell profile, so anything your terminal
+# sets in ~/.zshrc must be repeated here. This file is yours: Maestro
+# creates it, tightens its permissions to 0600, and never writes values
+# into it.
+"""
+
+
+class PreflightError(RuntimeError):
+    """The environment cannot support an unattended run (spec §3.6)."""
+
+
+@dataclass(frozen=True)
+class PreflightResult:
+    """Resolved absolute paths for the generated unit."""
+
+    maestro_bin: str
+    path: str
+
+
+@dataclass(frozen=True)
+class UnitSpec:
+    """Everything the generated unit needs, all resolved at install time."""
+
+    project: str
+    stage: Literal["orchestrate", "review"]
+    config_path: Path
+    db_path: Path
+    maestro_bin: str
+    path: str
+    env_file: Path
+    log_dir: Path
+    schedule: str | None = None
+    every_minutes: int | None = None
+
+
+def unit_name(
+    project: str, stage: str, *, platform: Literal["launchd", "systemd"]
+) -> str:
+    """Per (project, stage) unit identifier — the two never collide."""
+    slug = _UNSAFE.sub("-", project).strip("-") or "project"
+    if platform == "launchd":
+        return f"com.maestro.{slug}.{stage}"
+    return f"maestro-{slug}-{stage}"
+
+
+def _program_arguments(spec: UnitSpec) -> list[str]:
+    return [
+        spec.maestro_bin,
+        "service",
+        "run",
+        str(spec.config_path),
+        "--stage",
+        spec.stage,
+        "--db",
+        str(spec.db_path),
+    ]
+
+
+def _parse_schedule(schedule: str) -> tuple[int, int]:
+    hour, _, minute = schedule.partition(":")
+    return int(hour), int(minute)
+
+
+def render_launchd(spec: UnitSpec) -> str:
+    """Render the LaunchAgent plist.
+
+    `RunAtLoad=false` (installing is not running) and no `KeepAlive`:
+    per §5 the next scheduled tick is the retry — automatic restarts
+    would stack runs on top of each other.
+    """
+    plist: dict[str, object] = {
+        "Label": unit_name(spec.project, spec.stage, platform="launchd"),
+        "ProgramArguments": _program_arguments(spec),
+        "RunAtLoad": False,
+        "KeepAlive": False,
+        "EnvironmentVariables": {"PATH": spec.path},
+        "StandardOutPath": str(spec.log_dir / spec.project / "launchd.out.log"),
+        "StandardErrorPath": str(spec.log_dir / spec.project / "launchd.err.log"),
+    }
+    if spec.every_minutes is not None:
+        plist["StartInterval"] = spec.every_minutes * 60
+    else:
+        hour, minute = _parse_schedule(spec.schedule or "03:00")
+        plist["StartCalendarInterval"] = {"Hour": hour, "Minute": minute}
+    return plistlib.dumps(plist).decode()
+
+
+def render_systemd(spec: UnitSpec) -> tuple[str, str]:
+    """Render the (service, timer) pair for a systemd **user** unit."""
+    name = unit_name(spec.project, spec.stage, platform="systemd")
+    argv = " ".join(_program_arguments(spec))
+    service = f"""\
+[Unit]
+Description=Maestro {spec.stage} tick for {spec.project}
+
+[Service]
+Type=oneshot
+ExecStart={argv}
+Environment=PATH={spec.path}
+EnvironmentFile=-{spec.env_file}
+"""
+    if spec.every_minutes is not None:
+        cadence = f"OnUnitActiveSec={spec.every_minutes}min\nOnBootSec=5min"
+    else:
+        hour, minute = _parse_schedule(spec.schedule or "03:00")
+        cadence = f"OnCalendar=*-*-* {hour:02d}:{minute:02d}:00"
+    timer = f"""\
+[Unit]
+Description=Schedule for {name}
+
+[Timer]
+{cadence}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+    return service, timer
+
+
+def ensure_env_file(path: Path) -> Path:
+    """Create the user-owned env file if absent; always tighten to 0600.
+
+    Never overwrites an existing file — the operator's secrets live
+    there, and Maestro only guarantees the mode.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text(_ENV_FILE_HEADER, encoding="utf-8")
+    path.chmod(ENV_FILE_MODE)
+    return path
+
+
+def _env_file_keys(env_file: Path | None) -> set[str]:
+    if env_file is None or not env_file.exists():
+        return set()
+    keys: set[str] = set()
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        keys.add(stripped.split("=", 1)[0].strip())
+    return keys
+
+
+def preflight_environment(
+    *,
+    harness_binaries: list[str],
+    required_env: list[str] | None = None,
+    env_file: Path | None = None,
+) -> PreflightResult:
+    """Resolve binaries and verify credentials — refuse, never warn.
+
+    A unit that cannot authenticate is worse than no unit: it fails
+    silently at 03:00 and the operator finds out days later.
+
+    Raises:
+        PreflightError: a harness binary is not on PATH, or a required
+            credential is neither in the environment nor in the env file.
+    """
+    resolved: dict[str, str] = {}
+    missing: list[str] = []
+    for name in harness_binaries:
+        found = shutil.which(name)
+        if found is None:
+            missing.append(name)
+        else:
+            resolved[name] = found
+    if missing:
+        msg = (
+            f"not on PATH: {', '.join(missing)}. A scheduled unit runs without "
+            "your shell profile, so every harness must resolve to an absolute "
+            "path at install time. Install them, or run `maestro service "
+            "install` from a shell where they resolve."
+        )
+        raise PreflightError(msg)
+
+    available = set(os.environ) | _env_file_keys(env_file)
+    absent = [key for key in (required_env or []) if key not in available]
+    if absent:
+        target = env_file or Path("~/.maestro/service.env")
+        msg = (
+            f"missing credentials for an unattended run: {', '.join(absent)}. "
+            f"Add them to {target} (mode 0600) — a scheduled run gets no "
+            "shell profile, and a keychain item may be unreachable from a "
+            "background session."
+        )
+        raise PreflightError(msg)
+
+    directories: list[str] = []
+    for found in resolved.values():
+        parent = str(Path(found).parent)
+        if parent not in directories:
+            directories.append(parent)
+    for fallback in ("/usr/local/bin", "/usr/bin", "/bin"):
+        if fallback not in directories:
+            directories.append(fallback)
+    return PreflightResult(
+        maestro_bin=resolved.get("maestro", "maestro"),
+        path=":".join(directories),
+    )

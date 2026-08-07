@@ -19,7 +19,7 @@ import sys
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import typer
 from rich.console import Console
@@ -83,6 +83,17 @@ from maestro.review_workspace import (
     recover_push,
 )
 from maestro.scaffold import ScaffoldError, generate_project_yaml
+from maestro.service.locks import Stage  # noqa: TC001 — runtime cast target
+from maestro.service.tick import TickResult, run_argv, run_tick
+from maestro.service.units import (
+    PreflightError,
+    UnitSpec,
+    ensure_env_file,
+    preflight_environment,
+    render_launchd,
+    render_systemd,
+    unit_name,
+)
 from maestro.spawners import (
     AiderSpawner,
     AnnounceSpawner,
@@ -108,6 +119,11 @@ console = Console()
 err_console = Console(stderr=True)
 
 # Typer app
+service_app = typer.Typer(
+    help="Scheduled autonomous runs (launchd/systemd wrapper)",
+    no_args_is_help=True,
+)
+
 app = typer.Typer(
     name="maestro",
     help="AI Agent Orchestrator for coordinating multiple coding agents.",
@@ -115,6 +131,7 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(models_app, name="models")
+app.add_typer(service_app, name="service")
 
 
 # Benchmark constants and helpers
@@ -1937,6 +1954,278 @@ def check_scope_command(
             await database.close()
 
     raise typer.Exit(asyncio.run(_run()))
+
+
+DEFAULT_SERVICE_LOG_DIR = DEFAULT_DB_DIR / "service-logs"
+DEFAULT_SERVICE_ENV_FILE = DEFAULT_DB_DIR / "service.env"
+
+
+def platform_units_dir(platform: str) -> Path:
+    """Where the generated unit belongs for this platform (user scope)."""
+    if platform == "launchd":
+        return Path.home() / "Library" / "LaunchAgents"
+    return Path.home() / ".config" / "systemd" / "user"
+
+
+def _default_platform() -> str:
+    return "launchd" if sys.platform.startswith("darwin") else "systemd"
+
+
+@service_app.command("run")
+def service_run_command(
+    config: Annotated[Path, typer.Argument(help="Path to project YAML")],
+    stage: Annotated[
+        str, typer.Option("--stage", help="orchestrate | review")
+    ] = "orchestrate",
+    db_path: Annotated[
+        Path | None, typer.Option("--db", help="Path to state database")
+    ] = None,
+    no_sweep: Annotated[
+        bool, typer.Option("--no-sweep", help="Skip the stale-worktree sweep")
+    ] = False,
+) -> None:
+    """Run one scheduled tick — what the service manager calls.
+
+    Exit codes: 0 handled (including skipped, no-op, and a review tick
+    whose PRs need a human), 1 infrastructure failure, 2 an orchestrate
+    run that ended with failures.
+    """
+    if stage not in ("orchestrate", "review"):
+        err_console.print(f"[red]Unknown stage:[/red] {stage}")
+        raise typer.Exit(1)
+    code = asyncio.run(
+        _service_run(
+            config_path=config,
+            stage=cast("Stage", stage),
+            db_path=db_path or DEFAULT_DB_PATH,
+            sweep=not no_sweep,
+        )
+    )
+    raise typer.Exit(code)
+
+
+async def _service_run(
+    *, config_path: Path, stage: "Stage", db_path: Path, sweep: bool
+) -> int:
+    project = load_orchestrator_config(config_path)
+    db = Database(db_path)
+    await db.connect()
+    notifications = create_notification_manager(project.notifications)
+    try:
+        result: TickResult = await run_tick(
+            db=db,
+            project=project.project,
+            config_path=config_path,
+            db_path=db_path,
+            repo_path=Path(project.repo_path).expanduser(),  # noqa: ASYNC240
+            base_branch=project.base_branch,
+            stage=stage,
+            runner=run_argv,
+            notifier=notifications,
+            log_dir=DEFAULT_SERVICE_LOG_DIR,
+            sweep=sweep,
+        )
+        console.print(
+            f"{project.project} [{stage}]: {result.decision} -> "
+            f"{result.outcome} (exit {result.exit_code})"
+        )
+        return result.exit_code
+    finally:
+        await notifications.aclose()
+        await db.close()
+
+
+@service_app.command("install")
+def service_install_command(
+    config: Annotated[Path, typer.Argument(help="Path to project YAML")],
+    stage: Annotated[
+        str, typer.Option("--stage", help="orchestrate | review")
+    ] = "orchestrate",
+    schedule: Annotated[
+        str | None, typer.Option("--schedule", help='Daily time, e.g. "03:00"')
+    ] = None,
+    every: Annotated[
+        int | None, typer.Option("--every", help="Interval in minutes")
+    ] = None,
+    platform: Annotated[
+        str | None, typer.Option("--platform", help="launchd | systemd")
+    ] = None,
+    db_path: Annotated[
+        Path | None, typer.Option("--db", help="Path to state database")
+    ] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Print the unit, write nothing")
+    ] = False,
+    force: Annotated[
+        bool, typer.Option("--force", help="Overwrite an existing unit")
+    ] = False,
+    load: Annotated[
+        bool, typer.Option("--load/--no-load", help="Load the unit after writing")
+    ] = True,
+) -> None:
+    """Generate and load the platform unit for a scheduled tick."""
+    if stage not in ("orchestrate", "review"):
+        err_console.print(f"[red]Unknown stage:[/red] {stage}")
+        raise typer.Exit(1)
+    target_platform = platform or _default_platform()
+    project = load_orchestrator_config(config)
+    resolved_db = db_path or DEFAULT_DB_PATH
+
+    env_file = DEFAULT_SERVICE_ENV_FILE
+    if not dry_run:
+        ensure_env_file(env_file)
+    try:
+        preflight = preflight_environment(
+            harness_binaries=["maestro", "spec-runner"],
+            required_env=[],
+            env_file=env_file,
+        )
+    except PreflightError as exc:
+        err_console.print(f"[red]Refusing to install:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    spec = UnitSpec(
+        project=project.project,
+        stage=cast("Stage", stage),
+        config_path=config.resolve(),
+        db_path=resolved_db,
+        maestro_bin=preflight.maestro_bin,
+        path=preflight.path,
+        env_file=env_file,
+        log_dir=DEFAULT_SERVICE_LOG_DIR,
+        schedule=schedule if every is None else None,
+        every_minutes=every,
+    )
+    name = unit_name(project.project, stage, platform=cast("Any", target_platform))
+    units_dir = platform_units_dir(target_platform)
+
+    if target_platform == "launchd":
+        files = {f"{name}.plist": render_launchd(spec)}
+    else:
+        service_text, timer_text = render_systemd(spec)
+        files = {f"{name}.service": service_text, f"{name}.timer": timer_text}
+
+    if dry_run:
+        for filename, text in files.items():
+            console.print(f"[dim]--- {units_dir / filename} ---[/dim]")
+            console.print(text)
+        return
+
+    existing = [f for f in files if (units_dir / f).exists()]
+    if existing and not force:
+        err_console.print(
+            f"[red]Unit already exists:[/red] {', '.join(existing)} "
+            "(pass --force to overwrite)"
+        )
+        raise typer.Exit(1)
+
+    units_dir.mkdir(parents=True, exist_ok=True)
+    for filename, text in files.items():
+        (units_dir / filename).write_text(text, encoding="utf-8")
+    console.print(f"[green]Installed[/green] {name} in {units_dir}")
+    if load:
+        _load_unit(target_platform, name, units_dir)
+
+
+@service_app.command("uninstall")
+def service_uninstall_command(
+    config: Annotated[Path, typer.Argument(help="Path to project YAML")],
+    stage: Annotated[
+        str, typer.Option("--stage", help="orchestrate | review")
+    ] = "orchestrate",
+    platform: Annotated[
+        str | None, typer.Option("--platform", help="launchd | systemd")
+    ] = None,
+    db_path: Annotated[
+        Path | None, typer.Option("--db", help="Unused; accepted for symmetry")
+    ] = None,
+    load: Annotated[
+        bool, typer.Option("--load/--no-load", help="Unload before removing")
+    ] = True,
+) -> None:
+    """Unload and remove the generated unit."""
+    target_platform = platform or _default_platform()
+    project = load_orchestrator_config(config)
+    name = unit_name(project.project, stage, platform=cast("Any", target_platform))
+    units_dir = platform_units_dir(target_platform)
+    if load:
+        _unload_unit(target_platform, name, units_dir)
+    removed = 0
+    for suffix in (".plist", ".service", ".timer"):
+        path = units_dir / f"{name}{suffix}"
+        if path.exists():
+            path.unlink()
+            removed += 1
+    console.print(f"Removed {removed} unit file(s) for {name}")
+
+
+@service_app.command("status")
+def service_status_command(
+    config: Annotated[Path, typer.Argument(help="Path to project YAML")],
+    stage: Annotated[
+        str | None, typer.Option("--stage", help="Filter by stage")
+    ] = None,
+    limit: Annotated[int, typer.Option("--limit", help="How many ticks")] = 10,
+    db_path: Annotated[
+        Path | None, typer.Option("--db", help="Path to state database")
+    ] = None,
+) -> None:
+    """Show recent ticks for this project."""
+    asyncio.run(
+        _service_status(
+            config_path=config,
+            stage=stage,
+            limit=limit,
+            db_path=db_path or DEFAULT_DB_PATH,
+        )
+    )
+
+
+async def _service_status(
+    *, config_path: Path, stage: str | None, limit: int, db_path: Path
+) -> None:
+    project = load_orchestrator_config(config_path)
+    db = Database(db_path)
+    await db.connect()
+    try:
+        rows = await db.list_service_ticks(project.project, stage=stage, limit=limit)
+    finally:
+        await db.close()
+    if not rows:
+        console.print("[dim]No ticks recorded yet.[/dim]")
+        return
+    table = Table(title=f"Service ticks — {project.project}")
+    for column in ("Started", "Stage", "Decision", "Outcome", "Exit"):
+        table.add_column(column)
+    for row in rows:
+        table.add_row(
+            str(row["started_at"]),
+            row["stage"],
+            row["decision"],
+            str(row["outcome"] or "-"),
+            str(row["exit_code"] if row["exit_code"] is not None else "-"),
+        )
+    console.print(table)
+
+
+def _load_unit(platform: str, name: str, units_dir: Path) -> None:
+    if platform == "launchd":
+        cmd = ["launchctl", "load", str(units_dir / f"{name}.plist")]
+    else:
+        cmd = ["systemctl", "--user", "enable", "--now", f"{name}.timer"]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        err_console.print(
+            f"[yellow]Unit written but not loaded:[/yellow] {result.stderr.strip()}"
+        )
+
+
+def _unload_unit(platform: str, name: str, units_dir: Path) -> None:
+    if platform == "launchd":
+        cmd = ["launchctl", "unload", str(units_dir / f"{name}.plist")]
+    else:
+        cmd = ["systemctl", "--user", "disable", "--now", f"{name}.timer"]
+    subprocess.run(cmd, capture_output=True, check=False)
 
 
 @app.command("review-pr")
