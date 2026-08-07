@@ -66,6 +66,12 @@ def _run(project_yaml: Path, db_path: Path, *args: str):
     )
 
 
+@pytest.fixture(autouse=True)
+def _credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Install tests exercise unit writing; the credential gate has its own."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+
+
 # =============================================================================
 # `service run` — exit codes pass through (§5)
 # =============================================================================
@@ -188,6 +194,55 @@ def test_install_refuses_when_preflight_fails(
     assert result.exit_code == 1
     assert "spec-runner" in result.output
     assert not units.exists()  # nothing written
+
+
+def test_install_refuses_when_credentials_are_missing(
+    project_yaml: Path, db_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (Copilot, PR #154): the credential check must be ON.
+
+    Passing `required_env=[]` disabled it entirely, so install would
+    succeed for a unit that cannot authenticate — exactly the silent
+    03:00 failure this feature exists to prevent.
+    """
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    units = tmp_path / "LaunchAgents"
+    empty_env = tmp_path / "empty.env"
+    empty_env.write_text("# no credentials here\n")
+    with (
+        patch("maestro.cli.platform_units_dir", return_value=units),
+        patch("maestro.cli.DEFAULT_SERVICE_ENV_FILE", empty_env),
+    ):
+        result = _run(
+            project_yaml, db_path, "install", "--platform", "launchd", "--no-load"
+        )
+    assert result.exit_code == 1
+    assert "ANTHROPIC_API_KEY" in result.output
+    assert not units.exists()
+
+
+def test_install_escape_hatch_warns_and_proceeds(
+    project_yaml: Path, db_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    units = tmp_path / "LaunchAgents"
+    empty_env = tmp_path / "empty.env"
+    empty_env.write_text("# none\n")
+    with (
+        patch("maestro.cli.platform_units_dir", return_value=units),
+        patch("maestro.cli.DEFAULT_SERVICE_ENV_FILE", empty_env),
+    ):
+        result = _run(
+            project_yaml,
+            db_path,
+            "install",
+            "--platform",
+            "launchd",
+            "--no-load",
+            "--skip-credential-check",
+        )
+    assert result.exit_code == 0
+    assert "skipped" in result.output.lower()  # never silent
 
 
 # =============================================================================

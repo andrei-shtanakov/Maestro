@@ -178,7 +178,9 @@ right. What that buys you:
 - **Install refuses rather than fails at 03:00.** Scheduled runs get no
   shell profile, so `service install` resolves every harness binary and
   checks credentials up front, and writes no unit if they are missing.
-  Secrets go in `~/.maestro/service.env` (mode 0600, yours to fill).
+  Secrets go in `~/.maestro/service.env` (mode 0600, yours to fill); add
+  more with `--require-env NAME`, or skip the check with
+  `--skip-credential-check` if your harness authenticates another way.
 - **Conservative cleanup.** Each tick prunes worktrees only when the
   workstream is finished *and* its branch is merged; anything unmerged,
   dirty, or awaiting review is kept and reported.

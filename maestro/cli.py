@@ -86,6 +86,7 @@ from maestro.scaffold import ScaffoldError, generate_project_yaml
 from maestro.service.locks import Stage  # noqa: TC001 — runtime cast target
 from maestro.service.tick import TickResult, run_argv, run_tick
 from maestro.service.units import (
+    DEFAULT_REQUIRED_ENV,
     PreflightError,
     UnitSpec,
     ensure_env_file,
@@ -2059,6 +2060,20 @@ def service_install_command(
     force: Annotated[
         bool, typer.Option("--force", help="Overwrite an existing unit")
     ] = False,
+    require_env: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--require-env",
+            help="Extra credential names the unit needs (repeatable)",
+        ),
+    ] = None,
+    skip_credential_check: Annotated[
+        bool,
+        typer.Option(
+            "--skip-credential-check",
+            help="Install without verifying credentials (documented escape hatch)",
+        ),
+    ] = False,
     load: Annotated[
         bool, typer.Option("--load/--no-load", help="Load the unit after writing")
     ] = True,
@@ -2074,10 +2089,23 @@ def service_install_command(
     env_file = DEFAULT_SERVICE_ENV_FILE
     if not dry_run:
         ensure_env_file(env_file)
+    # A unit that cannot authenticate fails silently at 03:00, so the
+    # credential check is on by default; `--skip-credential-check` is a
+    # documented escape for setups that authenticate some other way
+    # (e.g. a CLI login file), and it warns rather than staying silent.
+    required = [] if skip_credential_check else [*DEFAULT_REQUIRED_ENV]
+    for name in require_env or []:
+        if name not in required:
+            required.append(name)
+    if skip_credential_check:
+        console.print(
+            "[yellow]Credential check skipped[/yellow] — if the harness cannot "
+            "authenticate non-interactively, scheduled ticks will fail."
+        )
     try:
         preflight = preflight_environment(
             harness_binaries=["maestro", "spec-runner"],
-            required_env=[],
+            required_env=required,
             env_file=env_file,
         )
     except PreflightError as exc:

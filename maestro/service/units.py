@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import plistlib
 import re
+import shlex
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,7 @@ from typing import Literal
 
 
 __all__ = [
+    "DEFAULT_REQUIRED_ENV",
     "ENV_FILE_MODE",
     "PreflightError",
     "PreflightResult",
@@ -33,6 +35,15 @@ __all__ = [
 ]
 
 ENV_FILE_MODE = 0o600
+
+# Credentials an unattended run needs, by harness. A scheduled process
+# has no shell profile and may not reach a login keychain, so these must
+# be resolvable from the environment or the service env file.
+CREDENTIALS_BY_HARNESS = {
+    "claude_code": ["ANTHROPIC_API_KEY"],
+    "codex_cli": ["OPENAI_API_KEY"],
+}
+DEFAULT_REQUIRED_ENV = CREDENTIALS_BY_HARNESS["claude_code"]
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -116,8 +127,14 @@ def render_launchd(spec: UnitSpec) -> str:
         "RunAtLoad": False,
         "KeepAlive": False,
         "EnvironmentVariables": {"PATH": spec.path},
-        "StandardOutPath": str(spec.log_dir / spec.project / "launchd.out.log"),
-        "StandardErrorPath": str(spec.log_dir / spec.project / "launchd.err.log"),
+        # Stage is part of the filename: both units of one project would
+        # otherwise interleave their output into the same file.
+        "StandardOutPath": str(
+            spec.log_dir / spec.project / f"launchd.{spec.stage}.out.log"
+        ),
+        "StandardErrorPath": str(
+            spec.log_dir / spec.project / f"launchd.{spec.stage}.err.log"
+        ),
     }
     if spec.every_minutes is not None:
         plist["StartInterval"] = spec.every_minutes * 60
@@ -128,9 +145,14 @@ def render_launchd(spec: UnitSpec) -> str:
 
 
 def render_systemd(spec: UnitSpec) -> tuple[str, str]:
-    """Render the (service, timer) pair for a systemd **user** unit."""
+    """Render the (service, timer) pair for a systemd **user** unit.
+
+    `ExecStart` is built with `shlex.quote` per argument: a config path
+    under "Application Support" would otherwise split into two words and
+    the timer would fail to start the tick — silently, at 03:00.
+    """
     name = unit_name(spec.project, spec.stage, platform="systemd")
-    argv = " ".join(_program_arguments(spec))
+    argv = " ".join(shlex.quote(arg) for arg in _program_arguments(spec))
     service = f"""\
 [Unit]
 Description=Maestro {spec.stage} tick for {spec.project}

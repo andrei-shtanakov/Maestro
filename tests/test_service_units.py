@@ -192,3 +192,30 @@ def test_preflight_accepts_credentials_from_the_env_file(
         env_file=env_file,
     )
     assert result.maestro_bin.endswith("maestro")
+
+
+# =============================================================================
+# Copilot review (PR #154): quoting and per-stage logs
+# =============================================================================
+
+
+def test_systemd_execstart_quotes_paths_with_spaces(tmp_path: Path) -> None:
+    """An unquoted path would split into two words and the timer would
+    silently fail to start the tick."""
+    spaced = tmp_path / "Application Support" / "project.yaml"
+    spaced.parent.mkdir(parents=True)
+    service, _timer = render_systemd(_spec(tmp_path, config_path=spaced))
+    exec_line = next(
+        line for line in service.splitlines() if line.startswith("ExecStart=")
+    )
+    assert "'" in exec_line or '"' in exec_line
+    assert str(spaced) in exec_line.replace("'", "")
+
+
+def test_launchd_log_paths_include_the_stage(tmp_path: Path) -> None:
+    """Both units of one project must not interleave into one log file."""
+    orchestrate = plistlib.loads(render_launchd(_spec(tmp_path)).encode())
+    review = plistlib.loads(render_launchd(_spec(tmp_path, stage="review")).encode())
+    assert orchestrate["StandardOutPath"] != review["StandardOutPath"]
+    assert "orchestrate" in orchestrate["StandardOutPath"]
+    assert "review" in review["StandardErrorPath"]
