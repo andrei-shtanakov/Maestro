@@ -67,8 +67,16 @@ def _run(project_yaml: Path, db_path: Path, *args: str):
 
 
 @pytest.fixture(autouse=True)
-def _credentials(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Install tests exercise unit writing; the credential gate has its own."""
+def _install_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the preflight environment-independent.
+
+    Binary resolution must not depend on what happens to be installed on
+    the machine running the tests (CI has no `spec-runner` on PATH), and
+    the credential gate has its own dedicated tests below.
+    """
+    from maestro.service import units
+
+    monkeypatch.setattr(units.shutil, "which", lambda name: f"/opt/bin/{name}")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
 
 
