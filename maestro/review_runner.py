@@ -220,6 +220,16 @@ async def run_review(
             return 1
 
         outcome = outcome_for_exit(exit_code)
+        # Dedup BEFORE finalizing: the query must see the previous run,
+        # not this one (service spec §4.1 — one notification per
+        # (repo, pr_number, head_sha, outcome), so nightly ticks over an
+        # unchanged PR stay silent while a new bot round alerts again).
+        previous = await db.previous_review_outcome(
+            ref.owner_repo,
+            ref.number,
+            head_sha,
+            exclude_run_id=review_run_id,
+        )
         await db.finalize_review_run(
             review_run_id,
             exit_code=exit_code,
@@ -228,7 +238,15 @@ async def run_review(
             report_json=json.dumps(report.model_dump(exclude_none=True)),
             output_head_sha=report.head_sha,
         )
-        await _notify(notifier, outcome, workstream_id, pr_url)
+        if previous != outcome:
+            await _notify(notifier, outcome, workstream_id, pr_url)
+        else:
+            logger.info(
+                "review-pr: %s unchanged for %s@%s — notification suppressed",
+                outcome,
+                ref.canonical_url,
+                head_sha[:8],
+            )
         cleanup_after_run(repo_path=repo_path, paths=paths, exit_code=exit_code)
         return exit_code
     finally:

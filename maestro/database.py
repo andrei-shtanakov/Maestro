@@ -3792,6 +3792,29 @@ class Database:
         await self._connection.commit()
         return cursor.rowcount > 0
 
+    async def previous_review_outcome(
+        self, repo: str, pr_number: int, head_sha: str, *, exclude_run_id: str
+    ) -> str | None:
+        """Outcome of the last finalized run for this exact PR head.
+
+        Backs notification dedup (service spec §4.1): the owner of the
+        outcome owns its notification identity, and the identity is
+        (repo, pr_number, head_sha, outcome). A new bot round moves the
+        head SHA and therefore legitimately alerts again.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        cursor = await self._connection.execute(
+            "SELECT outcome FROM post_pr_review_runs "
+            "WHERE repo = ? AND pr_number = ? AND input_head_sha = ? "
+            "AND finished_at IS NOT NULL AND review_run_id != ? "
+            "ORDER BY finished_at DESC, rowid DESC LIMIT 1",
+            (repo, pr_number, head_sha, exclude_run_id),
+        )
+        row = await cursor.fetchone()
+        return None if row is None else row["outcome"]
+
     async def list_unfinished_review_runs(self) -> list[dict[str, Any]]:
         """Sentinel rows left by a crash — finalized fail-closed on the next run."""
         if self._connection is None:
