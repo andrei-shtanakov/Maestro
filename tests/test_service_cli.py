@@ -169,7 +169,10 @@ def test_dry_run_previews_even_with_a_broken_environment(
     with (
         patch("maestro.cli.platform_units_dir", return_value=units_dir),
         patch("maestro.cli.DEFAULT_SERVICE_ENV_FILE", empty_env),
-        patch("maestro.service.units.DEFAULT_CREDENTIAL_STORES", [tmp_path / "no"]),
+        patch(
+            "maestro.service.units.CREDENTIAL_STORES_BY_ENV",
+            {"ANTHROPIC_API_KEY": [tmp_path / "no"]},
+        ),
     ):
         result = _run(
             project_yaml, db_path, "install", "--platform", "launchd", "--dry-run"
@@ -194,7 +197,10 @@ def test_install_accepts_a_harness_credential_store(
     with (
         patch("maestro.cli.platform_units_dir", return_value=units_dir),
         patch("maestro.cli.DEFAULT_SERVICE_ENV_FILE", empty_env),
-        patch("maestro.service.units.DEFAULT_CREDENTIAL_STORES", [store]),
+        patch(
+            "maestro.service.units.CREDENTIAL_STORES_BY_ENV",
+            {"ANTHROPIC_API_KEY": [store]},
+        ),
     ):
         result = _run(
             project_yaml, db_path, "install", "--platform", "launchd", "--no-load"
@@ -267,7 +273,10 @@ def test_install_refuses_when_credentials_are_missing(
     with (
         patch("maestro.cli.platform_units_dir", return_value=units),
         patch("maestro.cli.DEFAULT_SERVICE_ENV_FILE", empty_env),
-        patch("maestro.service.units.DEFAULT_CREDENTIAL_STORES", [tmp_path / "no"]),
+        patch(
+            "maestro.service.units.CREDENTIAL_STORES_BY_ENV",
+            {"ANTHROPIC_API_KEY": [tmp_path / "no"]},
+        ),
     ):
         result = _run(
             project_yaml, db_path, "install", "--platform", "launchd", "--no-load"

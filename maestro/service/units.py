@@ -23,7 +23,7 @@ from typing import Literal
 
 __all__ = [
     "CREDENTIAL_ENV_BY_HARNESS",
-    "DEFAULT_CREDENTIAL_STORES",
+    "CREDENTIAL_STORES_BY_ENV",
     "ENV_FILE_MODE",
     "PreflightError",
     "PreflightResult",
@@ -54,13 +54,25 @@ CREDENTIAL_ENV_BY_HARNESS = {
 }
 
 # Where those CLIs keep their own credentials when the user logged in
-# instead of exporting a key. Presence is what we can honestly check;
-# whether a *background* session can read it is the keychain caveat we
-# document rather than pretend to verify.
-DEFAULT_CREDENTIAL_STORES = [
-    Path.home() / ".claude.json",
-    Path.home() / ".claude",
-]
+# instead of exporting a key — keyed BY THE ENV VAR each store stands in
+# for. A flat list would let a `claude` login vouch for OPENAI_API_KEY,
+# which it obviously cannot. A key with no known store (anything the
+# operator adds via --require-env) can only be satisfied from the
+# environment or the env file.
+#
+# Presence is what we can honestly check; whether a *background* session
+# can read it is the keychain caveat we document rather than pretend to
+# verify.
+CREDENTIAL_STORES_BY_ENV: dict[str, list[Path]] = {
+    "ANTHROPIC_API_KEY": [
+        Path.home() / ".claude.json",
+        Path.home() / ".claude",
+    ],
+    "OPENAI_API_KEY": [
+        Path.home() / ".codex",
+        Path.home() / ".config" / "openai",
+    ],
+}
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -229,7 +241,7 @@ def probe_environment(
     harness_binaries: list[str],
     required_env: list[str] | None = None,
     env_file: Path | None = None,
-    credential_stores: list[Path] | None = None,
+    credential_stores: dict[str, list[Path]] | None = None,
 ) -> tuple[PreflightResult, list[str]]:
     """Resolve what it can and report what it cannot — never raises.
 
@@ -261,21 +273,35 @@ def probe_environment(
 
     if required_env:
         available = set(os.environ) | _env_file_keys(env_file)
-        absent = [key for key in required_env if key not in available]
-        stores = (
-            DEFAULT_CREDENTIAL_STORES
-            if credential_stores is None
-            else credential_stores
+        stores_by_env = (
+            CREDENTIAL_STORES_BY_ENV if credential_stores is None else credential_stores
         )
-        has_store = any(store.exists() for store in stores)
-        if absent and not has_store:
+        unsatisfied: list[str] = []
+        for key in required_env:
+            if key in available:
+                continue
+            # Only THIS key's own stores may vouch for it: a claude login
+            # says nothing about an OpenAI credential.
+            stores = stores_by_env.get(key, [])
+            if any(store.exists() for store in stores):
+                continue
+            unsatisfied.append(key)
+        if unsatisfied:
             target = env_file or Path("~/.maestro/service.env")
+            details = []
+            for key in unsatisfied:
+                stores = stores_by_env.get(key, [])
+                where = (
+                    f" (no login store at {', '.join(str(s) for s in stores)})"
+                    if stores
+                    else " (no known login store for this key)"
+                )
+                details.append(f"{key}{where}")
             problems.append(
-                f"no usable credentials for an unattended run: neither "
-                f"{', '.join(absent)} nor a harness credential store "
-                f"({', '.join(str(s) for s in stores)}). Log the harness CLI "
-                f"in, or add the key to {target} (mode 0600) — a scheduled "
-                "run gets no shell profile."
+                "no usable credentials for an unattended run: "
+                f"{'; '.join(details)}. Log the harness CLI in, or add the "
+                f"key to {target} (mode 0600) — a scheduled run gets no "
+                "shell profile."
             )
 
     directories: list[str] = []
@@ -298,7 +324,7 @@ def preflight_environment(
     harness_binaries: list[str],
     required_env: list[str] | None = None,
     env_file: Path | None = None,
-    credential_stores: list[Path] | None = None,
+    credential_stores: dict[str, list[Path]] | None = None,
 ) -> PreflightResult:
     """Strict probe for install: refuse rather than write a broken unit.
 
