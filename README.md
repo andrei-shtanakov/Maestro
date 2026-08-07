@@ -154,6 +154,40 @@ default.
 
 Add an `arbiter:` section to your project YAML to delegate per-task agent selection to the [Arbiter](https://github.com/andrei-shtanakov/arbiter) policy engine. Advisory mode honors your explicit `agent_type` and feeds the learning loop; authoritative mode lets the arbiter override your choice and gates retries on outcome delivery. When the section is absent, Maestro runs the zero-config static-routing path — no subprocess, no routing overhead. See [`examples/with-arbiter.yaml`](examples/with-arbiter.yaml).
 
+## Scheduled autonomous runs (optional)
+
+Once a project runs unattended well, schedule it:
+
+```bash
+maestro service install project.yaml --schedule "03:00"                  # nightly product tick
+maestro service install project.yaml --schedule "05:00" --stage review   # PR review, later and separate
+maestro service status project.yaml                                      # what the machine did overnight
+```
+
+The scheduler starts `maestro service run`, not `orchestrate` — the
+wrapper decides per tick whether to resume an unfinished DAG, start a
+fresh one, or do nothing, because only Maestro's state knows which is
+right. What that buys you:
+
+- **No stacked runs.** A tick that finds the previous one still going
+  records `skipped` and exits 0; the two stages of one project (and
+  different projects) still run concurrently, each under its own lock.
+- **Honest unit colours.** Red means broken. A workstream parked for a
+  human, or a PR whose review needs you, exits 0 and notifies instead —
+  otherwise you learn to ignore a permanently red unit.
+- **Install refuses rather than fails at 03:00.** Scheduled runs get no
+  shell profile, so `service install` resolves every harness binary and
+  checks credentials up front, and writes no unit if they are missing.
+  Secrets go in `~/.maestro/service.env` (mode 0600, yours to fill); add
+  more with `--require-env NAME`, or skip the check with
+  `--skip-credential-check` if your harness authenticates another way.
+- **Conservative cleanup.** Each tick prunes worktrees only when the
+  workstream is finished *and* its branch is merged; anything unmerged,
+  dirty, or awaiting review is kept and reported.
+
+Every tick is recorded (`maestro service status`) with its decision,
+outcome and exit code.
+
 ## Post-PR review (optional)
 
 Maestro creates the PR; the review-bot loop belongs to

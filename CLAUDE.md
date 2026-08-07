@@ -45,6 +45,12 @@ uv run maestro workspaces <project.yaml>     # List active worktrees
 uv run maestro review-pr <project.yaml> <workstream-id>  # Drive spec-runner's review-bot loop over that workstream's PR (needs spec-runner >= 2.21.0; exits 0 complete / 1 infra / 2 needs-human / 3 already-running)
 uv run maestro review-pr <project.yaml> --all            # Same, sequentially over every workstream PR
 
+# === Scheduled autonomous runs (service wrapper) ===
+uv run maestro service run <project.yaml> [--stage orchestrate|review]   # One tick: decides resume/fresh/no-op from DB state (this is what launchd/systemd call)
+uv run maestro service install <project.yaml> --schedule "03:00"         # Generate + load the launchd/systemd user unit (refuses if harness binaries/credentials don't resolve)
+uv run maestro service status <project.yaml>                             # Recent ticks (stage, decision, outcome, exit)
+uv run maestro service uninstall <project.yaml>                          # Unload + remove the unit
+
 # === Mode-2 config authoring ===
 uv run maestro init                          # Scaffold project.yaml from cwd
 uv run maestro validate project.yaml         # Preflight: cycles, scope overlap, repo sanity

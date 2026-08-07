@@ -229,3 +229,73 @@ def test_version_gate(output: str, ok: bool) -> None:
 
 def test_version_gate_handles_failed_probe() -> None:
     assert check_spec_runner_version("", returncode=127) is not None
+
+
+# =============================================================================
+# Notification dedup (service spec §4.1 prerequisite)
+# =============================================================================
+
+
+async def test_repeated_run_over_unchanged_pr_is_silent(
+    db: Database, paths: ReviewPaths
+) -> None:
+    """Nightly ticks over an unchanged PR must not alert every night."""
+    notifier = _Notifier()
+    await _run(
+        db, paths, _FakeInvocation(2, report=_report(2, needs_human=True)), notifier
+    )
+    assert notifier.events == [NotificationEvent.POST_PR_REVIEW_NEEDS_HUMAN]
+
+    await _run(
+        db, paths, _FakeInvocation(2, report=_report(2, needs_human=True)), notifier
+    )
+    assert len(notifier.events) == 1  # same (repo, pr, head_sha, outcome)
+
+
+async def test_new_head_sha_alerts_again(db: Database, paths: ReviewPaths) -> None:
+    """A new bot round legitimately deserves a fresh alert."""
+    notifier = _Notifier()
+    await _run(
+        db, paths, _FakeInvocation(2, report=_report(2, needs_human=True)), notifier
+    )
+
+    async def _prepare_new_head(**_kwargs: object) -> tuple[Path, str]:
+        return Path("/tmp/wt"), "b" * 40
+
+    other = json.dumps(
+        {
+            "repo": "o/r",
+            "pr_number": 7,
+            "head_sha": "b" * 40,
+            "new_comments": 1,
+            "comments": [],
+            "counts": {},
+            "needs_human": True,
+            "exit_code": 2,
+        }
+    )
+    await run_review(
+        db=db,
+        workstream_id="ws-1",
+        pr_url=PR_URL,
+        repo_path=Path("/tmp/x"),
+        paths=paths,
+        invocation=ReviewInvocation(_FakeInvocation(2, report=other)),
+        notifier=notifier,  # type: ignore[arg-type]
+        prepare=_prepare_new_head,
+        spec_runner_version="2.21.0",
+    )
+    assert len(notifier.events) == 2
+
+
+async def test_changed_outcome_alerts_again(db: Database, paths: ReviewPaths) -> None:
+    """needs_human -> complete on the same head is news worth telling."""
+    notifier = _Notifier()
+    await _run(
+        db, paths, _FakeInvocation(2, report=_report(2, needs_human=True)), notifier
+    )
+    await _run(db, paths, _FakeInvocation(0), notifier)
+    assert notifier.events == [
+        NotificationEvent.POST_PR_REVIEW_NEEDS_HUMAN,
+        NotificationEvent.POST_PR_REVIEW_COMPLETE,
+    ]

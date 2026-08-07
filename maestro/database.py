@@ -577,6 +577,11 @@ class Database:
                 "post_pr_review_runs",
                 self._migrate_post_pr_review_runs,
             ),
+            (
+                22,
+                "service_ticks",
+                self._migrate_service_ticks,
+            ),
         ]
 
         for version, name, fn in ordered:
@@ -1070,6 +1075,39 @@ class Database:
                 report_json         TEXT,
                 workspace_path      TEXT,
                 spec_runner_version TEXT
+            )
+            """
+        )
+
+    async def _migrate_service_ticks(self) -> None:
+        """Migration 22: scheduled-run tick ledger (`maestro service`).
+
+        One row per tick of either stage — `stage` is part of the record
+        because orchestrate and review are independent jobs. `decision`
+        is what the wrapper chose, `outcome` what came of it: the review
+        stage is where they diverge (decision='review',
+        outcome='needs_human', exit_code=0). Sentinel first, finalized
+        once by a CAS on `finished_at IS NULL`.
+        """
+        assert self._connection is not None
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS service_ticks (
+                tick_id         TEXT PRIMARY KEY,
+                project         TEXT NOT NULL,
+                stage           TEXT NOT NULL CHECK (stage IN
+                                  ('orchestrate','review')),
+                started_at      TIMESTAMP NOT NULL,
+                finished_at     TIMESTAMP,
+                decision        TEXT NOT NULL CHECK (decision IN
+                                  ('fresh','resume','review','skipped_running',
+                                   'noop_complete','noop_blocked')),
+                outcome         TEXT CHECK (outcome IN
+                                  ('ok','needs_human','failed','infra_error')),
+                exit_code       INTEGER,
+                reason          TEXT,
+                log_path        TEXT,
+                swept_worktrees INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -3754,6 +3792,29 @@ class Database:
         await self._connection.commit()
         return cursor.rowcount > 0
 
+    async def previous_review_outcome(
+        self, repo: str, pr_number: int, head_sha: str, *, exclude_run_id: str
+    ) -> str | None:
+        """Outcome of the last finalized run for this exact PR head.
+
+        Backs notification dedup (service spec §4.1): the owner of the
+        outcome owns its notification identity, and the identity is
+        (repo, pr_number, head_sha, outcome). A new bot round moves the
+        head SHA and therefore legitimately alerts again.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        cursor = await self._connection.execute(
+            "SELECT outcome FROM post_pr_review_runs "
+            "WHERE repo = ? AND pr_number = ? AND input_head_sha = ? "
+            "AND finished_at IS NOT NULL AND review_run_id != ? "
+            "ORDER BY finished_at DESC, rowid DESC LIMIT 1",
+            (repo, pr_number, head_sha, exclude_run_id),
+        )
+        row = await cursor.fetchone()
+        return None if row is None else row["outcome"]
+
     async def list_unfinished_review_runs(self) -> list[dict[str, Any]]:
         """Sentinel rows left by a crash — finalized fail-closed on the next run."""
         if self._connection is None:
@@ -3775,6 +3836,84 @@ class Database:
             "ORDER BY started_at, rowid",
             (workstream_id,),
         )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    # ------------------------------------------------------------------
+    # service ticks (`maestro service`) — migration 22
+    # ------------------------------------------------------------------
+
+    async def insert_service_tick(
+        self,
+        tick_id: str,
+        *,
+        project: str,
+        stage: str,
+        decision: str,
+        log_path: str | None,
+        swept_worktrees: int = 0,
+    ) -> None:
+        """Write the tick sentinel BEFORE acting on the decision (§4)."""
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        await self._connection.execute(
+            "INSERT INTO service_ticks "
+            "(tick_id, project, stage, decision, log_path, swept_worktrees, "
+            "started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                tick_id,
+                project,
+                stage,
+                decision,
+                log_path,
+                swept_worktrees,
+                _format_datetime(datetime.now(UTC)),
+            ),
+        )
+        await self._connection.commit()
+
+    async def finalize_service_tick(
+        self,
+        tick_id: str,
+        *,
+        outcome: str,
+        exit_code: int,
+        reason: str | None = None,
+    ) -> bool:
+        """Finalize a tick — CAS on `finished_at IS NULL`; immutable after."""
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        cursor = await self._connection.execute(
+            "UPDATE service_ticks SET finished_at = ?, outcome = ?, "
+            "exit_code = ?, reason = ? "
+            "WHERE tick_id = ? AND finished_at IS NULL",
+            (
+                _format_datetime(datetime.now(UTC)),
+                outcome,
+                exit_code,
+                reason,
+                tick_id,
+            ),
+        )
+        await self._connection.commit()
+        return cursor.rowcount > 0
+
+    async def list_service_ticks(
+        self, project: str, *, stage: str | None = None, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Recent ticks, newest first, optionally for one stage only."""
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        sql = "SELECT * FROM service_ticks WHERE project = ?"
+        params: list[Any] = [project]
+        if stage is not None:
+            sql += " AND stage = ?"
+            params.append(stage)
+        sql += " ORDER BY started_at DESC, rowid DESC LIMIT ?"
+        params.append(limit)
+        cursor = await self._connection.execute(sql, params)
         return [dict(row) for row in await cursor.fetchall()]
 
     async def record_workstream_rework(

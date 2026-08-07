@@ -3,6 +3,33 @@
 ## Unreleased
 
 ### Added
+- **`maestro service` — scheduled autonomous runs.** Generates and loads
+  a launchd/systemd **user** unit that starts a Maestro-owned wrapper
+  (`maestro service run`), never `orchestrate` directly: only Maestro's
+  own state can decide resume vs fresh vs no-op, and that decision table
+  lives in the wrapper. Two independent stages (`--stage orchestrate |
+  review`) with their own schedule, lock, ledger rows and logs.
+  Locking is a two-level flock hierarchy so legacy and scoped runs
+  exclude each other in *both* directions (legacy takes `global.lock`
+  exclusive; a scoped stage takes it shared plus an exclusive
+  per-(project, stage) lock) — different projects, and the two stages of
+  one project, run concurrently. A tick that cannot take its lock is
+  recorded and exits 0 rather than painting the unit red. Adds the
+  `service_ticks` ledger (migration 22, sentinel + CAS finalize, with
+  `decision` and `outcome` as distinct axes), a conservative
+  stale-worktree sweep that never removes unmerged/dirty/NEEDS_REVIEW
+  trees, Maestro-owned log rotation, and an install-time preflight that
+  **refuses** to write a unit whose harnesses or credentials cannot be
+  resolved non-interactively (a scheduled run gets no shell profile —
+  the classic silent 03:00 failure). Design:
+  `docs/superpowers/specs/2026-08-06-service-install-design.md`.
+
+### Changed
+- **`maestro review-pr` deduplicates its notifications** by
+  `(repo, pr_number, head_sha, outcome)`. Repeated scheduled runs over
+  an unchanged PR are now silent; a new review-bot round moves the head
+  SHA and alerts again. Prerequisite for the review service stage, which
+  deliberately sends no notification of its own.
 - **`maestro review-pr` — post-PR review wrapper.** Drives
   `spec-runner review-pr` (the review-bot loop: verify each comment
   against the code, TDD-fix the valid ones, reply in threads) over
