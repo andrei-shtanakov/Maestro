@@ -128,10 +128,11 @@ def test_review_workspaces_are_never_touched(repo: Path, tmp_path: Path) -> None
 
 def test_workstream_without_workspace_path_is_ignored(repo: Path) -> None:
     ws = Workstream(
-        id="z1", title="W", description="d", branch="feature/z1",
+        id="z1",
+        title="W",
+        description="d",
+        branch="feature/z1",
         status=WorkstreamStatus.DONE,
     )
-    report = sweep_stale_worktrees(
-        repo_path=repo, base_branch="main", workstreams=[ws]
-    )
+    report = sweep_stale_worktrees(repo_path=repo, base_branch="main", workstreams=[ws])
     assert report.removed == [] and report.kept == []

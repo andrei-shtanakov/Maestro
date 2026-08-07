@@ -17,7 +17,12 @@ if TYPE_CHECKING:
 from maestro.models import WorkstreamStatus
 
 
-__all__ = ["OrchestrateDecision", "ReviewDecision", "decide_orchestrate", "decide_review"]
+__all__ = [
+    "OrchestrateDecision",
+    "ReviewDecision",
+    "decide_orchestrate",
+    "decide_review",
+]
 
 OrchestrateDecision = Literal["fresh", "resume", "noop_complete", "noop_blocked"]
 ReviewDecision = Literal["review", "noop_complete"]

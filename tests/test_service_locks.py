@@ -15,6 +15,7 @@ from maestro.service.locks import (
     AlreadyRunning,
     LegacyLock,
     ScopedLock,
+    Stage,
     project_key,
     stage_lock_path,
 )
@@ -25,8 +26,10 @@ def root(tmp_path: Path) -> Path:
     return tmp_path / "maestro-home"
 
 
-def _scoped(root: Path, project: str = "p", stage: str = "orchestrate") -> ScopedLock:
-    return ScopedLock(project=project, db_path=Path("/tmp/x.db"), stage=stage, root=root)
+def _scoped(root: Path, project: str = "p", stage: Stage = "orchestrate") -> ScopedLock:
+    return ScopedLock(
+        project=project, db_path=Path("/tmp/x.db"), stage=stage, root=root
+    )
 
 
 # =============================================================================

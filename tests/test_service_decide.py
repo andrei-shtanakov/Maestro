@@ -45,16 +45,22 @@ def test_any_non_terminal_workstream_is_resume(status: WorkstreamStatus) -> None
 
 
 def test_all_terminal_is_noop_complete() -> None:
-    assert decide_orchestrate(
-        [_ws(WorkstreamStatus.DONE), _ws(WorkstreamStatus.ABANDONED, "z2")]
-    ) == "noop_complete"
+    assert (
+        decide_orchestrate(
+            [_ws(WorkstreamStatus.DONE), _ws(WorkstreamStatus.ABANDONED, "z2")]
+        )
+        == "noop_complete"
+    )
 
 
 def test_terminal_with_needs_review_is_noop_blocked() -> None:
     """A human-parked workstream is a normal end state, not an error."""
-    assert decide_orchestrate(
-        [_ws(WorkstreamStatus.DONE), _ws(WorkstreamStatus.NEEDS_REVIEW, "z2")]
-    ) == "noop_blocked"
+    assert (
+        decide_orchestrate(
+            [_ws(WorkstreamStatus.DONE), _ws(WorkstreamStatus.NEEDS_REVIEW, "z2")]
+        )
+        == "noop_blocked"
+    )
 
 
 def test_needs_review_does_not_mask_a_live_workstream() -> None:

@@ -77,7 +77,7 @@ def stage_lock_path(
     return base / "instances" / project_key(project, db_path) / f"{stage}.lock"
 
 
-def _flock(handle, operation: int, what: str) -> None:  # noqa: ANN001
+def _flock(handle, operation: int, what: str) -> None:
     try:
         fcntl.flock(handle, operation | fcntl.LOCK_NB)
     except OSError as exc:
