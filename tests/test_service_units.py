@@ -12,6 +12,7 @@ from maestro.service.units import (
     UnitSpec,
     ensure_env_file,
     preflight_environment,
+    probe_environment,
     render_launchd,
     render_systemd,
     unit_name,
@@ -143,6 +144,114 @@ def test_env_file_loose_permissions_are_tightened(tmp_path: Path) -> None:
 
 
 # =============================================================================
+# Credential probing: Maestro itself never calls the model API
+# =============================================================================
+
+
+def test_no_credential_is_required_when_the_cli_can_authenticate_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Maestro spawns harness CLIs; they authenticate themselves.
+
+    A `claude` login (its own credential store) is a working setup, and
+    install must not demand an API key the normal path never reads.
+    """
+    monkeypatch.setattr(shutil, "which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    store = tmp_path / ".claude.json"
+    store.write_text("{}")
+    result = preflight_environment(
+        harness_binaries=["maestro"],
+        required_env=["ANTHROPIC_API_KEY"],
+        credential_stores={"ANTHROPIC_API_KEY": [store]},
+    )
+    assert result.maestro_bin.endswith("maestro")
+
+
+def test_refuses_only_when_no_credential_source_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with pytest.raises(PreflightError) as exc:
+        preflight_environment(
+            harness_binaries=["maestro"],
+            required_env=["ANTHROPIC_API_KEY"],
+            credential_stores={"ANTHROPIC_API_KEY": [tmp_path / "absent.json"]},
+        )
+    assert "ANTHROPIC_API_KEY" in str(exc.value)
+
+
+def test_env_var_alone_is_enough(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    result = preflight_environment(
+        harness_binaries=["maestro"],
+        required_env=["ANTHROPIC_API_KEY"],
+        credential_stores={"ANTHROPIC_API_KEY": [tmp_path / "absent.json"]},
+    )
+    assert result.path
+
+
+def test_probe_reports_problems_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--dry-run` needs to preview a unit even when the environment is
+    incomplete — a preview must not be gated like a real install."""
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    result, problems = probe_environment(harness_binaries=["maestro", "nope"])
+    assert problems  # reported...
+    assert result.maestro_bin  # ...but a best-effort result is still usable
+
+
+def test_a_login_store_vouches_only_for_its_own_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (Copilot, PR #156): a claude login says nothing about
+    an OpenAI credential — stores are keyed by the variable they stand
+    in for, not pooled into one boolean."""
+    monkeypatch.setattr(shutil, "which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    claude_store = tmp_path / ".claude.json"
+    claude_store.write_text("{}")
+    stores = {
+        "ANTHROPIC_API_KEY": [claude_store],
+        "OPENAI_API_KEY": [tmp_path / "no-codex"],
+    }
+
+    # The claude key is satisfied by its own store...
+    preflight_environment(
+        harness_binaries=["maestro"],
+        required_env=["ANTHROPIC_API_KEY"],
+        credential_stores=stores,
+    )
+    # ...but it must not vouch for the OpenAI one.
+    with pytest.raises(PreflightError) as exc:
+        preflight_environment(
+            harness_binaries=["maestro"],
+            required_env=["ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
+            credential_stores=stores,
+        )
+    assert "OPENAI_API_KEY" in str(exc.value)
+    assert "ANTHROPIC_API_KEY" not in str(exc.value)
+
+
+def test_a_key_with_no_known_store_needs_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--require-env CUSTOM_TOKEN can only come from env or the env file."""
+    monkeypatch.setattr(shutil, "which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.delenv("CUSTOM_TOKEN", raising=False)
+    with pytest.raises(PreflightError, match="CUSTOM_TOKEN"):
+        preflight_environment(
+            harness_binaries=["maestro"], required_env=["CUSTOM_TOKEN"]
+        )
+
+
+# =============================================================================
 # Preflight (§3.6): refuse, don't warn
 # =============================================================================
 
@@ -167,16 +276,22 @@ def test_preflight_refuses_missing_binary(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_preflight_refuses_missing_credentials(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(shutil, "which", lambda name: f"/b/{name}")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     with pytest.raises(PreflightError) as exc:
         preflight_environment(
-            harness_binaries=["maestro"], required_env=["ANTHROPIC_API_KEY"]
+            harness_binaries=["maestro"],
+            required_env=["ANTHROPIC_API_KEY"],
+            # No env var AND no credential store — the only genuine
+            # "cannot authenticate" state.
+            credential_stores={"ANTHROPIC_API_KEY": [tmp_path / "absent.json"]},
         )
     # The message must tell the operator how to fix it, not just fail.
-    assert "service.env" in str(exc.value) or "environment" in str(exc.value)
+    assert (
+        "service.env" in str(exc.value) or "log the harness" in str(exc.value).lower()
+    )
 
 
 def test_preflight_accepts_credentials_from_the_env_file(

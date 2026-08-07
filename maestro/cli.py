@@ -86,11 +86,12 @@ from maestro.scaffold import ScaffoldError, generate_project_yaml
 from maestro.service.locks import Stage  # noqa: TC001 — runtime cast target
 from maestro.service.tick import TickResult, run_argv, run_tick
 from maestro.service.units import (
-    DEFAULT_REQUIRED_ENV,
+    CREDENTIAL_ENV_BY_HARNESS,
     PreflightError,
     UnitSpec,
     ensure_env_file,
     preflight_environment,
+    probe_environment,
     render_launchd,
     render_systemd,
     unit_name,
@@ -2089,11 +2090,13 @@ def service_install_command(
     env_file = DEFAULT_SERVICE_ENV_FILE
     if not dry_run:
         ensure_env_file(env_file)
-    # A unit that cannot authenticate fails silently at 03:00, so the
-    # credential check is on by default; `--skip-credential-check` is a
-    # documented escape for setups that authenticate some other way
-    # (e.g. a CLI login file), and it warns rather than staying silent.
-    required = [] if skip_credential_check else [*DEFAULT_REQUIRED_ENV]
+    # Maestro never calls a model API itself — it spawns harness CLIs
+    # that authenticate themselves — so the check is satisfied by either
+    # an exported key or the CLI's own credential store. Only the total
+    # absence of both is a genuine "cannot authenticate at 03:00".
+    required = (
+        [] if skip_credential_check else [*CREDENTIAL_ENV_BY_HARNESS["claude_code"]]
+    )
     for name in require_env or []:
         if name not in required:
             required.append(name)
@@ -2102,15 +2105,26 @@ def service_install_command(
             "[yellow]Credential check skipped[/yellow] — if the harness cannot "
             "authenticate non-interactively, scheduled ticks will fail."
         )
-    try:
-        preflight = preflight_environment(
+    if dry_run:
+        # A preview must render even when the environment is incomplete;
+        # problems are reported, not fatal.
+        preflight, problems = probe_environment(
             harness_binaries=["maestro", "spec-runner"],
             required_env=required,
             env_file=env_file,
         )
-    except PreflightError as exc:
-        err_console.print(f"[red]Refusing to install:[/red] {exc}")
-        raise typer.Exit(1) from exc
+        for problem in problems:
+            console.print(f"[yellow]Would refuse to install:[/yellow] {problem}")
+    else:
+        try:
+            preflight = preflight_environment(
+                harness_binaries=["maestro", "spec-runner"],
+                required_env=required,
+                env_file=env_file,
+            )
+        except PreflightError as exc:
+            err_console.print(f"[red]Refusing to install:[/red] {exc}")
+            raise typer.Exit(1) from exc
 
     spec = UnitSpec(
         project=project.project,

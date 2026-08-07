@@ -176,11 +176,15 @@ right. What that buys you:
   human, or a PR whose review needs you, exits 0 and notifies instead —
   otherwise you learn to ignore a permanently red unit.
 - **Install refuses rather than fails at 03:00.** Scheduled runs get no
-  shell profile, so `service install` resolves every harness binary and
-  checks credentials up front, and writes no unit if they are missing.
-  Secrets go in `~/.maestro/service.env` (mode 0600, yours to fill); add
-  more with `--require-env NAME`, or skip the check with
-  `--skip-credential-check` if your harness authenticates another way.
+  shell profile, so `service install` resolves every harness binary up
+  front and writes no unit if one is missing. Credentials are satisfied
+  either by an exported key or by the harness CLI's own login store
+  (Maestro spawns those CLIs and never calls a model API itself), so a
+  logged-in `claude` is a valid setup; only the absence of both is
+  refused. Keys you *do* export go in `~/.maestro/service.env`
+  (mode 0600, yours to fill); add more with `--require-env NAME`, or
+  skip the check with `--skip-credential-check`. `--dry-run` always
+  renders the unit, reporting problems instead of blocking the preview.
 - **Conservative cleanup.** Each tick prunes worktrees only when the
   workstream is finished *and* its branch is merged; anything unmerged,
   dirty, or awaiting review is kept and reported.
