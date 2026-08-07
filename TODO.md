@@ -13,11 +13,13 @@
 - **Уровень пунктов — командный.** Микрошаги реализации живут в
   `docs/superpowers/specs/` + `docs/superpowers/plans/` и в SDD-леджере
   `.superpowers/sdd/progress.md`; этот файл их намеренно не дублирует.
-- **Инлайн-теги** (все опциональные; контракт —
-  `../_cowork_output/2026-07-26-plan-fields-and-todo-coverage-handoff.md` §3):
-  `@owner:<handle>` · `@blocked_by:<repo>#<slug>` · `@trigger:"<проверяемое условие>"` ·
-  `@id:<node-id>`, в хвост первой строки пункта. Отсутствие тега значит «неизвестно» и это
-  осмысленный ответ — выдумывать триггер там, где его нет, хуже, чем оставить пусто.
+- **Инлайн-теги:** `@owner:<principal>` · `@blocked_by:<reference>` ·
+  `@trigger:"<проверяемое условие>"` · `@id:<node-id>`, в хвост первой строки
+  пункта. Канонические владельцы: `github:<login>`,
+  `github-team:<org>/<team>`, `repo:<manifest-key>` или литерал `TBD`.
+  Отсутствующий `@owner` означает `missing`, а `@owner:TBD` — явно отложенное
+  назначение; это разные измеримые состояния. Канонический блокер —
+  `todo://<repo>/<id>`.
   Грепается кросс-репно: `grep -rn "@blocked_by:" */TODO.md`.
   - `@id` — канонический идентификатор пункта (ADR-ECO-005 PF-2B): строчная грамматика
     `[a-z0-9][a-z0-9._-]{0,63}` (напр. `r-03b`, не `R-03b`), из него строится URI
@@ -99,7 +101,7 @@
 
 Дальнейший трек ведётся в Linear (Maestro / Arbiter проекты, team Labs). Ниже — snapshot на 2026-04-17.
 
-- [ ] **R-03b** (LABS-TBD): Mode 2 (`maestro orchestrate`) workstream-level routing. Gate: ≥1 неделя стабильного Mode-1 dogfood после v0.2.0 @owner:andrei @trigger:"≥1 неделя стабильного Mode-1 dogfood после v0.2.0" @id:r-03b
+- [ ] **R-03b** (LABS-TBD): Mode 2 (`maestro orchestrate`) workstream-level routing. Gate: ≥1 неделя стабильного Mode-1 dogfood после v0.2.0 @owner:github:andrei-shtanakov @trigger:"≥1 неделя стабильного Mode-1 dogfood после v0.2.0" @id:r-03b
 - [x] **R-05 contract-level** (commit `f1f7d26`, 2026-04-25): 4 e2e теста против реального `arbiter-mcp` бинарника в `tests/test_arbiter_real_subprocess.py`. Auto-skip без бинарника; `MAESTRO_ARBITER_BIN` override. Покрывает: decision_id i64, int→str coercion, route→report_outcome round-trip, distinct rowids.
 - [x] **R-05 CI job** (2026-05-07): новый `arbiter-e2e` job в `.github/workflows/ci.yml` — sibling-checkout Maestro + arbiter (`andrei-shtanakov/arbiter`), `cargo build --release --bin arbiter-mcp` под Swatinem cache, прогон `tests/test_arbiter_real_subprocess.py` с `MAESTRO_ARBITER_BIN`. Ref-strategy: PR/push на pinned `ARBITER_PINNED_SHA=d1a8ecd` (arbiter#9 fix), weekly schedule (Mon 06:00 UTC) на `master` для drift-check. Локальный smoke: 4/4 теста зелёные.
 - [x] **R-05 scheduler-driven e2e** (2026-05-07): `tests/test_scheduler_arbiter_real_subprocess.py` — 2 теста скрещивают real arbiter-mcp + Scheduler full cycle + MagicMock spawner. (1) ASSIGN happy-path: real arbiter routes → mock exit 0 → outcome reported back to real arbiter → DONE; проверяет int→str round-trip decision_id через TEXT-колонку. (2) Retry-gating с real rowids: exit 1 → ADVISORY reset → второй route real arbiter mint'ит fresh i64 ≠ первого. HOLD/REJECT покрыты в `test_scheduler_arbiter_integration.py` через FakeArbiter — дублирование через real subprocess не оправдано (требует seed'инга cost/failure history)
@@ -125,20 +127,20 @@
 ### Follow-ups from R-06b M4
 
 - [x] **M3-obs / arbiter trace** (2026-07-19): W3C `traceparent` инжектится в `params._meta` каждого `tools/call` (`arbiter_client._call_tool_once`); пропуск при нулевом trace-id; e2e-тест подтверждает, что пинованный arbiter игнорирует `_meta`. Arbiter-side чтение `_meta.traceparent` — handoff в `prograph-vault/authored/notes/2026-07-19-arbiter-meta-traceparent-handoff.md`.
-- [ ] **R-06b M4b**: revisit `max_per_task=200` sampling for swe-bench-full (>1000 tasks). Trigger: first PROD swe-bench-full run. @owner:andrei @trigger:"первый PROD-прогон swe-bench-full" @id:r-06b-m4b
-- [ ] **R-07 prereq (GIN index)**: GIN index on `benchmark_runs.per_task` jsonb. Trigger: when R-07 starts writing SQL filters on per_task. @owner:arbiter @blocked_by:arbiter#R-07 @trigger:"R-07 начинает писать SQL-фильтры по per_task" @id:r-07-prereq-gin-index
-- [ ] **R-07 prereq (normalize)**: normalize `benchmark_task_results` table (migration from jsonb blob). Trigger: same as GIN — formal query demand. @owner:arbiter @blocked_by:arbiter#R-07 @trigger:"тот же формальный запрос, что у GIN" @id:r-07-prereq-normalize
-- [ ] **R-07 prereq (retention)**: TTL / archive policy for `benchmark_runs`. Trigger: table > 10k rows OR > 1 GB total JSON blobs. @owner:arbiter @trigger:"benchmark_runs > 10k строк ИЛИ > 1 GB JSON" @id:r-07-prereq-retention
-- [ ] **R-14**: vendored `arbiter_client.py` → standalone PyPI `arbiter-py` package. M4 enlarged vendor surface. @owner:arbiter @blocked_by:arbiter#arbiter-py @id:r-14
-- [ ] **Unscheduled — outbox**: persistent outbox + background retry for benchmark report. Trigger: if fire-and-forget shows real CI churn. @owner:andrei @trigger:"fire-and-forget даёт реальный CI-churn" @id:outbox-persistent-retry
-- [ ] **Unscheduled — arbiter-initiated benchmark**: outgoing benchmark trigger from arbiter ("router uncertain → run benchmark"). From design open question #2. @owner:arbiter @id:arbiter-initiated-benchmark
-- [ ] **M5 / multi-tenant auth**: service-account ATP token for CI; multi-tenant arbiter auth as separate ticket if arbiter ever leaves subprocess trust model. @owner:atp @trigger:"arbiter выходит за subprocess-trust-модель" @id:m5-multi-tenant-auth
+- [ ] **R-06b M4b**: revisit `max_per_task=200` sampling for swe-bench-full (>1000 tasks). Trigger: first PROD swe-bench-full run. @owner:github:andrei-shtanakov @trigger:"первый PROD-прогон swe-bench-full" @id:r-06b-m4b
+- [ ] **R-07 prereq (GIN index)**: GIN index on `benchmark_runs.per_task` jsonb. Trigger: when R-07 starts writing SQL filters on per_task. @owner:repo:arbiter @blocked_by:arbiter#R-07 @trigger:"R-07 начинает писать SQL-фильтры по per_task" @id:r-07-prereq-gin-index
+- [ ] **R-07 prereq (normalize)**: normalize `benchmark_task_results` table (migration from jsonb blob). Trigger: same as GIN — formal query demand. @owner:repo:arbiter @blocked_by:arbiter#R-07 @trigger:"тот же формальный запрос, что у GIN" @id:r-07-prereq-normalize
+- [ ] **R-07 prereq (retention)**: TTL / archive policy for `benchmark_runs`. Trigger: table > 10k rows OR > 1 GB total JSON blobs. @owner:repo:arbiter @trigger:"benchmark_runs > 10k строк ИЛИ > 1 GB JSON" @id:r-07-prereq-retention
+- [ ] **R-14**: vendored `arbiter_client.py` → standalone PyPI `arbiter-py` package. M4 enlarged vendor surface. @owner:repo:arbiter @blocked_by:arbiter#arbiter-py @id:r-14
+- [ ] **Unscheduled — outbox**: persistent outbox + background retry for benchmark report. Trigger: if fire-and-forget shows real CI churn. @owner:github:andrei-shtanakov @trigger:"fire-and-forget даёт реальный CI-churn" @id:outbox-persistent-retry
+- [ ] **Unscheduled — arbiter-initiated benchmark**: outgoing benchmark trigger from arbiter ("router uncertain → run benchmark"). From design open question #2. @owner:repo:arbiter @id:arbiter-initiated-benchmark
+- [ ] **M5 / multi-tenant auth**: service-account ATP token for CI; multi-tenant arbiter auth as separate ticket if arbiter ever leaves subprocess trust model. @owner:repo:atp-platform @trigger:"arbiter выходит за subprocess-trust-модель" @id:m5-multi-tenant-auth
 
 ### Новое из v0.2.0 dogfood (LABS-87..90)
 
 - [x] **LABS-87** (2026-05-07): validation-failure path теперь репортит outcome в arbiter с retry-gating. `_handle_validation_failure` отзеркалил `_handle_task_failure`: build outcome (status FAILURE) → `_try_report_outcome` → ADVISORY/AUTHORITATIVE-aware reset. Both paths (retry-available + exhausted-NEEDS_REVIEW) шлют outcome. +4 теста в `test_scheduler_arbiter_integration.py` (advisory+retry, exhausted, advisory+arbiter-down, authoritative+arbiter-down). Routing API не расширен — `validation_passed` остаётся out-of-scope
 - [x] **LABS-88** (Low): CI guard для unreferenced public modules (commit `c002f46`) — `tests/test_no_unreferenced_modules.py`, grimp import-graph, allowlist `maestro.schemas.generate` (python -m)
-- [ ] **LABS-89** (Medium): release automation (version-vs-tag guard + release-drafter) @owner:andrei @id:labs-89
+- [ ] **LABS-89** (Medium): release automation (version-vs-tag guard + release-drafter) @owner:github:andrei-shtanakov @id:labs-89
 - [x] **LABS-90** (Medium): per-example YAML smoke test в CI (commit `e9cbb1c`) — `tests/test_examples_smoke.py`, parametrized `examples/*.yaml` (Mode-1 `load_config`; Mode-2 `load_orchestrator_config`+`validate_project(check_fs=False)`) + `observed-models.json`; dummy `${VAR}` env; caught+fixed drifted `maestro-builds-maestro.yaml` (`repo: .`)
 
 ### Observability (cross-project) — M1 closed, M2 closed 2026-04-25
@@ -147,9 +149,9 @@
 - [x] **M2** (commit `d474120`, 2026-04-25): scheduler instrumentation. `obs.span("scheduler.session")` + `obs.span("task.spawn")` (subprocess inheritance через TRACEPARENT), 4 структурированных emit'а (`task.completed`/`task.validation_failed`/`task.failed`/`task.timeout`), `spawn_env()` helper в `spawners/base.py` пропагирует трасу в claude_code/codex/aider/validator subprocesses. 3 теста в `test_scheduler_observability.py`
 - [x] **M3 (runtime-decision instrumentation)** (closed by feat/observability-m3): `scheduler.tick` emit-on-change per poll cycle + `task.route` span around the routing decision (covers static + arbiter, records latency/decision_id; failure → `task.route.failed`).
 - [x] **M-obs stdlib bridge** (2026-07-19): все stdlib `logging` вызовы (~93 call-sites в ~16 модулях) маршрутизируются в obs OTel JSONL через `maestro/logging_bridge.py` (`ObsBridgeHandler` + `setup_logging` в cli.py); WARNING+ дублируются в stderr (замена lastResort). Vendored `_vendor/obs.py` не тронут.
-- [ ] **M3 — observability dashboards** (pending): separate project (backend/viz over the OTel JSONL or the existing `maestro/dashboard/` UI). @owner:andrei @id:m3-observability-dashboards
+- [ ] **M3 — observability dashboards** (pending): separate project (backend/viz over the OTel JSONL or the existing `maestro/dashboard/` UI). @owner:github:andrei-shtanakov @id:m3-observability-dashboards
 - [x] **M3 — W3C traceparent into the MCP JSON-RPC envelope** (2026-07-19, Maestro-side done): injection in `params._meta` on every `tools/call`; arbiter-side reading is the remaining half (handoff note in prograph-vault).
-- [ ] **Single async pytest plugin** (follow-up к фиксу R-05 2026-07-19): в тестах конкурируют pytest-asyncio (`asyncio_mode=auto`) и anyio-плагин — владелец `@pytest.mark.anyio`-теста зависит от порядка регистрации плагинов (uv 0.11.29 флипнул порядок в CI → cross-loop падения real-subprocess тестов). Точечный фикс: маркеры сняты в 3 real-subprocess файлах. Системно: стандартизироваться на одном плагине (anyio, по конвенции) и убрать pytest-asyncio. Trigger: следующий флип порядка или новые async-фикстуры с loop-bound состоянием. @owner:andrei @trigger:"следующий флип порядка плагинов или новые async-фикстуры с loop-bound состоянием" @id:single-async-pytest-plugin
+- [ ] **Single async pytest plugin** (follow-up к фиксу R-05 2026-07-19): в тестах конкурируют pytest-asyncio (`asyncio_mode=auto`) и anyio-плагин — владелец `@pytest.mark.anyio`-теста зависит от порядка регистрации плагинов (uv 0.11.29 флипнул порядок в CI → cross-loop падения real-subprocess тестов). Точечный фикс: маркеры сняты в 3 real-subprocess файлах. Системно: стандартизироваться на одном плагине (anyio, по конвенции) и убрать pytest-asyncio. Trigger: следующий флип порядка или новые async-фикстуры с loop-bound состоянием. @owner:github:andrei-shtanakov @trigger:"следующий флип порядка плагинов или новые async-фикстуры с loop-bound состоянием" @id:single-async-pytest-plugin
 
 ---
 
@@ -196,32 +198,32 @@
 
 ### Открытые follow-ups июльского трека
 
-- [ ] **Verifier: CHECK-констрейнт на `task_costs.execution_phase`** @owner:andrei @id:verifier-execution-phase-check-constraint
+- [ ] **Verifier: CHECK-констрейнт на `task_costs.execution_phase`** @owner:github:andrei-shtanakov @id:verifier-execution-phase-check-constraint
       Схемное ужесточение, требует rebuild таблицы. Отдельным маленьким PR — решение
       2026-07-26: три verifier-follow-up'а не бандлить в один.
-- [ ] **Verifier: envelope без usage не должен схлопываться в $0** @owner:andrei @id:verifier-envelope-no-usage-unknown
+- [ ] **Verifier: envelope без usage не должен схлопываться в $0** @owner:github:andrei-shtanakov @id:verifier-envelope-no-usage-unknown
       В `maestro costs` такая строка обязана оставаться UNKNOWN. Корректность.
-- [ ] **Verifier: кэш `load_catalog`** @owner:andrei @trigger:"замер показал реальную стоимость повторных load_catalog" @id:verifier-load-catalog-cache
+- [ ] **Verifier: кэш `load_catalog`** @owner:github:andrei-shtanakov @trigger:"замер показал реальную стоимость повторных load_catalog" @id:verifier-load-catalog-cache
       Перф; браться только после замера, не раньше.
-- [ ] **Verifier-docker: интеграционные и smoke-тесты не проверены против живого демона** @owner:andrei @trigger:"первый прогон с доступным docker-демоном (CI или локально)" @id:verifier-docker-live-daemon-tests
+- [ ] **Verifier-docker: интеграционные и smoke-тесты не проверены против живого демона** @owner:github:andrei-shtanakov @trigger:"первый прогон с доступным docker-демоном (CI или локально)" @id:verifier-docker-live-daemon-tests
       `tests/integration/test_verifier_docker_*.py` сейчас чисто скипаются без docker,
       то есть контейнерные ассерты не подтверждены ни разу.
-- [ ] **Verifier-docker: мелочи из леджера #110** @owner:andrei @id:verifier-docker-ledger-110-nits
+- [ ] **Verifier-docker: мелочи из леджера #110** @owner:github:andrei-shtanakov @id:verifier-docker-ledger-110-nits
       Коллизия имён `get_open_verification_handle` (ед.ч.) / `...handles` (мн.ч.) —
       сегодня предикаты состояний эквивалентны, новое состояние разойдётся молча;
       collection-time `docker info` probe на 10s в каждом прогоне сьюты; `docker pull`
       без таймаута.
-- [ ] **Distributed Execution Phase 3 — routing/registry/queues** @owner:andrei @id:distributed-execution-phase-3
+- [ ] **Distributed Execution Phase 3 — routing/registry/queues** @owner:github:andrei-shtanakov @id:distributed-execution-phase-3
       Сознательно отложено через все фазы 0…2c.
-- [ ] **Mode-1 remote: patch-collect** @owner:andrei @id:mode-1-remote-patch-collect
+- [ ] **Mode-1 remote: patch-collect** @owner:github:andrei-shtanakov @id:mode-1-remote-patch-collect
       Сегодня collect умеет только `scope_paths`.
-- [ ] **Полный именованный реестр `backends: {}`** + публикация образа `maestro-runner` @owner:andrei @id:named-backends-registry
-- [ ] **Хвост Phase 2b/2c** (детали — в `.superpowers/sdd/progress.md`) @owner:andrei @id:phase-2b-2c-tail
+- [ ] **Полный именованный реестр `backends: {}`** + публикация образа `maestro-runner` @owner:github:andrei-shtanakov @id:named-backends-registry
+- [ ] **Хвост Phase 2b/2c** (детали — в `.superpowers/sdd/progress.md`) @owner:github:andrei-shtanakov @id:phase-2b-2c-tail
       reap/recovery re-hold reconciliation; local not-started held-not-released;
       `SshBackend` scope ключуется по `include`, а не по `mode`; arbiter-outcome на
       collect-conflict; `mktemp -d` без таймаута в `can_run`; дедуп ветки
       `decode_transport_ref`+isolation между probe и GC.
-- [ ] **Stage B: ssh+docker dual-probe зеркало в `orchestrator.py`** @owner:andrei @trigger:"первый нелокальный бэкенд верификатора в Mode 2" @id:stage-b-ssh-docker-dual-probe
+- [ ] **Stage B: ssh+docker dual-probe зеркало в `orchestrator.py`** @owner:github:andrei-shtanakov @trigger:"первый нелокальный бэкенд верификатора в Mode 2" @id:stage-b-ssh-docker-dual-probe
       TODO стоит в коде; сегодня верификатор Mode-2 пинён на локальный бэкенд.
 
 ---
@@ -231,13 +233,13 @@
 > Источник: findings-maestro-2026-08 (kapelle S2). Все пять приняты под исходными
 > слагами; порядок исполнения: #121 → #125 + DB-docs → дизайн #122 → #124 → #123.
 
-- [x] **#121 preflight: подавить scope-overlap при упорядочивающем пути** (P1) @owner:andrei @id:preflight-overlap-depends-edge
+- [x] **#121 preflight: подавить scope-overlap при упорядочивающем пути** (P1) @owner:github:andrei-shtanakov @id:preflight-overlap-depends-edge
       Учитывать не только прямое `depends_on`, а любой упорядочивающий путь в DAG:
       при его наличии overlap — максимум info, без совета добавить уже существующее ребро.
       Сделано (PR #127, merge `3e4d148`): новая severity `info` в обеих ярусах
       (статическая эвристика + точное FS-пересечение), транзитивная достижимость
       `_ordered_pairs` (cycle-safe), `--strict` info не эскалирует; issue закрыт.
-- [x] **#122 scope gate: конвенция harness-owned paths** (P0 на проектирование) @owner:andrei @id:scope-gate-harness-owned-paths
+- [x] **#122 scope gate: конвенция harness-owned paths** (P0 на проектирование) @owner:github:andrei-shtanakov @id:scope-gate-harness-owned-paths
       spec-runner ≥2.15 коммитит `spec/.gitignore` → ex-post гейт шлёт зелёный
       workstream в NEEDS_REVIEW. Решение НЕ фиксировать заранее (whitelist / pre-created
       gitignore / spec-runner-side fix / baseline / content-aware / versioned
@@ -249,7 +251,7 @@
       fail-closed до создания worktree, scope gate не тронут. Дизайн:
       `docs/superpowers/specs/2026-08-05-spec-runner-version-gate-design.md`;
       issue закрыт. ⚠️ локальный spec-runner 2.15.0 требует апгрейда.
-- [x] **#123 честный знаменатель прогресса воркстрима** (P2) @owner:andrei @id:workstream-progress-honest-total
+- [x] **#123 честный знаменатель прогресса воркстрима** (P2) @owner:github:andrei-shtanakov @id:workstream-progress-honest-total
       Инварианты: финальный refresh перед DONE, невозможность «DONE 4/5», явное
       отображение skipped/no-op. Не заводить второй парсер maestro-tasks.md, если
       spec-runner может отдать устойчивый машинный JSON (counterpart: spec-runner#97).
@@ -259,7 +261,7 @@
       после генерации спеки, `_final_progress_refresh` перед терминальным переходом,
       метка `N/N done (K no-op)`; полностью display-only/fail-open; 17 тестов.
       Issue закрыт. ЭТИМ ЗАКРЫТ ВЕСЬ INBOX-ЦИКЛ #121–#125 (5/5).
-- [x] **#124 `maestro workstream-rework <id>`** (P1, отдельный feature-трек) @owner:andrei @id:workstream-rework-command
+- [x] **#124 `maestro workstream-rework <id>`** (P1, отдельный feature-трек) @owner:github:andrei-shtanakov @id:workstream-rework-command
       До реализации — описать state machine: допустимые исходные состояния, append-only
       evidence прошлой попытки, новый attempt/decomposition identity, транзакционный
       сброс, идемпотентность после сбоя, аудит причины/инициатора. Не скрытая
@@ -272,7 +274,7 @@
       seq-ключу), CLI `workstream-rework` + `workstream-resolve-ambiguity`,
       исчерпывающий READY-dispatch, колонка Reworks; 38 тестов по acceptance-чеклисту
       спеки. Issue закрыт.
-- [x] **#125 канон конфига для dual-mode репо (docs)** (P1) @owner:andrei @id:dual-mode-config-canon
+- [x] **#125 канон конфига для dual-mode репо (docs)** (P1) @owner:github:andrei-shtanakov @id:dual-mode-config-canon
       Mode-2 docs: project.yaml — SSOT, генерируемый `spec-runner.config.yaml` не
       трекается, для прямых spec-runner-запусков — локальная untracked-копия; указатель
       из warning `spec-runner-config-tracked`. Зафиксировать как текущее ограничение
@@ -285,7 +287,7 @@
 
 ## Входящие 2026-08, волна 2 (inbox #137, принят 2026-08-06)
 
-- [x] **#137 ex-post gate: pluggable `approver_cmd` hook** (P1, сначала дизайн-спека) @owner:andrei @id:expost-approver-cmd
+- [x] **#137 ex-post gate: pluggable `approver_cmd` hook** (P1, сначала дизайн-спека) @owner:github:andrei-shtanakov @id:expost-approver-cmd
       Хук-команда по образцу CommandVerifier: получает review-контекст
       `{workstream, phase, sha, reason, diff}`, возвращает вердикт по строгому
       run-keyed контракту (как verdict v2). PASS → `workstream-approve` с
@@ -334,7 +336,7 @@
 > post_pr_command → 6) дизайн service install после стабилизации автономных
 > операций.
 
-- [x] **Notification на PR_CREATED** (P1, маленький PR) @owner:andrei @id:notify-pr-created
+- [x] **Notification на PR_CREATED** (P1, маленький PR) @owner:github:andrei-shtanakov @id:notify-pr-created
       Событие и централизованный переход уже есть, PR URL сохранён — добавить
       `NotificationEvent` + строку в `WORKSTREAM_EFFECTS`. URL передавать
       структурированным полем / гарантированным payload-ом перехода, не
@@ -345,7 +347,7 @@
       (в `PR_CREATED` ведут три пути, уведомляет только тот, что реально
       создал PR; пустая строка от `_get_existing_pr_url` = отсутствие URL,
       фикс по Copilot-ревью). TDD, 246 смежных тестов зелёные.
-- [x] **Webhook-канал нотификаций** (P1, отдельный PR) @owner:andrei @id:webhook-notification-channel
+- [x] **Webhook-канал нотификаций** (P1, отдельный PR) @owner:github:andrei-shtanakov @id:webhook-notification-channel
       Конфиг обещает `webhook_url`/telegram-поля, runtime не даёт. Generic
       webhook: JSON schema/version, timeout, bounded retry; ошибка доставки
       non-blocking для оркестрации, но durable-visible; секреты не попадают
@@ -363,7 +365,7 @@
       durable outbox — возможный follow-up за тем же швом очереди.
       telegram-поля deprecated. httpx — прямая зависимость. Попутно:
       регенерация схем подобрала июльский дрейф VerifierConfig. 23+9 тестов.
-- [x] **`post_pr_command` — тонкий мост к spec-runner review-pr** (P2, после webhook и spec-runner#102) @owner:andrei @id:post-pr-command
+- [x] **`post_pr_command` — тонкий мост к spec-runner review-pr** (P2, после webhook и spec-runner#102) @owner:github:andrei-shtanakov @id:post-pr-command
       Maestro создаёт свои PR, но review-bot-циклом не владеет: отдельный
       opt-in хук на границе PR_CREATED, вызывающий resumable
       `spec-runner review-pr <PR>`. Не approver_cmd и не notify_cmd. Сейчас
@@ -393,7 +395,7 @@
       notification-события; 74 теста. На момент этого мержа трек «Нотификации
       и post-PR» был закрыт на 5 из 6 шагов — оставался дизайн service install
       (P3), закрытый следом (см. пункт ниже).
-- [x] **Дизайн `maestro service install`** (P3, после стабилизации автономных операций) @owner:andrei @id:service-install-design
+- [x] **Дизайн `maestro service install`** (P3, после стабилизации автономных операций) @owner:github:andrei-shtanakov @id:service-install-design
       Отдельный operational track, НЕ связывать с #137. Launchd/systemd-генератор
       сам по себе не решает: single-instance locking, resume после crash, stale
       worktrees, SQLite ownership, credentials, log rotation, recurring schedule
@@ -427,15 +429,15 @@
 > Источник: `../prograph-vault/authored/notes/2026-07-22-ideas-from-ai-repos-research.md`
 > Закрыто оттуда: #6 (#107), #7a (#92), #10 (#94), #25 (#97).
 
-- [ ] **Idea #1 — сериализуемый RunState** со schema-version, interruptions, approvals @owner:andrei @id:idea-1-serializable-runstate
+- [ ] **Idea #1 — сериализуемый RunState** со schema-version, interruptions, approvals @owner:github:andrei-shtanakov @id:idea-1-serializable-runstate
       Сначала отдельный discovery-проход: состояние Maestro уже живёт в SQLite, надо
       понять, что именно добавляет версионированный снапшот сверху.
-- [ ] **Idea #3 — семафорный dispatch и лимиты конкурентности** подзадач @owner:andrei @id:idea-3-semaphore-dispatch
+- [ ] **Idea #3 — семафорный dispatch и лимиты конкурентности** подзадач @owner:github:andrei-shtanakov @id:idea-3-semaphore-dispatch
       Изолированный контекст на файл-бандл (default 8, BatchStrategy по языку/директории).
-- [ ] **Idea #8 — guardrails с tripwire** на input/output/tool-вызовы @owner:andrei @id:idea-8-guardrails-tripwire
+- [ ] **Idea #8 — guardrails с tripwire** на input/output/tool-вызовы @owner:github:andrei-shtanakov @id:idea-8-guardrails-tripwire
       Сначала fit-спайк: какие границы Maestro реально наблюдает — иначе это, как и
       отклонённый #17, окажется заботой харнесса, а не оркестратора.
-- [ ] **Idea #21 — handover-блоки с обязательной секцией Test Result** @owner:andrei @id:idea-21-handover-blocks
+- [ ] **Idea #21 — handover-блоки с обязательной секцией Test Result** @owner:github:andrei-shtanakov @id:idea-21-handover-blocks
       Оркестратор валидирует структуру и требует переделать. Лёгкая структурная
       верификация свободного текста без JSON-схем.
 - ~~**Idea #17 — architect/editor split**~~ — **отклонено 2026-07-23**: aider уже
@@ -447,7 +449,7 @@
 
 ## Кросс-репные watch-items
 
-- [ ] **`executor-config v0-provisional` висит без потребителя** @owner:andrei @blocked_by:dispatcher#DESIGN-301 @id:specrunnerconfig-passthrough
+- [ ] **`executor-config v0-provisional` висит без потребителя** @owner:github:andrei-shtanakov @blocked_by:dispatcher#DESIGN-301 @id:specrunnerconfig-passthrough
       dispatcher запинил `contracts/executor-config/v0-provisional/schema.json`
       (DESIGN-301), и единственная ссылка на него во всей экосистеме — наш план-док
       `docs/superpowers/plans/2026-07-17-specrunnerconfig-passthrough.md`. Либо довести
@@ -483,16 +485,16 @@ ls .github/workflows/
 
 ## Catalog distribution follow-ups (ADR-ECO-003b)
 
-- [ ] XDG default catalog path ($XDG_CONFIG_HOME/<eco>/agents-catalog.toml) once the @owner:andrei @blocked_by:atp-platform#eco-namespace @trigger:"<eco> namespace ратифицирован" @id:xdg-catalog-path
+- [ ] XDG default catalog path ($XDG_CONFIG_HOME/<eco>/agents-catalog.toml) once the @owner:github:andrei-shtanakov @blocked_by:atp-platform#eco-namespace @trigger:"<eco> namespace ратифицирован" @id:xdg-catalog-path
       <eco> namespace is ratified; extend `resolve_catalog_path`.
 - [x] `maestro models init | list | discover | update` CLI (ADR-003b D3) (closed by feat/models-cli).
-- [ ] Shared `CLAUDE_MODEL` / `CODEX_MODEL` cross-tool override layer. @owner:andrei @id:shared-model-override-layer
-- [ ] `default = true` field in the catalog `[[agents]]` schema to disambiguate the @owner:atp @blocked_by:atp-platform#agents-catalog-default-flag @id:agents-catalog-default-flag
+- [ ] Shared `CLAUDE_MODEL` / `CODEX_MODEL` cross-tool override layer. @owner:github:andrei-shtanakov @id:shared-model-override-layer
+- [ ] `default = true` field in the catalog `[[agents]]` schema to disambiguate the @owner:repo:atp-platform @blocked_by:atp-platform#agents-catalog-default-flag @id:agents-catalog-default-flag
       A/B window (cross-repo, PM-owned) — removes the `HarnessModelUnresolved`
       ambiguity raise.
-- [ ] Extract the loader to a shared PyPI lib with a cross-reader behavioral @owner:andrei @id:catalog-loader-shared-lib
+- [ ] Extract the loader to a shared PyPI lib with a cross-reader behavioral @owner:github:andrei-shtanakov @id:catalog-loader-shared-lib
       conformance test (precedence + alias resolution across Maestro / ATP / arbiter).
-- [ ] `maestro models`: detect the same observed model id under TWO vendors in @owner:andrei @id:models-duplicate-vendor-detection
+- [ ] `maestro models`: detect the same observed model id under TWO vendors in @owner:github:andrei-shtanakov @id:models-duplicate-vendor-detection
       one manifest — today it renders an unparseable Plane-1 block (two
       `[models."id"]` tables); update refuses safely via the validation gate
       (cryptic tomllib message), discover --out writes the broken block while
@@ -526,14 +528,14 @@ ls .github/workflows/
       (`harness_of_agent_id(task.routed_agent_type)` fallback) at the same
       call site.
       (closed by feat/cost-from-log)
-- [ ] Recovery-path reported cost: `_reconstruct_outcome` (recovery.py) always @owner:andrei @id:recovery-reported-cost
+- [ ] Recovery-path reported cost: `_reconstruct_outcome` (recovery.py) always @owner:github:andrei-shtanakov @id:recovery-reported-cost
       reports cost_usd=None even when a persisted TaskCost row with
       reported_cost_usd exists for the crashed attempt — honest-unknown, but
       real dollars the DB already holds are lost on crash-recovery reports.
-- [ ] Responder `cost or None` (spawner_responder.py) collapses a genuine @owner:andrei @trigger:"free/local open-модели реально бегут под opencode" @id:responder-cost-none-collapse
+- [ ] Responder `cost or None` (spawner_responder.py) collapses a genuine @owner:github:andrei-shtanakov @trigger:"free/local open-модели реально бегут под opencode" @id:responder-cost-none-collapse
       reported $0.00 into None ("confirmed free" reads as "unknown") — becomes
       real when free/local open models run under opencode.
-- [ ] Codex cost-from-log (research): `codex exec` writes plain text (no @owner:andrei @id:codex-cost-from-log
+- [ ] Codex cost-from-log (research): `codex exec` writes plain text (no @owner:github:andrei-shtanakov @id:codex-cost-from-log
       `--output-format json`); `parse_log` routes CODEX through the Claude JSON
       parser, which extracts nothing. Investigate whether codex can emit
       structured usage/cost (tokens + cost) and, if so, add a dedicated codex
@@ -586,7 +588,7 @@ ls .github/workflows/
 
 ## mcp SDK v2 migration (deferred, blocked on upstream)
 
-- [ ] mcp SDK v2: blocked on upstream — fastmcp (≤3.4.5) pins mcp<2.0. @trigger:"fastmcp release notes announce mcp>=2 support"
+- [ ] mcp SDK v2: blocked on upstream — fastmcp (≤3.4.5) pins mcp<2.0. @trigger:"fastmcp release notes announce mcp>=2 support" @id:mcp-sdk-v2-migration
       Then: lift both pins together, re-run test_mcp_server.py, and check the
       fastmcp 3→v2-based changelog for Client/transport API changes.
       Context: prograph-vault/authored/notes/2026-08-04-mcp-v2-migration-plan.md
