@@ -22,13 +22,15 @@ from typing import Literal
 
 
 __all__ = [
-    "DEFAULT_REQUIRED_ENV",
+    "CREDENTIAL_ENV_BY_HARNESS",
+    "DEFAULT_CREDENTIAL_STORES",
     "ENV_FILE_MODE",
     "PreflightError",
     "PreflightResult",
     "UnitSpec",
     "ensure_env_file",
     "preflight_environment",
+    "probe_environment",
     "render_launchd",
     "render_systemd",
     "unit_name",
@@ -36,14 +38,29 @@ __all__ = [
 
 ENV_FILE_MODE = 0o600
 
-# Credentials an unattended run needs, by harness. A scheduled process
-# has no shell profile and may not reach a login keychain, so these must
-# be resolvable from the environment or the service env file.
-CREDENTIALS_BY_HARNESS = {
+# Maestro itself never calls a model API — it spawns harness CLIs, and
+# each one authenticates itself. So there is **no** blanket credential
+# requirement: an API key in the environment and the CLI's own credential
+# store are equally valid, and demanding the former would refuse a
+# perfectly working `claude` login.
+#
+# (The one place Maestro really needs `ANTHROPIC_API_KEY` is the Mode-1
+# Docker verifier, where the judge runs with `inherit_env=False` and the
+# key must be passed explicitly — that path has its own runtime
+# preflight in `maestro/verifier/preflight.py` and is out of scope here.)
+CREDENTIAL_ENV_BY_HARNESS = {
     "claude_code": ["ANTHROPIC_API_KEY"],
     "codex_cli": ["OPENAI_API_KEY"],
 }
-DEFAULT_REQUIRED_ENV = CREDENTIALS_BY_HARNESS["claude_code"]
+
+# Where those CLIs keep their own credentials when the user logged in
+# instead of exporting a key. Presence is what we can honestly check;
+# whether a *background* session can read it is the keychain caveat we
+# document rather than pretend to verify.
+DEFAULT_CREDENTIAL_STORES = [
+    Path.home() / ".claude.json",
+    Path.home() / ".claude",
+]
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -207,22 +224,26 @@ def _env_file_keys(env_file: Path | None) -> set[str]:
     return keys
 
 
-def preflight_environment(
+def probe_environment(
     *,
     harness_binaries: list[str],
     required_env: list[str] | None = None,
     env_file: Path | None = None,
-) -> PreflightResult:
-    """Resolve binaries and verify credentials — refuse, never warn.
+    credential_stores: list[Path] | None = None,
+) -> tuple[PreflightResult, list[str]]:
+    """Resolve what it can and report what it cannot — never raises.
 
-    A unit that cannot authenticate is worse than no unit: it fails
-    silently at 03:00 and the operator finds out days later.
+    `--dry-run` previews a unit, so an incomplete environment must not
+    stop it from rendering; `preflight_environment` is the strict
+    wrapper that install uses.
 
-    Raises:
-        PreflightError: a harness binary is not on PATH, or a required
-            credential is neither in the environment nor in the env file.
+    Credentials are satisfied by *either* an environment/env-file entry
+    *or* the harness CLI's own credential store — Maestro spawns those
+    CLIs and never calls a model API itself, so a `claude` login is as
+    valid as an exported key.
     """
     resolved: dict[str, str] = {}
+    problems: list[str] = []
     missing: list[str] = []
     for name in harness_binaries:
         found = shutil.which(name)
@@ -231,25 +252,31 @@ def preflight_environment(
         else:
             resolved[name] = found
     if missing:
-        msg = (
+        problems.append(
             f"not on PATH: {', '.join(missing)}. A scheduled unit runs without "
             "your shell profile, so every harness must resolve to an absolute "
             "path at install time. Install them, or run `maestro service "
             "install` from a shell where they resolve."
         )
-        raise PreflightError(msg)
 
-    available = set(os.environ) | _env_file_keys(env_file)
-    absent = [key for key in (required_env or []) if key not in available]
-    if absent:
-        target = env_file or Path("~/.maestro/service.env")
-        msg = (
-            f"missing credentials for an unattended run: {', '.join(absent)}. "
-            f"Add them to {target} (mode 0600) — a scheduled run gets no "
-            "shell profile, and a keychain item may be unreachable from a "
-            "background session."
+    if required_env:
+        available = set(os.environ) | _env_file_keys(env_file)
+        absent = [key for key in required_env if key not in available]
+        stores = (
+            DEFAULT_CREDENTIAL_STORES
+            if credential_stores is None
+            else credential_stores
         )
-        raise PreflightError(msg)
+        has_store = any(store.exists() for store in stores)
+        if absent and not has_store:
+            target = env_file or Path("~/.maestro/service.env")
+            problems.append(
+                f"no usable credentials for an unattended run: neither "
+                f"{', '.join(absent)} nor a harness credential store "
+                f"({', '.join(str(s) for s in stores)}). Log the harness CLI "
+                f"in, or add the key to {target} (mode 0600) — a scheduled "
+                "run gets no shell profile."
+            )
 
     directories: list[str] = []
     for found in resolved.values():
@@ -259,7 +286,33 @@ def preflight_environment(
     for fallback in ("/usr/local/bin", "/usr/bin", "/bin"):
         if fallback not in directories:
             directories.append(fallback)
-    return PreflightResult(
+    result = PreflightResult(
         maestro_bin=resolved.get("maestro", "maestro"),
         path=":".join(directories),
     )
+    return result, problems
+
+
+def preflight_environment(
+    *,
+    harness_binaries: list[str],
+    required_env: list[str] | None = None,
+    env_file: Path | None = None,
+    credential_stores: list[Path] | None = None,
+) -> PreflightResult:
+    """Strict probe for install: refuse rather than write a broken unit.
+
+    Raises:
+        PreflightError: a harness binary is not on PATH, or no credential
+            source (environment, env file, or harness credential store)
+            can be found for a required key.
+    """
+    result, problems = probe_environment(
+        harness_binaries=harness_binaries,
+        required_env=required_env,
+        env_file=env_file,
+        credential_stores=credential_stores,
+    )
+    if problems:
+        raise PreflightError(" ".join(problems))
+    return result

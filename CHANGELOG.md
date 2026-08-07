@@ -25,6 +25,13 @@
   `docs/superpowers/specs/2026-08-06-service-install-design.md`.
 
 ### Changed
+- **`maestro service install` no longer demands an API key the normal
+  path never reads.** Maestro spawns harness CLIs and never calls a
+  model API itself, so a credential is satisfied by *either* an exported
+  key *or* the CLI's own login store (`~/.claude.json`); only the
+  absence of both is refused. Previously a blanket `ANTHROPIC_API_KEY`
+  requirement rejected working `claude`-login setups. `--dry-run` now
+  renders the unit and reports problems instead of blocking the preview.
 - **`maestro review-pr` deduplicates its notifications** by
   `(repo, pr_number, head_sha, outcome)`. Repeated scheduled runs over
   an unchanged PR are now silent; a new review-bot round moves the head

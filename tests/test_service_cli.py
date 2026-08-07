@@ -155,6 +155,53 @@ def test_install_writes_a_launchd_unit(
     assert parsed["ProgramArguments"][1:3] == ["service", "run"]
 
 
+def test_dry_run_previews_even_with_a_broken_environment(
+    project_yaml: Path, db_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A preview is not an install: preflight problems are reported, not fatal."""
+    from maestro.service import units
+
+    monkeypatch.setattr(units.shutil, "which", lambda _name: None)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    units_dir = tmp_path / "LaunchAgents"
+    empty_env = tmp_path / "empty.env"
+    empty_env.write_text("# none\n")
+    with (
+        patch("maestro.cli.platform_units_dir", return_value=units_dir),
+        patch("maestro.cli.DEFAULT_SERVICE_ENV_FILE", empty_env),
+        patch("maestro.service.units.DEFAULT_CREDENTIAL_STORES", [tmp_path / "no"]),
+    ):
+        result = _run(
+            project_yaml, db_path, "install", "--platform", "launchd", "--dry-run"
+        )
+    assert result.exit_code == 0
+    assert "com.maestro.demo.orchestrate" in result.output  # the preview rendered
+    assert "Would refuse" in result.output  # ...with the problems named
+    assert not units_dir.exists()
+
+
+def test_install_accepts_a_harness_credential_store(
+    project_yaml: Path, db_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A logged-in `claude` CLI is a working setup — install must not
+    demand an API key the normal path never reads."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    units_dir = tmp_path / "LaunchAgents"
+    empty_env = tmp_path / "empty.env"
+    empty_env.write_text("# none\n")
+    store = tmp_path / ".claude.json"
+    store.write_text("{}")
+    with (
+        patch("maestro.cli.platform_units_dir", return_value=units_dir),
+        patch("maestro.cli.DEFAULT_SERVICE_ENV_FILE", empty_env),
+        patch("maestro.service.units.DEFAULT_CREDENTIAL_STORES", [store]),
+    ):
+        result = _run(
+            project_yaml, db_path, "install", "--platform", "launchd", "--no-load"
+        )
+    assert result.exit_code == 0
+
+
 def test_install_dry_run_writes_nothing(
     project_yaml: Path, db_path: Path, tmp_path: Path
 ) -> None:
@@ -220,6 +267,7 @@ def test_install_refuses_when_credentials_are_missing(
     with (
         patch("maestro.cli.platform_units_dir", return_value=units),
         patch("maestro.cli.DEFAULT_SERVICE_ENV_FILE", empty_env),
+        patch("maestro.service.units.DEFAULT_CREDENTIAL_STORES", [tmp_path / "no"]),
     ):
         result = _run(
             project_yaml, db_path, "install", "--platform", "launchd", "--no-load"
