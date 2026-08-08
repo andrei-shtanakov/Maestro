@@ -422,6 +422,26 @@
       (repo, pr, head_sha, outcome); ~93 теста. **Этим закрыт весь трек
       «Нотификации и post-PR» — 6/6.**
 
+## Входящие 2026-08, волна 3 (inbox #160, принят 2026-08-08)
+
+- [ ] **#160 gate-catalog-for-ws006: канонические gate_id/obligation в gate_verdicts.jsonl** (P2, не срочно) @owner:github:andrei-shtanakov @id:gate-catalog-for-ws006
+      steward#50 (master `c26ca38`) доставил SSOT стабильных gate_id —
+      `profiles/gate-catalog.yaml` (v1: 19 active/quality + GC-APPROVAL-MISSING;
+      словарь `obligation: quality|approval`). Просьба steward: записи нашего
+      `gate_verdicts.jsonl` должны ссылаться на канонические gate_id и словарь
+      каталога; каталог завендорить пиненой копией (две гарантии —
+      copy-integrity / upstream-drift — раздельно). Фактическое состояние
+      (уточнено при принятии, отражено в комментарии к issue): триггер «старт
+      WS-006 M-1» уже сработал — писатель живёт с gates v1.0–1.3 как внутренний
+      контракт `maestro.gate-verdict-record/v1` (`maestro/gates.py`); наш
+      словарь `mandatory|advisory` — ось enforcement, не интент, и наши
+      gate_id (`steward.risk_classify_*`, `human.owner_approval`,
+      `maestro.validate_strict`) вне каталога GC-*; вендоренной steward-схемы
+      `contracts/gate-verdicts/v1` у нас нет. Работа: согласовать со steward
+      маппинг словарей (возможно, два поля, а не замена), завендорить каталог,
+      привести писатель к каноническим id — без потери schema-дискриминатора
+      (approver spec §7.3).
+
 ---
 
 ## Бэклог идей из research-дайджеста (2026-07-22)
