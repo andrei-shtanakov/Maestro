@@ -449,12 +449,15 @@
 
 ## Кросс-репные watch-items
 
-- [ ] **`executor-config v0-provisional` висит без потребителя** @owner:github:andrei-shtanakov @blocked_by:dispatcher#DESIGN-301 @id:specrunnerconfig-passthrough
+- [ ] **`executor-config v0-provisional` висит без потребителя** @owner:github:andrei-shtanakov @id:specrunnerconfig-passthrough
       dispatcher запинил `contracts/executor-config/v0-provisional/schema.json`
       (DESIGN-301), и единственная ссылка на него во всей экосистеме — наш план-док
       `docs/superpowers/plans/2026-07-17-specrunnerconfig-passthrough.md`. Либо довести
       passthrough до реального потребителя, либо явно пометить контракт отложенным,
-      чтобы пин не висел зомби (рекомендация статуса 2026-07-24).
+      чтобы пин не висел зомби (рекомендация статуса 2026-07-24). Обратный blocker на
+      dispatcher снят: контракт уже опубликован, а его
+      `todo://dispatcher/executor-config-consumer` сам ждёт этот пункт Maestro;
+      канонизация прежней ссылки создала бы ложный цикл вместо зависимости.
 
 ---
 
