@@ -131,7 +131,7 @@
 - [ ] **R-07 prereq (GIN index)**: GIN index on `benchmark_runs.per_task` jsonb. Trigger: when R-07 starts writing SQL filters on per_task. @owner:repo:arbiter @blocked_by:arbiter#R-07 @trigger:"R-07 начинает писать SQL-фильтры по per_task" @id:r-07-prereq-gin-index
 - [ ] **R-07 prereq (normalize)**: normalize `benchmark_task_results` table (migration from jsonb blob). Trigger: same as GIN — formal query demand. @owner:repo:arbiter @blocked_by:arbiter#R-07 @trigger:"тот же формальный запрос, что у GIN" @id:r-07-prereq-normalize
 - [ ] **R-07 prereq (retention)**: TTL / archive policy for `benchmark_runs`. Trigger: table > 10k rows OR > 1 GB total JSON blobs. @owner:repo:arbiter @trigger:"benchmark_runs > 10k строк ИЛИ > 1 GB JSON" @id:r-07-prereq-retention
-- [ ] **R-14**: vendored `arbiter_client.py` → standalone PyPI `arbiter-py` package. M4 enlarged vendor surface. @owner:repo:arbiter @blocked_by:arbiter#arbiter-py @id:r-14
+- [ ] **R-14**: vendored `arbiter_client.py` → standalone PyPI `arbiter-py` package. M4 enlarged vendor surface. @owner:repo:arbiter @trigger:"arbiter публикует standalone arbiter-py package" @id:r-14
 - [ ] **Unscheduled — outbox**: persistent outbox + background retry for benchmark report. Trigger: if fire-and-forget shows real CI churn. @owner:github:andrei-shtanakov @trigger:"fire-and-forget даёт реальный CI-churn" @id:outbox-persistent-retry
 - [ ] **Unscheduled — arbiter-initiated benchmark**: outgoing benchmark trigger from arbiter ("router uncertain → run benchmark"). From design open question #2. @owner:repo:arbiter @id:arbiter-initiated-benchmark
 - [ ] **M5 / multi-tenant auth**: service-account ATP token for CI; multi-tenant arbiter auth as separate ticket if arbiter ever leaves subprocess trust model. @owner:repo:atp-platform @trigger:"arbiter выходит за subprocess-trust-модель" @id:m5-multi-tenant-auth
@@ -488,11 +488,11 @@ ls .github/workflows/
 
 ## Catalog distribution follow-ups (ADR-ECO-003b)
 
-- [ ] XDG default catalog path ($XDG_CONFIG_HOME/<eco>/agents-catalog.toml) once the @owner:github:andrei-shtanakov @blocked_by:atp-platform#eco-namespace @trigger:"<eco> namespace ратифицирован" @id:xdg-catalog-path
+- [ ] XDG default catalog path ($XDG_CONFIG_HOME/<eco>/agents-catalog.toml) once the @owner:github:andrei-shtanakov @trigger:"<eco> namespace ратифицирован" @id:xdg-catalog-path
       <eco> namespace is ratified; extend `resolve_catalog_path`.
 - [x] `maestro models init | list | discover | update` CLI (ADR-003b D3) (closed by feat/models-cli).
 - [ ] Shared `CLAUDE_MODEL` / `CODEX_MODEL` cross-tool override layer. @owner:github:andrei-shtanakov @id:shared-model-override-layer
-- [ ] `default = true` field in the catalog `[[agents]]` schema to disambiguate the @owner:repo:atp-platform @blocked_by:atp-platform#agents-catalog-default-flag @id:agents-catalog-default-flag
+- [ ] `default = true` field in the catalog `[[agents]]` schema to disambiguate the @owner:repo:atp-platform @trigger:"atp-platform catalog schema добавляет default=true" @id:agents-catalog-default-flag
       A/B window (cross-repo, PM-owned) — removes the `HarnessModelUnresolved`
       ambiguity raise.
 - [ ] Extract the loader to a shared PyPI lib with a cross-reader behavioral @owner:github:andrei-shtanakov @id:catalog-loader-shared-lib
