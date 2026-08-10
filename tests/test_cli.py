@@ -1552,6 +1552,11 @@ workstreams:
         not reveal whether that class escalated. A bug report arrived from the
         disputatio pilot (#163) claiming exactly that it did not; it did not
         reproduce, and this test pins down why.
+
+        An exit code alone would be weak evidence — `--strict` exits 1 on
+        *any* warning, so the assertion has to attribute that 1 to this
+        class. Hence the third run: creating the file the glob was waiting
+        for is the only change, and it flips `--strict` back to green.
         """
         repo = self._make_repo(tmp_path)
         config_file = self._write_project_yaml(
@@ -1569,11 +1574,21 @@ workstreams:
 
         assert "scope-no-match" in lenient.output, lenient.output
         assert lenient.exit_code == 0, "a warning must not block without --strict"
+        assert "scope-no-match" in strict.output, strict.output
         assert strict.exit_code == 1, "--strict must escalate scope-no-match"
 
-    def test_no_fs_removes_the_filesystem_warning_class(
-        self, tmp_path: Path
-    ) -> None:
+        (repo / "src" / "not-created-yet").mkdir(parents=True)
+        (repo / "src" / "not-created-yet" / "main.py").write_text("x")
+        now_matching = runner.invoke(app, ["validate", str(config_file), "--strict"])
+
+        assert "scope-no-match" not in now_matching.output, now_matching.output
+        assert now_matching.exit_code == 0, (
+            "with the glob satisfied, --strict has nothing left to escalate — "
+            "so the exit 1 above belongs to scope-no-match, not to some other "
+            "warning this config carries"
+        )
+
+    def test_no_fs_removes_the_filesystem_warning_class(self, tmp_path: Path) -> None:
         """`--no-fs` does not escalate more gently — it drops the fs tier.
 
         The consequence is easy to miss and matters in CI: `--strict --no-fs`
