@@ -1540,6 +1540,30 @@ class ExecutorState(BaseModel):
     total_failed: int = Field(
         default=0, ge=0, description="Total permanently failed tasks"
     )
+    last_run_stop_reason: str | None = Field(
+        default=None,
+        description=(
+            "spec-runner's own reason for ending the last run "
+            "(`task_failed_stop`, `blocked_after_skip`, `state_spec_mismatch`, "
+            "…), or None when the executor recorded none"
+        ),
+    )
+    last_run_stop_detail: str | None = Field(
+        default=None,
+        description="Free-form detail accompanying `last_run_stop_reason`",
+    )
+
+    @field_validator("last_run_stop_reason", "last_run_stop_detail")
+    @classmethod
+    def _empty_stop_field_is_absent(cls, v: str | None) -> str | None:
+        """An empty reason is no reason — normalize `""` to None.
+
+        Placed on the field rather than in the SQLite loader so both on-disk
+        formats agree: the legacy JSON path builds this model straight from
+        `model_validate`, and a falsy-but-present value invites consumers to
+        branch on a reason that carries no information.
+        """
+        return v or None
 
     @property
     def total(self) -> int:

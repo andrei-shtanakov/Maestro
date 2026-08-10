@@ -182,6 +182,43 @@ class TestReadExecutorStatePrefixed:
 
 
 # ---------------------------------------------------------------------------
+# Stop-reason field semantics (shared by both on-disk formats)
+# ---------------------------------------------------------------------------
+
+
+class TestStopReasonNormalization:
+    """`""` means "no reason recorded", whichever path built the state.
+
+    The rule belongs to the field rather than to the SQLite loader: the legacy
+    JSON path constructs `ExecutorState` straight from `model_validate`, so a
+    loader-only check would let the two formats disagree about the same value.
+    """
+
+    def test_empty_stop_reason_normalizes_to_none(self) -> None:
+        state = ExecutorState(last_run_stop_reason="", last_run_stop_detail="")
+
+        assert state.last_run_stop_reason is None
+        assert state.last_run_stop_detail is None
+
+    def test_legacy_json_empty_stop_reason_is_absent(self, tmp_path: Path) -> None:
+        spec_dir = tmp_path / "spec"
+        spec_dir.mkdir()
+        (spec_dir / JSON_STATE_FILENAME).write_text(
+            json.dumps({"tasks": {}, "last_run_stop_reason": ""})
+        )
+
+        state = read_executor_state(spec_dir)
+
+        assert state is not None
+        assert state.last_run_stop_reason is None
+
+    def test_real_stop_reason_is_untouched(self) -> None:
+        state = ExecutorState(last_run_stop_reason="state_spec_mismatch")
+
+        assert state.last_run_stop_reason == "state_spec_mismatch"
+
+
+# ---------------------------------------------------------------------------
 # SQLite path (spec-runner 2.0+)
 # ---------------------------------------------------------------------------
 
@@ -191,9 +228,14 @@ def _build_sqlite_state(
     *,
     tasks: list[tuple[str, str, str | None, str | None]],
     attempts: list[tuple[str, str, int, float, str | None, str | None, str | None]],
-    meta: dict[str, int],
+    meta: dict[str, int | str | None],
 ) -> None:
-    """Create a SQLite state file matching spec-runner 2.0's schema."""
+    """Create a SQLite state file matching spec-runner 2.0's schema.
+
+    `meta` values are written as the TEXT column holds them: integers become
+    their decimal string, strings go in verbatim, and `None` stays SQL NULL —
+    all three occur in a real `executor_meta` table.
+    """
     conn = sqlite3.connect(str(path))
     try:
         conn.executescript(
@@ -235,7 +277,7 @@ def _build_sqlite_state(
         )
         conn.executemany(
             "INSERT INTO executor_meta (key, value) VALUES (?, ?)",
-            [(k, str(v)) for k, v in meta.items()],
+            [(k, None if v is None else str(v)) for k, v in meta.items()],
         )
         conn.commit()
     finally:
@@ -277,6 +319,111 @@ class TestReadExecutorStateSQLite:
         assert state.total_completed == 1
         assert state.tasks["t-1"].attempts[0].duration_seconds == 5.5
         assert state.tasks["t-2"].attempts[0].error_code == "RATE_LIMIT"
+
+    def test_stop_reason_survives_alongside_integer_counters(
+        self, tmp_path: Path
+    ) -> None:
+        """spec-runner's own reason for ending a run must reach Maestro (#169).
+
+        `executor_meta` is one TEXT key-value table carrying two unrelated
+        kinds of value: integer counters and free-form strings. The loader
+        used to cast every row with `int()` and swallow the failure, so
+        `last_run_stop_reason` / `last_run_stop_detail` were dropped in
+        silence — the pilot could not tell "a task failed and we stopped"
+        from "everything completed" without parsing logs.
+
+        Both halves are asserted together on purpose: preserving the strings
+        must not cost the counters their integer typing.
+        """
+        spec_dir = tmp_path / "spec"
+        spec_dir.mkdir()
+        _build_sqlite_state(
+            spec_dir / SQLITE_STATE_FILENAME,
+            tasks=[
+                ("t-1", "success", "2026-08-10T00:00:00", "2026-08-10T00:01:00"),
+                ("t-2", "failed", "2026-08-10T00:01:00", None),
+            ],
+            attempts=[],
+            meta={
+                "consecutive_failures": 1,
+                "total_completed": 1,
+                "total_failed": 1,
+                "last_run_stop_reason": "task_failed_stop",
+                "last_run_stop_detail": "t-2 exhausted retries",
+            },
+        )
+
+        state = read_executor_state(spec_dir)
+
+        assert state is not None
+        assert state.last_run_stop_reason == "task_failed_stop"
+        assert state.last_run_stop_detail == "t-2 exhausted retries"
+        assert state.consecutive_failures == 1
+        assert state.total_completed == 1
+        assert state.total_failed == 1
+
+    def test_numeric_looking_stop_detail_is_kept_verbatim(self, tmp_path: Path) -> None:
+        """A stop detail that parses as an integer is still text.
+
+        This is why the loader keys off the column name rather than probing
+        the value: "3" is a perfectly good detail, and a parse-first loader
+        would file it under the counters and lose it exactly as before.
+        """
+        spec_dir = tmp_path / "spec"
+        spec_dir.mkdir()
+        _build_sqlite_state(
+            spec_dir / SQLITE_STATE_FILENAME,
+            tasks=[("t-1", "pending", None, None)],
+            attempts=[],
+            meta={
+                "last_run_stop_reason": "blocked_after_skip",
+                "last_run_stop_detail": "3",
+            },
+        )
+
+        state = read_executor_state(spec_dir)
+
+        assert state is not None
+        assert state.last_run_stop_detail == "3"
+
+    def test_absent_stop_reason_reads_as_none(self, tmp_path: Path) -> None:
+        """Older spec-runners record no stop reason at all — that is not an error."""
+        spec_dir = tmp_path / "spec"
+        spec_dir.mkdir()
+        _build_sqlite_state(
+            spec_dir / SQLITE_STATE_FILENAME,
+            tasks=[("t-1", "success", None, None)],
+            attempts=[],
+            meta={"consecutive_failures": 0, "total_completed": 1, "total_failed": 0},
+        )
+
+        state = read_executor_state(spec_dir)
+
+        assert state is not None
+        assert state.last_run_stop_reason is None
+        assert state.last_run_stop_detail is None
+
+    def test_null_and_empty_stop_reason_read_as_absent(self, tmp_path: Path) -> None:
+        """A NULL or empty value is absence, not a stop reason of `""`.
+
+        Same call as the notification URL precedent: a falsy-but-present
+        value invites consumers to branch on a reason that carries no
+        information.
+        """
+        spec_dir = tmp_path / "spec"
+        spec_dir.mkdir()
+        _build_sqlite_state(
+            spec_dir / SQLITE_STATE_FILENAME,
+            tasks=[("t-1", "success", None, None)],
+            attempts=[],
+            meta={"last_run_stop_reason": None, "last_run_stop_detail": ""},
+        )
+
+        state = read_executor_state(spec_dir)
+
+        assert state is not None
+        assert state.last_run_stop_reason is None
+        assert state.last_run_stop_detail is None
 
     def test_sqlite_preferred_over_json(self, tmp_path: Path) -> None:
         """When both files exist, SQLite wins (spec-runner's own convention)."""
