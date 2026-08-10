@@ -91,6 +91,16 @@ uv run maestro workspaces                # List active worktrees
   treats warnings as errors (exit 1), `--no-fs` skips filesystem access for a
   deterministic check with no real repo required.
 
+Findings come in three severities. `error` always blocks. `warning` blocks only
+under `--strict` — every warning class, including `scope-no-match`. `info` never
+blocks, even under `--strict`.
+
+`--no-fs` is not a milder `--strict`: it removes the filesystem tier entirely,
+so the warnings that tier produces (`scope-no-match`, repo sanity) are never
+raised at all. A config that fails `--strict` can therefore pass
+`--strict --no-fs` — the two check different amounts, and the combined CI form
+above is the weaker of the two by design.
+
 `maestro orchestrate` also runs this preflight automatically as a fail-fast
 gate before spawning any workstream.
 

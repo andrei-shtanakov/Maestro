@@ -1541,6 +1541,68 @@ workstreams:
         result = runner.invoke(app, ["validate", str(config_file), "--strict"])
         assert result.exit_code == 1
 
+    def test_scope_no_match_warnings_escalate_under_strict(
+        self, tmp_path: Path
+    ) -> None:
+        """`scope-no-match` is a warning too, and `--strict` escalates it.
+
+        The contract was only covered for `scope-empty`, which left room for
+        doubt: greenfield globs over not-yet-created files produce
+        `scope-no-match`, and the summary line ("0 errors, N warnings") does
+        not reveal whether that class escalated. A bug report arrived from the
+        disputatio pilot (#163) claiming exactly that it did not; it did not
+        reproduce, and this test pins down why.
+        """
+        repo = self._make_repo(tmp_path)
+        config_file = self._write_project_yaml(
+            tmp_path,
+            repo,
+            """  - id: a
+    title: A
+    description: d
+    scope: ["src/not-created-yet/**"]
+""",
+        )
+
+        lenient = runner.invoke(app, ["validate", str(config_file)])
+        strict = runner.invoke(app, ["validate", str(config_file), "--strict"])
+
+        assert "scope-no-match" in lenient.output, lenient.output
+        assert lenient.exit_code == 0, "a warning must not block without --strict"
+        assert strict.exit_code == 1, "--strict must escalate scope-no-match"
+
+    def test_no_fs_removes_the_filesystem_warning_class(
+        self, tmp_path: Path
+    ) -> None:
+        """`--no-fs` does not escalate more gently — it drops the fs tier.
+
+        The consequence is easy to miss and matters in CI: `--strict --no-fs`
+        checks strictly less than `--strict`, because `scope-no-match` and the
+        repo checks are only produced by the filesystem tier. A config that
+        fails under `--strict` passes under `--strict --no-fs`, and that is a
+        difference in coverage, not a defect in escalation.
+        """
+        repo = self._make_repo(tmp_path)
+        config_file = self._write_project_yaml(
+            tmp_path,
+            repo,
+            """  - id: a
+    title: A
+    description: d
+    scope: ["src/not-created-yet/**"]
+""",
+        )
+
+        with_fs = runner.invoke(app, ["validate", str(config_file), "--strict"])
+        without_fs = runner.invoke(
+            app, ["validate", str(config_file), "--strict", "--no-fs"]
+        )
+
+        assert with_fs.exit_code == 1
+        assert "scope-no-match" in with_fs.output
+        assert without_fs.exit_code == 0
+        assert "scope-no-match" not in without_fs.output
+
     def test_no_fs_skips_repo_checks(self, tmp_path: Path) -> None:
         config_file = self._write_project_yaml(
             tmp_path,
