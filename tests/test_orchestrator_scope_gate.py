@@ -102,6 +102,7 @@ async def _build_single(
     changed: list[str],
     status: WorkstreamStatus = WorkstreamStatus.RUNNING,
     ws_id: str = "z1",
+    process_pid: int | None = None,
 ) -> tuple[Orchestrator, Database, str, Path]:
     """One real git repo, checked out on the workstream's feature branch."""
     repo = tmp_path / "repo"
@@ -133,6 +134,7 @@ async def _build_single(
             scope=scope,
             branch=f"feature/{ws_id}",
             status=status,
+            process_pid=process_pid,
         )
     )
     return orch, db, ws_id, repo
@@ -235,6 +237,53 @@ async def test_scope_escape_blocks_to_needs_review_with_marker(
         assert "gates:approval-required phase=ex_post" in ws.error_message
         assert orch._stats.failed == 1
         assert worktree.exists()  # worktree left intact
+    finally:
+        await db.close()
+
+
+@pytest.mark.anyio
+async def test_scope_block_clears_the_stale_pid_and_unwedges_rework(
+    tmp_path: Path,
+    mock_workspace_mgr: MagicMock,
+    mock_decomposer: MagicMock,
+    mock_pr_manager: MagicMock,
+) -> None:
+    """A gate block must not leave a pid behind (#162).
+
+    By the time the ex-post gate blocks, the spec-runner process has exited
+    and its exit was handled, so the recorded pid is stale by construction.
+    Leaving it set wedges the documented operator path: `workstream-rework`
+    refuses fail-closed on any recorded pid, and NEEDS_REVIEW is a stable
+    state that startup reconciliation never revisits. The disputatio pilot
+    had to clear it by hand with raw SQL four times in a single wave.
+
+    The assertion is deliberately end-to-end rather than field-level: it is
+    `prove_no_live_process` passing that makes the operator path work, and a
+    test on the column alone would not show that.
+    """
+    from maestro.rework import prove_no_live_process
+
+    orch, db, ws_id, worktree = await _build_single(
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        scope=["src/**"],
+        changed=["src/a.py", "docs/evil.md"],
+        process_pid=999_999,
+    )
+    try:
+        assert (await db.get_workstream(ws_id)).process_pid == 999_999
+
+        ok = await orch._gate_scope(ws_id, await db.get_workstream(ws_id), worktree)
+
+        assert ok is False
+        ws = await db.get_workstream(ws_id)
+        assert ws.status == WorkstreamStatus.NEEDS_REVIEW
+        assert ws.process_pid is None, "stale pid must be cleared with the block"
+        assert ws.generation_pid is None
+        # The point of clearing it: rework is no longer refused.
+        assert await prove_no_live_process(db, ws) is None
     finally:
         await db.close()
 
