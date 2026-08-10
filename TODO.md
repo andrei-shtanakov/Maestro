@@ -494,6 +494,15 @@
       exit 0 установить пост-фактум стало невозможно. Отличие от kapelle M-04
       («DONE X/Y врал» в 0.3.x, чинилось как честность дисплея): здесь дисплей
       честен, решение DONE его игнорирует.
+      Дизайн-этап идёт: спека
+      `docs/superpowers/specs/2026-08-10-done-completeness-gate-design.md`
+      (Status proposed, 4 решения владельца зафиксированы при принятии).
+      Ключевая находка разведки, изменившая форму дизайна: на SSH логи
+      исполнителя вообще не приезжают локально (`*.log` в
+      `RSYNC_EXCLUDES_COLLECT`), а remote `rm -rf` происходит внутри
+      финализации — до того, как DONE-хук мог бы сработать. Поэтому единая
+      точка захвата для всех транспортов — колбэк `on_collected` между collect
+      и cleanup, и гейт читает архивный снапшот, а не живой worktree.
 
 - [ ] **#165 rework-dangling-deps-retries: dangling deps между ревизиями + детерминированный fail без ре-декомпозиции** (P1, зависит от сигнала #169a) @owner:github:andrei-shtanakov @id:rework-dangling-deps-retries @blocked_by:todo://maestro/spec-runner-exit-contract-bump
       Два наблюдения на живом rework-цикле (третья ревизия одного workstream).
