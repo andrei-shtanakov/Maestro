@@ -15,6 +15,7 @@ import logging
 import re
 import sqlite3
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from maestro.models import (
@@ -157,9 +158,11 @@ def _read_state_from_sqlite(path: Path) -> ExecutorState:
 
     return ExecutorState(
         tasks=tasks,
-        consecutive_failures=meta.get("consecutive_failures", 0),
-        total_completed=meta.get("total_completed", 0),
-        total_failed=meta.get("total_failed", 0),
+        consecutive_failures=meta.counters.get("consecutive_failures", 0),
+        total_completed=meta.counters.get("total_completed", 0),
+        total_failed=meta.counters.get("total_failed", 0),
+        last_run_stop_reason=meta.texts.get(_STOP_REASON_KEY),
+        last_run_stop_detail=meta.texts.get(_STOP_DETAIL_KEY),
     )
 
 
@@ -229,17 +232,56 @@ def _attach_attempts(
         )
 
 
-def _load_meta(conn: sqlite3.Connection) -> dict[str, int]:
-    """Load integer meta counters from the `executor_meta` key-value table."""
+_STOP_REASON_KEY = "last_run_stop_reason"
+_STOP_DETAIL_KEY = "last_run_stop_detail"
+
+# `executor_meta` keys whose value is free-form text, not a counter. Typing is
+# driven by the key rather than by probing the value because a stop detail may
+# itself be numeric-looking ("3"), and a parse-first loader would file it under
+# the counters and lose it — the very defect issue #169 reported.
+_TEXT_META_KEYS = frozenset({_STOP_REASON_KEY, _STOP_DETAIL_KEY})
+
+
+@dataclass(frozen=True)
+class _ExecutorMeta:
+    """Parsed `executor_meta` rows, split by value kind.
+
+    spec-runner stores counters and free-form strings in one TEXT key-value
+    table. Until #169 this loader cast every row with `int()` and swallowed
+    the failure, so `last_run_stop_reason` / `last_run_stop_detail` never
+    reached Maestro: "a task failed and we stopped" was indistinguishable
+    from "everything completed" without parsing logs.
+    """
+
+    counters: dict[str, int] = field(default_factory=dict)
+    texts: dict[str, str] = field(default_factory=dict)
+
+
+def _load_meta(conn: sqlite3.Connection) -> _ExecutorMeta:
+    """Load the `executor_meta` key-value table, split by value kind.
+
+    Keys in `_TEXT_META_KEYS` are taken verbatim; every other key keeps the
+    historical integer cast, so an unknown future counter still arrives as a
+    number and an unknown future string is still ignored rather than guessed
+    at. A NULL text value is absent; `ExecutorState` owns the equivalent rule
+    for the empty string, so both on-disk formats agree on it.
+    """
     try:
         cursor = conn.execute("SELECT key, value FROM executor_meta")
     except sqlite3.OperationalError:
-        return {}
+        return _ExecutorMeta()
 
-    meta: dict[str, int] = {}
+    counters: dict[str, int] = {}
+    texts: dict[str, str] = {}
     for row in cursor.fetchall():
+        key = row["key"]
+        value = row["value"]
+        if key in _TEXT_META_KEYS:
+            if value is not None:
+                texts[key] = str(value)
+            continue
         try:
-            meta[row["key"]] = int(row["value"])
+            counters[key] = int(value)
         except (TypeError, ValueError):
             continue
-    return meta
+    return _ExecutorMeta(counters=counters, texts=texts)
