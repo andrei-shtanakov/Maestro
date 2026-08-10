@@ -2212,12 +2212,19 @@ class Orchestrator:
 
         The worktree is left intact for inspection. Returns False (blocked).
         """
+        # Both writes clear the pids (#162): the RUNNING -> FAILED step is
+        # where the stale pid stops being meaningful, and the FAILED ->
+        # NEEDS_REVIEW step must not reintroduce one if a concurrent writer
+        # set it in between. See `_route_gate_block` for why a leftover pid
+        # wedges `workstream-rework`.
         await self._transition(
             workstream_id,
             WorkstreamStatus.FAILED,
             expected_status=WorkstreamStatus.RUNNING,
             message=reason,
             error_message=reason,
+            process_pid=None,
+            generation_pid=None,
         )
         await self._transition(
             workstream_id,
@@ -2225,6 +2232,8 @@ class Orchestrator:
             expected_status=WorkstreamStatus.FAILED,
             message=reason,
             error_message=reason,
+            process_pid=None,
+            generation_pid=None,
         )
         self._stats.failed += 1
         return False
@@ -2320,12 +2329,23 @@ class Orchestrator:
         self._logger.warning(
             "Gates blocked workstream '%s': %s", workstream_id, decision.reason
         )
+        # Clear both pids atomically with the status write (#162). By the time
+        # a gate blocks, the spec-runner process has exited and its exit was
+        # already handled — the recorded pid is stale by construction. Leaving
+        # it set wedges the documented operator path: `workstream-rework`
+        # refuses fail-closed on any recorded pid (`rework.py`), and
+        # NEEDS_REVIEW is a stable state, so startup reconciliation never
+        # revisits it. The only remaining exit was a manual
+        # `UPDATE workstreams SET process_pid=NULL`, which the disputatio pilot
+        # had to run four times in one wave.
         await self._transition(
             workstream_id,
             WorkstreamStatus.NEEDS_REVIEW,
             expected_status=expected,
             message=decision.reason,
             error_message=decision.reason,
+            process_pid=None,
+            generation_pid=None,
         )
 
     # ------------------------------------------------------------------
