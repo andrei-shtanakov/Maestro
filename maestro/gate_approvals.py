@@ -27,7 +27,7 @@ BLOCK_REASON_PREFIX = "gates: human.owner_approval required"
 
 _MARKER_RE = re.compile(
     re.escape(APPROVAL_MARKER_PREFIX)
-    + r" phase=(ex_ante|ex_post) sha=([0-9a-fA-F]{7,64})"
+    + r" phase=(ex_ante|ex_post|completeness) sha=([0-9a-fA-F]{7,64})"
 )
 
 
@@ -36,15 +36,19 @@ class ApprovalMarker(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    phase: Literal["ex_ante", "ex_post"]
+    phase: Literal["ex_ante", "ex_post", "completeness"]
     sha: str
 
 
-def build_approval_marker(phase: Literal["ex_ante", "ex_post"], sha: str) -> str:
+def build_approval_marker(
+    phase: Literal["ex_ante", "ex_post", "completeness"], sha: str
+) -> str:
     """Render the durable approval marker embedded in a block reason.
 
-    ``phase`` is constrained to the two parseable values so type-checking
+    ``phase`` is constrained to the parseable values so type-checking
     rejects a marker that ``parse_approval_marker`` could never match.
+    ``completeness`` (#164) joins the two gate edges as a third approvable
+    phase: the same single authority, a different question being approved.
     """
     return f"{APPROVAL_MARKER_PREFIX} phase={phase} sha={sha}"
 
@@ -63,7 +67,8 @@ def parse_approval_marker(error_message: str | None) -> ApprovalMarker | None:
     if match is None:
         return None
     phase = match.group(1)
-    assert phase in ("ex_ante", "ex_post")  # regex guarantees; narrows type
+    # regex guarantees; narrows type
+    assert phase in ("ex_ante", "ex_post", "completeness")
     return ApprovalMarker(phase=phase, sha=match.group(2))
 
 
