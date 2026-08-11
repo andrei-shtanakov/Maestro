@@ -96,8 +96,16 @@ def build_dangling_dependency_error(dangling: list[DanglingDependency]) -> str:
 def _parse_dependencies(text: str) -> dict[str, list[str]]:
     """Task id -> referenced ids, in file order.
 
-    Only the first `**Depends on:**` line under a header counts, matching
-    spec-runner's parser, which assigns and moves on.
+    Mirrors the vendored parser's assignment semantics exactly: EVERY
+    `**Depends on:**` line under a header assigns, so the last one wins, and a
+    line reading `—` leaves whatever was already there untouched (it means "no
+    dependencies", not "clear the list").
+
+    That is not a detail to paraphrase. Agents editing tasks.md mid-run do
+    duplicate meta lines, and a vendored copy that reads a file differently
+    from the tool that owns the format would produce findings spec-runner
+    disagrees with — the opposite of the early-diagnosis this validator exists
+    for.
     """
     tasks: dict[str, list[str]] = {}
     current: str | None = None
@@ -110,7 +118,7 @@ def _parse_dependencies(text: str) -> dict[str, list[str]]:
         if current is None:
             continue
         depends = _DEPENDS_ON.search(line)
-        if depends and not tasks[current]:
+        if depends:
             body = depends.group(1)
             if body.strip() != _NO_DEPENDENCIES:
                 tasks[current] = _TASK_REF.findall(body)

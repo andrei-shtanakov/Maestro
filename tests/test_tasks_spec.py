@@ -257,3 +257,65 @@ Do the thing.
         assert find_dangling_dependencies(text) == [
             DanglingDependency(task_id="TASK-001", missing="TASK-021")
         ]
+
+
+class TestMultipleDependsLines:
+    """Fidelity to the vendored parser when a block has more than one line.
+
+    Upstream assigns on EVERY `**Depends on:**` match — last non-em-dash wins —
+    and leaves the value untouched for `—`. Agents editing tasks.md mid-run do
+    produce duplicated meta lines, so this is not hypothetical; and a vendored
+    contract that quietly disagrees with its source is worse than no copy.
+    """
+
+    def test_last_depends_line_wins(self) -> None:
+        text = (
+            "# Tasks\n\n"
+            "### TASK-001: A\n\n"
+            "### TASK-002: B\n\n"
+            "**Depends on:** [TASK-999]\n"
+            "**Depends on:** [TASK-001]\n"
+        )
+
+        # The stale first line names a task that does not exist; the second
+        # replaces it, exactly as spec-runner would read the file.
+        assert find_dangling_dependencies(text) == []
+
+    def test_em_dash_after_a_real_line_keeps_the_earlier_value(self) -> None:
+        text = (
+            "# Tasks\n\n"
+            "### TASK-002: B\n\n"
+            "**Depends on:** [TASK-021]\n"
+            "**Depends on:** —\n"
+        )
+
+        assert find_dangling_dependencies(text) == [
+            DanglingDependency(task_id="TASK-002", missing="TASK-021")
+        ]
+
+    def test_a_dangling_last_line_is_caught(self) -> None:
+        text = (
+            "# Tasks\n\n"
+            "### TASK-001: A\n\n"
+            "### TASK-002: B\n\n"
+            "**Depends on:** [TASK-001]\n"
+            "**Depends on:** [TASK-021]\n"
+        )
+
+        assert find_dangling_dependencies(text) == [
+            DanglingDependency(task_id="TASK-002", missing="TASK-021")
+        ]
+
+
+class TestNonAsciiContent:
+    def test_emoji_status_markers_parse(self) -> None:
+        """The generator template emits `🔴 P0 | ⬜ TODO` on every task."""
+        text = (
+            "# Tasks\n\n"
+            "### TASK-001: A\n🔴 P0 | ⬜ TODO | Est: 2d\n\n"
+            "**Depends on:** —\n\n"
+            "### TASK-002: B\n🟠 P1 | 🔄 IN PROGRESS\n\n"
+            "**Depends on:** [TASK-001]\n"
+        )
+
+        assert find_dangling_dependencies(text) == []

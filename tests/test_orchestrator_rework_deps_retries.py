@@ -217,6 +217,47 @@ class TestDanglingDependencyBlocksBeforeSpawn:
             await db.close()
 
     @pytest.mark.anyio
+    async def test_undecodable_bytes_are_skipped_not_crashed(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A decode failure must reach the skip path, not the orchestrator.
+
+        tasks.md legitimately contains non-ASCII — the generator template puts
+        `🔴 P0 | ⬜ TODO` on every task — so reading it without an explicit
+        encoding is a real hazard on a non-UTF-8 default locale, and
+        UnicodeDecodeError is a ValueError, which an `except OSError` never
+        catches.
+        """
+        orch, db, _mgr, _dec, workspace = await _build(tmp_path)
+        try:
+            (workspace / "spec" / f"{SPEC_PREFIX}tasks.md").write_bytes(
+                b"### TASK-001: \xff\xfe broken\n**Depends on:** [TASK-021]\n"
+            )
+
+            with caplog.at_level("INFO", logger="maestro.orchestrator"):
+                assert await orch._validate_generated_tasks(WS, workspace)
+
+            assert "workstream.tasks_validation.skipped" in caplog.text
+            assert (await db.get_workstream(WS)).status is WorkstreamStatus.READY
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_emoji_content_parses(self, tmp_path: Path) -> None:
+        """The real generator format, read as UTF-8 regardless of locale."""
+        orch, db, _mgr, _dec, workspace = await _build(tmp_path)
+        try:
+            (workspace / "spec" / f"{SPEC_PREFIX}tasks.md").write_text(
+                "# Tasks\n\n### TASK-001: A\n🔴 P0 | ⬜ TODO\n\n**Depends on:** —\n",
+                encoding="utf-8",
+            )
+
+            assert await orch._validate_generated_tasks(WS, workspace)
+            assert (await db.get_workstream(WS)).status is WorkstreamStatus.READY
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
     async def test_unreadable_tasks_file_does_not_block(self, tmp_path: Path) -> None:
         """spec-runner still validates at run time; blocking on our own path
         assumption would turn it into an outage."""

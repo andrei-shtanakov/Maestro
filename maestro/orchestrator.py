@@ -2500,10 +2500,15 @@ class Orchestrator:
         """
         tasks_path = workspace / "spec" / f"{SPEC_PREFIX}tasks.md"
         try:
+            # Explicit utf-8: the generated file carries emoji status markers
+            # (`🔴 P0 | ⬜ TODO`) on every task, so the platform default
+            # encoding is not a safe assumption. A decode failure is a
+            # ValueError, not an OSError, and must reach the skip path rather
+            # than escape into the orchestrator loop.
             text = await asyncio.get_running_loop().run_in_executor(
-                None, tasks_path.read_text
+                None, functools.partial(tasks_path.read_text, encoding="utf-8")
             )
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             # SKIPPED, not passed. Three distinct events on purpose: a
             # fail-open skip must never read as a statement about the file's
             # correctness, or an operator scanning the log will believe the
