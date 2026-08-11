@@ -145,7 +145,7 @@ CREATE TABLE IF NOT EXISTS task_costs (
 CREATE TABLE IF NOT EXISTS gate_approvals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     workstream_id TEXT NOT NULL,
-    phase TEXT NOT NULL CHECK (phase IN ('ex_ante', 'ex_post')),
+    phase TEXT NOT NULL CHECK (phase IN ('ex_ante', 'ex_post', 'completeness')),
     sha TEXT NOT NULL,
     approved_at TEXT NOT NULL,
     UNIQUE (workstream_id, phase, sha)
@@ -588,6 +588,11 @@ class Database:
                 23,
                 "postmortem_archives",
                 self._migrate_postmortem_archives,
+            ),
+            (
+                24,
+                "gate_approvals_completeness",
+                self._migrate_gate_approvals_completeness,
             ),
         ]
 
@@ -1146,6 +1151,72 @@ class Database:
             )
             """
         )
+
+    async def _migrate_gate_approvals_completeness(self) -> None:
+        """Migration 24: widen `gate_approvals.phase` CHECK for #164.
+
+        The completeness gate is a third approvable phase, and the original
+        CHECK allowed only the two gate edges. SQLite cannot ALTER a CHECK, so
+        this rebuilds the table (rename -> create -> copy -> drop), the same
+        shape as `_migrate_execution_phase_verification` (migration 15), and
+        is idempotent via `sqlite_master.sql` because a fresh database already
+        gets the widened CHECK from SCHEMA_SQL.
+
+        This was found the hard way: `approve_workstream_with_gate_record` used
+        `INSERT OR IGNORE`, which ignores CHECK violations as readily as
+        duplicates, so approving a completeness block recorded nothing and
+        reported success. The insert is now `ON CONFLICT(...) DO NOTHING`,
+        which suppresses only the intended UNIQUE collision (idempotent
+        re-approval) and lets a constraint violation raise.
+        """
+        assert self._connection is not None
+        cursor = await self._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='gate_approvals'"
+        )
+        row = await cursor.fetchone()
+        if row is not None and "completeness" in (row["sql"] or ""):
+            return
+
+        await self._connection.execute(
+            "ALTER TABLE gate_approvals RENAME TO gate_approvals_old"
+        )
+        await self._connection.execute(
+            """
+            CREATE TABLE gate_approvals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workstream_id TEXT NOT NULL,
+                phase TEXT NOT NULL CHECK (phase IN
+                    ('ex_ante', 'ex_post', 'completeness')),
+                sha TEXT NOT NULL,
+                approved_at TEXT NOT NULL,
+                actor TEXT NOT NULL DEFAULT 'human',
+                approval_run_id TEXT,
+                UNIQUE (workstream_id, phase, sha)
+            )
+            """
+        )
+        old_cols = await self._connection.execute(
+            "PRAGMA table_info(gate_approvals_old)"
+        )
+        available = {r["name"] for r in await old_cols.fetchall()}
+        carried = [
+            c
+            for c in (
+                "workstream_id",
+                "phase",
+                "sha",
+                "approved_at",
+                "actor",
+                "approval_run_id",
+            )
+            if c in available
+        ]
+        columns = ", ".join(carried)
+        await self._connection.execute(
+            f"INSERT INTO gate_approvals ({columns}) "
+            f"SELECT {columns} FROM gate_approvals_old"
+        )
+        await self._connection.execute("DROP TABLE gate_approvals_old")
 
     async def _migrate_workstream_rework(self) -> None:
         """Migration 18: operator rework columns + audit tables (#124).
@@ -3526,9 +3597,10 @@ class Database:
         async with self.transaction() as conn:
             if phase is not None and sha is not None:
                 await conn.execute(
-                    "INSERT OR IGNORE INTO gate_approvals "
+                    "INSERT INTO gate_approvals "
                     "(workstream_id, phase, sha, approved_at) "
-                    "VALUES (?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(workstream_id, phase, sha) DO NOTHING",
                     (workstream_id, phase, sha, _format_datetime(datetime.now(UTC))),
                 )
             if phase == COMPLETENESS_PHASE:

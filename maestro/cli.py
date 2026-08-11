@@ -1693,6 +1693,74 @@ def workstream_approve_command(
     )
 
 
+@app.command("postmortem")
+def postmortem_command(
+    config_file: Annotated[Path, typer.Argument(help="Path to project.yaml")],
+    gc: Annotated[
+        bool,
+        typer.Option("--gc", help="Apply the retention policy and prune old archives"),
+    ] = False,
+    db: Annotated[
+        Path | None,
+        typer.Option("--db", "-d", help="Path to SQLite database file"),
+    ] = None,
+) -> None:
+    """Operator-driven post-mortem archive retention (#164, spec §6.3).
+
+    Applies the SAME policy the orchestrator applies after each successful
+    capture (`postmortem.keep_per_workstream`), for the case where archives
+    accumulated before the policy was tightened or a prune failed at the time.
+    Never touches the newest archive of any workstream.
+
+    Examples:
+        maestro postmortem project.yaml --gc
+        maestro postmortem project.yaml --gc --db run/maestro.db
+    """
+    if not gc:
+        console.print(
+            "[yellow]Nothing to do: pass --gc to apply the retention policy.[/yellow]"
+        )
+        raise typer.Exit(1)
+    db_path = db or DEFAULT_DB_PATH
+
+    async def _run() -> tuple[int, int]:
+        from maestro.config import load_orchestrator_config
+        from maestro.database import Database
+        from maestro.postmortem import prune_archives
+
+        config = load_orchestrator_config(config_file)
+        keep = config.postmortem.keep_per_workstream
+        root = Path(db_path).parent / "postmortem"
+        database = Database(db_path)
+        await database.connect()
+        try:
+            workstreams = await database.get_all_workstreams()
+            pruned = 0
+            for workstream in workstreams:
+                removed = prune_archives(root, workstream.id, keep=keep)
+                for path in removed:
+                    execution_id = (
+                        path.name.split("-", 1)[1] if "-" in path.name else path.name
+                    )
+                    await database.delete_postmortem_archive(
+                        workstream.id, execution_id
+                    )
+                pruned += len(removed)
+            return pruned, keep
+        finally:
+            await database.close()
+
+    try:
+        pruned, keep = asyncio.run(_run())
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(
+        f"[green]Pruned {pruned} post-mortem archive(s); "
+        f"keeping the newest {keep} per workstream.[/green]"
+    )
+
+
 @app.command("workstream-recapture")
 def workstream_recapture_command(
     workstream_id: Annotated[str, typer.Argument(help="Workstream ID to recapture")],
