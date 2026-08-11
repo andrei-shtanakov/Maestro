@@ -7,9 +7,10 @@ when that shipped: #164 gives approve (accept an incomplete result, execute
 nothing) and rework (ordinary re-decomposition); **catching up the remaining
 work is this document's subject**, and #164 deliberately left the naming free.
 Builds on the whole of wave 4: `stop_reason` is guaranteed by the 2.24.0 pin
-(#169b), the post-mortem archive already preserves an interrupted run's
-evidence (#164), and the retry classifier already distinguishes failures worth
-re-running (#165).
+(#169b), the post-mortem archive machinery exists and is reused here (#164) —
+though it does **not** yet cover an interrupted run, because a hard kill skips
+the finalization that writes it (§2.3, §4.4) — and the retry classifier
+already distinguishes failures worth re-running (#165).
 
 ## 1. What the pilot did, and why both halves of the fix are separate
 
@@ -32,7 +33,8 @@ Two independent defects hide behind that, and they need different fixes:
   the process, so "quarantine this one" is spelled "kill all three".
 - **B. An interrupted workstream cannot resume; it can only start over.**
   Whatever ends a run, the workstream lands in READY, and READY means
-  "Always regenerate" (`orchestrator.py:1606`) — a fresh spec, a fresh LLM
+  "Always regenerate" (the comment of that name in
+  `orchestrator.py::_spawn_workstream`) — a fresh spec, a fresh LLM
   lottery, fresh money, and the partial work discarded.
 
 A is worth fixing because it removes the need to kill. B is worth fixing
@@ -45,8 +47,8 @@ B is what makes the acceptance criterion's second branch true.
 |---|---|---|
 | Graceful stop (SIGTERM/SIGINT) | `_cleanup` terminates **every** running handle, then walks each RUNNING → FAILED → READY | `orchestrator.py::_cleanup` |
 | Hard kill (SIGKILL, watchdog) | Nothing runs; rows stay RUNNING until the next start | — |
-| Next start after a hard kill | `_recover_stranded_workstreams` reconciles: a dead RUNNING → READY; a live orphan or possibly-live handle → NEEDS_REVIEW with an ambiguity marker | `orchestrator.py:541` |
-| Either way | READY → `_spawn_workstream` → DECOMPOSING → **regenerate** | `orchestrator.py:1606` |
+| Next start after a hard kill | `_recover_stranded_workstreams` reconciles: a dead RUNNING → READY; a live orphan or possibly-live handle → NEEDS_REVIEW with an ambiguity marker | `orchestrator.py::_recover_stranded_workstreams` |
+| Either way | READY → `_spawn_workstream` → DECOMPOSING → **regenerate** | the "Always regenerate" comment in `_spawn_workstream` |
 | Interrupted evidence | The post-mortem archive exists **only if finalization ran**; a hard kill skips it | #164, `finalize.py` |
 
 Three consequences the design has to respect:
@@ -119,7 +121,8 @@ spawn the author*. `resume_reason` already carves out five exceptions
 (`verification_rework`, `verification_reverify`, `operator_rework`,
 `completeness_accept_partial`, `postmortem_recapture`), and the dispatch is
 exhaustive over that set — an unknown value is routed fail-closed, never
-treated as a plain resume (`orchestrator.py:1533`).
+treated as a plain resume (the `KNOWN_RESUME_REASONS` guard at the head of
+the resume dispatch in `_spawn_workstream`).
 
 This spec adds one more member rather than a new status:
 `RESUME_CONTINUE_TASKS` — *re-dispatch spec-runner against the existing
