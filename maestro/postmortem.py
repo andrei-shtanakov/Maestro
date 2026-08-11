@@ -17,6 +17,7 @@ must not clean anything up (spec §6.5).
 
 import json
 import logging
+import re
 import shutil
 import sqlite3
 from collections.abc import Mapping
@@ -308,3 +309,32 @@ def _discard(partial: Path) -> None:
         shutil.rmtree(partial)
     except OSError as exc:
         logger.warning("could not remove partial archive %s: %s", partial, exc)
+
+
+RECAPTURE_MARKER_PREFIX = "maestro:recapture-required"
+
+_RECAPTURE_RE = re.compile(
+    re.escape(RECAPTURE_MARKER_PREFIX) + r" execution=([A-Za-z0-9._:-]{1,128})"
+)
+
+
+def build_recapture_marker(execution_id: str) -> str:
+    """Durable "retry the capture, nothing else" token (#164).
+
+    A failed capture leaves the workstream in NEEDS_REVIEW with no approval
+    marker — correct, since there is no result to approve, only an archive
+    root to fix. But without a second token that state is an operational dead
+    end: a plain requeue falls through to the full respawn and re-runs the
+    work the operator was trying to preserve. This names the execution whose
+    evidence still needs capturing, so `maestro workstream-recapture` can
+    retry exactly that and nothing more.
+    """
+    return f"{RECAPTURE_MARKER_PREFIX} execution={execution_id}"
+
+
+def parse_recapture_marker(error_message: str | None) -> str | None:
+    """Extract the execution id from a recapture token, or None."""
+    if not error_message:
+        return None
+    match = _RECAPTURE_RE.search(error_message)
+    return match.group(1) if match else None

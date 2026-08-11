@@ -1693,6 +1693,72 @@ def workstream_approve_command(
     )
 
 
+@app.command("workstream-recapture")
+def workstream_recapture_command(
+    workstream_id: Annotated[str, typer.Argument(help="Workstream ID to recapture")],
+    db: Annotated[
+        Path | None,
+        typer.Option("--db", "-d", help="Path to SQLite database file"),
+    ] = None,
+) -> None:
+    """Retry ONLY post-mortem evidence capture for a blocked workstream (#164).
+
+    Use after a `post-mortem capture failed` block: the run itself finished and
+    its worktree is intact, only the archive write failed (an unwritable
+    archive root, no space). This re-runs that one step for the same execution
+    and then continues the normal success pipeline — no executor, no
+    decomposition, no new sha.
+
+    This is NOT an approval: nothing about the result is accepted here. Fix
+    whatever made the archive root unwritable first, then run this.
+
+    Examples:
+        maestro workstream-recapture w-contracts --db run/maestro.db
+    """
+    db_path = db or DEFAULT_DB_PATH
+
+    async def _run() -> str:
+        from maestro.database import Database
+        from maestro.models import WorkstreamStatus
+        from maestro.postmortem import parse_recapture_marker
+
+        database = Database(db_path)
+        await database.connect()
+        try:
+            workstream = await database.get_workstream(workstream_id)
+            if workstream is None:
+                raise ValueError(f"workstream '{workstream_id}' not found")
+            if workstream.status != WorkstreamStatus.NEEDS_REVIEW:
+                raise ValueError(
+                    f"workstream '{workstream_id}' is {workstream.status}, "
+                    f"only NEEDS_REVIEW can be requeued for recapture"
+                )
+            execution_id = parse_recapture_marker(workstream.error_message)
+            if execution_id is None:
+                raise ValueError(
+                    f"workstream '{workstream_id}' carries no recapture token — "
+                    f"it was not blocked by a post-mortem capture failure, so "
+                    f"there is no capture to retry"
+                )
+            await database.requeue_for_recapture(workstream_id)
+            return execution_id
+        finally:
+            await database.close()
+
+    try:
+        execution_id = asyncio.run(_run())
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(
+        f"[green]Workstream '{workstream_id}' requeued to recapture evidence "
+        f"for execution {execution_id} (NEEDS_REVIEW -> READY).[/green]"
+    )
+    console.print(
+        f"Resume with: maestro orchestrate <project.yaml> --db {db_path} --resume"
+    )
+
+
 async def _rework_workstream(
     db: "Database",
     workstream_id: str,

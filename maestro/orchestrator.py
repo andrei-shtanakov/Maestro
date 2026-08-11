@@ -46,6 +46,7 @@ from maestro.domain import (
     KNOWN_RESUME_REASONS,
     RESUME_ACCEPT_PARTIAL,
     RESUME_OPERATOR_REWORK,
+    RESUME_RECAPTURE,
     RESUME_REVERIFY,
     RESUME_REWORK,
     CommandVerifier,
@@ -104,7 +105,9 @@ from maestro.notifications.manager import NotificationManager
 from maestro.postmortem import (
     PostmortemCaptureError,
     archive_is_committed,
+    build_recapture_marker,
     capture_archive,
+    parse_recapture_marker,
     prune_archives,
     read_manifest,
 )
@@ -1572,6 +1575,10 @@ class Orchestrator:
             )
             return
         rework_addendum: str | None = None
+        if workstream.resume_reason == RESUME_RECAPTURE:
+            # #164: retry ONLY the evidence capture for the same execution.
+            await self._resume_recapture(workstream)
+            return
         if workstream.resume_reason == RESUME_ACCEPT_PARTIAL:
             # #164: the operator accepted an incomplete result. Continue the
             # existing success pipeline over the untouched worktree; nothing
@@ -2047,7 +2054,16 @@ class Orchestrator:
                     # gate flow: the gate's own input is the archive that does
                     # not exist. No approval marker — there is nothing to
                     # approve here, the operator has to fix the archive root.
-                    reason = f"post-mortem capture failed: {fin.archive_error}"
+                    # No approval marker: there is no result to approve, only
+                    # an archive root to fix. A recapture token instead, so
+                    # this is not a dead end — `maestro workstream-recapture`
+                    # retries the capture for THIS execution and nothing else,
+                    # where a plain requeue would fall through to a respawn
+                    # and re-run the very work we are trying to preserve.
+                    reason = (
+                        f"post-mortem capture failed: {fin.archive_error}; "
+                        f"{build_recapture_marker(self._evidence_key(running))}"
+                    )
                     self._logger.error("workstream '%s' %s", zid, reason)
                     await self._transition(
                         zid,
@@ -2165,8 +2181,37 @@ class Orchestrator:
         the workspace; every other failure mode of this method is a genuine
         capture failure too, so nothing here is swallowed.
         """
-        workstream_id = running.workstream.id
-        spec_dir = running.workspace_path / "spec"
+        try:
+            await self._capture_evidence(
+                running.workstream.id,
+                running.workspace_path,
+                evidence_key=self._evidence_key(running),
+                backend_id=running.backend_id,
+                transport=running.handle.ref.backend_id,
+                exit_code=running.handle.poll(),
+            )
+        except PostmortemCaptureError as exc:
+            raise EvidenceCaptureFailed(str(exc)) from exc
+
+    async def _capture_evidence(
+        self,
+        workstream_id: str,
+        workspace_path: Path,
+        *,
+        evidence_key: str,
+        backend_id: str,
+        transport: str,
+        exit_code: int | None,
+    ) -> None:
+        """Capture one execution's evidence and record it.
+
+        Shared by finalization and `maestro workstream-recapture`, which
+        retries exactly this step for the same execution after a capture
+        failure — no executor, no decomposition. Raises
+        `PostmortemCaptureError`; each caller decides what that means for the
+        workspace it owns.
+        """
+        spec_dir = workspace_path / "spec"
         loop = asyncio.get_running_loop()
         state = await loop.run_in_executor(
             None, read_executor_state, spec_dir, SPEC_PREFIX
@@ -2180,32 +2225,28 @@ class Orchestrator:
         }
         identity: dict[str, Any] = {
             "workstream_id": workstream_id,
-            "execution_id": self._evidence_key(running),
+            "execution_id": evidence_key,
             "attempt": persisted.retry_count,
-            "backend_id": running.backend_id,
-            "transport": running.handle.ref.backend_id,
-            "exit_code": running.handle.poll(),
+            "backend_id": backend_id,
+            "transport": transport,
+            "exit_code": exit_code,
             "branch": persisted.branch,
-            "head_sha": await self._workspace_head(running.workspace_path),
+            "head_sha": await self._workspace_head(workspace_path),
             "captured_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "last_run_stop_reason": state.last_run_stop_reason if state else None,
             "last_run_stop_detail": state.last_run_stop_detail if state else None,
         }
-        try:
-            archive = await loop.run_in_executor(
-                None,
-                functools.partial(
-                    capture_archive,
-                    spec_dir=spec_dir,
-                    root=self._postmortem_root(),
-                    identity=identity,
-                    counters=counters,
-                    config=self._config.postmortem,
-                ),
-            )
-        except PostmortemCaptureError as exc:
-            raise EvidenceCaptureFailed(str(exc)) from exc
-
+        archive = await loop.run_in_executor(
+            None,
+            functools.partial(
+                capture_archive,
+                spec_dir=spec_dir,
+                root=self._postmortem_root(),
+                identity=identity,
+                counters=counters,
+                config=self._config.postmortem,
+            ),
+        )
         # The row goes in only after the directory is committed, so its
         # existence implies evidence on disk. Retention runs strictly after
         # that — a prune fault must never cost the archive just captured.
@@ -2507,6 +2548,89 @@ class Orchestrator:
         )
         await self._handle_success(workstream.id, workspace)
         return True
+
+    async def _resume_recapture(self, workstream: Workstream) -> None:
+        """Retry evidence capture for the same execution, then continue.
+
+        The only thing that failed was the archive write, so this repeats
+        exactly that step over the untouched worktree and re-enters the
+        success continuation. Nothing is executed and nothing is regenerated:
+        the alternative — a plain requeue into the full respawn — would re-run
+        the work whose evidence the operator was trying to preserve.
+
+        A second failure returns to NEEDS_REVIEW carrying the same token, so
+        the operator can fix the archive root and try again rather than
+        landing in a state with no way forward.
+        """
+        execution_id = parse_recapture_marker(workstream.error_message)
+        workspace_exists = self._workspace_mgr.workspace_exists(workstream.id)
+        if execution_id is None or not workspace_exists:
+            detail = (
+                "no recapture token in the block reason"
+                if execution_id is None
+                else "the worktree is gone, so there is nothing left to capture"
+            )
+            reason = f"recapture cannot proceed: {detail}"
+            self._logger.error("workstream '%s' %s", workstream.id, reason)
+            await self._transition(
+                workstream.id,
+                WorkstreamStatus.NEEDS_REVIEW,
+                expected_status=WorkstreamStatus.READY,
+                message=reason,
+                error_message=reason,
+                resume_reason=None,
+                process_pid=None,
+                generation_pid=None,
+            )
+            return
+
+        workspace = self._workspace_mgr.get_workspace_path(workstream.id)
+        try:
+            await self._capture_evidence(
+                workstream.id,
+                workspace,
+                evidence_key=execution_id,
+                backend_id="recapture",
+                transport="recapture",
+                exit_code=None,
+            )
+        except PostmortemCaptureError as exc:
+            reason = (
+                f"post-mortem recapture failed: {exc}; "
+                f"{build_recapture_marker(execution_id)}"
+            )
+            self._logger.error("workstream '%s' %s", workstream.id, reason)
+            await self._transition(
+                workstream.id,
+                WorkstreamStatus.NEEDS_REVIEW,
+                expected_status=WorkstreamStatus.READY,
+                message="post-mortem recapture failed; workspace preserved",
+                error_message=reason,
+                resume_reason=None,
+                process_pid=None,
+                generation_pid=None,
+            )
+            return
+
+        # Clear the token with the status write: the evidence now exists, and
+        # leaving it would re-enter this path on any later READY.
+        await self._transition(
+            workstream.id,
+            WorkstreamStatus.RUNNING,
+            expected_status=WorkstreamStatus.READY,
+            error_message=None,
+            resume_reason=None,
+            process_pid=None,
+            generation_pid=None,
+            workspace_path=str(workspace),
+        )
+        self._logger.info(
+            "Workstream '%s' evidence recaptured for execution %s; "
+            "continuing the success pipeline (no executor, no decomposition)",
+            workstream.id,
+            execution_id,
+        )
+        await self._handle_success(workstream.id, workspace)
 
     async def _resume_accept_partial(self, workstream: Workstream) -> None:
         """Continue the success pipeline over an approved incomplete result.

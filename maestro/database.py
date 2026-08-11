@@ -17,7 +17,7 @@ from urllib.request import pathname2url
 import aiosqlite
 
 from maestro.completeness import COMPLETENESS_PHASE
-from maestro.domain.resume import RESUME_ACCEPT_PARTIAL
+from maestro.domain.resume import RESUME_ACCEPT_PARTIAL, RESUME_RECAPTURE
 from maestro.models import (
     AgentType,
     Complexity,
@@ -3454,6 +3454,44 @@ class Database:
         )
         rows = await cursor.fetchall()
         return {(row["phase"], row["sha"]) for row in rows}
+
+    async def requeue_for_recapture(self, workstream_id: str) -> None:
+        """NEEDS_REVIEW -> READY with `resume_reason=RESUME_RECAPTURE` (#164).
+
+        Deliberately NOT an approval: nothing about the result is being
+        accepted here. A capture failure blocks with no approval marker, and
+        this is the operator's way to retry only that step — the CAS on
+        `status='needs_review'` keeps it a single guarded transition, and the
+        resume reason is written in the same statement so a crash cannot leave
+        a READY workstream that falls through to a full respawn.
+
+        Raises:
+            WorkstreamNotFoundError: If the workstream does not exist.
+            ValueError: If the workstream is not in NEEDS_REVIEW.
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                "UPDATE workstreams SET status = 'ready', resume_reason = ? "
+                "WHERE id = ? AND status = 'needs_review'",
+                (RESUME_RECAPTURE, workstream_id),
+            )
+            if cursor.rowcount == 0:
+                check = await conn.execute(
+                    "SELECT status FROM workstreams WHERE id = ?", (workstream_id,)
+                )
+                row = await check.fetchone()
+                if row is None:
+                    msg = f"Workstream with ID '{workstream_id}' not found"
+                    raise WorkstreamNotFoundError(msg)
+                msg = (
+                    f"workstream '{workstream_id}' is {row['status']}, "
+                    f"only NEEDS_REVIEW can be requeued for recapture"
+                )
+                raise ValueError(msg)
 
     async def approve_workstream_with_gate_record(
         self, workstream_id: str, phase: str | None, sha: str | None
