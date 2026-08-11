@@ -40,6 +40,8 @@ uv run maestro workstreams                   # Show workstreams status
 uv run maestro workstream-approve <workstream-id>  # Approve a NEEDS_REVIEW workstream — records the durable gate approval (phase+sha) and re-queues
 uv run maestro workstream-rework <workstream-id> --reason "<why>" [--instructions "<next attempt>"] [--refresh-from project.yaml]  # Rework (NOT approve): NEEDS_REVIEW/FAILED -> READY into re-decomposition; fail-closed liveness proof; audited
 uv run maestro workstream-resolve-ambiguity <workstream-id> --statement "<how verified>"  # Resolve a recovery-ambiguity marker after manual cleanup (unblocks rework)
+uv run maestro workstream-recapture <workstream-id>  # Retry ONLY post-mortem evidence capture for the same execution after a `post-mortem capture failed` block (no executor, no decomposition); NOT an approval
+uv run maestro postmortem <project.yaml> --gc         # Apply the post-mortem retention policy (same one the orchestrator applies after each capture)
 uv run maestro check-scope <workstream-id> --base <base-branch>  # deterministic scope containment (exit 1 on escape)
 uv run maestro workspaces <project.yaml>     # List active worktrees
 uv run maestro review-pr <project.yaml> <workstream-id>  # Drive spec-runner's review-bot loop over that workstream's PR (needs spec-runner >= 2.21.0; exits 0 complete / 1 infra / 2 needs-human / 3 already-running)
@@ -150,6 +152,8 @@ Each of these has cost a full session at least once — they are not hypothetica
 - **gates.py**: Guard hooks on exactly two workstream edges — **ex-ante** before `READY -> RUNNING` (classifies the *declared* `scope`) and **ex-post** before `RUNNING -> MERGING` (classifies the *actual* diff, so it catches scope violations the author actually committed). Risk tiers come from `steward risk-classify` and **only** from there — Maestro never computes risk itself (DESIGN-610/612). Fail-closed at every tier: a mandatory gate whose verdict is missing or errored *blocks*. A blocked workstream goes to `NEEDS_REVIEW` carrying an approval marker; a new commit changes the SHA and invalidates the approval. Gates whose enforcement point lies outside these two edges (branch protection, PR review) are recorded as advisory annotations, not blocks — that transition belongs to the git host, not to Maestro's table.
 - **gate_approvals.py**: The `gate_approvals` table is the *single authority* on "was this (workstream, phase, sha) approved", written in one transaction by `maestro workstream-approve`. The marker in `error_message` is operator UX plus the H-6 resume-position signal; the verdict store is pure evidence. **Neither of those grants approval** — only the table does.
 - **approver.py** (+ orchestrator wiring): opt-in `gates.approver` hook (#137) — an *automated operator* for ex-post blocks: an external critic command gets a run-keyed request envelope (built ONLY from the immutable `gate_block_contexts` snapshot persisted at block time) and returns a verdict under a strict echo handshake; PASS goes through the same approval API with `actor='agent'` (post-verdict cost check + stale-SHA recheck + CAS), everything else stays NEEDS_REVIEW for the human. Guard skips are `not_run` observations that never consume the one-paid-evaluation-per-SHA slot (`gate_approver_runs`, migration 20); kill-switches (`enabled: false`, `MAESTRO_APPROVER_DISABLED=1`) are reversible. Design spec: `docs/superpowers/specs/2026-08-06-expost-approver-cmd-design.md`.
+- **completeness.py**: The DONE completeness decision (#164) — pure counters-in/verdict-out, four blocking reasons (`incomplete` / `unknown_total` / `inconsistent` / `unreadable`) because each asks the operator for something different, plus the `completeness` approval phase and the evidence-freshness rule that stops one approval from accepting the next partial result
+- **postmortem.py**: Evidence capture before any destruction (#164) — `backup()`-consistent state snapshot + harness logs + self-describing manifest, committed by a single directory rename out of `.partial/`, bounded by a byte cap, with retention. Capture hangs off finalization's `on_collected` (the one moment every transport agrees on: collect applied, nothing destroyed yet) and a failure there raises `EvidenceCaptureFailed`, which skips cleanup and preserves the workspace. A missing state db is NOT a capture failure — capture runs for failed runs too, and raising would cost them their retry
 - **scope_gate.py**: Pure containment matcher (no git, no FS, no DB) — `find_escapes` answers only "which changed paths are matched by none of the declared scope globs". Backs `maestro check-scope` (exit 1 on escape) and the ex-post gate.
 
 **Subpackages:**
@@ -206,6 +210,29 @@ PENDING -> DECOMPOSING -> READY -> RUNNING -> MERGING -> PR_CREATED -> DONE
                             |         finalization happens INSIDE VERIFYING)
                             └-> ABANDONED
 ```
+
+The **completeness gate** (#164, always-on) sits at the head of the success
+continuation, before both diff gates: `done` (from the post-mortem archive)
+must equal `workstreams.subtask_total`, or the workstream goes to
+NEEDS_REVIEW instead of MERGING. Fail-closed on an uncaptured denominator, a
+missing archive or an unreadable manifest; no config key or env var disables
+it. An all-no-op run passes and is reported as a structured event —
+completeness is not productivity.
+
+**Three recovery paths out of NEEDS_REVIEW, and they must not be confused:**
+
+| Verb | `resume_reason` | What runs |
+|---|---|---|
+| `workstream-approve` on a completeness block | `completeness_accept_partial` | Nothing. Accepts the incomplete result and continues the existing delivery tail over the untouched worktree — no author respawn, no spec-gen, no new sha. Catching up the missing tasks is #166's concern and has no mechanism here. |
+| `workstream-recapture` after a capture failure | `postmortem_recapture` | Only the archive step, for the same execution, then the same delivery tail. Not an approval: nothing about the result is accepted. |
+| `workstream-rework` | `operator_rework` | An ordinary re-decomposition through DECOMPOSING — the author is respawned and the spec regenerated. |
+
+The first two refuse rather than falling back to a respawn: a respawn would
+regenerate the spec and mint a new sha, voiding the very approval that got
+there. A completeness approval is bound to BOTH the worktree sha and the
+evidence snapshot (`evidence=<execution_id>` in the marker), so it goes stale
+after a rework or a re-collect and cannot silently accept a different partial
+result.
 
 With a `gates:` block configured, two guard edges are inserted (see `gates.py` above):
 `READY -> RUNNING` is preceded by the **ex-ante** gate and `RUNNING -> MERGING` by the

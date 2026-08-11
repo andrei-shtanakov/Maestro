@@ -3,6 +3,75 @@
 ## Unreleased
 
 ### Added
+- **DONE now means the work finished, not just the process (#164).** A new
+  always-on **completeness gate** compares the executor's completed subtask
+  count against the planned total before a Mode-2 workstream is delivered.
+  Previously `DONE = spec-runner exited 0 + merge ok`, which merged a branch
+  containing 1 of 9 tasks into the base while the display honestly read
+  "1/9 done". Four distinct blocking verdicts, each asking the operator for
+  something different: `incomplete`, `unknown_total`, `inconsistent`
+  (`done > planned`, i.e. the counters describe different revisions of the
+  plan), and `unreadable`. An all-no-op run **passes** and is reported as a
+  structured event — completeness is not productivity; judging usefulness
+  belongs to verification. There is deliberately no kill-switch: the audited
+  per-SHA approve is the only way past it.
+- **Post-mortem archives (#164).** Every execution's evidence — a
+  `backup()`-consistent snapshot of the executor state database, the harness
+  logs, and a self-describing `manifest.json`
+  (`maestro.postmortem-manifest/v1`) — is copied to
+  `<db_dir>/postmortem/<workstream>/<ts>-<execution_id>/` **before anything is
+  destroyed**, and the gate reads that archive rather than a live worktree.
+  This is what makes local and SSH runs one code path: on SSH the executor
+  logs are never collected back (`*.log` is excluded from the collect rsync)
+  and the remote is `rm -rf`'d during finalization, so a DONE-time hook would
+  have been log-empty for every remote run while looking like it worked.
+  Capture is committed by a single directory rename, so a crash leaves either
+  ignorable `.partial/` garbage or a complete archive. **If capture fails,
+  nothing is destroyed**: cleanup is skipped and the workspace preserved.
+  Retention is bounded (`postmortem.keep_per_workstream`,
+  `postmortem.max_archive_bytes`) with `maestro postmortem <config> --gc` for
+  operator-driven pruning. The `postmortem:` config block carries retention
+  only — there is no `enabled: false`, and an absent block means defaults.
+- **`maestro workstream-recapture <id>`** — retry *only* evidence capture for
+  the same execution after a `post-mortem capture failed` block: no executor,
+  no decomposition, no new SHA. Explicitly **not** an approval; it refuses a
+  workstream that carries no recapture token rather than becoming a generic
+  requeue.
+
+### Fixed
+- **Approvals could be silently discarded (found while implementing #164).**
+  `gate_approvals.phase` carried `CHECK (phase IN ('ex_ante','ex_post'))`
+  while the approval was inserted with `INSERT OR IGNORE` — which suppresses
+  CHECK violations exactly as readily as duplicate keys. Any approval for a
+  phase outside those two recorded **nothing and reported success**, so the
+  operator saw "approved" and the gate blocked again on the same SHA.
+  Migration 24 rebuilds the table with the widened CHECK, and the insert now
+  uses `ON CONFLICT(workstream_id, phase, sha) DO NOTHING` so only the
+  intended UNIQUE collision (idempotent re-approval) is suppressed and a
+  constraint violation raises. Pre-existing `ex_ante`/`ex_post` approvals were
+  never affected; the defect could only bite a new phase.
+
+### Upgrade impact
+- **A workstream that is mid-run when you upgrade may stop for an operator
+  decision.** The completeness gate is fail-closed on an uncaptured
+  denominator, and `workstreams.subtask_total` is nullable — it has only been
+  recorded since migration 19. A workstream that started before that (or
+  whose spec-generation never captured a total) reaches the gate with
+  `subtask_total IS NULL`, blocks as `unknown_total`, and waits in
+  NEEDS_REVIEW until an operator runs `maestro workstream-approve <id>`
+  (accept the result as-is and continue delivery) or
+  `maestro workstream-rework <id>` (redo the work). This is the intended
+  change — it is precisely the case the incident was — but it means an
+  unattended upgrade of a running wave can pause at delivery instead of
+  merging. Nothing is lost: the worktree and the branch are left intact.
+- **Delivery now requires a post-mortem archive.** Any code path that reaches
+  the delivery tail without one blocks fail-closed. In normal operation the
+  archive is written during finalization, so this only surfaces for runs whose
+  finalization predates the upgrade.
+- Two new migrations run automatically on first connect: **23**
+  (`postmortem_archives`, additive) and **24** (`gate_approvals` rebuilt with
+  the widened phase CHECK, data preserved).
+
 - **`maestro service` — scheduled autonomous runs.** Generates and loads
   a launchd/systemd **user** unit that starts a Maestro-owned wrapper
   (`maestro service run`), never `orchestrate` directly: only Maestro's
