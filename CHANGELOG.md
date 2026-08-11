@@ -3,6 +3,60 @@
 ## Unreleased
 
 ### Added
+- **Dangling dependencies are caught before the executor starts (#165).** A
+  rework regenerates `spec/maestro-tasks.md` wholesale, and the decomposer —
+  told it is continuing after TASK-021 — emits `**Depends on:** [TASK-021]`
+  for a task that exists only in the revision it replaced. spec-runner
+  rejects that correctly, but at run time, after Maestro has paid for
+  generation and spawned a process. Maestro now validates the generated file
+  immediately after `plan --full` and **before any spawner**: every dependency
+  must resolve inside the current revision, and a violation blocks the
+  workstream into NEEDS_REVIEW naming each referencing task and missing id
+  (`TASK-022 -> TASK-021`). The block consumes **no retry** — a retry would
+  re-decompose, which is exactly the waste being fixed. An unreadable
+  tasks.md is a *skip*, not a pass: it logs
+  `workstream.tasks_validation.skipped` and proceeds, because spec-runner
+  remains the final validator and blocking on Maestro's own path assumption
+  would turn early diagnosis into an outage. The three outcomes
+  (`skipped` / `passed` / `blocked`) are distinct log events so a skip can
+  never be misread as a clean bill of health.
+- **Rework always carries the self-contained-dependency rule.** Every rework
+  regeneration gets the constraint appended to its decomposition input,
+  independently of `--instructions`: the risk comes from replacing the plan
+  revision the model remembers, not from whether an operator typed
+  instructions. The rule is **prevention only** — correctness comes from the
+  validator above, which runs whether or not the model honoured it.
+
+### Changed
+- **Retries no longer pay for a failure they cannot change (#165).** Every
+  Mode-2 retry costs a full re-decomposition (fresh spec-generation spend),
+  and the pilot burned three of them on one validation error, hitting the
+  identical failure each time. Maestro now classifies the failure from
+  spec-runner's typed `stop_reason` (delivered by #169a — before it, those
+  string values were dropped by an integer cast and never reached Maestro at
+  all) and routes three known reasons straight to NEEDS_REVIEW instead of
+  retrying:
+
+  | `stop_reason` | Outcome | Why |
+  |---|---|---|
+  | `validation_failed` | NEEDS_REVIEW, no retry | Re-generating the spec does not remove the established cause |
+  | `state_spec_mismatch` | NEEDS_REVIEW, no retry | A configuration fact, not a transient one |
+  | `dependency_blocked_after_skip` | NEEDS_REVIEW, no retry | Re-running does not unblock; something must change first |
+  | `task_failed_stop` | **retry unchanged** | May be a rate limit or a flaky test |
+  | `max_consecutive_failures` | **retry unchanged** | Same, in bulk |
+  | `budget_exceeded` | **retry unchanged** | Whether a retry gets a fresh budget is spec-runner's business |
+  | unknown / dynamic `error_*` / empty / **absent** | **retry unchanged** | Unclassified is not unfit |
+
+  "Unfit for automatic retry" is a claim about policy, not mathematics: a
+  fresh LLM decomposition could in principle differ. What is certain is that
+  re-generating cannot remove the cause and spends budget reaching the same
+  place, so a human — who can change the input — is the right next step. The
+  classification never keys off `stop_detail` prose or how fast the run
+  failed; a fast failure is at least as likely to be an infrastructure hiccup,
+  and treating it as terminal would trade one bad behaviour for another. The
+  NEEDS_REVIEW message carries the exact `stop_reason` and the policy
+  rationale.
+
 - **DONE now means the work finished, not just the process (#164).** A new
   always-on **completeness gate** compares the executor's completed subtask
   count against the planned total before a Mode-2 workstream is delivered.

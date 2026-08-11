@@ -18,6 +18,7 @@ import pytest
 
 from maestro.database import Database
 from maestro.models import Workstream, WorkstreamStatus
+from maestro.tasks_spec import SELF_CONTAINED_DEPENDENCIES_INSTRUCTION
 
 
 @pytest.fixture
@@ -653,7 +654,13 @@ class TestResumeDispatch:
         await orch._spawn_workstream("ws-1")
         assert len(decomposer.generate_spec_calls) == 1
         description = decomposer.generate_spec_calls[0].description
-        assert description == "original description"
+        # No operator instructions section — that is what this test guards.
+        # The dependency constraint (#165) is appended to every rework
+        # regeneration regardless, because the risk comes from rewriting
+        # tasks.md over a revision the model remembers, not from instructions.
+        assert description.startswith("original description")
+        assert "Recorded instructions" not in description
+        assert SELF_CONTAINED_DEPENDENCIES_INSTRUCTION in description
 
 
 class TestVisibility:
