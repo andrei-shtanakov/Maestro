@@ -8,6 +8,7 @@ setup, process spawning, monitoring, and PR creation.
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -32,10 +33,18 @@ from maestro.approver import (
     validate_verdict,
 )
 from maestro.changed_paths import changed_paths_since
+from maestro.completeness import (
+    COMPLETENESS_PHASE,
+    CompletenessVerdict,
+    build_completeness_block_reason,
+    classify_completeness,
+    completeness_approval_is_fresh,
+)
 from maestro.database import Database
 from maestro.decomposer import ProjectDecomposer
 from maestro.domain import (
     KNOWN_RESUME_REASONS,
+    RESUME_ACCEPT_PARTIAL,
     RESUME_OPERATOR_REWORK,
     RESUME_REVERIFY,
     RESUME_REWORK,
@@ -58,7 +67,7 @@ from maestro.execution.docker_recovery import (
     DockerProbe,
     gc_terminal_handle,
 )
-from maestro.execution.finalize import ensure_finalize_task
+from maestro.execution.finalize import EvidenceCaptureFailed, ensure_finalize_task
 from maestro.execution.handle_ref import handle_ref_from_row
 from maestro.execution.local import LocalBackend
 from maestro.execution.models import (
@@ -92,6 +101,13 @@ from maestro.models import (
     WorkstreamStatus,
 )
 from maestro.notifications.manager import NotificationManager
+from maestro.postmortem import (
+    PostmortemCaptureError,
+    archive_is_committed,
+    capture_archive,
+    prune_archives,
+    read_manifest,
+)
 from maestro.pr_manager import PRManager, PRManagerError
 from maestro.rework import build_operator_rework_addendum
 from maestro.scope_gate import build_scope_escape_reason, find_escapes, normalize
@@ -275,6 +291,15 @@ def build_ssh_execution_request(
         attempt=attempt,
         backend_id="",  # set by the caller via model_copy (existing pattern)
     )
+
+
+def _execution_id_of_archive(path: Path) -> str:
+    """Recover the execution id from an archive directory name.
+
+    The name is `<utc-compact>-<execution_id>` and the id may itself contain
+    hyphens, so the split is on the FIRST separator only.
+    """
+    return path.name.split("-", 1)[1] if "-" in path.name else path.name
 
 
 @dataclass
@@ -1547,6 +1572,12 @@ class Orchestrator:
             )
             return
         rework_addendum: str | None = None
+        if workstream.resume_reason == RESUME_ACCEPT_PARTIAL:
+            # #164: the operator accepted an incomplete result. Continue the
+            # existing success pipeline over the untouched worktree; nothing
+            # is executed and nothing is regenerated.
+            await self._resume_accept_partial(workstream)
+            return
         if workstream.resume_reason == RESUME_REVERIFY:
             workspace = self._workspace_mgr.get_workspace_path(workstream_id)
             await self._transition(
@@ -1963,11 +1994,20 @@ class Orchestrator:
                             eid, "terminal", allowed_from=["prepared", "running"]
                         )
 
-                async def _mark_collected(eid: str | None = eid) -> None:
+                async def _mark_collected(
+                    eid: str | None = eid, running: RunningWorkstream = running
+                ) -> None:
                     if eid is not None:
                         await self._db.mark_execution_state(
                             eid, "collected", allowed_from=["terminal"]
                         )
+                    # #164: capture the evidence HERE — the one moment every
+                    # transport agrees on. Collect has applied, so the state
+                    # db is local; nothing has been destroyed yet, so the ssh
+                    # logs (excluded from the collect rsync) are still on the
+                    # remote. The durable-phase write above stays first, and
+                    # keeps its own crash semantics.
+                    await self._capture_postmortem(running)
 
                 fin = await asyncio.shield(
                     ensure_finalize_task(
@@ -1998,6 +2038,25 @@ class Orchestrator:
                         expected_status=WorkstreamStatus.RUNNING,
                         message="collect failed/conflict; remote workspace preserved",
                         error_message=(fin.collect_error or "collect failed"),
+                    )
+                    completed.append(zid)
+                    continue
+                if fin.archive_error is not None:
+                    # Evidence capture failed, so cleanup was skipped and the
+                    # workspace is intact (#164, spec §6.5). Do NOT enter the
+                    # gate flow: the gate's own input is the archive that does
+                    # not exist. No approval marker — there is nothing to
+                    # approve here, the operator has to fix the archive root.
+                    reason = f"post-mortem capture failed: {fin.archive_error}"
+                    self._logger.error("workstream '%s' %s", zid, reason)
+                    await self._transition(
+                        zid,
+                        WorkstreamStatus.NEEDS_REVIEW,
+                        expected_status=WorkstreamStatus.RUNNING,
+                        message="post-mortem capture failed; workspace preserved",
+                        error_message=reason,
+                        process_pid=None,
+                        generation_pid=None,
                     )
                     completed.append(zid)
                     continue
@@ -2074,6 +2133,248 @@ class Orchestrator:
             workstream_id,
             subtask_progress=state.progress_label(total=workstream.subtask_total),
         )
+
+    def _postmortem_root(self) -> Path:
+        """`<db_dir>/postmortem` — anchored to the DB, never to the cwd.
+
+        Archives then travel with the database that describes them, and
+        recovery does not depend on where the incident run was launched from
+        (spec §6.1). A cwd-relative root would make one database resolve
+        different archive sets from different directories.
+        """
+        return Path(self._db.db_path).parent / "postmortem"
+
+    @staticmethod
+    def _evidence_key(running: RunningWorkstream) -> str:
+        """Stable per-execution archive key.
+
+        `execution_id` is None on the bare-local path, which persists no
+        handle, so that case falls back to the start timestamp — still unique
+        per execution, which is all the key has to be.
+        """
+        if running.execution_id is not None:
+            return running.execution_id
+        return f"local-{running.started_at.strftime('%Y%m%dT%H%M%S%f')}"
+
+    async def _capture_postmortem(self, running: RunningWorkstream) -> None:
+        """Archive this execution's evidence before anything is destroyed.
+
+        Runs inside finalization's `on_collected` (#164, spec §3) — after
+        collect has applied and before `cleanup()`. Raises
+        `EvidenceCaptureFailed` so finalization skips cleanup and preserves
+        the workspace; every other failure mode of this method is a genuine
+        capture failure too, so nothing here is swallowed.
+        """
+        workstream_id = running.workstream.id
+        spec_dir = running.workspace_path / "spec"
+        loop = asyncio.get_running_loop()
+        state = await loop.run_in_executor(
+            None, read_executor_state, spec_dir, SPEC_PREFIX
+        )
+        persisted = await self._db.get_workstream(workstream_id)
+        counters: dict[str, int | None] = {
+            "done": state.done if state else None,
+            "noop_done": state.noop_done if state else None,
+            "state_total": state.total if state else None,
+            "planned": persisted.subtask_total,
+        }
+        identity: dict[str, Any] = {
+            "workstream_id": workstream_id,
+            "execution_id": self._evidence_key(running),
+            "attempt": persisted.retry_count,
+            "backend_id": running.backend_id,
+            "transport": running.handle.ref.backend_id,
+            "exit_code": running.handle.poll(),
+            "branch": persisted.branch,
+            "head_sha": await self._workspace_head(running.workspace_path),
+            "captured_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "last_run_stop_reason": state.last_run_stop_reason if state else None,
+            "last_run_stop_detail": state.last_run_stop_detail if state else None,
+        }
+        try:
+            archive = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    capture_archive,
+                    spec_dir=spec_dir,
+                    root=self._postmortem_root(),
+                    identity=identity,
+                    counters=counters,
+                    config=self._config.postmortem,
+                ),
+            )
+        except PostmortemCaptureError as exc:
+            raise EvidenceCaptureFailed(str(exc)) from exc
+
+        # The row goes in only after the directory is committed, so its
+        # existence implies evidence on disk. Retention runs strictly after
+        # that — a prune fault must never cost the archive just captured.
+        await self._db.record_postmortem_archive(
+            workstream_id,
+            identity["execution_id"],
+            path=str(archive.path),
+            bytes_written=archive.bytes_written,
+            truncated=archive.truncated,
+        )
+        self._logger.info(
+            "postmortem.captured workstream=%s execution=%s path=%s bytes=%d",
+            workstream_id,
+            identity["execution_id"],
+            archive.path,
+            archive.bytes_written,
+        )
+        await self._prune_postmortem(workstream_id)
+
+    async def _prune_postmortem(self, workstream_id: str) -> None:
+        """Apply the retention policy; never let its failure escape.
+
+        A retention fault is not a capture failure: the fresh evidence is
+        already committed, and raising here would preserve a workspace over a
+        housekeeping problem.
+        """
+        keep = self._config.postmortem.keep_per_workstream
+        loop = asyncio.get_running_loop()
+        try:
+            removed = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    prune_archives,
+                    self._postmortem_root(),
+                    workstream_id,
+                    keep=keep,
+                ),
+            )
+        except OSError as exc:
+            self._logger.warning(
+                "postmortem retention failed for '%s': %s", workstream_id, exc
+            )
+            return
+        for path in removed:
+            await self._db.delete_postmortem_archive(
+                workstream_id, _execution_id_of_archive(path)
+            )
+
+    async def _gate_completeness(
+        self,
+        workstream_id: str,
+        workstream: Workstream,
+        workspace_path: Path,
+    ) -> bool:
+        """Always-on completeness gate (#164, spec §4).
+
+        DONE used to mean "spec-runner exited 0 and the merge applied" — a
+        true statement about the process and a false one about the work. This
+        reads the counters the post-mortem capture recorded and refuses to
+        deliver a run that did not finish its planned tasks.
+
+        Reads the ARCHIVE rather than the live worktree, which is what keeps
+        local and ssh on one path (spec §3). Fail-closed throughout: a missing
+        archive, an unreadable manifest or an uncaptured denominator all
+        block.
+        """
+        head = await self._workspace_head(workspace_path)
+        archive_row = await self._newest_archive(workstream_id)
+        verdict = await self._completeness_verdict(archive_row)
+
+        if verdict.all_no_op:
+            # Passes the gate; visibility only (§4.3/§10.2). Judging whether
+            # the work was substantively useful belongs to verification.
+            self._logger.warning(
+                "workstream.completeness.all_no_op workstream=%s execution=%s "
+                "done=%s planned=%s head_sha=%s",
+                workstream_id,
+                (archive_row or {}).get("execution_id"),
+                verdict.message,
+                workstream.subtask_total,
+                (head or "unknown")[:12],
+            )
+        if verdict.ok:
+            return True
+
+        evidence = (archive_row or {}).get("execution_id")
+        if head is not None and await self._completeness_approved(
+            workstream_id, workstream, head, evidence
+        ):
+            self._logger.info(
+                "workstream '%s' completeness block approved by operator "
+                "(%s); accepting the partial result",
+                workstream_id,
+                verdict.reason,
+            )
+            return True
+
+        reason = build_completeness_block_reason(
+            verdict,
+            head or "0" * 40,
+            evidence=evidence,
+            stop_reason=(archive_row or {}).get("stop_reason"),
+        )
+        self._logger.warning("workstream '%s' blocked: %s", workstream_id, reason)
+        return await self._route_scope_block(workstream_id, reason)
+
+    async def _newest_archive(self, workstream_id: str) -> dict[str, Any] | None:
+        """The freshest committed archive for a workstream, or None.
+
+        "Committed" is decided by the filesystem, not the row: a row can
+        outlive its directory, and this answer gates both delivery and the
+        destruction of the last copy of the logs.
+        """
+        for row in await self._db.list_postmortem_archives(workstream_id):
+            if archive_is_committed(row["path"]):
+                return row
+        return None
+
+    async def _completeness_verdict(
+        self, archive_row: dict[str, Any] | None
+    ) -> CompletenessVerdict:
+        """Classify the archived counters (fail-closed on anything missing)."""
+        if archive_row is None:
+            return CompletenessVerdict.unreadable(
+                "no committed post-mortem archive for this run"
+            )
+        manifest = await asyncio.get_running_loop().run_in_executor(
+            None, read_manifest, archive_row["path"]
+        )
+        if manifest is None:
+            return CompletenessVerdict.unreadable(
+                f"unreadable manifest in {archive_row['path']}"
+            )
+        done = manifest.get("done")
+        noop_done = manifest.get("noop_done")
+        if done is None:
+            return CompletenessVerdict.unreadable(
+                "archive recorded no executor state "
+                f"(state_missing={manifest.get('state_missing')})"
+            )
+        archive_row["stop_reason"] = manifest.get("last_run_stop_reason")
+        return classify_completeness(
+            done=int(done),
+            planned=manifest.get("planned"),
+            noop_done=int(noop_done or 0),
+        )
+
+    async def _completeness_approved(
+        self,
+        workstream_id: str,
+        workstream: Workstream,
+        head: str,
+        evidence: str | None,
+    ) -> bool:
+        """True when the operator approved THIS result at THIS snapshot.
+
+        Two independent conditions, both required. The `gate_approvals` table
+        is the authority on "was (workstream, completeness, sha) approved".
+        The marker adds freshness: it names the evidence snapshot the operator
+        saw, so an approval cannot silently accept a later partial result that
+        happens to sit at the same sha.
+        """
+        approvals = await self._db.list_gate_approvals(workstream_id)
+        if (COMPLETENESS_PHASE, head) not in approvals:
+            return False
+        marker = parse_approval_marker(workstream.error_message)
+        if marker is None:
+            return False
+        return completeness_approval_is_fresh(marker, current_evidence=evidence)
 
     async def _gate_ex_ante(self, workstream_id: str, workstream: Workstream) -> bool:
         """Evaluate the ex-ante gate; on block route READY -> NEEDS_REVIEW."""
@@ -2206,6 +2507,60 @@ class Orchestrator:
         )
         await self._handle_success(workstream.id, workspace)
         return True
+
+    async def _resume_accept_partial(self, workstream: Workstream) -> None:
+        """Continue the success pipeline over an approved incomplete result.
+
+        The operator's decision was "accept what exists", so this executes
+        nothing: no author respawn, no re-decomposition, and no attempt at the
+        tasks that are missing (catching up is #166's concern and has no
+        mechanism here). READY -> RUNNING over the untouched worktree, then
+        the ordinary success continuation — the completeness gate re-evaluates
+        and passes through the recorded approval, and scope/ex-post/verification
+        still apply. Approving incompleteness does not approve anything else.
+
+        Refuses rather than falling back to a respawn: a respawn would
+        regenerate the spec and mint a new sha, voiding the very approval that
+        brought us here, so an operator who asked to accept a result would
+        silently get a fresh run instead.
+        """
+        if not self._workspace_mgr.workspace_exists(workstream.id):
+            reason = (
+                "completeness approval cannot be honoured: the worktree is "
+                "gone, so the accepted result no longer exists"
+            )
+            self._logger.error("workstream '%s' %s", workstream.id, reason)
+            await self._transition(
+                workstream.id,
+                WorkstreamStatus.NEEDS_REVIEW,
+                expected_status=WorkstreamStatus.READY,
+                message=reason,
+                error_message=reason,
+                resume_reason=None,
+                process_pid=None,
+                generation_pid=None,
+            )
+            return
+        workspace = self._workspace_mgr.get_workspace_path(workstream.id)
+        # Clear `resume_reason` atomically with the status write: the gate
+        # reads the approval from `gate_approvals` plus the marker, so the
+        # reason has done its job here, and leaving it set would re-enter this
+        # path on any later READY.
+        await self._transition(
+            workstream.id,
+            WorkstreamStatus.RUNNING,
+            expected_status=WorkstreamStatus.READY,
+            resume_reason=None,
+            process_pid=None,
+            generation_pid=None,
+            workspace_path=str(workspace),
+        )
+        self._logger.info(
+            "Resuming workstream '%s' with an accepted partial result "
+            "(no executor, no decomposition)",
+            workstream.id,
+        )
+        await self._handle_success(workstream.id, workspace)
 
     async def _route_scope_block(self, workstream_id: str, reason: str) -> bool:
         """Fail-closed RUNNING -> FAILED -> NEEDS_REVIEW for the scope gate.
@@ -2894,6 +3249,12 @@ class Orchestrator:
         # last task must read "N/N done (1 no-op)", never "DONE N-1/N".
         await self._final_progress_refresh(workstream_id, workspace_path)
 
+        # Completeness (#164, always-on, first): an incomplete run's diff is
+        # not worth classifying, so this precedes both diff gates. DONE must
+        # be a statement about the work, not just about the process.
+        if not await self._gate_completeness(workstream_id, workstream, workspace_path):
+            return
+
         # Deterministic scope containment (always-on, before the optional
         # steward risk gate). Fail-fast on out-of-scope commits.
         if not await self._gate_scope(workstream_id, workstream, workspace_path):
@@ -3048,8 +3409,30 @@ class Orchestrator:
         )
         self._stats.completed += 1
 
-        # Cleanup workspace
-        self._workspace_mgr.cleanup_workspace(workstream_id)
+        # Cleanup destroys the last copy of the executor logs, so it only runs
+        # once the evidence is provably elsewhere (#164, spec §6.5). The
+        # workstream stays DONE either way: the merge did apply, and rewriting
+        # a correct terminal state because a diagnostic copy is missing would
+        # be a worse lie than a leftover directory.
+        if await self._postmortem_secured(workstream_id):
+            self._workspace_mgr.cleanup_workspace(workstream_id)
+
+    async def _postmortem_secured(self, workstream_id: str) -> bool:
+        """True when a committed archive exists for this workstream's run.
+
+        Asks the filesystem, not the row: a `postmortem_archives` row can
+        outlive its directory, and being wrong here means destroying evidence
+        that no longer exists anywhere else.
+        """
+        if await self._newest_archive(workstream_id) is not None:
+            return True
+        self._logger.warning(
+            "workstream '%s' is DONE but has no committed post-mortem "
+            "archive; leaving the worktree in place so its executor logs "
+            "survive for diagnosis",
+            workstream_id,
+        )
+        return False
 
     async def _run_verification(self, workstream_id: str, workspace_path: Path) -> None:
         """Drive the VERIFYING loop for one workstream (Stage B, §4/§6).

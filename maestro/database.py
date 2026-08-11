@@ -16,6 +16,8 @@ from urllib.request import pathname2url
 
 import aiosqlite
 
+from maestro.completeness import COMPLETENESS_PHASE
+from maestro.domain.resume import RESUME_ACCEPT_PARTIAL
 from maestro.models import (
     AgentType,
     Complexity,
@@ -3491,11 +3493,26 @@ class Database:
                     "VALUES (?, ?, ?, ?)",
                     (workstream_id, phase, sha, _format_datetime(datetime.now(UTC))),
                 )
-            cursor = await conn.execute(
-                "UPDATE workstreams SET status = 'ready' "
-                "WHERE id = ? AND status = 'needs_review'",
-                (workstream_id,),
-            )
+            if phase == COMPLETENESS_PHASE:
+                # #164: the completeness resume needs a durable "why", and it
+                # must be written in THIS transaction — an approval recorded
+                # without its resume reason would send the workstream back
+                # through a full respawn, minting a new sha and voiding the
+                # approval the operator just granted.
+                cursor = await conn.execute(
+                    "UPDATE workstreams SET status = 'ready', resume_reason = ? "
+                    "WHERE id = ? AND status = 'needs_review'",
+                    (RESUME_ACCEPT_PARTIAL, workstream_id),
+                )
+            else:
+                # Every other phase (and the no-marker requeue) leaves
+                # resume_reason alone: the ex-post resume is marker-driven and
+                # a verification resume may already have one set.
+                cursor = await conn.execute(
+                    "UPDATE workstreams SET status = 'ready' "
+                    "WHERE id = ? AND status = 'needs_review'",
+                    (workstream_id,),
+                )
             if cursor.rowcount == 0:
                 # Distinguish missing vs wrong-status; raising rolls back
                 # the INSERT above via the transaction context.

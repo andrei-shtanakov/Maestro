@@ -1,6 +1,7 @@
 """Pytest configuration and fixtures for Maestro tests."""
 
 import shutil
+import sqlite3
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
@@ -259,3 +260,75 @@ def _stub_spec_runner_help(monkeypatch: pytest.MonkeyPatch) -> None:
         return real_run(cmd, **kwargs)
 
     monkeypatch.setattr(preflight.subprocess, "run", fake_run)
+
+
+@pytest.fixture
+def seed_postmortem():
+    """Seed a committed post-mortem archive for a workstream (#164).
+
+    Delivery is gated on evidence existing, so any test that drives
+    `_handle_success` through to DONE has to have captured an archive first —
+    exactly as a real run does inside finalization. This writes a real one via
+    the production `capture_archive`, so the gate reads what it would read in
+    production rather than a hand-built stand-in.
+    """
+    from maestro.models import PostmortemConfig
+    from maestro.postmortem import capture_archive
+
+    async def _seed(
+        db,
+        workstream_id: str,
+        *,
+        done: int = 1,
+        planned: int | None = 1,
+        noop_done: int = 0,
+        execution_id: str = "exec-1",
+        head_sha: str = "c" * 40,
+        stop_reason: str | None = None,
+        spec_dir: Path | None = None,
+    ) -> Path:
+        root = Path(db.db_path).parent / "postmortem"
+        source = spec_dir if spec_dir is not None else root.parent / "seed-spec"
+        source.mkdir(parents=True, exist_ok=True)
+        state_db = source / ".executor-maestro-state.db"
+        if not state_db.exists():
+            conn = sqlite3.connect(str(state_db))
+            try:
+                conn.execute("CREATE TABLE tasks (task_id TEXT PRIMARY KEY)")
+                conn.commit()
+            finally:
+                conn.close()
+        archive = capture_archive(
+            spec_dir=source,
+            root=root,
+            identity={
+                "workstream_id": workstream_id,
+                "execution_id": execution_id,
+                "attempt": 0,
+                "backend_id": "local",
+                "transport": "local",
+                "exit_code": 0,
+                "branch": f"feature/{workstream_id}",
+                "head_sha": head_sha,
+                "captured_at": "2026-08-11T00:00:00Z",
+                "last_run_stop_reason": stop_reason,
+                "last_run_stop_detail": None,
+            },
+            counters={
+                "done": done,
+                "planned": planned,
+                "noop_done": noop_done,
+                "state_total": done,
+            },
+            config=PostmortemConfig(),
+        )
+        await db.record_postmortem_archive(
+            workstream_id,
+            execution_id,
+            path=str(archive.path),
+            bytes_written=archive.bytes_written,
+            truncated=archive.truncated,
+        )
+        return archive.path
+
+    return _seed

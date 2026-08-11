@@ -233,25 +233,39 @@ class TestCapture:
 
         assert not list(root.rglob("*.partial"))
 
-    def test_missing_state_db_is_a_capture_error(self, tmp_path: Path) -> None:
-        """Fail-closed: no snapshot means the gate has no input, and the
-        caller must not destroy anything (spec §6.5)."""
-        spec_dir = tmp_path / "wt" / "spec"
-        spec_dir.mkdir(parents=True)
+    def test_missing_state_db_archives_logs_and_flags_it(self, tmp_path: Path) -> None:
+        """Not a capture failure — capture runs for failed runs too.
 
-        with pytest.raises(PostmortemCaptureError):
-            capture_archive(
-                spec_dir=spec_dir,
-                root=tmp_path / "postmortem",
-                identity=_identity(),
-                counters={"done": 0, "planned": 1, "noop_done": 0, "state_total": 0},
-                config=PostmortemConfig(),
-            )
+        A spec-runner that died before creating its database must keep its
+        retry path; raising here would convert a retryable FAILED into
+        NEEDS_REVIEW. The absent counters are the completeness gate's problem,
+        and it fails closed on them by itself.
+        """
+        spec_dir = tmp_path / "wt" / "spec"
+        logs_dir = spec_dir / ".executor-maestro-logs"
+        logs_dir.mkdir(parents=True)
+        (logs_dir / "t-1-001.log").write_text("died early\n")
+
+        result = capture_archive(
+            spec_dir=spec_dir,
+            root=tmp_path / "postmortem",
+            identity=_identity(exit_code=1),
+            counters={"done": 0, "planned": 9, "noop_done": 0, "state_total": 0},
+            config=PostmortemConfig(),
+        )
+
+        manifest = json.loads((result.path / MANIFEST_FILENAME).read_text())
+        assert manifest["state_missing"] is True
+        assert not (result.path / "executor-state.db").exists()
+        assert (result.path / "logs" / "t-1-001.log").is_file()
+        assert archive_is_committed(result.path)
 
     def test_failed_capture_leaves_no_committed_archive(self, tmp_path: Path) -> None:
-        spec_dir = tmp_path / "wt" / "spec"
-        spec_dir.mkdir(parents=True)
-        root = tmp_path / "postmortem"
+        """An unwritable archive root is the real capture failure (§6.5)."""
+        spec_dir = _make_spec_dir(tmp_path / "wt")
+        root = tmp_path / "readonly" / "postmortem"
+        root.parent.mkdir(parents=True)
+        root.parent.chmod(0o500)
 
         with pytest.raises(PostmortemCaptureError):
             capture_archive(
@@ -262,8 +276,8 @@ class TestCapture:
                 config=PostmortemConfig(),
             )
 
-        committed = [p for p in root.rglob("*") if p.name == MANIFEST_FILENAME]
-        assert committed == []
+        root.parent.chmod(0o700)
+        assert not root.exists()
 
     def test_oversized_logs_truncate_instead_of_failing(self, tmp_path: Path) -> None:
         """Truncation is a recorded policy outcome, not a failure (spec §6.3)."""

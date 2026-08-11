@@ -78,15 +78,20 @@ def capture_archive(
         config: Retention policy (byte cap).
         prefix: spec-runner's `spec_prefix`, which names both artifacts.
 
+    A missing state database is **not** a capture failure. It is recorded as
+    `state_missing: true` and the archive is committed with whatever else
+    exists, because capture runs for failed runs too: a spec-runner that died
+    before creating its database must still keep its retry path, and turning
+    that into a capture failure would convert a retryable FAILED into
+    NEEDS_REVIEW. The completeness gate sees the absent counters and fails
+    closed on its own, which is the correct place for that decision.
+
     Raises:
-        PostmortemCaptureError: The state database is missing or unreadable,
-            or the archive could not be written. Nothing is committed.
+        PostmortemCaptureError: The archive itself could not be written
+            (unwritable root, no space, an unreadable state database).
+            Nothing is committed.
     """
     state_db = spec_dir / f".executor-{prefix}state.db"
-    if not state_db.is_file():
-        msg = f"executor state db not found at {state_db}"
-        raise PostmortemCaptureError(msg)
-
     workstream_id = str(identity["workstream_id"])
     final = root / workstream_id / _archive_dirname(identity)
     partial = final.with_name(final.name + _PARTIAL_SUFFIX)
@@ -95,7 +100,11 @@ def capture_archive(
         if partial.exists():
             shutil.rmtree(partial)
         partial.mkdir(parents=True)
-        _snapshot_state(state_db, partial / STATE_FILENAME)
+        state_missing = not state_db.is_file()
+        if not state_missing:
+            _snapshot_state(state_db, partial / STATE_FILENAME)
+        else:
+            logger.warning("no executor state db at %s; archiving logs only", state_db)
         written, truncated, omitted = _copy_logs(
             spec_dir / f".executor-{prefix}logs",
             partial / LOGS_DIRNAME,
@@ -107,6 +116,7 @@ def capture_archive(
             bytes_written=written,
             truncated=truncated,
             logs_omitted=omitted,
+            state_missing=state_missing,
         )
         (partial / MANIFEST_FILENAME).write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n"
@@ -148,6 +158,23 @@ def archive_is_committed(path: Path | str) -> bool:
     if archive.name.endswith(_PARTIAL_SUFFIX):
         return False
     return archive.is_dir() and (archive / MANIFEST_FILENAME).is_file()
+
+
+def read_manifest(archive: Path | str) -> dict[str, Any] | None:
+    """Load a committed archive's manifest, or None when unreadable.
+
+    This is the completeness gate's input: it reads the numbers the capture
+    recorded rather than re-reading a worktree, which is what keeps local and
+    ssh runs on one code path. None means the gate fails closed — an
+    unreadable manifest is not an empty one.
+    """
+    path = Path(archive) / MANIFEST_FILENAME
+    try:
+        loaded = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        logger.warning("unreadable post-mortem manifest %s: %s", path, exc)
+        return None
+    return loaded if isinstance(loaded, dict) else None
 
 
 def prune_archives(root: Path, workstream_id: str, *, keep: int) -> list[Path]:
@@ -248,6 +275,7 @@ def _build_manifest(
     bytes_written: int,
     truncated: bool,
     logs_omitted: int,
+    state_missing: bool = False,
 ) -> dict[str, Any]:
     """The archive's self-describing record.
 
@@ -263,6 +291,7 @@ def _build_manifest(
         "noop_done": noop_done,
         "state_total": counters.get("state_total"),
         "all_no_op": bool(done) and done == noop_done,
+        "state_missing": state_missing,
         "bytes_written": bytes_written,
         "truncated": truncated,
         "logs_omitted": logs_omitted,
