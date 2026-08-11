@@ -37,7 +37,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from maestro._vendor.obs import current_pipeline_id
 from maestro.changed_paths import changed_paths_since
@@ -49,6 +49,7 @@ from maestro.gate_approvals import (
     parse_approval_marker,
     preserve_approval_marker,
 )
+from maestro.gate_catalog import GateCatalogError, classify_gate_id
 
 
 if TYPE_CHECKING:
@@ -77,28 +78,49 @@ _DEFERRED_GATES = {
     "steward.gate_check": "runs in the target repo's CI, not at this edge",
 }
 
+_NAMESPACE_GATE = "maestro.gate_id_namespace"
+"""The check that refuses a gate id we are not entitled to interpret (#160).
+
+Its own producer id, rather than folding the refusal into
+``steward.risk_classify_*``: that classification ran and succeeded, and
+recording its verdict as an error would misattribute the failure.
+"""
+
+_CANONICAL_GATE_NOTE = "catalog gate-check gate; enforced by steward, not at this edge"
+
 
 class GateVerdictRecord(BaseModel):
     """One appended line of logs/<ULID>/gate_verdicts.jsonl (DESIGN-607).
 
     This is Maestro's INTERNAL run-level audit format
-    (`maestro.gate-verdict-record/v1`) — not steward's canonical
+    (`maestro.gate-verdict-record/v2`) — not steward's canonical
     `contracts/gate-verdicts/v1` findings-bundle. The explicit `schema`
     discriminator on every line keeps the two from being mistaken for
     one contract (approver spec §7.3). `not_run` marks an approver
     observation: the evaluator did not run and the gate still blocks —
     semantically neutral, never a waiver.
+
+    **v2 (#160)** renamed `obligation` -> `enforcement`. The two are
+    different axes, and v1 used steward's name for ours: `obligation`
+    (`quality | approval`) is the catalog-owned *intent* of a gate, while
+    `enforcement` (`mandatory | advisory`) is this run's answer to "does it
+    block the transition" — a consumer policy steward neither defines nor
+    validates. The rename is breaking, hence the version bump rather than an
+    alias; steward's loader now permanently bars `mandatory`/`advisory` from
+    `obligation_vocabulary`, so the names cannot collide again by accident.
+    `obligation` is deliberately absent here, not null: classifying our own
+    producer ids with steward's taxonomy is allowed but has no consumer yet.
     """
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     record_schema: str = Field(
-        default="maestro.gate-verdict-record/v1",
+        default="maestro.gate-verdict-record/v2",
         alias="schema",
         serialization_alias="schema",
     )
     gate_id: str
-    obligation: Literal["mandatory", "advisory"]
+    enforcement: Literal["mandatory", "advisory"]
     verdict: Literal["pass", "fail", "waived", "error", "missing", "not_run"]
     tier: str | None = None
     phase: Literal["ex_ante", "ex_post"]
@@ -107,6 +129,23 @@ class GateVerdictRecord(BaseModel):
     ts: str
     workstream_id: str
     note: str | None = None
+
+    @field_validator("gate_id")
+    @classmethod
+    def _namespace_conformant(cls, value: str) -> str:
+        """No record is written under an id we are not entitled to use.
+
+        The branch that matters (an unknown `GC-*` must block the transition,
+        not vanish) is decided in `_decide`, where a decision can still be
+        returned. This validator is the backstop for every other writer: it
+        turns "we accidentally minted a governance id" into a loud failure
+        instead of a line in an audit log that reads as authoritative.
+        """
+        try:
+            classify_gate_id(value)
+        except GateCatalogError as exc:
+            raise ValueError(str(exc)) from exc
+        return value
 
 
 class GateDecision(BaseModel):
@@ -227,7 +266,7 @@ class GateKeeper:
 
         def record(
             gate_id: str,
-            obligation: Literal["mandatory", "advisory"],
+            enforcement: Literal["mandatory", "advisory"],
             verdict: Literal["pass", "fail", "waived", "error", "missing"],
             tier: str | None = None,
             risk_model_version: str | None = None,
@@ -235,7 +274,7 @@ class GateKeeper:
         ) -> GateVerdictRecord:
             return GateVerdictRecord(
                 gate_id=gate_id,
-                obligation=obligation,
+                enforcement=enforcement,
                 verdict=verdict,
                 tier=tier,
                 risk_model_version=risk_model_version,
@@ -251,7 +290,7 @@ class GateKeeper:
             records = [
                 record(
                     gate_id=classify_gate,
-                    obligation="mandatory",
+                    enforcement="mandatory",
                     verdict="error",
                     note=classification,
                 )
@@ -269,7 +308,7 @@ class GateKeeper:
         records = [
             record(
                 gate_id=classify_gate,
-                obligation="mandatory",
+                enforcement="mandatory",
                 verdict="pass",
                 tier=tier,
                 risk_model_version=model_version,
@@ -279,11 +318,51 @@ class GateKeeper:
 
         # Advisory annotations for gates enforced beyond these edges (M-2).
         for gate_id in classification.get("mandatory_gates", []):
-            if gate_id in _DEFERRED_GATES:
+            try:
+                namespace = classify_gate_id(gate_id)
+            except GateCatalogError as exc:
+                # #160 fail-closed: an id in steward's reserved namespace that
+                # our pinned catalog does not define — or one that is no valid
+                # id at all — must not pass unnoticed. Recorded under our own
+                # id: minting a record under the id we are refusing would be
+                # the "invent the entry" half of what the ruling forbids.
+                records.append(
+                    record(
+                        gate_id=_NAMESPACE_GATE,
+                        enforcement="mandatory",
+                        verdict="error",
+                        tier=tier,
+                        risk_model_version=model_version,
+                        note=str(exc),
+                    )
+                )
+                self._write(records)
+                return GateDecision(
+                    allow=False,
+                    reason=f"gates: {_NAMESPACE_GATE} error: {exc}",
+                    records=records,
+                    tier=tier,
+                    flags=list(flags),
+                )
+            if namespace == "canonical":
+                # A catalog gate is real, but gate-check runs it in the target
+                # repo's CI — the same "enforced beyond these edges" case as
+                # _DEFERRED_GATES, so the same advisory annotation.
                 records.append(
                     record(
                         gate_id=gate_id,
-                        obligation="advisory",
+                        enforcement="advisory",
+                        verdict="missing",
+                        tier=tier,
+                        risk_model_version=model_version,
+                        note=_CANONICAL_GATE_NOTE,
+                    )
+                )
+            elif gate_id in _DEFERRED_GATES:
+                records.append(
+                    record(
+                        gate_id=gate_id,
+                        enforcement="advisory",
                         verdict="missing",
                         tier=tier,
                         risk_model_version=model_version,
@@ -294,7 +373,7 @@ class GateKeeper:
                 records.append(
                     record(
                         gate_id=gate_id,
-                        obligation="mandatory",
+                        enforcement="mandatory",
                         verdict="pass",
                         tier=tier,
                         risk_model_version=model_version,
@@ -316,7 +395,7 @@ class GateKeeper:
                 records.append(
                     record(
                         gate_id="human.owner_approval",
-                        obligation="mandatory",
+                        enforcement="mandatory",
                         verdict="pass",
                         tier=tier,
                         risk_model_version=model_version,
@@ -332,7 +411,7 @@ class GateKeeper:
                 records.append(
                     record(
                         gate_id="human.owner_approval",
-                        obligation="mandatory",
+                        enforcement="mandatory",
                         verdict="missing",
                         tier=tier,
                         risk_model_version=model_version,

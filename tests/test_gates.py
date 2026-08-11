@@ -171,7 +171,7 @@ async def test_ex_ante_high_tier_blocks_for_approval(
     assert decision.reason and APPROVAL_MARKER_PREFIX in decision.reason
     approvals = [r for r in decision.records if r.gate_id == "human.owner_approval"]
     assert approvals and approvals[0].verdict == "missing"
-    assert approvals[0].obligation == "mandatory"
+    assert approvals[0].enforcement == "mandatory"
 
 
 async def test_ex_ante_operator_requeue_counts_as_approval(
@@ -235,7 +235,7 @@ async def test_missing_binary_fails_closed(repo: Path, tmp_path: Path) -> None:
     decision = await keeper.evaluate_ex_ante("ws-1", ["src/**"], approvals=set())
     assert not decision.allow
     errs = [r for r in decision.records if r.verdict == "error"]
-    assert errs and errs[0].obligation == "mandatory"
+    assert errs and errs[0].enforcement == "mandatory"
 
 
 async def test_steward_failure_fails_closed(
@@ -990,7 +990,7 @@ def test_verdict_record_accepts_not_run() -> None:
     """§6: observations use the semantically-neutral not_run, never waived."""
     rec = GateVerdictRecord(
         gate_id="agent.approver",
-        obligation="advisory",
+        enforcement="advisory",
         verdict="not_run",
         phase="ex_post",
         ts="2026-08-06T00:00:00+00:00",
@@ -1005,21 +1005,21 @@ def test_verdict_record_serializes_schema_discriminator() -> None:
     file is never mistaken for steward's contracts/gate-verdicts/v1."""
     rec = GateVerdictRecord(
         gate_id="agent.approver",
-        obligation="advisory",
+        enforcement="advisory",
         verdict="not_run",
         phase="ex_post",
         ts="2026-08-06T00:00:00+00:00",
         workstream_id="ws-1",
     )
     dumped = rec.model_dump(by_alias=True, exclude_none=True)
-    assert dumped["schema"] == "maestro.gate-verdict-record/v1"
+    assert dumped["schema"] == "maestro.gate-verdict-record/v2"
 
 
 async def test_append_records_writes_schema_field(tmp_path: Path) -> None:
     keeper = _make_keeper(tmp_path)
     rec = GateVerdictRecord(
         gate_id="agent.approver",
-        obligation="advisory",
+        enforcement="advisory",
         verdict="not_run",
         phase="ex_post",
         ts="2026-08-06T00:00:00+00:00",
@@ -1029,5 +1029,5 @@ async def test_append_records_writes_schema_field(tmp_path: Path) -> None:
     keeper.append_records([rec])
     jsonl = tmp_path / "logs" / "gate_verdicts.jsonl"
     lines = [json.loads(line) for line in jsonl.read_text().splitlines()]
-    assert lines[-1]["schema"] == "maestro.gate-verdict-record/v1"
+    assert lines[-1]["schema"] == "maestro.gate-verdict-record/v2"
     assert lines[-1]["verdict"] == "not_run"

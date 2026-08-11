@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+### Changed
+- **BREAKING (verdict log): `maestro.gate-verdict-record/v1` -> `/v2` — the
+  `obligation` field is now `enforcement` (#160).** The two names denote
+  different axes and v1 used steward's name for ours: `obligation`
+  (`quality | approval`) is the **intent** of a gate and belongs to steward's
+  catalog, resolved from `gate_id`; `enforcement` (`mandatory | advisory`) is
+  **this consumer's** answer to "does it block the transition", which steward
+  neither defines nor validates. Renaming a required field is incompatible, so
+  the `schema` discriminator on every line of `logs/<ULID>/gate_verdicts.jsonl`
+  moves to `/v2` rather than gaining an alias — anything that parses these
+  lines must branch on it. `obligation` is **absent**, not null: classifying
+  our own producer ids with steward's taxonomy is permitted but has no
+  consumer yet, and an always-null field would read as "unclassified" rather
+  than "not claimed". Catalog owner's ruling on maestro#160 / steward#63
+  (2026-08-12); steward's loader now permanently bars `mandatory`/`advisory`
+  from `obligation_vocabulary`, so the two axes cannot collide by name again.
+- **`gate_id` namespaces are now enforced (#160).** `GC-` is steward's closed
+  namespace: a `GC-*` id **unknown to the vendored catalog blocks the
+  transition** fail-closed instead of being silently dropped, and the refusal
+  is recorded under Maestro's own `maestro.gate_id_namespace` — minting a
+  record under the id we are refusing would be the "invent the entry" half of
+  what the ruling forbids. A `GC-*` the catalog **does** know is annotated
+  advisory (`verdict: missing`): it is a real gate, enforced by gate-check in
+  the target repo's CI rather than at Maestro's two edges — the existing M-2
+  case. Producer ids (`<namespace>.<name>`) are validated by **shape only and
+  never resolved** against the catalog, so `steward.risk_classify_*`,
+  `human.owner_approval` and `maestro.validate_strict` keep their names: they
+  are enforcement points of this runtime, not gate-check gates, and no
+  canonical aliases were issued for them. An id in neither namespace is
+  rejected. In practice nothing changes for current runs — steward's
+  `tier_gates` carries only producer ids today — but that profile is
+  operator-editable, which is why the guard exists.
+- steward's gate catalog is **vendored, not referenced**:
+  `maestro/resources/gate_catalog/upstream/` carries `profiles/gate-catalog.yaml`
+  (catalog v2) and the normative `contracts/gate-verdicts/v1/README.md`, pinned
+  at steward `afd192f`. Shipped inside the package, because the sibling checkout
+  they came from does not exist for anyone who installed Maestro. The id
+  patterns and the reserved-token list are read **from the vendored file** —
+  steward publishes that mirror precisely because consumers vendor the file and
+  not the loader, and it is not a knob: the `GC-` pattern cannot be widened
+  locally. Copy-integrity (digest) and upstream provenance/drift (against the
+  sibling, skipped where absent) are separate tests, because a local edit, a
+  fabricated pin and a stale pin are different defects.
+
 ### Added
 - **Per-workstream quarantine (#166 half A).**
   `maestro workstream-quarantine <id> --reason "<why>"` forbids one

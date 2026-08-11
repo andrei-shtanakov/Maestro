@@ -424,7 +424,25 @@
 
 ## Входящие 2026-08, волна 3 (inbox #160, принят 2026-08-08)
 
-- [ ] **#160 gate-catalog-for-ws006: канонические gate_id/obligation в gate_verdicts.jsonl** (P2, не срочно) @owner:github:andrei-shtanakov @id:gate-catalog-for-ws006
+- [x] **#160 gate-catalog-for-ws006: канонические gate_id/obligation в gate_verdicts.jsonl** (P2, не срочно) @owner:github:andrei-shtanakov @id:gate-catalog-for-ws006
+      **Закрыт 2026-08-12.** Владелец каталога ответил по обоим открытым
+      вопросам (steward#63, master `afd192f`): (1) оси не сводятся — принят наш
+      вариант (a), два поля; `obligation: quality|approval` остаётся у steward
+      как часть идентичности гейта, `enforcement: mandatory|advisory` — наше
+      поле в нашей схеме, steward его не определяет и не валидирует, а его
+      загрузчик навсегда закрыл ключ `enforcement` и токены `mandatory`/
+      `advisory` в `obligation_vocabulary`; (2) канонического маппинга нашим id
+      не выдаётся — `GC-` закрытое пространство steward, наши id живут по
+      `producer_pattern`, ведущий сегмент называет инструмент-источник, а не
+      владельца, переименования нет. Сделано: `obligation` -> `enforcement` и
+      дискриминатор `maestro.gate-verdict-record/v2` (переименование
+      обязательного поля несовместимо); вендоринг каталога и нормативного
+      README в `maestro/resources/gate_catalog/upstream/` с пина, паттерны
+      читаются из файла, а не дублируются в коде; неизвестный `GC-*`
+      fail-closed блокирует переход и пишется под `maestro.gate_id_namespace`,
+      известный — advisory-аннотация; producer-id валидируются по форме и через
+      каталог не резолвятся. `obligation` собственным id **не** добавляли —
+      решение владельца: поле отсутствует, а не null, до появления потребителя.
       steward#50 (master `c26ca38`) доставил SSOT стабильных gate_id —
       `profiles/gate-catalog.yaml` (v1: 19 active/quality + GC-APPROVAL-MISSING;
       словарь `obligation: quality|approval`). Просьба steward: записи нашего
