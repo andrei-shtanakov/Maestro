@@ -1738,6 +1738,44 @@ class Orchestrator:
             expected_status=WorkstreamStatus.DECOMPOSING,
         )
 
+        await self._dispatch_execution(
+            workstream_id,
+            workstream,
+            workspace,
+            subtask_total=subtask_total,
+            clear_resume_reason=is_rework_resume,
+        )
+
+    async def _dispatch_execution(
+        self,
+        workstream_id: str,
+        workstream: Workstream,
+        workspace: Path,
+        *,
+        subtask_total: int | None = None,
+        clear_resume_reason: bool = False,
+        continuation: bool = False,
+    ) -> None:
+        """Gate, resolve a backend, take READY -> RUNNING and spawn.
+
+        `subtask_total` is the planned denominator captured right after spec
+        generation (#123); a continuation passes None and keeps whatever the
+        row already holds, since it regenerates nothing and the plan is
+        unchanged.
+
+        `clear_resume_reason` belongs to the Stage B rework path: the marker is
+        cleared only after a successful respawn, so a crash before the process
+        is live re-picks the rework path (and its addendum) rather than a plain
+        re-run.
+
+        Shared by the ordinary path (after spec generation) and by a
+        continuation (#166 B), which reaches it over an existing tasks.md with
+        no generation at all. `continuation=True` threads two guards into the
+        READY -> RUNNING CAS: the counter increment, so an accepted
+        continuation is counted exactly once and a lost race counts nothing,
+        and the quarantine check, so an operator who forbade progression cannot
+        get a continuation instead.
+        """
         # Gates (WS-006): ex-ante guard over the declared scope. A block
         # routes to NEEDS_REVIEW; the operator re-queueing it approves the
         # gate for this exact repo SHA (see maestro/gates.py).
@@ -1834,6 +1872,8 @@ class Orchestrator:
                 backend_id=backend.id,
                 transport_ref=f"{backend.id}:maestro-{execution_id}",
                 attempt=attempt,
+                increment_continuation=continuation,
+                require_not_quarantined=continuation,
             )
             request_launch_fields = {
                 "execution_id": execution_id,
@@ -1848,6 +1888,8 @@ class Orchestrator:
                 WorkstreamStatus.RUNNING,
                 expected_status=WorkstreamStatus.READY,
                 process_pid=_SPAWNING_SENTINEL,
+                increment_continuation=continuation,
+                require_not_quarantined=continuation,
             )
 
         # Spawn spec-runner
@@ -1939,10 +1981,8 @@ class Orchestrator:
         # real pid here for non-local backends too is harmless.
         await self._update_fields(workstream_id, process_pid=handle.os_pid)
 
-        # Stage B: clear the rework marker ONLY after a successful respawn, so
-        # a crash before the process is live re-picks the rework path (and its
-        # addendum) rather than a plain re-run.
-        if is_rework_resume:
+        # See `clear_resume_reason` in this method's docstring.
+        if clear_resume_reason:
             await self._update_fields(workstream_id, resume_reason=None)
 
         self._logger.info(

@@ -2224,6 +2224,8 @@ class Database:
         backend_id: str,
         transport_ref: str,
         attempt: int,
+        increment_continuation: bool = False,
+        require_not_quarantined: bool = False,
         remote_host: str | None = None,
         remote_dir: str | None = None,
         status_marker: str | None = None,
@@ -2271,11 +2273,22 @@ class Database:
             raise DatabaseError(msg)
 
         table = "tasks" if entity_kind == "task" else "workstreams"
+        # #166 B: a continuation's counter increment and its quarantine guard
+        # ride THIS CAS, so an accepted continuation is counted exactly once and
+        # a quarantined workstream cannot be dispatched as one. Workstreams only
+        # — tasks have neither column.
+        extra_set = ""
+        extra_where = ""
+        if entity_kind == "workstream":
+            if increment_continuation:
+                extra_set = ", continuation_count = continuation_count + 1"
+            if require_not_quarantined:
+                extra_where = " AND quarantined_at IS NULL"
         cursor = await self._connection.execute(
             f"""
             UPDATE {table}
-            SET status = ?, started_at = COALESCE(started_at, ?)
-            WHERE id = ? AND status = ?
+            SET status = ?, started_at = COALESCE(started_at, ?){extra_set}
+            WHERE id = ? AND status = ?{extra_where}
             """,
             (
                 running_status,
