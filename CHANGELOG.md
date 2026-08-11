@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Changed
+- **`spec-runner >= 2.24.0` is now required (#169b).** The floor moves from
+  2.16.0 to the release that closed the false-green exit class: `run --all`
+  no longer exits 0 with work undone, and the run records an honest
+  `last_run_stop_reason`. Two mechanisms shipped in this same cycle depend on
+  that being *true* rather than merely available — the completeness gate
+  (#164) treats a zero exit as a claim it verifies against the counters, and
+  the retry classifier (#165) routes three typed stop reasons away from a
+  retry that cannot help. Both degrade safely on an older spec-runner
+  (fail-closed and retry-as-before), so the pin is what turns "best effort"
+  into a guarantee. Surfaces re-verified at the bump: `plan --full`,
+  `run --all`, `--spec-prefix`, `status --json` (`total_tasks`), `review-pr`,
+  and the two vendored contracts, which already recorded 2.24.0 in
+  `VENDORED_FROM_SPEC_RUNNER`.
+
+### Upgrade impact
+- **Upgrade spec-runner before the next `maestro orchestrate`.** The preflight
+  version gate is fail-closed: an installed spec-runner below 2.24.0 now
+  blocks before any worktree is created, naming the found and required
+  versions. This includes 2.16–2.23, which were acceptable until now — a user
+  who upgraded once for #122 and stopped is exactly whom the gate must stop,
+  since those versions still exit 0 with work undone.
+  `MAESTRO_SPEC_RUNNER_ALLOW_UNVERIFIED=1` remains the documented escape for
+  unpublished local builds and downgrades the block to a warning, never to
+  silence.
+
 ### Added
 - **Dangling dependencies are caught before the executor starts (#165).** A
   rework regenerates `spec/maestro-tasks.md` wholesale, and the decomposer —

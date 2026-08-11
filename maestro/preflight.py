@@ -531,12 +531,15 @@ def _check_scope_fs(
 
 
 def _check_spec_runner_version() -> list[ValidationIssue]:
-    """#122 gate: the installed spec-runner must be >= 2.16.0.
+    """#122 gate: the installed spec-runner must be >= the pinned version.
 
-    Older versions (2.15.x) commit the harness-owned spec/.gitignore into
-    task commits (fixed upstream in spec-runner#96), which the ex-post
-    scope gate flags as a scope escape — green workstreams land in
-    NEEDS_REVIEW through no agent's choice. Fail-closed: a version below
+    Two reasons stack. Versions below 2.16 commit the harness-owned
+    spec/.gitignore into task commits (fixed upstream in spec-runner#96),
+    which the ex-post scope gate flags as a scope escape — green workstreams
+    land in NEEDS_REVIEW through no agent's choice. Versions below 2.24
+    (#169b) can exit 0 with work undone and record no honest stop reason,
+    which is the false-green class the completeness gate and the retry
+    classifier are built around. Fail-closed: a version below
     the minimum, unparseable output, or any failure to obtain the version
     blocks before a worktree exists. Setting
     MAESTRO_SPEC_RUNNER_ALLOW_UNVERIFIED=1 (documented escape hatch for

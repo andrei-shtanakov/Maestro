@@ -39,8 +39,16 @@ class TestVersionPin:
         2.16.0 keeps the harness-owned spec/.gitignore out of auto-commits
         (spec-runner#96); the state/plan contract this module reads is
         unchanged between 2.0 and 2.16.
+
+        2.16.0 -> 2.24.0 reviewed 2026-08-11 (#169b, upstream release
+        v2.24.0): the release that closed the false-green exit class, which
+        the completeness gate (#164) and the retry classifier (#165) are both
+        built around. Surfaces re-verified at the bump: `plan --full`,
+        `run --all`, `--spec-prefix`, `status --json` (`total_tasks`),
+        `review-pr`, plus the two vendored contracts, which record the same
+        release in `VENDORED_FROM_SPEC_RUNNER`.
         """
-        assert SPEC_RUNNER_REQUIRED_VERSION == "2.16.0"
+        assert SPEC_RUNNER_REQUIRED_VERSION == "2.24.0"
 
 
 # ---------------------------------------------------------------------------
