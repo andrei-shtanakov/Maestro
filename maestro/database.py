@@ -582,6 +582,11 @@ class Database:
                 "service_ticks",
                 self._migrate_service_ticks,
             ),
+            (
+                23,
+                "postmortem_archives",
+                self._migrate_postmortem_archives,
+            ),
         ]
 
         for version, name, fn in ordered:
@@ -1108,6 +1113,34 @@ class Database:
                 reason          TEXT,
                 log_path        TEXT,
                 swept_worktrees INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+
+    async def _migrate_postmortem_archives(self) -> None:
+        """Migration 23: post-mortem archive records (#164, spec §6.4).
+
+        Additive, `CREATE TABLE IF NOT EXISTS` — mirrors
+        `_migrate_gate_approvals` (migration 6). No data migration: the gate's
+        other input, `workstreams.subtask_total`, is already nullable from
+        migration 19, and a NULL there is a deliberate fail-closed block
+        rather than something to backfill.
+
+        A row is written only AFTER the archive directory is committed, so
+        its existence implies complete evidence on disk — which is exactly
+        what the worktree-cleanup guard checks before destroying anything.
+        """
+        assert self._connection is not None
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS postmortem_archives (
+                workstream_id TEXT NOT NULL,
+                execution_id  TEXT NOT NULL,
+                path          TEXT NOT NULL,
+                created_at    TIMESTAMP NOT NULL,
+                bytes_written INTEGER NOT NULL,
+                truncated     INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (workstream_id, execution_id)
             )
             """
         )
@@ -3915,6 +3948,95 @@ class Database:
         params.append(limit)
         cursor = await self._connection.execute(sql, params)
         return [dict(row) for row in await cursor.fetchall()]
+
+    # ------------------------------------------------------------------
+    # post-mortem archives (#164) — migration 23
+    # ------------------------------------------------------------------
+
+    async def record_postmortem_archive(
+        self,
+        workstream_id: str,
+        execution_id: str,
+        *,
+        path: str,
+        bytes_written: int,
+        truncated: bool,
+    ) -> None:
+        """Record a committed archive — call only AFTER the directory lands.
+
+        Upsert rather than plain insert: finalization can be retried (a
+        crash between the directory rename and this write leaves the archive
+        on disk with no row), and the retry must reconcile rather than raise.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        await self._connection.execute(
+            "INSERT INTO postmortem_archives "
+            "(workstream_id, execution_id, path, created_at, bytes_written, "
+            "truncated) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(workstream_id, execution_id) DO UPDATE SET "
+            "path = excluded.path, created_at = excluded.created_at, "
+            "bytes_written = excluded.bytes_written, "
+            "truncated = excluded.truncated",
+            (
+                workstream_id,
+                execution_id,
+                path,
+                _format_datetime(datetime.now(UTC)),
+                bytes_written,
+                int(truncated),
+            ),
+        )
+        await self._connection.commit()
+
+    async def get_postmortem_archive(
+        self, workstream_id: str, execution_id: str
+    ) -> dict[str, Any] | None:
+        """The archive record for one execution, or None.
+
+        None is the cleanup guard's stop signal: without a committed archive
+        the worktree is the only remaining copy of the evidence and must not
+        be removed (spec §6.5).
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        cursor = await self._connection.execute(
+            "SELECT * FROM postmortem_archives "
+            "WHERE workstream_id = ? AND execution_id = ?",
+            (workstream_id, execution_id),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    async def list_postmortem_archives(
+        self, workstream_id: str
+    ) -> list[dict[str, Any]]:
+        """All archive records for a workstream, newest first."""
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        cursor = await self._connection.execute(
+            "SELECT * FROM postmortem_archives WHERE workstream_id = ? "
+            "ORDER BY created_at DESC, rowid DESC",
+            (workstream_id,),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def delete_postmortem_archive(
+        self, workstream_id: str, execution_id: str
+    ) -> None:
+        """Drop one archive record (retention pruned its directory)."""
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        await self._connection.execute(
+            "DELETE FROM postmortem_archives "
+            "WHERE workstream_id = ? AND execution_id = ?",
+            (workstream_id, execution_id),
+        )
+        await self._connection.commit()
 
     async def record_workstream_rework(
         self,
