@@ -169,3 +169,19 @@ class TestNoConnectionOnAnUnopenableFile:
         await db.close()
 
         assert await read_all_costs_readonly(p) == []
+
+    @pytest.mark.anyio
+    async def test_special_file_is_not_reported_as_missing(self, tmp_path):
+        """A FIFO exists; calling it "does not exist" would misdirect the reader.
+
+        The message is what an operator acts on: missing means a typo or the
+        wrong `--db`, a directory usually means the repo root, and a special
+        file means neither.
+        """
+        import os
+
+        fifo = tmp_path / "pipe.db"
+        os.mkfifo(fifo)
+
+        with pytest.raises(DatabaseError, match="not a regular file"):
+            await read_all_costs_readonly(fifo)

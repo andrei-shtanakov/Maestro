@@ -4636,11 +4636,18 @@ async def read_all_costs_readonly(db_path: str | Path) -> list[TaskCost]:
     # simply succeed, and if it vanishes we fall back to the old error path.
     path = Path(db_path)
     if not path.is_file():  # noqa: ASYNC240 — one fast stat, CLI context
-        detail = (
-            "is a directory"
-            if path.is_dir()  # noqa: ASYNC240 — same
-            else "does not exist"
-        )
+        # Three distinct cases, because the operator acts on this sentence: a
+        # missing path is a typo or the wrong --db, a directory is usually the
+        # repo root passed by mistake, and something that exists but is not a
+        # regular file (FIFO, socket, device, broken symlink target) is neither.
+        # Reporting "does not exist" for a FIFO that plainly does would send
+        # someone looking for the wrong problem.
+        if path.is_dir():  # noqa: ASYNC240 — same
+            detail = "is a directory"
+        elif path.exists():  # noqa: ASYNC240 — same
+            detail = "exists but is not a regular file"
+        else:
+            detail = "does not exist"
         raise DatabaseError(f"cannot open database read-only: {path} {detail}")
 
     try:
