@@ -1303,6 +1303,24 @@ def _get_workstream_status_style(
     return styles.get(status, "white")
 
 
+def _quarantine_cell(quarantined_at: datetime | None) -> Text:
+    """Flag plus age for the quarantine column (#166).
+
+    The age matters as much as the flag: a quarantine raised a minute ago is an
+    incident in progress, one standing for two days is a forgotten blocker, and
+    an operator scanning the table should not have to open the row to tell them
+    apart.
+    """
+    if quarantined_at is None:
+        return Text("-", style="dim")
+    delta = datetime.now(UTC) - quarantined_at
+    hours = delta.total_seconds() / 3600
+    age = f"{int(delta.total_seconds() // 60)}m" if hours < 1 else f"{hours:.0f}h"
+    if hours >= 24:
+        age = f"{int(hours // 24)}d"
+    return Text(f"YES ({age})", style="red")
+
+
 def _display_workstreams_table(workstreams: list, title: str = "Workstreams") -> None:
     """Display workstreams in a rich table."""
     if not workstreams:
@@ -1317,6 +1335,13 @@ def _display_workstreams_table(workstreams: list, title: str = "Workstreams") ->
     # Operator reworks (#124) are unbounded but must not be invisible:
     # the column appears once any workstream has one, yellow at threshold.
     show_reworks = any(getattr(z, "operator_rework_count", 0) > 0 for z in workstreams)
+    # Quarantine (#166): a workstream whose delivery an operator has forbidden
+    # must never look ordinary. The column appears only when one exists, and
+    # shows the AGE — an incident an operator forgot about for two days reads
+    # differently from one raised a minute ago.
+    show_quarantine = any(
+        getattr(z, "quarantined_at", None) is not None for z in workstreams
+    )
 
     table.add_column("ID", style="cyan", no_wrap=True)
     table.add_column("Title", style="white")
@@ -1325,6 +1350,8 @@ def _display_workstreams_table(workstreams: list, title: str = "Workstreams") ->
     table.add_column("Progress", justify="center")
     if show_reworks:
         table.add_column("Reworks", justify="center")
+    if show_quarantine:
+        table.add_column("Quarantined", justify="center")
     table.add_column("PR", style="blue", max_width=30)
 
     for z in workstreams:
@@ -1345,6 +1372,8 @@ def _display_workstreams_table(workstreams: list, title: str = "Workstreams") ->
             count = getattr(z, "operator_rework_count", 0)
             rework_style = "yellow" if count >= _REWORK_WARN_THRESHOLD else "dim"
             row.append(Text(str(count) if count else "-", style=rework_style))
+        if show_quarantine:
+            row.append(_quarantine_cell(getattr(z, "quarantined_at", None)))
         row.append(pr_text)
         table.add_row(*row)
 
@@ -1758,6 +1787,140 @@ def postmortem_command(
     console.print(
         f"[green]Pruned {pruned} post-mortem archive(s); "
         f"keeping the newest {keep} per workstream.[/green]"
+    )
+
+
+@app.command("workstream-quarantine")
+def workstream_quarantine_command(
+    workstream_id: Annotated[str, typer.Argument(help="Workstream ID to quarantine")],
+    reason: Annotated[
+        str, typer.Option("--reason", help="Why this result must not progress")
+    ],
+    db: Annotated[
+        Path | None,
+        typer.Option("--db", "-d", help="Path to SQLite database file"),
+    ] = None,
+) -> None:
+    """Forbid a workstream's result from progressing (#166).
+
+    Stops dispatch and withholds delivery: a finished quarantined workstream
+    goes to NEEDS_REVIEW instead of merging. **A running execution is NOT
+    terminated** — it finishes normally, because killing work to isolate it is
+    the loss this command exists to avoid. Independent workstreams are
+    untouched.
+
+    Refuses once delivery has started (MERGING/PR_CREATED/DONE): after that the
+    remedy is a revert, and accepting the quarantine would claim to have
+    prevented something that already happened.
+
+    Idempotent — a second call keeps the original timestamp, which reads as the
+    age of the incident.
+
+    Examples:
+        maestro workstream-quarantine w-adapters --reason "false DONE, 1/9"
+    """
+    db_path = db or DEFAULT_DB_PATH
+
+    async def _run() -> str:
+        import getpass
+
+        from maestro.database import Database
+
+        database = Database(db_path)
+        await database.connect()
+        try:
+            before = await database.get_workstream(workstream_id)
+            if before is None:
+                raise ValueError(f"workstream '{workstream_id}' not found")
+            already = before.quarantined_at is not None
+            await database.quarantine_workstream(
+                workstream_id, reason=reason, actor=getpass.getuser()
+            )
+            return "already" if already else "new"
+        finally:
+            await database.close()
+
+    try:
+        outcome = asyncio.run(_run())
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    if outcome == "already":
+        console.print(
+            f"[yellow]Workstream '{workstream_id}' was already quarantined; "
+            f"the original reason and timestamp are kept.[/yellow]"
+        )
+    else:
+        console.print(
+            f"[green]Workstream '{workstream_id}' quarantined: no new dispatch, "
+            f"delivery withheld. A running execution keeps going and will park "
+            f"in NEEDS_REVIEW when it finishes.[/green]"
+        )
+    console.print(
+        f"Lift with: maestro workstream-unquarantine {workstream_id} "
+        f'--reason "<why it is safe now>"'
+    )
+
+
+@app.command("workstream-unquarantine")
+def workstream_unquarantine_command(
+    workstream_id: Annotated[str, typer.Argument(help="Workstream ID to release")],
+    reason: Annotated[
+        str, typer.Option("--reason", help="Why it is safe to progress again")
+    ],
+    db: Annotated[
+        Path | None,
+        typer.Option("--db", "-d", help="Path to SQLite database file"),
+    ] = None,
+) -> None:
+    """Lift a quarantine — an audited action, and nothing more (#166).
+
+    Clears the quarantine so dispatch and delivery are allowed again. It does
+    **not** change the workstream's status, does **not** start anything, and is
+    **not** an approval: whatever gate or review the workstream still owes, it
+    still owes. The orchestrator picks it up on its own next loop if its status
+    makes it eligible.
+
+    Examples:
+        maestro workstream-unquarantine w-adapters --reason "false DONE fixed"
+    """
+    db_path = db or DEFAULT_DB_PATH
+
+    async def _run() -> str:
+        import getpass
+
+        from maestro.database import Database
+
+        database = Database(db_path)
+        await database.connect()
+        try:
+            before = await database.get_workstream(workstream_id)
+            if before is None:
+                raise ValueError(f"workstream '{workstream_id}' not found")
+            if before.quarantined_at is None:
+                return "not_quarantined"
+            await database.unquarantine_workstream(
+                workstream_id, reason=reason, actor=getpass.getuser()
+            )
+            return before.status.value
+        finally:
+            await database.close()
+
+    try:
+        outcome = asyncio.run(_run())
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    if outcome == "not_quarantined":
+        console.print(
+            f"[yellow]Workstream '{workstream_id}' is not quarantined; "
+            f"nothing to lift.[/yellow]"
+        )
+        return
+    console.print(
+        f"[green]Quarantine lifted for '{workstream_id}' (status unchanged: "
+        f"{outcome.upper()}). This is not an approval — any gate it owed, it "
+        f"still owes.[/green]"
     )
 
 

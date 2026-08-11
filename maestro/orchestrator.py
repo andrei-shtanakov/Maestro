@@ -4230,9 +4230,10 @@ class Orchestrator:
         if self._shutdown_requested:
             self._force_shutdown = True
             self._logger.warning(
-                "second shutdown signal — forcing termination of %d running "
-                "execution(s); in-flight work may be lost",
+                "orchestrator.shutdown.forced running=%d workstreams=%s — "
+                "forcing termination; in-flight work may be lost",
                 len(self._running),
+                ",".join(sorted(self._running)),
             )
         else:
             self._logger.info(
@@ -4296,12 +4297,21 @@ class Orchestrator:
                 # in _spawn_workstream, and _update_progress only patches
                 # subtask_progress, never status), matching the scheduler's
                 # analogous shutdown-cleanup transition (expected=RUNNING).
+                # Say WHY durably (#166): a forced shutdown is a deliberate
+                # act, and an operator or tool reading this row afterwards must
+                # be able to tell it from a process that simply died — the
+                # latter leaves the row in RUNNING for recovery to reconcile,
+                # the former lands here with this message.
+                forced_msg = (
+                    "orchestrator forced shutdown (second signal): execution "
+                    "terminated deliberately, not a crash"
+                )
                 await self._transition(
                     zid,
                     WorkstreamStatus.FAILED,
                     expected_status=WorkstreamStatus.RUNNING,
-                    message="Orchestrator shutdown",
-                    error_message="Orchestrator shutdown",
+                    message=forced_msg,
+                    error_message=forced_msg,
                 )
                 await self._transition(
                     zid,
