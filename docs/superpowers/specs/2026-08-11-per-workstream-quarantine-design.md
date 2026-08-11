@@ -382,8 +382,12 @@ quarantine/completion race is resolved by one CAS at the MERGING edge (§3.3).
 Stated separately because each is a place where an implementation could
 plausibly drift into the wrong behaviour:
 
-1. **Quarantining one workstream does not stop its neighbours.** Independent
-   executions keep running; only the quarantined one is terminated.
+1. **Quarantining one workstream stops nothing that is running — neither its
+   neighbours nor itself.** Independent executions keep running because they
+   were never touched; the quarantined one keeps running because quarantine
+   blocks the progression of its *result*, not its process (§3.1). What
+   changes for it is that no new dispatch occurs and its completion routes to
+   NEEDS_REVIEW instead of the delivery tail.
 2. **A global `maestro stop` freezes new dispatch and either lets in-flight
    workstreams finish or preserves `RESUME_CONTINUE_TASKS` for them.** It
    never leaves a workstream whose only way forward is regeneration.
