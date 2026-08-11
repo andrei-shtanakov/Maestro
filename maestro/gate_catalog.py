@@ -31,7 +31,7 @@ would be free to drift from the one guarantee it is supposed to carry.
 import re
 from functools import lru_cache
 from importlib import resources
-from pathlib import Path
+from importlib.abc import Traversable
 from typing import Literal
 
 import yaml
@@ -80,16 +80,21 @@ class UnknownCanonicalGate(GateCatalogError):
     """
 
 
-def vendored_path(relative: str) -> Path:
-    """Filesystem path of one vendored upstream file, by its upstream path."""
+def vendored_file(relative: str) -> Traversable:
+    """One vendored upstream file, addressed by its path in steward's repo.
+
+    A `Traversable`, not a `Path`: `read_text`/`read_bytes` is all any caller
+    needs, and materialising a filesystem path would assume the package is
+    always unpacked on disk.
+    """
     root = resources.files("maestro.resources.gate_catalog")
-    return Path(str(root.joinpath(_UPSTREAM_ROOT, *relative.split("/"))))
+    return root.joinpath(_UPSTREAM_ROOT, *relative.split("/"))
 
 
 @lru_cache(maxsize=1)
 def _catalog() -> dict:
     """The vendored catalog, parsed once."""
-    text = vendored_path("profiles/gate-catalog.yaml").read_text(encoding="utf-8")
+    text = vendored_file("profiles/gate-catalog.yaml").read_text(encoding="utf-8")
     return yaml.safe_load(text)
 
 

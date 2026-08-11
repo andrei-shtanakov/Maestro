@@ -33,7 +33,7 @@ from maestro.gate_catalog import (
     canonical_gate_ids,
     catalog_version,
     classify_gate_id,
-    vendored_path,
+    vendored_file,
 )
 
 
@@ -49,7 +49,7 @@ class TestCopyIntegrity:
 
     def test_every_vendored_file_matches_its_recorded_digest(self) -> None:
         for relative, digest in VENDORED_FILE_SHA256.items():
-            actual = hashlib.sha256(vendored_path(relative).read_bytes()).hexdigest()
+            actual = hashlib.sha256(vendored_file(relative).read_bytes()).hexdigest()
             assert actual == digest, f"{relative} was edited after vendoring"
 
     def test_the_pin_is_a_full_sha(self) -> None:
@@ -79,7 +79,7 @@ class TestUpstreamProvenance:
             capture_output=True,
             check=True,
         ).stdout
-        assert vendored_path(relative).read_bytes() == upstream
+        assert vendored_file(relative).read_bytes() == upstream
 
 
 @_needs_sibling
@@ -120,7 +120,7 @@ class TestMirroredRule:
         """Guards against the one refactor that would void the mirror:
         replacing the load with a pair of regexes typed out in Python."""
         published = yaml.safe_load(
-            vendored_path("profiles/gate-catalog.yaml").read_text(encoding="utf-8")
+            vendored_file("profiles/gate-catalog.yaml").read_text(encoding="utf-8")
         )["gate_id_namespaces"]
 
         assert CANONICAL_GATE_ID_PATTERN.pattern == published["canonical_pattern"]
