@@ -1194,11 +1194,60 @@ class TestBackgroundGeneration:
         # Process is spawned + registered but the pid-update await is
         # still pending — the exact orphan window.
         assert "z1" in orchestrator._running
+        # A FORCED shutdown is the path where termination is the intent (#166:
+        # a drain terminates nothing). The window this test guards is unchanged
+        # — registration must happen before the pid update so `_cleanup` can
+        # see the handle at all — it is just asserted on the path that kills.
+        orchestrator._force_shutdown = True
         await orchestrator._cleanup()
 
         # _cleanup found the handle in _running and terminated it.
         assert fake_backend.created_handles[0].terminate_called
         assert "z1" not in orchestrator._running
+
+    @pytest.mark.anyio
+    async def test_cleanup_without_force_leaves_the_process_running(
+        self, orchestrator, mock_db, mock_decomposer, tmp_path
+    ) -> None:
+        """A drained shutdown terminates nothing (#166, spec §4.6/§9.5).
+
+        The counterpart of the test above: same orphan window, no force. The
+        execution is left alone — it is not an orphan but work we chose to let
+        finish, and recovery reconciles it if the process exits first. If this
+        ever starts terminating, the collateral-kill defect is back.
+        """
+        import asyncio
+
+        orchestrator._log_dir = tmp_path
+        orchestrator._shutdown_grace_seconds = 0
+        workspace = tmp_path / "ws-z2"
+        workspace.mkdir()
+        orchestrator._workspace_mgr.workspace_exists = MagicMock(return_value=True)
+        orchestrator._workspace_mgr.get_workspace_path = MagicMock(
+            return_value=workspace
+        )
+        mock_db.get_workstream = AsyncMock(
+            return_value=_ws("z2", WorkstreamStatus.READY)
+        )
+        fake_backend = FakeOrchestratorBackend(pid=4343, exit_code=0)
+        _set_fake_backend(orchestrator, fake_backend)
+        reached = asyncio.Event()
+
+        async def hang_on_pid(*args, **kwargs):
+            if kwargs.get("process_pid") == fake_backend.pid:
+                reached.set()
+                await asyncio.sleep(3600)
+            return _ws(args[0], args[1])
+
+        mock_db.update_workstream_status = AsyncMock(side_effect=hang_on_pid)
+
+        await orchestrator._spawn_ready(["z2"])
+        await reached.wait()
+        assert "z2" in orchestrator._running
+
+        await orchestrator._cleanup()
+
+        assert not fake_backend.created_handles[0].terminate_called
 
     @pytest.mark.anyio
     async def test_spawn_ready_does_not_duplicate_in_flight_generation(
