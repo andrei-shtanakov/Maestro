@@ -1829,9 +1829,10 @@ def workstream_quarantine_command(
         database = Database(db_path)
         await database.connect()
         try:
+            # `get_workstream` RAISES WorkstreamNotFoundError for an unknown id;
+            # it never returns None. Checking for None would be dead code and
+            # the real exception would escape the ValueError handler below.
             before = await database.get_workstream(workstream_id)
-            if before is None:
-                raise ValueError(f"workstream '{workstream_id}' not found")
             already = before.quarantined_at is not None
             await database.quarantine_workstream(
                 workstream_id, reason=reason, actor=getpass.getuser()
@@ -1840,9 +1841,11 @@ def workstream_quarantine_command(
         finally:
             await database.close()
 
+    from maestro.database import WorkstreamNotFoundError
+
     try:
         outcome = asyncio.run(_run())
-    except ValueError as exc:
+    except (ValueError, WorkstreamNotFoundError) as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
     if outcome == "already":
@@ -1894,9 +1897,8 @@ def workstream_unquarantine_command(
         database = Database(db_path)
         await database.connect()
         try:
+            # See the note in workstream-quarantine: an unknown id raises.
             before = await database.get_workstream(workstream_id)
-            if before is None:
-                raise ValueError(f"workstream '{workstream_id}' not found")
             if before.quarantined_at is None:
                 return "not_quarantined"
             await database.unquarantine_workstream(
@@ -1906,9 +1908,11 @@ def workstream_unquarantine_command(
         finally:
             await database.close()
 
+    from maestro.database import WorkstreamNotFoundError
+
     try:
         outcome = asyncio.run(_run())
-    except ValueError as exc:
+    except (ValueError, WorkstreamNotFoundError) as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
     if outcome == "not_quarantined":

@@ -3648,6 +3648,14 @@ class Orchestrator:
                 require_not_quarantined=True,
             )
         except ConcurrentModificationError:
+            # A failed CAS here has TWO possible causes and they must not be
+            # conflated: a quarantine that won the race, or an ordinary
+            # expected_status mismatch (a genuine concurrency fault). Labelling
+            # the second as "quarantined; delivery withheld" would hide a real
+            # bug behind an operator-facing explanation, so confirm which it was.
+            current = await self._db.get_workstream(workstream_id)
+            if current.quarantined_at is None:
+                raise
             await self._route_quarantined_completion(workstream_id, expected_status)
             return
 

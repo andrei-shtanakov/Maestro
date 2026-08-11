@@ -226,3 +226,64 @@ class TestLifting:
         assert len(rows) == 2
         assert rows[0]["reason"] == "again"
         assert rows[0]["lifted_at"] is None
+
+
+class TestAtomicity:
+    """The guard must live in the UPDATE, not in a preceding SELECT.
+
+    `transaction()` is deferred — it does not take a write lock until the first
+    write — so a read-then-write leaves a window where another writer changes
+    status or quarantined_at. That window is exactly what the spec forbids: the
+    outcome must be decided by one write, not by what a read saw a moment ago.
+    """
+
+    async def test_refused_quarantine_writes_no_audit_row(self, db: Database) -> None:
+        """An audit row must never claim a quarantine that did not take effect.
+
+        The absence of a race window is structural rather than testable: the
+        guard is part of the UPDATE's WHERE clause, so there is no instant
+        between deciding and writing for another writer to occupy. What IS
+        testable is the consequence — a write that matched nothing leaves no
+        trace claiming it did.
+        """
+        await _ws(db, WorkstreamStatus.MERGING)
+
+        with pytest.raises(ValueError, match="delivery"):
+            await db.quarantine_workstream("w1", reason="too late", actor="a")
+
+        assert await db.list_quarantine_events("w1") == []
+        assert (await db.get_workstream("w1")).quarantined_at is None
+
+    async def test_accepted_quarantine_writes_exactly_one_audit_row(
+        self, db: Database
+    ) -> None:
+        await _ws(db, WorkstreamStatus.RUNNING)
+
+        await db.quarantine_workstream("w1", reason="r", actor="a")
+
+        rows = await db.list_quarantine_events("w1")
+        assert len(rows) == 1
+        assert rows[0]["prior_status"] == "running"
+
+    async def test_repeat_writes_no_second_audit_row(self, db: Database) -> None:
+        """Idempotence covers the audit too, or a retry inflates the history."""
+        await _ws(db)
+        await db.quarantine_workstream("w1", reason="r", actor="a")
+
+        await db.quarantine_workstream("w1", reason="again", actor="b")
+
+        assert len(await db.list_quarantine_events("w1")) == 1
+
+    async def test_missing_workstream_raises_not_found(self, db: Database) -> None:
+        from maestro.database import WorkstreamNotFoundError
+
+        with pytest.raises(WorkstreamNotFoundError):
+            await db.quarantine_workstream("nope", reason="r", actor="a")
+
+    async def test_unquarantine_missing_workstream_raises_not_found(
+        self, db: Database
+    ) -> None:
+        from maestro.database import WorkstreamNotFoundError
+
+        with pytest.raises(WorkstreamNotFoundError):
+            await db.unquarantine_workstream("nope", reason="r", actor="a")

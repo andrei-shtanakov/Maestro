@@ -3629,34 +3629,55 @@ class Database:
             msg = "Database not connected"
             raise DatabaseError(msg)
         async with self.transaction() as conn:
+            now = _format_datetime(datetime.now(UTC))
+            delivering = ", ".join("?" for _ in self._DELIVERING_STATUSES)
+            # The guard lives in the UPDATE, not in a preceding SELECT.
+            # `transaction()` is deferred — no write lock is taken until the
+            # first write — so a read-then-write leaves a window in which
+            # another writer moves the row into delivery or quarantines it
+            # first. One conditional write decides the outcome instead.
             cursor = await conn.execute(
-                "SELECT status, quarantined_at FROM workstreams WHERE id = ?",
-                (workstream_id,),
+                f"UPDATE workstreams SET quarantined_at = ?, quarantine_reason = ? "
+                f"WHERE id = ? AND quarantined_at IS NULL "
+                f"AND status NOT IN ({delivering})",
+                (now, reason, workstream_id, *self._DELIVERING_STATUSES),
             )
-            row = await cursor.fetchone()
-            if row is None:
-                msg = f"Workstream with ID '{workstream_id}' not found"
-                raise WorkstreamNotFoundError(msg)
-            if row["quarantined_at"] is not None:
-                return  # already quarantined; keep the original record
-            if row["status"] in self._DELIVERING_STATUSES:
+            if cursor.rowcount == 0:
+                # Nothing changed: find out which of the three reasons applies,
+                # and never write an audit row for a quarantine that did not
+                # take effect.
+                check = await conn.execute(
+                    "SELECT status, quarantined_at FROM workstreams WHERE id = ?",
+                    (workstream_id,),
+                )
+                row = await check.fetchone()
+                if row is None:
+                    msg = f"Workstream with ID '{workstream_id}' not found"
+                    raise WorkstreamNotFoundError(msg)
+                if row["quarantined_at"] is not None:
+                    return  # already quarantined; keep the original record
                 msg = (
                     f"workstream '{workstream_id}' is {row['status']}: delivery "
                     f"has already started, so a quarantine would prevent "
                     f"nothing — revert instead"
                 )
                 raise ValueError(msg)
-            now = _format_datetime(datetime.now(UTC))
-            await conn.execute(
-                "UPDATE workstreams SET quarantined_at = ?, quarantine_reason = ? "
-                "WHERE id = ? AND quarantined_at IS NULL",
-                (now, reason, workstream_id),
+
+            status_row = await conn.execute(
+                "SELECT status FROM workstreams WHERE id = ?", (workstream_id,)
             )
+            prior = await status_row.fetchone()
             await conn.execute(
                 "INSERT INTO workstream_quarantines "
                 "(workstream_id, reason, actor, quarantined_at, prior_status) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (workstream_id, reason, actor, now, row["status"]),
+                (
+                    workstream_id,
+                    reason,
+                    actor,
+                    now,
+                    prior["status"] if prior is not None else "unknown",
+                ),
             )
 
     async def unquarantine_workstream(

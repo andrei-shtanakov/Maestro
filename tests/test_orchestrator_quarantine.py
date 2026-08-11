@@ -393,3 +393,33 @@ class TestDrain:
             assert (await db.get_workstream(WS)).process_pid == 4242
         finally:
             await db.close()
+
+
+class TestCasFailureIsNotAlwaysQuarantine:
+    @pytest.mark.anyio
+    async def test_unrelated_cas_failure_is_reraised(self, tmp_path: Path) -> None:
+        """A failed MERGING CAS has two causes; only one is a quarantine.
+
+        Treating an `expected_status` mismatch as "quarantined; delivery
+        withheld" would hide a genuine concurrency fault behind an
+        operator-facing explanation — the workstream would look deliberately
+        held when in fact something raced unexpectedly.
+        """
+        from maestro.database import ConcurrentModificationError
+
+        orch, db, _worktree, _mgr, merge = await _build(tmp_path)
+        try:
+            workstream = await db.get_workstream(WS)
+            # Not quarantined, but the CAS will fail: the row is RUNNING while
+            # the delivery tail is told to expect VERIFYING.
+            with pytest.raises(ConcurrentModificationError):
+                await orch._merge_and_pr(
+                    WS, workstream, expected_status=WorkstreamStatus.VERIFYING
+                )
+
+            ws = await db.get_workstream(WS)
+            assert ws.status is WorkstreamStatus.RUNNING  # untouched
+            assert "quarantined" not in (ws.error_message or "")
+            merge.assert_not_called()
+        finally:
+            await db.close()
