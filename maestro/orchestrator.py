@@ -3378,7 +3378,7 @@ class Orchestrator:
                 [
                     GateVerdictRecord(
                         gate_id="agent.approver",
-                        obligation="advisory",
+                        enforcement="advisory",
                         verdict=verdict,
                         phase="ex_post",
                         sha=sha,

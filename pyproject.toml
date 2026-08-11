@@ -71,6 +71,10 @@ include = ["maestro*"]
 
 [tool.setuptools.package-data]
 "maestro.resources" = ["*.toml"]
+# Vendored steward gate catalog (#160): shipped, because runtime resolves the
+# catalog from inside the package — the sibling checkout it came from does not
+# exist for anyone who installed Maestro.
+"maestro.resources.gate_catalog" = ["upstream/**/*.yaml", "upstream/**/*.md"]
 "maestro.execution.resources" = ["*.py"]
 
 [tool.pyrefly]

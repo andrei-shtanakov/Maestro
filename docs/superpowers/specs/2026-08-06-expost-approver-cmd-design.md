@@ -506,6 +506,14 @@ The filename stays `gate_verdicts.jsonl`: renaming would break existing
 `EvidenceRef kind=gate-verdict` addressing, and the schema field now
 disambiguates content, not the path.
 
+> **Superseded in part by #160 (2026-08-12).** The discriminator is now
+> `maestro.gate-verdict-record/v2`: the `obligation` field was renamed to
+> `enforcement` after the catalog owner ruled that `obligation`
+> (`quality | approval`) names the catalog-owned *intent* axis, while
+> `mandatory | advisory` is the consumer-owned *enforcement* axis. The rest of
+> this section — the namespace boundary and why the filename does not change —
+> still holds. See `maestro/gate_catalog.py` and the CHANGELOG entry.
+
 ## 8. Lifecycle, crash-safety, and recovery
 
 ### 8.1 Scheduling (revision 2)
