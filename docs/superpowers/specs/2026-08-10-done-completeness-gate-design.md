@@ -1,12 +1,15 @@
 # DONE completeness gate + post-mortem archive (#164) — design
 
-**Status:** approved (revision 2, 2026-08-10 — every §10 question answered by
-the owner and folded in; Copilot review on the revision-1 PR #172 raised no
-contract comments, which was the owner's stated condition for leaving
-`proposed`). Four acceptance decisions are recorded verbatim in §2 and are not
-re-litigated. Depends on the `executor_meta` string fields merged as #169a
-(PR #171, `16150e5`). Explicitly does **not** include #165 (rework dangling
-deps / retry classification) — see §11.
+**Status:** approved (revision 3, 2026-08-11 — two corrections found while
+implementing, both owner-confirmed: the `on_collected` failure contract is
+narrowed to a typed capture error (§6.5), and approve's resume constant is
+renamed `RESUME_ACCEPT_PARTIAL` so it cannot be read as catching up the
+missing tasks (§5.2, §5.4). Revision 2 answered every §10 question; Copilot
+raised no contract comments on the revision-1 PR #172, which was the owner's
+condition for leaving `proposed`.) Four acceptance decisions are recorded
+verbatim in §2 and are not re-litigated. Depends on the `executor_meta` string
+fields merged as #169a (PR #171, `16150e5`). Explicitly does **not** include
+#165 (rework dangling deps / retry classification) — see §11.
 
 ## 1. What the pilot saw, and why the exit code was not enough
 
@@ -216,15 +219,20 @@ one: `gate_approvals` is already "the single authority on *was this
 `maestro workstream-approve` (`gate_approvals.py`). This gate registers a
 third `phase` value alongside the ex-ante/ex-post phases.
 
+Approve here means exactly one thing: **an audited permission to accept the
+current incomplete result and continue the existing success pipeline.** It
+does not run any remaining task, and it must never be mistaken for doing so.
+
 Resume is the **H-6 mechanism that already exists**: `READY` + approval marker
 + unchanged worktree HEAD resumes straight into the delivery tail with no
 regeneration and no respawn. Concretely, approval sets
-`resume_reason = RESUME_DELIVER` (new constant next to `RESUME_REVERIFY` /
-`RESUME_REWORK` in `maestro/domain/resume.py:8`), and the READY dispatch —
-which is already exhaustive and routes an unknown `resume_reason` to
-`NEEDS_REVIEW` (`orchestrator.py:1533`) — gains one branch that jumps to
-`_merge_and_pr`, exactly as the `RESUME_REVERIFY` branch (`:1550`) jumps to
-`_run_verification`. **No spec-gen, no author respawn, no new money.**
+`resume_reason = RESUME_ACCEPT_PARTIAL` (new constant next to
+`RESUME_REVERIFY` / `RESUME_REWORK` in `maestro/domain/resume.py:8`), and the
+READY dispatch — which is already exhaustive and routes an unknown
+`resume_reason` to `NEEDS_REVIEW` (`orchestrator.py:1533`) — gains one branch
+that jumps to `_merge_and_pr`, exactly as the `RESUME_REVERIFY` branch
+(`:1550`) jumps to `_run_verification`. **No spec-gen, no author respawn, no
+new money, and no missing task is executed.**
 
 A new commit changes the SHA and invalidates the approval, as with every other
 gate approval.
@@ -235,6 +243,12 @@ gate approval.
 already routes `NEEDS_REVIEW -> READY` into re-decomposition with a
 fail-closed liveness proof and an audit row. Nothing new is needed. This is
 the correct verb when the partial result is not worth delivering.
+
+Rework runs an **ordinary re-decomposition** and is not dressed up as a
+resume: it keeps its own `RESUME_*_REWORK` reason and its existing path
+through `DECOMPOSING`. #164 adds no branch to it, precisely so that "redo the
+work" and "accept what exists" stay two visibly different operations in the
+dispatch rather than two flavours of one.
 
 ### 5.4 Continue the remaining tasks without re-decomposing — deliberately deferred
 
@@ -249,9 +263,8 @@ acceptance criterion of #166**. Specifying it in this PR would smuggle #166's
 architectural stage into #164. This spec therefore:
 
 - ships **approve** (§5.2) and **rework** (§5.3) as #164's exit paths;
-- names `RESUME_DELIVER` as the first member of a family that #166 extends
-  with a continuation counterpart, so #166 does not have to re-litigate the
-  dispatch shape;
+- reserves no catch-up mechanism of its own, so #166 is free to design the
+  dispatch shape for continuation;
 - records the operator cost honestly: until #166, finishing a partially
   completed workstream means paying one re-decomposition (`rework`) or
   delivering 1/9 (`approve`).
@@ -260,22 +273,18 @@ architectural stage into #164. This spec therefore:
 only; "catch up the remaining tasks" is #166's responsibility, and the two
 meanings of READY are not introduced inside #164.
 
-**One naming correction to that confirmation.** The owner's wording named
-`RESUME_DELIVER` as the constant for "catch up the remaining tasks". In this
-spec `RESUME_DELIVER` is #164's *approve* path — resume into the delivery tail
-and ship the partial work as-is — which is what actually ships here. Letting
-one constant mean both "deliver as-is" and "run the missing tasks" would make
-the exhaustive READY dispatch ambiguous at the exact point it is designed to be
-total. So:
+**Naming, settled (revision 3).** The constant behind approve was called
+`RESUME_DELIVER` in revisions 1–2, and that name twice invited the reading
+"resume and finish the delivery, i.e. run what is missing" — the owner's
+follow-up asked, correctly, that approve not go through a constant meaning
+catch-up. The semantics were never catch-up, but a name that has to be
+defended twice is a bad name. It is now `RESUME_ACCEPT_PARTIAL`, which states
+the operator's actual decision and cannot be misread as executing anything:
 
 | Constant | Meaning | Owner |
 |---|---|---|
-| `RESUME_DELIVER` | approved → resume into `_merge_and_pr`, deliver as-is, no regen | **#164 (this spec)** |
-| `RESUME_CONTINUE` | re-dispatch spec-runner against the existing `tasks.md` | **#166** (name reserved, not defined here) |
-
-The intent behind the confirmation is unaffected — continuation stays outside
-#164 either way. Only the label moves, and #166 may rename its own member
-freely.
+| `RESUME_ACCEPT_PARTIAL` | approved → resume into `_merge_and_pr`; accept the incomplete result, execute nothing | **#164 (this spec)** |
+| *(unnamed)* | re-dispatch spec-runner against the existing `tasks.md` | **#166** — free to choose its own name |
 
 ## 6. Post-mortem archive
 
@@ -385,15 +394,27 @@ half-written archive is indistinguishable from a finished one.
 and both must honor it:
 
 - **Remote (`rm -rf`) inside `handle.cleanup()`.** Capture runs in
-  `on_collected`, which today is awaited un-guarded by `finalize_handle`
-  (`finalize.py:53`), so a raising callback propagates out of finalization.
-  This spec makes that contract explicit: **an `on_collected` failure is
-  treated exactly like a collect failure — `cleanup()` is skipped and the
-  remote workspace is preserved**, and `FinalizationResult` grows an
-  `archive_error` field so the caller can distinguish it from
-  `collect_error`. The workstream routes to `NEEDS_REVIEW`
-  ("post-mortem capture failed; workspace preserved"). It does **not** proceed
-  to the gate, because the gate's own input is the archive.
+  `on_collected`, which is awaited by `finalize_handle` (`finalize.py:53`).
+  **Only an expected capture failure is absorbed:** the callback signals it by
+  raising `EvidenceCaptureFailed`, and finalization then skips `cleanup()`,
+  preserves the workspace, and reports it as `archive_error` — a field
+  distinct from `collect_error`, so the caller can tell "the diff never made
+  it back" from "the evidence never made it out". The workstream routes to
+  `NEEDS_REVIEW` ("post-mortem capture failed; workspace preserved") and does
+  **not** proceed to the gate, because the gate's own input is the archive.
+
+  **Every other exception from `on_collected` keeps its crash semantics and
+  propagates**, unchanged. Revisions 1–2 said the callback's failure was
+  "treated exactly like a collect failure", full stop; implementing that
+  literally broke a real invariant, and
+  `test_crash_window_between_terminal_and_collected_is_durable` caught it.
+  That callback carries a second, unrelated responsibility — persisting the
+  collected phase — and Mode 1's scheduler depends on a failed durable write
+  surfacing, so the handle is left honestly at `terminal` instead of
+  reporting a finalization that never happened. Absorbing it would have
+  converted a crash into a silent partial finalization. Hence the typed
+  exception: capture failures are an expected outcome with a defined
+  response, durable-write failures are not (owner-confirmed, revision 3).
 - **Local worktree removal at `_merge_and_pr:3052`.** Guarded by the
   `postmortem_archives` row: the worktree is removed only if a committed
   archive exists for this execution. Otherwise cleanup is skipped, a WARNING
@@ -443,12 +464,13 @@ not only unit invariants. Row 4 is that test.
 | 5 | **no-op completeness** | 5 planned, 5 SUCCESS of which 2 `no_op` | gate passes; message/label reads `5/5 done (2 no-op)`; empty diff handled by the existing scope gate, not by this one |
 | 6 | **conflicting stop reason** | `done == planned` **and** `stop_reason="task_failed_stop"` | gate **passes** (decision 2); WARNING logged with both facts; manifest records the reason |
 | 7 | **stale denominator** | `done=10`, `planned=9` (rework rewrote tasks.md) | `NEEDS_REVIEW`, reason `inconsistent`; not passed on `>=` |
-| 8 | **archive failure, remote** | capture raises (unwritable `<db_dir>`) on an ssh run | `cleanup()` **not** called; remote workspace preserved; `NEEDS_REVIEW`; gate not evaluated; `archive_error` distinct from `collect_error` |
+| 8 | **archive failure, remote** | capture raises `EvidenceCaptureFailed` (unwritable `<db_dir>`) on an ssh run | `cleanup()` **not** called; remote workspace preserved; `NEEDS_REVIEW`; gate not evaluated; `archive_error` distinct from `collect_error` |
+| 8b | **durable-write failure is not absorbed** | `on_collected` raises something other than `EvidenceCaptureFailed` | exception propagates; `cleanup()` still not called; Mode-1 handle stays at `terminal` |
 | 9 | **archive failure, local** | capture fails after a successful merge | worktree **not** removed; WARNING; workstream stays DONE |
 | 10 | **atomic commit** | kill between writing and `os.replace` | only `.partial/` on disk; no `postmortem_archives` row; next run does not mistake it for evidence |
 | 11 | **truncation** | logs exceed `max_archive_bytes` | archive committed, `truncated: true` + omitted count in the manifest; treated as complete for §6.5 |
 | 12 | **retention** | 6 archives with `keep_per_workstream=5` | oldest pruned after the new one commits; a prune failure leaves the fresh archive intact |
-| 13 | **approve resumes without spec-gen** | block, then `workstream-approve` | `resume_reason=RESUME_DELIVER`; READY dispatch jumps to `_merge_and_pr`; decomposer/spec-gen **never invoked** (assert on the spawn call, not on timing) |
+| 13 | **approve resumes without spec-gen** | block, then `workstream-approve` | `resume_reason=RESUME_ACCEPT_PARTIAL`; READY dispatch jumps to `_merge_and_pr`; decomposer/spec-gen **never invoked** (assert on the spawn call, not on timing) |
 | 14 | **approval invalidated by a new commit** | approve, then commit into the worktree | SHA mismatch → still `NEEDS_REVIEW`, approval not honored |
 | 15 | **rework path** | block, then `workstream-rework` | `NEEDS_REVIEW -> READY` into re-decomposition, existing #124 behaviour unchanged |
 | 16 | **collect failure precedes the gate** | ssh collect conflict | existing `NEEDS_REVIEW` "remote workspace preserved"; gate never runs; no archive expected |
@@ -481,10 +503,9 @@ Revision 1 raised four questions; all four are answered. Nothing here is open.
 #164 ships **approve + rework only**. "Catch up the remaining tasks" is #166's
 responsibility, and the second meaning of READY is not introduced inside #164.
 One naming correction attaches to this answer — see the table in §5.4:
-`RESUME_DELIVER` is #164's approve path (deliver as-is), and #166's
-continuation gets its own constant, because a single constant meaning both
-would make the exhaustive READY dispatch ambiguous exactly where it is designed
-to be total.
+the approve constant is now `RESUME_ACCEPT_PARTIAL` (revision 3), which
+names the operator's decision — accept the incomplete result — and cannot be
+misread as executing the missing tasks; #166 names its own continuation.
 
 ### 10.2 All-no-op — do not block
 
