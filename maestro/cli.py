@@ -1964,7 +1964,11 @@ def workstream_continue_command(
         )
         from maestro.database import Database
         from maestro.models import SPEC_PREFIX, WorkstreamStatus
-        from maestro.tasks_spec import find_dangling_dependencies
+        from maestro.orchestrator import _maybe_live_orphan
+        from maestro.tasks_spec import (
+            DanglingDependency,
+            find_dangling_dependencies,
+        )
 
         database = Database(db_path)
         await database.connect()
@@ -1981,7 +1985,7 @@ def workstream_continue_command(
             recorded = workstream.workspace_path
             worktree = Path(recorded) if recorded else None
             spec_dir = worktree / "spec" if worktree else None
-            dangling = []
+            dangling: list[DanglingDependency] = []
             state_present = False
             if spec_dir is not None:
                 tasks_path = spec_dir / f"{SPEC_PREFIX}tasks.md"
@@ -1990,15 +1994,23 @@ def workstream_continue_command(
                         tasks_path.read_text(encoding="utf-8")
                     )
                 except (OSError, UnicodeDecodeError):
-                    dangling = []
+                    # An unreadable plan is not "no dependencies": there is
+                    # nothing to continue. Calling it fine here would queue a
+                    # continuation the orchestrator is certain to refuse, which
+                    # is the opposite of the fast readable refusal this check
+                    # exists for.
+                    dangling = [
+                        DanglingDependency(task_id="<file>", missing="tasks.md")
+                    ]
                 state_present = (
                     spec_dir / f".executor-{SPEC_PREFIX}state.db"
                 ).is_file()
             verdict = classify_continuation_readiness(
                 worktree_exists=bool(worktree and worktree.is_dir()),
-                live_execution=bool(
-                    workstream.process_pid and workstream.process_pid > 0
-                ),
+                # The SAME predicate the orchestrator uses, not a hand-rolled
+                # `pid > 0`: that misses the spawning sentinel (-1), the window
+                # in which a spawn was in flight and a process may well exist.
+                live_execution=_maybe_live_orphan(workstream.process_pid),
                 dangling=dangling,
                 state_db_present=state_present,
             )

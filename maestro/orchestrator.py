@@ -1792,10 +1792,14 @@ class Orchestrator:
         row already holds, since it regenerates nothing and the plan is
         unchanged.
 
-        `clear_resume_reason` belongs to the Stage B rework path: the marker is
-        cleared only after a successful respawn, so a crash before the process
-        is live re-picks the rework path (and its addendum) rather than a plain
-        re-run.
+        `clear_resume_reason` is set by any caller whose resume marker must
+        survive a crash that happens BEFORE the spawn is accepted — the Stage B
+        rework path (a crash re-picks the rework path and its addendum rather
+        than a plain re-run) and the #166 B continuation path (a crash re-picks
+        the continuation rather than letting the row look like a plain READY and
+        regenerate). In both cases the marker is cleared only after the process
+        is live, which is why this is a parameter rather than something the
+        callee infers.
 
         Shared by the ordinary path (after spec generation) and by a
         continuation (#166 B), which reaches it over an existing tasks.md with
