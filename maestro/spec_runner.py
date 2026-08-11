@@ -35,12 +35,27 @@ logger = logging.getLogger(__name__)
 # `--full` / `--from-file` / `--no-interactive` flags and the
 # `spec/{requirements,design,tasks}.md` output layout. Enforced at runtime
 # by the preflight version gate (`preflight._check_spec_runner_version`,
-# issue #122): 2.16.0 is the first version that keeps the harness-owned
+# issue #122): 2.16.0 was the first version that keeps the harness-owned
 # `spec/.gitignore` out of auto-commits (spec-runner#96) — older versions
 # put it into the workstream diff, which the ex-post scope gate flags as a
 # scope escape. Bumping requires reviewing the contract tests and any
 # format changes.
-SPEC_RUNNER_REQUIRED_VERSION = "2.16.0"
+#
+# 2.24.0 (#169b, 2026-08-11) raises the floor to the release that closed the
+# false-green exit class: `run --all` no longer exits 0 with work undone, and
+# the run records an honest `last_run_stop_reason`. Two mechanisms now depend
+# on that being true rather than merely available — the completeness gate
+# (#164) treats a zero exit as a claim it verifies against the counters, and
+# the retry classifier (#165) routes three typed reasons away from a retry
+# that cannot help. Both degrade safely on an older spec-runner (fail-closed
+# and retry-as-before respectively), but the pin makes the guarantee real
+# instead of best-effort.
+#
+# Surfaces re-verified against 2.24.0 at the bump: `plan --full`,
+# `run --all`, `--spec-prefix`, `status --json` (`total_tasks`), `review-pr`,
+# and the two vendored contracts (`tasks_spec`, `retry_policy`), which carry
+# their own `VENDORED_FROM_SPEC_RUNNER = "2.24.0"`.
+SPEC_RUNNER_REQUIRED_VERSION = "2.24.0"
 
 _VERSION_OUTPUT_RE = re.compile(r"^\s*spec-runner (\d+)\.(\d+)\.(\d+)\s*$")
 

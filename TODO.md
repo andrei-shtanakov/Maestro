@@ -468,7 +468,7 @@
       без него оба пункта будут различать «упало / заблокировано / отказ
       политики» парсингом логов.
 
-- [ ] **#169b Поднять `SPEC_RUNNER_REQUIRED_VERSION` под новый exit-контракт** (P2) @owner:github:andrei-shtanakov @id:spec-runner-exit-contract-pin @trigger:"spec-runner опубликовал тег с новым exit-контрактом (`run --all` не отдаёт 0 при недоделанной работе); номер апстрим обещал написать в issue #169"
+- [x] **#169b Поднять `SPEC_RUNNER_REQUIRED_VERSION` под новый exit-контракт** (P2) @owner:github:andrei-shtanakov @id:spec-runner-exit-contract-pin @trigger:"spec-runner опубликовал тег с новым exit-контрактом (`run --all` не отдаёт 0 при недоделанной работе); номер апстрим обещал написать в issue #169"
       В master spec-runner закрыт класс ложно-зелёного выхода: `run --all`
       больше не завершается нулём при недоделанной работе, появились честные
       `stop_reason` (`task_failed_stop`, `blocked_after_skip`,
@@ -477,6 +477,15 @@
       (`maestro/spec_runner.py`). Бамп ждёт тега — до него пункт не работа, а
       watch. Важно для #164: апстрим проверил по нашему коду, что 1/9 объясняется
       именно этим классом, а не by-design поведением голого `run`.
+      Сделано 2026-08-11 (PR #177): апстрим выпустил тег v2.24.0, пин поднят
+      2.16.0 → 2.24.0. Триггер отработал как задумано, и сработал ещё один
+      сторож: тест «`SPEC_RUNNER_REQUIRED_VERSION` не выше вендоренной
+      версии» (заведён в #165) заставил при бампе сверить обе вендоренные
+      поверхности (`tasks_spec`, `retry_policy`) и потребляемые CLI-поверхности
+      (`plan --full`, `run --all`, `--spec-prefix`, `status --json`/
+      `total_tasks`, `review-pr`) — а не «когда-нибудь». Upgrade impact:
+      preflight fail-closed блокирует установленный spec-runner < 2.24.0,
+      включая 2.16–2.23. Issue #169 закрывается этим PR.
 
 - [x] **#164 done-ignores-subtask-completion: DONE по фактической завершённости + долговечные executor-логи** (P1, зависит от сигнала #169a) (PR #174, merge `5ddb9dd`) @owner:github:andrei-shtanakov @id:done-ignores-subtask-completion @blocked_by:todo://maestro/spec-runner-exit-contract-bump
       Наблюдение пилота (0.4.x, Mode 2): `w-contracts` после rework выполнил

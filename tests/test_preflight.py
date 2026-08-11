@@ -481,9 +481,14 @@ class TestSpecRunnerContractGuard:
 
 
 class TestSpecRunnerVersionGate:
-    """#122: spec-runner < 2.16.0 may commit the harness-owned
-    spec/.gitignore into task commits; preflight blocks fail-closed
-    before any worktree exists."""
+    """The installed spec-runner must meet the pinned floor.
+
+    Two stacked reasons: below 2.16 the harness-owned spec/.gitignore lands in
+    task commits (#122), and below 2.24 a run can exit 0 with work undone and
+    record no honest stop reason (#169b) — the false-green class the
+    completeness gate and the retry classifier are built around. Preflight
+    blocks fail-closed before any worktree exists.
+    """
 
     @staticmethod
     def _fake_version(monkeypatch, stdout: str, returncode: int = 0) -> None:
@@ -505,14 +510,27 @@ class TestSpecRunnerVersionGate:
         assert [i.code for i in issues] == ["spec-runner-version-unsupported"]
         assert issues[0].severity == "error"
         assert "2.15.0" in issues[0].message  # found version
-        assert "2.16.0" in issues[0].message  # required version
+        assert "2.24.0" in issues[0].message  # required version
         assert "spec/.gitignore" in issues[0].message  # reason
         assert "upgrade" in issues[0].message.lower()  # remedy
+
+    def test_previous_floor_is_now_blocked(self, monkeypatch) -> None:
+        """2.16 was the floor until #169b; it no longer is.
+
+        A user who upgraded once and stopped is exactly who this gate has to
+        stop now: 2.16 still exits 0 with work undone.
+        """
+        from maestro import preflight
+
+        self._fake_version(monkeypatch, "spec-runner 2.16.0\n")
+        issues = preflight._check_spec_runner_version()
+        assert [i.code for i in issues] == ["spec-runner-version-unsupported"]
+        assert "2.24.0" in issues[0].message
 
     def test_minimum_version_passes(self, monkeypatch) -> None:
         from maestro import preflight
 
-        self._fake_version(monkeypatch, "spec-runner 2.16.0\n")
+        self._fake_version(monkeypatch, "spec-runner 2.24.0\n")
         assert preflight._check_spec_runner_version() == []
 
     def test_newer_version_passes(self, monkeypatch) -> None:
@@ -535,7 +553,7 @@ class TestSpecRunnerVersionGate:
     def test_dev_version_is_not_guessed(self, monkeypatch) -> None:
         from maestro import preflight
 
-        self._fake_version(monkeypatch, "spec-runner 2.16.0.dev1\n")
+        self._fake_version(monkeypatch, "spec-runner 2.24.0.dev1\n")
         issues = preflight._check_spec_runner_version()
         assert [i.code for i in issues] == ["spec-runner-version-unsupported"]
 
