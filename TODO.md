@@ -478,7 +478,7 @@
       watch. Важно для #164: апстрим проверил по нашему коду, что 1/9 объясняется
       именно этим классом, а не by-design поведением голого `run`.
 
-- [ ] **#164 done-ignores-subtask-completion: DONE по фактической завершённости + долговечные executor-логи** (P1, зависит от сигнала #169a) @owner:github:andrei-shtanakov @id:done-ignores-subtask-completion @blocked_by:todo://maestro/spec-runner-exit-contract-bump
+- [x] **#164 done-ignores-subtask-completion: DONE по фактической завершённости + долговечные executor-логи** (P1, зависит от сигнала #169a) (PR #174, merge `5ddb9dd`) @owner:github:andrei-shtanakov @id:done-ignores-subtask-completion @blocked_by:todo://maestro/spec-runner-exit-contract-bump
       Наблюдение пилота (0.4.x, Mode 2): `w-contracts` после rework выполнил
       TASK-001 из 9 сгенерированных задач, spec-runner вышел с 0 — Maestro
       прошёл RUNNING → MERGING → PR_CREATED → DONE и смержил ветку с одной
@@ -528,6 +528,14 @@
       только счётчики. **Продолжение исполнения оставшихся задач (догон) в
       этот объём НЕ входит и остаётся за #166** — здесь нет и не должно быть
       механизма для него.
+      Влито: PR #174, merge `5ddb9dd`; issue #164 закрыта. Два дефекта
+      найдены и исправлены по ходу: `INSERT OR IGNORE` глотал нарушение CHECK
+      у `gate_approvals.phase`, из-за чего одобрение молча не записывалось и
+      сообщало об успехе (миграция 24 + целевой `ON CONFLICT`); и
+      `_newest_archive` откатывался на более старый архив при исчезновении
+      новейшего, из-за чего гейт судил по чужому прогону, а cleanup уничтожил
+      бы логи текущего (нашёл Copilot; тест сеет две execution и удаляет
+      только новейшую).
 
 - [ ] **#165 rework-dangling-deps-retries: dangling deps между ревизиями + детерминированный fail без ре-декомпозиции** (P1, зависит от сигнала #169a) @owner:github:andrei-shtanakov @id:rework-dangling-deps-retries @blocked_by:todo://maestro/spec-runner-exit-contract-bump
       Два наблюдения на живом rework-цикле (третья ревизия одного workstream).
