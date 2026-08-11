@@ -2504,9 +2504,14 @@ class Orchestrator:
                 None, tasks_path.read_text
             )
         except OSError as exc:
+            # SKIPPED, not passed. Three distinct events on purpose: a
+            # fail-open skip must never read as a statement about the file's
+            # correctness, or an operator scanning the log will believe the
+            # dependencies were checked when they were not.
             self._logger.warning(
-                "workstream '%s': cannot read %s for dependency validation "
-                "(%s); spec-runner will still validate at run time",
+                "workstream.tasks_validation.skipped workstream=%s path=%s "
+                "error=%s note=unreadable; spec-runner still validates at "
+                "run time",
                 workstream_id,
                 tasks_path,
                 exc,
@@ -2515,10 +2520,20 @@ class Orchestrator:
 
         dangling = find_dangling_dependencies(text)
         if not dangling:
+            self._logger.info(
+                "workstream.tasks_validation.passed workstream=%s path=%s",
+                workstream_id,
+                tasks_path,
+            )
             return True
 
         reason = build_dangling_dependency_error(dangling)
-        self._logger.error("workstream '%s' %s", workstream_id, reason)
+        self._logger.error(
+            "workstream.tasks_validation.blocked workstream=%s dangling=%d %s",
+            workstream_id,
+            len(dangling),
+            reason,
+        )
         await self._transition(
             workstream_id,
             WorkstreamStatus.NEEDS_REVIEW,

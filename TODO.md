@@ -537,7 +537,7 @@
       бы логи текущего (нашёл Copilot; тест сеет две execution и удаляет
       только новейшую).
 
-- [ ] **#165 rework-dangling-deps-retries: dangling deps между ревизиями + детерминированный fail без ре-декомпозиции** (P1, зависит от сигнала #169a) @owner:github:andrei-shtanakov @id:rework-dangling-deps-retries @blocked_by:todo://maestro/spec-runner-exit-contract-bump
+- [x] **#165 rework-dangling-deps-retries: dangling deps между ревизиями + детерминированный fail без ре-декомпозиции** (P1, зависит от сигнала #169a) @owner:github:andrei-shtanakov @id:rework-dangling-deps-retries @blocked_by:todo://maestro/spec-runner-exit-contract-bump
       Два наблюдения на живом rework-цикле (третья ревизия одного workstream).
       (1) **Dangling deps между ревизиями:** `workstream-rework`
       пере-декомпозирует и ПЕРЕЗАПИСЫВАЕТ `spec/maestro-tasks.md`; декомпозер,
@@ -554,6 +554,18 @@
       и без повторной декомпозиции. Разблокировано в пилоте вручную (правка
       файла + UPDATE в DB); попутно четвёртый раз мешал stale pid — это уже
       закрыто #162/PR #167.
+      Реализация сделана: `maestro/tasks_spec.py` (вендоренный контракт формата
+      spec-runner 2.24.0 + `find_dangling_dependencies`, врезан после
+      `plan --full` и до любого спавнера, блок без расхода ретрая) и
+      `maestro/retry_policy.py` (три `stop_reason` — `validation_failed`,
+      `state_spec_mismatch`, `dependency_blocked_after_skip` — сразу в
+      NEEDS_REVIEW; unknown/`error_*`/пустое/отсутствующее сохраняют политику).
+      Уточнение решения автора issue, согласованное с владельцем: вместо
+      «промпт-инструкция ИЛИ перенос задач» — **детерминированный валидатор у
+      нас**, потому что промпт декомпозиции принадлежит spec-runner, а
+      инструкция не является проверкой; она добавлена как профилактика к
+      каждому rework независимо от `--instructions`. Тайминг как признак
+      детерминированности не используется даже как fallback.
 
 - [ ] **#166 collateral-workstream-kill: per-workstream quarantine и resume без regen** (P2, проектировать можно параллельно, внедрять последним) @owner:github:andrei-shtanakov @id:collateral-workstream-kill
       Границы дефекта (заданы автором issue): это НЕ про сам watchdog и НЕ про

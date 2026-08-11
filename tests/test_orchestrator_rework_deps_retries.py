@@ -189,6 +189,34 @@ class TestDanglingDependencyBlocksBeforeSpawn:
             await db.close()
 
     @pytest.mark.anyio
+    async def test_skip_and_pass_are_distinguishable_events(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A fail-open skip must not read as "the dependencies are fine".
+
+        Both return True, so the log is the only place the difference exists;
+        an operator scanning it would otherwise believe a file was checked
+        when it was only unreadable.
+        """
+        orch, db, _mgr, _dec, workspace = await _build(tmp_path)
+        try:
+            with caplog.at_level("INFO", logger="maestro.orchestrator"):
+                await orch._validate_generated_tasks(WS, workspace)
+            assert "workstream.tasks_validation.skipped" in caplog.text
+            assert "workstream.tasks_validation.passed" not in caplog.text
+
+            caplog.clear()
+            (workspace / "spec" / f"{SPEC_PREFIX}tasks.md").write_text(
+                _tasks_md(dangling=False)
+            )
+            with caplog.at_level("INFO", logger="maestro.orchestrator"):
+                await orch._validate_generated_tasks(WS, workspace)
+            assert "workstream.tasks_validation.passed" in caplog.text
+            assert "workstream.tasks_validation.skipped" not in caplog.text
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
     async def test_unreadable_tasks_file_does_not_block(self, tmp_path: Path) -> None:
         """spec-runner still validates at run time; blocking on our own path
         assumption would turn it into an outage."""
