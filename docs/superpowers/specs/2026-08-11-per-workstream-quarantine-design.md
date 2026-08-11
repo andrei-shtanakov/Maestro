@@ -1,6 +1,9 @@
 # Per-workstream quarantine + resume without regeneration (#166) — design
 
-**Status:** approved (revision 3, 2026-08-11 — quarantine does **not**
+**Status:** approved (revision 4, 2026-08-11 — recovery capture is placed
+AFTER the isolation-aware classification, not before it: a live orphan is still
+writing its state and logs, and an archive taken mid-write is a torn snapshot
+that looks like evidence (§4.4). Revision 3 — quarantine does **not**
 terminate a live handle, which reverses revision 2's "no new durable state"
 conclusion and reinstates a migration; §3 rewritten accordingly. Revision 2
 answered all four §8 questions, one of which corrected freeze from
@@ -204,32 +207,51 @@ never to a silent regeneration.
 - It does not resurrect an approval. A continuation produces new commits,
   which move the SHA and void any prior approval — the existing rule.
 
-### 4.4 Evidence for an interrupted run — captured at recovery
+### 4.4 Evidence for an interrupted run — captured at recovery, after classification
 
 A hard kill skips finalization, so #164's archive is never written (§2.3).
-Recovery therefore captures it (owner decision, §8.1), and the ordering is the
-load-bearing part: **capture runs before cleanup, before any rework, and
-before a new dispatch** — those are precisely the operations that destroy or
-overwrite what is being captured.
+Recovery therefore captures it — but **not before it has classified what it is
+looking at** (owner correction, revision 4).
 
-Four properties, each with a reason:
+The naive placement (capture first, then reconcile) is wrong for a specific
+reason: a **live orphan is still writing** its state database and its logs. An
+archive taken mid-write is not evidence, it is a torn snapshot that looks like
+evidence. Such a workstream must go back to monitoring, and its ordinary
+finalization will capture a consistent archive at the proper moment.
 
-- **Through the existing post-mortem core**, not a second implementation.
-  `_capture_evidence` already takes an explicit evidence key and a workspace
-  (it was factored that way for `workstream-recapture`), so recovery is a
-  third caller rather than a parallel path that could drift.
-- **Idempotent.** Recovery can run repeatedly — a restart loop, an operator
-  re-running `orchestrate --resume` — and must not multiply archives or fail
-  on the second pass. The archive is keyed by execution and the row upserts,
-  so a repeat reconciles.
-- **Marked with its source.** The manifest records `captured_by: recovery`, so
-  an operator reading the evidence knows it was taken after an interruption
-  rather than at an orderly finalization; the two say different things about
-  how complete the executor state is.
-- **An expected capture failure preserves the worktree and hands the operator
-  `RESUME_RECAPTURE`** — the #164 path — instead of silently proceeding down a
-  destructive route. This is the same rule finalization already follows: if
-  the evidence cannot be saved, nothing that would destroy it may run.
+So recovery runs in phases, and the existing four-way classification is left
+exactly as it is:
+
+```
+probe / classify (isolation-aware, unchanged)
+        │
+        ├─ live orphan / possibly-live handle → back to monitoring, NO capture
+        │                                        (finalization captures later)
+        │
+        └─ provably dead / stranded → capture checkpoint ──→ the branch's
+                                       (single, shared)      original action
+                                                             (cleanup, rework,
+                                                              dispatch)
+```
+
+Four properties of the checkpoint, each with a reason:
+
+- **One checkpoint, not four in-branch calls.** Capture is inserted between
+  classification and action rather than inside each branch, so the branches
+  keep their current logic and cannot drift apart in whether they capture.
+- **Nothing destructive runs before it succeeds.** Cleanup, rework and dispatch
+  are all downstream of the checkpoint, because each of them destroys or
+  overwrites what is being captured.
+- **An expected capture failure preserves the worktree** and hands the operator
+  `RESUME_RECAPTURE` (#164), rather than silently proceeding.
+- **A branch with no execution at all may record `state_missing`** — but only
+  once the classifier has established that, never as a default assumption.
+
+Otherwise unchanged from revision 2: capture goes through the existing
+`_capture_evidence` core (a third caller after finalization and
+`workstream-recapture`), is idempotent, and records `captured_by: recovery` so
+an operator can tell interrupted evidence from evidence taken at an orderly
+finalization.
 
 ### 4.5 Counting continuations without capping them
 

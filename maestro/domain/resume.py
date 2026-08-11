@@ -33,6 +33,19 @@ would be an operational dead end: the block carries no approval marker (there
 is no result to approve, only an archive root to fix), and a plain requeue
 falls through to the full respawn, re-running the work being preserved."""
 
+RESUME_CONTINUE_TASKS = "continue_tasks"
+"""Re-dispatch spec-runner against the EXISTING `spec/maestro-tasks.md` (#166 B).
+
+Set ONLY by `maestro workstream-continue`. No regeneration, no author respawn,
+no new sha — the interrupted run simply carries on from its own executor state.
+This is the second meaning of READY the design deliberately kept out of #164:
+`completeness_accept_partial` accepts a partial result and executes nothing,
+while this one executes the work that is missing.
+
+Fail-closed on four preconditions re-checked immediately before spawn
+(`maestro/continuation.py`); a refusal parks the workstream back in
+NEEDS_REVIEW with a distinct reason and never falls back to a regeneration."""
+
 KNOWN_RESUME_REASONS = frozenset(
     {
         RESUME_REWORK,
@@ -40,6 +53,7 @@ KNOWN_RESUME_REASONS = frozenset(
         RESUME_OPERATOR_REWORK,
         RESUME_ACCEPT_PARTIAL,
         RESUME_RECAPTURE,
+        RESUME_CONTINUE_TASKS,
     }
 )
 """The complete allowed resume_reason value set (plus NULL for a plain

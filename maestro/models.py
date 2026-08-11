@@ -1292,6 +1292,16 @@ class Workstream(BaseModel):
     quarantine_reason: str | None = Field(
         default=None, description="Operator's reason for the active quarantine"
     )
+    continuation_count: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "How many times an operator has continued this workstream over "
+            "its existing tasks.md (#166 B). Incremented only when the "
+            "dispatcher accepts a continuation, never when one is queued. "
+            "Surfaced and warned about, never capped."
+        ),
+    )
 
     def can_transition_to(self, target: WorkstreamStatus) -> bool:
         """Check if transition to target status is valid."""

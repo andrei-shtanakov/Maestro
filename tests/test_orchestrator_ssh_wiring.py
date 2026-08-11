@@ -925,6 +925,11 @@ class TestSshRecoveryBranch:
         name (which Task 13d's fail-closed `_is_ssh_terminal_strand` now
         correctly routes to NEEDS_REVIEW instead of silently resetting)."""
         orch, db = await _orch_with_db(tmp_path)
+        # No worktree: this test is about ssh-vs-docker recovery routing, not
+        # about evidence, and #166 B's capture checkpoint only archives when
+        # there is a worktree to archive. A MagicMock workspace_mgr would
+        # otherwise report one that does not exist.
+        orch._workspace_mgr.workspace_exists = MagicMock(return_value=False)
         docker = MagicMock()
         docker.ps_ids_by_label = AsyncMock(return_value=[])
         orch._docker = docker

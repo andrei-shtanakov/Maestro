@@ -1928,6 +1928,129 @@ def workstream_unquarantine_command(
     )
 
 
+@app.command("workstream-continue")
+def workstream_continue_command(
+    workstream_id: Annotated[str, typer.Argument(help="Workstream ID to continue")],
+    db: Annotated[
+        Path | None,
+        typer.Option("--db", "-d", help="Path to SQLite database file"),
+    ] = None,
+) -> None:
+    """Queue a continuation over the workstream's EXISTING tasks.md (#166).
+
+    Re-runs spec-runner against the plan that is already there: no
+    regeneration, no author respawn, no new sha. Use it when a run was
+    interrupted — a stop, a kill, a crash — and the remaining tasks should
+    simply be finished.
+
+    This only QUEUES the continuation; the orchestrator dispatches it on its
+    next loop. The preconditions are checked here so a refusal is fast and
+    readable, and checked AGAIN immediately before the spawn — between the two
+    a live process can appear, the worktree can vanish, or tasks.md can change,
+    and only the later check can be trusted.
+
+    Not an approval and not a rework: nothing about the result is accepted and
+    no spec is regenerated.
+
+    Examples:
+        maestro workstream-continue w-adapters
+    """
+    db_path = db or DEFAULT_DB_PATH
+
+    async def _run() -> tuple[int, str | None]:
+        from maestro.continuation import (
+            classify_continuation_readiness,
+            describe_continuation_count,
+        )
+        from maestro.database import Database
+        from maestro.models import SPEC_PREFIX, WorkstreamStatus
+        from maestro.orchestrator import _maybe_live_orphan
+        from maestro.tasks_spec import (
+            DanglingDependency,
+            find_dangling_dependencies,
+        )
+
+        database = Database(db_path)
+        await database.connect()
+        try:
+            workstream = await database.get_workstream(workstream_id)
+            if workstream.status != WorkstreamStatus.NEEDS_REVIEW:
+                raise ValueError(
+                    f"workstream '{workstream_id}' is {workstream.status}, "
+                    f"only NEEDS_REVIEW can be queued for continuation"
+                )
+
+            # A snapshot check, deliberately not the authority: the orchestrator
+            # re-checks the same four facts just before spawning.
+            recorded = workstream.workspace_path
+            worktree = Path(recorded) if recorded else None
+            spec_dir = worktree / "spec" if worktree else None
+            dangling: list[DanglingDependency] = []
+            state_present = False
+            if spec_dir is not None:
+                tasks_path = spec_dir / f"{SPEC_PREFIX}tasks.md"
+                try:
+                    dangling = find_dangling_dependencies(
+                        tasks_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, UnicodeDecodeError):
+                    # An unreadable plan is not "no dependencies": there is
+                    # nothing to continue. Calling it fine here would queue a
+                    # continuation the orchestrator is certain to refuse, which
+                    # is the opposite of the fast readable refusal this check
+                    # exists for.
+                    dangling = [
+                        DanglingDependency(task_id="<file>", missing="tasks.md")
+                    ]
+                state_present = (
+                    spec_dir / f".executor-{SPEC_PREFIX}state.db"
+                ).is_file()
+            verdict = classify_continuation_readiness(
+                worktree_exists=bool(worktree and worktree.is_dir()),
+                # The SAME predicate the orchestrator uses, not a hand-rolled
+                # `pid > 0`: that misses the spawning sentinel (-1), the window
+                # in which a spawn was in flight and a process may well exist.
+                live_execution=_maybe_live_orphan(workstream.process_pid),
+                dangling=dangling,
+                state_db_present=state_present,
+            )
+            if not verdict.ok:
+                raise ValueError(
+                    f"cannot continue ({verdict.reason}): {verdict.message}"
+                )
+
+            await database.requeue_for_continuation(workstream_id)
+            return (
+                workstream.continuation_count,
+                describe_continuation_count(workstream.continuation_count),
+            )
+        finally:
+            await database.close()
+
+    from maestro.database import WorkstreamNotFoundError
+
+    try:
+        started, warning = asyncio.run(_run())
+    except (ValueError, WorkstreamNotFoundError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    console.print(
+        f"[green]Workstream '{workstream_id}' queued for continuation over its "
+        f"existing tasks.md (NEEDS_REVIEW -> READY).[/green]"
+    )
+    console.print(
+        f"Continuations actually started so far: {started}. "
+        f"The orchestrator dispatches this one on its next loop, after "
+        f"re-checking the preconditions."
+    )
+    if warning is not None:
+        console.print(f"[yellow]{warning}[/yellow]")
+        console.print(
+            "[dim]This is a warning, not a limit — continuing again is allowed.[/dim]"
+        )
+
+
 @app.command("workstream-recapture")
 def workstream_recapture_command(
     workstream_id: Annotated[str, typer.Argument(help="Workstream ID to recapture")],

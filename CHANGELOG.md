@@ -32,53 +32,64 @@
     `quarantine_reason`, plus a `workstream_quarantines` audit table).
     Deliberately not a status: the process keeps running, so the row stays
     RUNNING and every existing `expected_status=RUNNING` CAS keeps working.
+- **`maestro workstream-continue <id>` — finish an interrupted workstream
+  without starting over (#166 half B).** It re-dispatches spec-runner against
+  the **existing** `spec/maestro-tasks.md`: no regeneration, no author respawn,
+  no new SHA, and the partial work is kept. Before this, whatever ended a run —
+  a stop, a kill, a crash — left the workstream in READY, and READY means
+  "Always regenerate": a fresh spec, a fresh LLM lottery, fresh money.
+  - **It only queues the request.** The orchestrator dispatches it on its next
+    loop. The command checks the preconditions so a refusal is fast and
+    readable, but that answer is not the authority: between it and the spawn a
+    live process can appear, the worktree can vanish or tasks.md can change, so
+    the preconditions are re-checked immediately before spawning and **that
+    late check is the guarantee.**
+  - **Fail-closed on four preconditions**, each with its own reason because each
+    needs a different action: a live process or execution handle (never run a
+    second spec-runner over one worktree), a missing worktree, a tasks.md that
+    fails #165's dangling-dependency validation, and an unreadable executor
+    state database (without it "continue" is a fresh start wearing the wrong
+    name). A refusal parks the workstream in NEEDS_REVIEW, clears the resume
+    marker so the next loop does **not** retry by itself, spawns nothing,
+    generates nothing and leaves the counter untouched. A new explicit
+    `workstream-continue` is accepted once the cause is gone.
+  - **How it differs from its neighbours**, which is the distinction most worth
+    keeping straight:
 
-### Changed
-- **`maestro stop` now drains instead of destroying work (#166 half A).** The
-  first signal (SIGTERM/SIGINT) **forbids new dispatch and waits for live
-  executions to finish**, monitoring each to its own finalization; it
-  terminates nothing. Previously it terminated every running handle and reset
-  each workstream to READY, which meant "Always regenerate" — so a routine
-  stop discarded partial work exactly as an external SIGKILL did.
-  - **A second signal forces termination** and may leave work needing recovery
-    on the next start. That escalation is deliberate: without it the only
-    escape from a long drain would be SIGKILL, the hammer this change removes.
-    A forced shutdown is recorded distinctly (the structured
-    `orchestrator.shutdown.forced` event, and a human-readable cause on the
-    affected rows) so a deliberate stop is legible afterwards rather than
-    looking like a crash.
-  - Recovery's automatic behaviour is unchanged: it still classifies by
-    process/handle liveness. The cause is diagnostics for a person, not a
-    branch condition.
+    | Verb | What it does |
+    |---|---|
+    | `workstream-continue` | Runs the tasks that are **missing**, over the existing plan |
+    | `workstream-approve` | **Accepts** the current incomplete result and delivers it; executes nothing |
+    | `workstream-rework` | **Re-decomposes** from scratch and respawns the author |
+    | `workstream-recapture` | Retries **only** the evidence archiving, for the same execution |
+
+  - **The counter records accepted dispatch attempts**, not requests: it moves
+    inside the `READY -> RUNNING` CAS, so a queued continuation that is later
+    refused, cancelled or lost to a race counts nothing. Past a threshold the
+    operator is **warned, never blocked** — an explicit audited action is not an
+    automatic loop, and forbidding the N+1th without new knowledge would only
+    invite a workaround. Migration 26 adds the column.
+- **Recovery now archives the evidence of interrupted runs (#166 half B).** A
+  hard kill skips finalization, so #164's post-mortem archive was never written
+  for exactly the runs an operator most needs to inspect. Recovery now captures
+  it, and **only for provably-dead / stranded executions**:
+  - a **live orphan** (or a possibly-live handle) is returned to
+    review/monitoring and is **not** archived — a process still writing its
+    state and logs would yield a torn snapshot that looks like evidence; its own
+    finalization captures a consistent archive later;
+  - a stranded **DECOMPOSING** is not archived either, having produced no
+    executor state to preserve;
+  - the decision comes from recovery's existing classification, not from a
+    second probe that could disagree with it.
+  - **Capture completes before anything that could overwrite the evidence** —
+    cleanup, requeue or the `FAILED -> READY` reset that leads to the next
+    dispatch. It records `captured_by: recovery` so interrupted evidence is
+    distinguishable from evidence taken at an orderly finalization, and it is
+    idempotent for the same execution, so a restart loop reconciles instead of
+    multiplying archives. An expected capture failure preserves the worktree and
+    hands the operator the `workstream-recapture` path instead of proceeding.
 
 
-### Changed
-- **`spec-runner >= 2.24.0` is now required (#169b).** The floor moves from
-  2.16.0 to the release that closed the false-green exit class: `run --all`
-  no longer exits 0 with work undone, and the run records an honest
-  `last_run_stop_reason`. Two mechanisms shipped in this same cycle depend on
-  that being *true* rather than merely available — the completeness gate
-  (#164) treats a zero exit as a claim it verifies against the counters, and
-  the retry classifier (#165) routes three typed stop reasons away from a
-  retry that cannot help. Both degrade safely on an older spec-runner
-  (fail-closed and retry-as-before), so the pin is what turns "best effort"
-  into a guarantee. Surfaces re-verified at the bump: `plan --full`,
-  `run --all`, `--spec-prefix`, `status --json` (`total_tasks`), `review-pr`,
-  and the two vendored contracts, which already recorded 2.24.0 in
-  `VENDORED_FROM_SPEC_RUNNER`.
-
-### Upgrade impact
-- **Upgrade spec-runner before the next `maestro orchestrate`.** The preflight
-  version gate is fail-closed: an installed spec-runner below 2.24.0 now
-  blocks before any worktree is created, naming the found and required
-  versions. This includes 2.16–2.23, which were acceptable until now — a user
-  who upgraded once for #122 and stopped is exactly whom the gate must stop,
-  since those versions still exit 0 with work undone.
-  `MAESTRO_SPEC_RUNNER_ALLOW_UNVERIFIED=1` remains the documented escape for
-  unpublished local builds and downgrades the block to a warning, never to
-  silence.
-
-### Added
 - **Dangling dependencies are caught before the executor starts (#165).** A
   rework regenerates `spec/maestro-tasks.md` wholesale, and the decomposer —
   told it is continuing after TASK-021 — emits `**Depends on:** [TASK-021]`
@@ -103,7 +114,43 @@
   instructions. The rule is **prevention only** — correctness comes from the
   validator above, which runs whether or not the model honoured it.
 
+- **`maestro workstream-approve <id>` (gates v1.1, H-5):** the sanctioned
+  operator re-queue for gate-blocked workstreams — NEEDS_REVIEW → READY with
+  `error_message` preserved (used to require a raw sqlite UPDATE).
+
 ### Changed
+- **`maestro stop` now drains instead of destroying work (#166 half A).** The
+  first signal (SIGTERM/SIGINT) **forbids new dispatch and waits for live
+  executions to finish**, monitoring each to its own finalization; it
+  terminates nothing. Previously it terminated every running handle and reset
+  each workstream to READY, which meant "Always regenerate" — so a routine
+  stop discarded partial work exactly as an external SIGKILL did.
+  - **A second signal forces termination** and may leave work needing recovery
+    on the next start. That escalation is deliberate: without it the only
+    escape from a long drain would be SIGKILL, the hammer this change removes.
+    A forced shutdown is recorded distinctly (the structured
+    `orchestrator.shutdown.forced` event, and a human-readable cause on the
+    affected rows) so a deliberate stop is legible afterwards rather than
+    looking like a crash.
+  - Recovery's automatic behaviour is unchanged: it still classifies by
+    process/handle liveness. The cause is diagnostics for a person, not a
+    branch condition.
+
+
+- **`spec-runner >= 2.24.0` is now required (#169b).** The floor moves from
+  2.16.0 to the release that closed the false-green exit class: `run --all`
+  no longer exits 0 with work undone, and the run records an honest
+  `last_run_stop_reason`. Two mechanisms shipped in this same cycle depend on
+  that being *true* rather than merely available — the completeness gate
+  (#164) treats a zero exit as a claim it verifies against the counters, and
+  the retry classifier (#165) routes three typed stop reasons away from a
+  retry that cannot help. Both degrade safely on an older spec-runner
+  (fail-closed and retry-as-before), so the pin is what turns "best effort"
+  into a guarantee. Surfaces re-verified at the bump: `plan --full`,
+  `run --all`, `--spec-prefix`, `status --json` (`total_tasks`), `review-pr`,
+  and the two vendored contracts, which already recorded 2.24.0 in
+  `VENDORED_FROM_SPEC_RUNNER`.
+
 - **Retries no longer pay for a failure they cannot change (#165).** Every
   Mode-2 retry costs a full re-decomposition (fresh spec-generation spend),
   and the pilot burned three of them on one validation error, hitting the
@@ -168,62 +215,6 @@
   workstream that carries no recapture token rather than becoming a generic
   requeue.
 
-### Fixed
-- **Approvals could be silently discarded (found while implementing #164).**
-  `gate_approvals.phase` carried `CHECK (phase IN ('ex_ante','ex_post'))`
-  while the approval was inserted with `INSERT OR IGNORE` — which suppresses
-  CHECK violations exactly as readily as duplicate keys. Any approval for a
-  phase outside those two recorded **nothing and reported success**, so the
-  operator saw "approved" and the gate blocked again on the same SHA.
-  Migration 24 rebuilds the table with the widened CHECK, and the insert now
-  uses `ON CONFLICT(workstream_id, phase, sha) DO NOTHING` so only the
-  intended UNIQUE collision (idempotent re-approval) is suppressed and a
-  constraint violation raises. Pre-existing `ex_ante`/`ex_post` approvals were
-  never affected; the defect could only bite a new phase.
-
-### Upgrade impact
-- **A workstream that is mid-run when you upgrade may stop for an operator
-  decision.** The completeness gate is fail-closed on an uncaptured
-  denominator, and `workstreams.subtask_total` is nullable — it has only been
-  recorded since migration 19. A workstream that started before that (or
-  whose spec-generation never captured a total) reaches the gate with
-  `subtask_total IS NULL`, blocks as `unknown_total`, and waits in
-  NEEDS_REVIEW until an operator runs `maestro workstream-approve <id>`
-  (accept the result as-is and continue delivery) or
-  `maestro workstream-rework <id>` (redo the work). This is the intended
-  change — it is precisely the case the incident was — but it means an
-  unattended upgrade of a running wave can pause at delivery instead of
-  merging. Nothing is lost: the worktree and the branch are left intact.
-- **Delivery now requires a post-mortem archive.** Any code path that reaches
-  the delivery tail without one blocks fail-closed. In normal operation the
-  archive is written during finalization, so this only surfaces for runs whose
-  finalization predates the upgrade.
-- Two new migrations run automatically on first connect: **23**
-  (`postmortem_archives`, additive) and **24** (`gate_approvals` rebuilt with
-  the widened phase CHECK, data preserved).
-
-- **`maestro service` — scheduled autonomous runs.** Generates and loads
-  a launchd/systemd **user** unit that starts a Maestro-owned wrapper
-  (`maestro service run`), never `orchestrate` directly: only Maestro's
-  own state can decide resume vs fresh vs no-op, and that decision table
-  lives in the wrapper. Two independent stages (`--stage orchestrate |
-  review`) with their own schedule, lock, ledger rows and logs.
-  Locking is a two-level flock hierarchy so legacy and scoped runs
-  exclude each other in *both* directions (legacy takes `global.lock`
-  exclusive; a scoped stage takes it shared plus an exclusive
-  per-(project, stage) lock) — different projects, and the two stages of
-  one project, run concurrently. A tick that cannot take its lock is
-  recorded and exits 0 rather than painting the unit red. Adds the
-  `service_ticks` ledger (migration 22, sentinel + CAS finalize, with
-  `decision` and `outcome` as distinct axes), a conservative
-  stale-worktree sweep that never removes unmerged/dirty/NEEDS_REVIEW
-  trees, Maestro-owned log rotation, and an install-time preflight that
-  **refuses** to write a unit whose harnesses or credentials cannot be
-  resolved non-interactively (a scheduled run gets no shell profile —
-  the classic silent 03:00 failure). Design:
-  `docs/superpowers/specs/2026-08-06-service-install-design.md`.
-
-### Changed
 - **`maestro service install` no longer demands an API key the normal
   path never reads.** Maestro spawns harness CLIs and never calls a
   model API itself, so a credential is satisfied by *either* an exported
@@ -293,73 +284,6 @@
   webhook URL never reaches logs — including httpx's own request lines,
   which are filtered. `httpx` becomes a direct dependency.
 
-### Deprecated
-- **`notifications.telegram_token` / `telegram_chat_id`.** Never wired to a
-  runtime channel; setting them now logs a deprecation warning. Use
-  `webhook_url` (e.g. via a small relay). The fields will be removed in a
-  future config-schema window.
-- **PR-created notification.** Entering `PR_CREATED` with an actual PR now
-  fires a desktop notification carrying the PR URL. The URL travels as a
-  structured transition payload (`Notification.url`) — never re-read from
-  the mutable DB after the fact — and the effect stays declarative: a new
-  `notification_requires_url` gate on the transition table means the two
-  PR-less paths into `PR_CREATED` (PR-creation error, `auto_pr: false`
-  convergence) keep firing the event log entry but stay silent.
-- **Honest workstream progress (#123).** The progress denominator no longer
-  grows lazily during a run: the planned subtask total is captured once
-  from `spec-runner status --json` (spec-runner's own tasks.md parser)
-  right after spec generation and persisted (`workstreams.subtask_total`,
-  migration 19). A final progress refresh runs before any terminal
-  transition, and no-op completions (spec-runner >= 2.16, #97) are counted
-  and rendered — a run whose last task was a legitimate no-op now finishes
-  as `5/5 done (1 no-op)` instead of the archaeology-inducing `DONE 4/5`.
-  All of it is display-only and fail-open: any failure to obtain the total
-  or read the final state keeps the previous label and never blocks
-  completion.
-- **`maestro workstream-rework <id>` (#124).** Sanctioned operator rework
-  for a gate-blocked/failed workstream: `NEEDS_REVIEW/FAILED -> READY`
-  with `resume_reason='operator_rework'` into the existing
-  re-decomposition path (same worktree, same lineage, idempotent harness
-  state cleanup). Mandatory `--reason` (audit-only, never enters the
-  prompt), optional `--instructions` (next-attempt addendum, keyed by an
-  explicit audit seq) and `--refresh-from <project.yaml>`
-  (description/scope only, re-validated before anything is written;
-  topology fields refused). Fail-closed liveness proof: pid-NULL alone is
-  insufficient — open execution handles and the new durable
-  recovery-ambiguity marker (written by startup recovery when parking
-  possibly-live workstreams) block the command until proven terminal or
-  explicitly resolved via the new `maestro workstream-resolve-ambiguity`.
-  One CAS UPDATE + append-only audit row per rework (migration 18);
-  nothing is ever written to `gate_approvals`; the Stage B rework budget
-  is untouched. Unknown `resume_reason` values now fail closed to
-  NEEDS_REVIEW instead of silently plain-resuming. `maestro workstreams`
-  shows an operator-rework counter (warning-styled from 3).
-- **Preflight spec-runner version gate (#122).** Mode 2 now requires
-  spec-runner >= 2.16.0, enforced fail-closed by `maestro validate` and the
-  `maestro orchestrate` preflight before any worktree is created: older
-  versions (2.15.x) commit the harness-owned `spec/.gitignore` into task
-  commits, which the ex-post scope gate flags as a scope escape. A version
-  below the minimum, unparseable `spec-runner --version` output, or a
-  missing binary all block with `spec-runner-version-unsupported`;
-  `MAESTRO_SPEC_RUNNER_ALLOW_UNVERIFIED=1` (for unpublished local builds)
-  downgrades the block to a warning. The scope gate itself is unchanged —
-  `spec/.gitignore` deliberately stays visible to changed-paths.
-
-### Fixed
-- **Preflight scope-overlap no longer flags DAG-ordered workstreams as a
-  merge-conflict risk (#121).** When a `depends_on` path (direct or
-  transitive) already orders two workstreams, they never run concurrently,
-  so their scope overlap is reported at a new `info` severity — without the
-  misleading "add a depends_on edge" advice — instead of `warning`. Info
-  findings never fail `maestro validate --strict`. Genuinely parallel
-  overlaps keep the warning unchanged.
-
-### Added
-- **`maestro workstream-approve <id>` (gates v1.1, H-5):** the sanctioned
-  operator re-queue for gate-blocked workstreams — NEEDS_REVIEW → READY with
-  `error_message` preserved (used to require a raw sqlite UPDATE).
-
-### Changed
 - **`validation_backend` default flipped `local` → `same` (validation_backend
   PR3).** Post-task validation now runs by default in the *same* backend the
   task ran in (environment parity), instead of always on the local host.
@@ -374,7 +298,58 @@
   recorded value (no data-migration; migration 12 only changes the column
   default for new rows); only newly-created tasks pick up the new default.
 
+- **Routing (D2):** the arbiter can now route to any harness that has a
+  registered spawner; the closed `AgentType` enum no longer gates spawns
+  (`scheduler.py`). Under **arbiter routing**, an unknown harness → retryable
+  HOLD (`unknown_agent`); `auto` → refuse (`auto_not_resolved`) — semantics
+  unchanged. Under **static/scheduler routing** (no arbiter to re-route), an
+  unregistered harness fails **terminally** (`SchedulerError`, task FAILED) —
+  a HOLD there would leave the task READY forever and hang the run.
+- **Model execution (D1):** the arbiter-routed model (`<harness>@<model>`) is now
+  passed into `spawn()` and executed. Each spawn emits an `agent.model_resolved
+  {harness, model, source}` log for observability.
+- **Catalog-driven model defaults (AI#4, ADR-ECO-003b):** the baked
+  `DEFAULT_<H>_MODEL` constants have been removed. The model is now resolved
+  from a user-config catalog loaded from `$ATP_CATALOG` (see `maestro/catalog.py`).
+  New precedence is **`routed` (arbiter) > `MAESTRO_<H>_MODEL` env > catalog
+  default > fail-loud** — env is now a fallback used only when routing
+  supplies no model, and the catalog default is used only when neither routing
+  nor env supply one. A status-graded coherence warning (`retired` /
+  `deprecated` / `unknown`) is logged when the routed or env-supplied model
+  doesn't cleanly match an `active` catalog entry.
+  Fault taxonomy is split by blast radius: a malformed or unconfigured
+  catalog raises a global `CatalogError` (`CatalogNotConfigured` /
+  `CatalogMalformed`) that halts the whole run, while a harness with no (or
+  an ambiguous) routable default raises a per-task `HarnessModelUnresolved`
+  that sends only that task to `NEEDS_REVIEW`.
+  **Breaking change:** a run with no routed model, no `MAESTRO_<H>_MODEL`,
+  and no `$ATP_CATALOG` now fails loud (`CatalogNotConfigured`: "model
+  catalog not configured: set $ATP_CATALOG (or run 'atp models init')")
+  instead of silently falling back to a built-in default model.
+
+---
+
 ### Fixed
+- **Approvals could be silently discarded (found while implementing #164).**
+  `gate_approvals.phase` carried `CHECK (phase IN ('ex_ante','ex_post'))`
+  while the approval was inserted with `INSERT OR IGNORE` — which suppresses
+  CHECK violations exactly as readily as duplicate keys. Any approval for a
+  phase outside those two recorded **nothing and reported success**, so the
+  operator saw "approved" and the gate blocked again on the same SHA.
+  Migration 24 rebuilds the table with the widened CHECK, and the insert now
+  uses `ON CONFLICT(workstream_id, phase, sha) DO NOTHING` so only the
+  intended UNIQUE collision (idempotent re-approval) is suppressed and a
+  constraint violation raises. Pre-existing `ex_ante`/`ex_post` approvals were
+  never affected; the defect could only bite a new phase.
+
+- **Preflight scope-overlap no longer flags DAG-ordered workstreams as a
+  merge-conflict risk (#121).** When a `depends_on` path (direct or
+  transitive) already orders two workstreams, they never run concurrently,
+  so their scope overlap is reported at a new `info` severity — without the
+  misleading "add a depends_on edge" advice — instead of `warning`. Info
+  findings never fail `maestro validate --strict`. Genuinely parallel
+  overlaps keep the warning unchanged.
+
 - **Gates approval memory survives phase overwrites (H-3):** the single-slot
   `error_message` marker gets overwritten when a later phase blocks; the
   verdict store (`gate_verdicts.jsonl`) is now the durable approval memory —
@@ -432,37 +407,109 @@
   and self-checks the generated config against `OrchestratorConfig` before
   writing (`maestro/scaffold.py`).
 
-### Changed
-- **Routing (D2):** the arbiter can now route to any harness that has a
-  registered spawner; the closed `AgentType` enum no longer gates spawns
-  (`scheduler.py`). Under **arbiter routing**, an unknown harness → retryable
-  HOLD (`unknown_agent`); `auto` → refuse (`auto_not_resolved`) — semantics
-  unchanged. Under **static/scheduler routing** (no arbiter to re-route), an
-  unregistered harness fails **terminally** (`SchedulerError`, task FAILED) —
-  a HOLD there would leave the task READY forever and hang the run.
-- **Model execution (D1):** the arbiter-routed model (`<harness>@<model>`) is now
-  passed into `spawn()` and executed. Each spawn emits an `agent.model_resolved
-  {harness, model, source}` log for observability.
-- **Catalog-driven model defaults (AI#4, ADR-ECO-003b):** the baked
-  `DEFAULT_<H>_MODEL` constants have been removed. The model is now resolved
-  from a user-config catalog loaded from `$ATP_CATALOG` (see `maestro/catalog.py`).
-  New precedence is **`routed` (arbiter) > `MAESTRO_<H>_MODEL` env > catalog
-  default > fail-loud** — env is now a fallback used only when routing
-  supplies no model, and the catalog default is used only when neither routing
-  nor env supply one. A status-graded coherence warning (`retired` /
-  `deprecated` / `unknown`) is logged when the routed or env-supplied model
-  doesn't cleanly match an `active` catalog entry.
-  Fault taxonomy is split by blast radius: a malformed or unconfigured
-  catalog raises a global `CatalogError` (`CatalogNotConfigured` /
-  `CatalogMalformed`) that halts the whole run, while a harness with no (or
-  an ambiguous) routable default raises a per-task `HarnessModelUnresolved`
-  that sends only that task to `NEEDS_REVIEW`.
-  **Breaking change:** a run with no routed model, no `MAESTRO_<H>_MODEL`,
-  and no `$ATP_CATALOG` now fails loud (`CatalogNotConfigured`: "model
-  catalog not configured: set $ATP_CATALOG (or run 'atp models init')")
-  instead of silently falling back to a built-in default model.
+### Deprecated
+- **`notifications.telegram_token` / `telegram_chat_id`.** Never wired to a
+  runtime channel; setting them now logs a deprecation warning. Use
+  `webhook_url` (e.g. via a small relay). The fields will be removed in a
+  future config-schema window.
+- **PR-created notification.** Entering `PR_CREATED` with an actual PR now
+  fires a desktop notification carrying the PR URL. The URL travels as a
+  structured transition payload (`Notification.url`) — never re-read from
+  the mutable DB after the fact — and the effect stays declarative: a new
+  `notification_requires_url` gate on the transition table means the two
+  PR-less paths into `PR_CREATED` (PR-creation error, `auto_pr: false`
+  convergence) keep firing the event log entry but stay silent.
+- **Honest workstream progress (#123).** The progress denominator no longer
+  grows lazily during a run: the planned subtask total is captured once
+  from `spec-runner status --json` (spec-runner's own tasks.md parser)
+  right after spec generation and persisted (`workstreams.subtask_total`,
+  migration 19). A final progress refresh runs before any terminal
+  transition, and no-op completions (spec-runner >= 2.16, #97) are counted
+  and rendered — a run whose last task was a legitimate no-op now finishes
+  as `5/5 done (1 no-op)` instead of the archaeology-inducing `DONE 4/5`.
+  All of it is display-only and fail-open: any failure to obtain the total
+  or read the final state keeps the previous label and never blocks
+  completion.
+- **`maestro workstream-rework <id>` (#124).** Sanctioned operator rework
+  for a gate-blocked/failed workstream: `NEEDS_REVIEW/FAILED -> READY`
+  with `resume_reason='operator_rework'` into the existing
+  re-decomposition path (same worktree, same lineage, idempotent harness
+  state cleanup). Mandatory `--reason` (audit-only, never enters the
+  prompt), optional `--instructions` (next-attempt addendum, keyed by an
+  explicit audit seq) and `--refresh-from <project.yaml>`
+  (description/scope only, re-validated before anything is written;
+  topology fields refused). Fail-closed liveness proof: pid-NULL alone is
+  insufficient — open execution handles and the new durable
+  recovery-ambiguity marker (written by startup recovery when parking
+  possibly-live workstreams) block the command until proven terminal or
+  explicitly resolved via the new `maestro workstream-resolve-ambiguity`.
+  One CAS UPDATE + append-only audit row per rework (migration 18);
+  nothing is ever written to `gate_approvals`; the Stage B rework budget
+  is untouched. Unknown `resume_reason` values now fail closed to
+  NEEDS_REVIEW instead of silently plain-resuming. `maestro workstreams`
+  shows an operator-rework counter (warning-styled from 3).
+- **Preflight spec-runner version gate (#122).** Mode 2 now requires
+  spec-runner >= 2.16.0, enforced fail-closed by `maestro validate` and the
+  `maestro orchestrate` preflight before any worktree is created: older
+  versions (2.15.x) commit the harness-owned `spec/.gitignore` into task
+  commits, which the ex-post scope gate flags as a scope escape. A version
+  below the minimum, unparseable `spec-runner --version` output, or a
+  missing binary all block with `spec-runner-version-unsupported`;
+  `MAESTRO_SPEC_RUNNER_ALLOW_UNVERIFIED=1` (for unpublished local builds)
+  downgrades the block to a warning. The scope gate itself is unchanged —
+  `spec/.gitignore` deliberately stays visible to changed-paths.
 
----
+### Upgrade impact
+- **Upgrade spec-runner before the next `maestro orchestrate`.** The preflight
+  version gate is fail-closed: an installed spec-runner below 2.24.0 now
+  blocks before any worktree is created, naming the found and required
+  versions. This includes 2.16–2.23, which were acceptable until now — a user
+  who upgraded once for #122 and stopped is exactly whom the gate must stop,
+  since those versions still exit 0 with work undone.
+  `MAESTRO_SPEC_RUNNER_ALLOW_UNVERIFIED=1` remains the documented escape for
+  unpublished local builds and downgrades the block to a warning, never to
+  silence.
+
+- **A workstream that is mid-run when you upgrade may stop for an operator
+  decision.** The completeness gate is fail-closed on an uncaptured
+  denominator, and `workstreams.subtask_total` is nullable — it has only been
+  recorded since migration 19. A workstream that started before that (or
+  whose spec-generation never captured a total) reaches the gate with
+  `subtask_total IS NULL`, blocks as `unknown_total`, and waits in
+  NEEDS_REVIEW until an operator runs `maestro workstream-approve <id>`
+  (accept the result as-is and continue delivery) or
+  `maestro workstream-rework <id>` (redo the work). This is the intended
+  change — it is precisely the case the incident was — but it means an
+  unattended upgrade of a running wave can pause at delivery instead of
+  merging. Nothing is lost: the worktree and the branch are left intact.
+- **Delivery now requires a post-mortem archive.** Any code path that reaches
+  the delivery tail without one blocks fail-closed. In normal operation the
+  archive is written during finalization, so this only surfaces for runs whose
+  finalization predates the upgrade.
+- Two new migrations run automatically on first connect: **23**
+  (`postmortem_archives`, additive) and **24** (`gate_approvals` rebuilt with
+  the widened phase CHECK, data preserved).
+
+- **`maestro service` — scheduled autonomous runs.** Generates and loads
+  a launchd/systemd **user** unit that starts a Maestro-owned wrapper
+  (`maestro service run`), never `orchestrate` directly: only Maestro's
+  own state can decide resume vs fresh vs no-op, and that decision table
+  lives in the wrapper. Two independent stages (`--stage orchestrate |
+  review`) with their own schedule, lock, ledger rows and logs.
+  Locking is a two-level flock hierarchy so legacy and scoped runs
+  exclude each other in *both* directions (legacy takes `global.lock`
+  exclusive; a scoped stage takes it shared plus an exclusive
+  per-(project, stage) lock) — different projects, and the two stages of
+  one project, run concurrently. A tick that cannot take its lock is
+  recorded and exits 0 rather than painting the unit red. Adds the
+  `service_ticks` ledger (migration 22, sentinel + CAS finalize, with
+  `decision` and `outcome` as distinct axes), a conservative
+  stale-worktree sweep that never removes unmerged/dirty/NEEDS_REVIEW
+  trees, Maestro-owned log rotation, and an install-time preflight that
+  **refuses** to write a unit whose harnesses or credentials cannot be
+  resolved non-interactively (a scheduled run gets no shell profile —
+  the classic silent 03:00 failure). Design:
+  `docs/superpowers/specs/2026-08-06-service-install-design.md`.
 
 ## v0.4.0 — Rename Zadacha → Workstream (2026-05-23)
 

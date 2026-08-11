@@ -221,16 +221,22 @@ class TestResumeConstants:
     def test_known_resume_reasons(self) -> None:
         """The dispatch is exhaustive over this set, so additions are reviewed.
 
-        The five members are three different kinds of resume and must not be
+        The six members are four different kinds of resume and must not be
         confused: the two rework reasons re-decompose through DECOMPOSING and
-        respawn the author, `verification_reverify` re-enters VERIFYING, and
-        #164's two run NOTHING — `completeness_accept_partial` continues the
-        delivery tail over an accepted incomplete result, while
-        `postmortem_recapture` retries only the evidence capture.
+        respawn the author; `verification_reverify` re-enters VERIFYING; #164's
+        two run NOTHING — `completeness_accept_partial` continues the delivery
+        tail over an accepted incomplete result, `postmortem_recapture` retries
+        only the evidence capture; and #166's `continue_tasks` DOES execute, but
+        over the existing tasks.md, with no regeneration and no author respawn.
+
+        That last distinction is the one worth guarding: "accept what exists"
+        and "run what is missing" were deliberately kept as separate reasons so
+        the dispatch cannot confuse them.
         """
         from maestro.domain.resume import (
             KNOWN_RESUME_REASONS,
             RESUME_ACCEPT_PARTIAL,
+            RESUME_CONTINUE_TASKS,
             RESUME_OPERATOR_REWORK,
             RESUME_RECAPTURE,
         )
@@ -238,12 +244,14 @@ class TestResumeConstants:
         assert RESUME_OPERATOR_REWORK == "operator_rework"
         assert RESUME_ACCEPT_PARTIAL == "completeness_accept_partial"
         assert RESUME_RECAPTURE == "postmortem_recapture"
+        assert RESUME_CONTINUE_TASKS == "continue_tasks"
         assert {
             "verification_rework",
             "verification_reverify",
             "operator_rework",
             "completeness_accept_partial",
             "postmortem_recapture",
+            "continue_tasks",
         } == KNOWN_RESUME_REASONS
 
 
