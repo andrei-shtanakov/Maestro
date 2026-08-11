@@ -1279,6 +1279,20 @@ class Workstream(BaseModel):
         ),
     )
 
+    quarantined_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When an operator forbade this workstream's result from "
+            "progressing (#166). None = not quarantined. Deliberately NOT a "
+            "status: quarantine never terminates a live handle, so the row "
+            "stays RUNNING while the process runs and every existing "
+            "`expected_status=RUNNING` CAS keeps working."
+        ),
+    )
+    quarantine_reason: str | None = Field(
+        default=None, description="Operator's reason for the active quarantine"
+    )
+
     def can_transition_to(self, target: WorkstreamStatus) -> bool:
         """Check if transition to target status is valid."""
         return self.status.can_transition_to(target)

@@ -427,6 +427,8 @@ def _row_to_workstream(row: aiosqlite.Row) -> Workstream:
         operator_rework_seq=row["operator_rework_seq"],
         recovery_ambiguity=row["recovery_ambiguity"],
         subtask_total=row["subtask_total"],
+        quarantined_at=_parse_datetime(row["quarantined_at"]),
+        quarantine_reason=row["quarantine_reason"],
         depends_on=[],  # Populated separately
     )
 
@@ -593,6 +595,11 @@ class Database:
                 24,
                 "gate_approvals_completeness",
                 self._migrate_gate_approvals_completeness,
+            ),
+            (
+                25,
+                "workstream_quarantine",
+                self._migrate_workstream_quarantine,
             ),
         ]
 
@@ -1217,6 +1224,47 @@ class Database:
             f"SELECT {columns} FROM gate_approvals_old"
         )
         await self._connection.execute("DROP TABLE gate_approvals_old")
+
+    async def _migrate_workstream_quarantine(self) -> None:
+        """Migration 25: durable per-workstream quarantine (#166 half A).
+
+        Two additive nullable columns plus an audit table. Deliberately NOT a
+        new status: quarantine leaves a live handle running (spec §3.1), so the
+        row must stay RUNNING while the process runs — overloading the status
+        would break the `expected_status=RUNNING` CAS that
+        `_handle_completion` relies on and would mix what the process is doing
+        with what the operator has forbidden.
+
+        The audit table mirrors `workstream_reworks` (#124): one row per
+        quarantine, closed in place when it is lifted, so "who forbade this and
+        who allowed it again" is answerable after the fact.
+        """
+        assert self._connection is not None
+        cursor = await self._connection.execute("PRAGMA table_info(workstreams)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "quarantined_at" not in columns:
+            await self._connection.execute(
+                "ALTER TABLE workstreams ADD COLUMN quarantined_at TIMESTAMP"
+            )
+        if "quarantine_reason" not in columns:
+            await self._connection.execute(
+                "ALTER TABLE workstreams ADD COLUMN quarantine_reason TEXT"
+            )
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS workstream_quarantines (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                workstream_id TEXT NOT NULL,
+                reason        TEXT NOT NULL,
+                actor         TEXT NOT NULL,
+                quarantined_at TIMESTAMP NOT NULL,
+                prior_status  TEXT NOT NULL,
+                lifted_at     TIMESTAMP,
+                lifted_by     TEXT,
+                lift_reason   TEXT
+            )
+            """
+        )
 
     async def _migrate_workstream_rework(self) -> None:
         """Migration 18: operator rework columns + audit tables (#124).
@@ -3231,6 +3279,12 @@ class Database:
             msg = "Database not connected"
             raise DatabaseError(msg)
 
+        # #166 §3.3: the delivery edge asks for this guard so a quarantine that
+        # landed while the workstream was still RUNNING provably stops MERGING.
+        # Expressed as part of the same CAS rather than a read-then-write, so
+        # exactly one of the two writers wins and the loser learns it here.
+        quarantine_guard = bool(extra_fields.pop("require_not_quarantined", False))
+
         set_clauses = ["status = ?"]
         params: list[Any] = [new_status.value]
 
@@ -3277,6 +3331,9 @@ class Database:
             where_clauses.append("status = ?")
             params.append(expected_status.value)
 
+        if quarantine_guard:
+            where_clauses.append("quarantined_at IS NULL")
+
         query = (
             f"UPDATE workstreams SET {', '.join(set_clauses)} "
             f"WHERE {' AND '.join(where_clauses)}"
@@ -3295,6 +3352,19 @@ class Database:
             if row is None:
                 msg = f"Workstream with ID '{workstream_id}' not found"
                 raise WorkstreamNotFoundError(msg)
+
+            if quarantine_guard:
+                quarantined = await self._connection.execute(
+                    "SELECT quarantined_at FROM workstreams WHERE id = ?",
+                    (workstream_id,),
+                )
+                qrow = await quarantined.fetchone()
+                if qrow is not None and qrow["quarantined_at"] is not None:
+                    msg = (
+                        f"Workstream '{workstream_id}' is quarantined "
+                        f"(since {qrow['quarantined_at']}); delivery refused"
+                    )
+                    raise ConcurrentModificationError(msg)
 
             if expected_status is not None:
                 msg = (
@@ -3525,6 +3595,126 @@ class Database:
         )
         rows = await cursor.fetchall()
         return {(row["phase"], row["sha"]) for row in rows}
+
+    # ------------------------------------------------------------------
+    # per-workstream quarantine (#166) — migration 25
+    # ------------------------------------------------------------------
+
+    _DELIVERING_STATUSES = ("merging", "pr_created", "done")
+
+    async def quarantine_workstream(
+        self, workstream_id: str, *, reason: str, actor: str
+    ) -> None:
+        """Forbid this workstream's result from progressing (#166, spec §3).
+
+        Does NOT touch `status`, `process_pid` or the running execution: a
+        quarantine never terminates a live handle, so the row stays RUNNING
+        while the process runs and every `expected_status=RUNNING` CAS keeps
+        working. What stops is dispatch (the READY dispatcher skips a
+        quarantined row) and delivery (the MERGING CAS carries
+        `require_not_quarantined`).
+
+        Idempotent: a second call leaves the original timestamp and reason
+        alone rather than resetting "since when", which an operator reads as
+        the age of the incident.
+
+        Raises:
+            WorkstreamNotFoundError: If the workstream does not exist.
+            ValueError: If delivery has already begun (§3.3) — after that the
+                remedy is a revert, and accepting the quarantine would claim
+                to have prevented something that already happened.
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                "SELECT status, quarantined_at FROM workstreams WHERE id = ?",
+                (workstream_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                msg = f"Workstream with ID '{workstream_id}' not found"
+                raise WorkstreamNotFoundError(msg)
+            if row["quarantined_at"] is not None:
+                return  # already quarantined; keep the original record
+            if row["status"] in self._DELIVERING_STATUSES:
+                msg = (
+                    f"workstream '{workstream_id}' is {row['status']}: delivery "
+                    f"has already started, so a quarantine would prevent "
+                    f"nothing — revert instead"
+                )
+                raise ValueError(msg)
+            now = _format_datetime(datetime.now(UTC))
+            await conn.execute(
+                "UPDATE workstreams SET quarantined_at = ?, quarantine_reason = ? "
+                "WHERE id = ? AND quarantined_at IS NULL",
+                (now, reason, workstream_id),
+            )
+            await conn.execute(
+                "INSERT INTO workstream_quarantines "
+                "(workstream_id, reason, actor, quarantined_at, prior_status) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (workstream_id, reason, actor, now, row["status"]),
+            )
+
+    async def unquarantine_workstream(
+        self, workstream_id: str, *, reason: str, actor: str
+    ) -> None:
+        """Lift a quarantine — a separate, audited action (spec §3.1).
+
+        Never a side effect of another verb: an operator undoing a safety
+        decision is itself a decision, and the audit row records who and why.
+
+        Raises:
+            WorkstreamNotFoundError: If the workstream does not exist.
+            ValueError: If it is not currently quarantined — usually the wrong
+                id, so a silent no-op would hide the mistake.
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                "SELECT quarantined_at FROM workstreams WHERE id = ?",
+                (workstream_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                msg = f"Workstream with ID '{workstream_id}' not found"
+                raise WorkstreamNotFoundError(msg)
+            if row["quarantined_at"] is None:
+                msg = f"workstream '{workstream_id}' is not quarantined"
+                raise ValueError(msg)
+            await conn.execute(
+                "UPDATE workstreams SET quarantined_at = NULL, "
+                "quarantine_reason = NULL WHERE id = ?",
+                (workstream_id,),
+            )
+            await conn.execute(
+                "UPDATE workstream_quarantines SET lifted_at = ?, lifted_by = ?, "
+                "lift_reason = ? WHERE workstream_id = ? AND lifted_at IS NULL",
+                (
+                    _format_datetime(datetime.now(UTC)),
+                    actor,
+                    reason,
+                    workstream_id,
+                ),
+            )
+
+    async def list_quarantine_events(self, workstream_id: str) -> list[dict[str, Any]]:
+        """Quarantine audit rows for a workstream, newest first."""
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        cursor = await self._connection.execute(
+            "SELECT * FROM workstream_quarantines WHERE workstream_id = ? "
+            "ORDER BY id DESC",
+            (workstream_id,),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
 
     async def requeue_for_recapture(self, workstream_id: str) -> None:
         """NEEDS_REVIEW -> READY with `resume_reason=RESUME_RECAPTURE` (#164).
