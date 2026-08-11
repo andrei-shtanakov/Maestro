@@ -1,10 +1,12 @@
 # DONE completeness gate + post-mortem archive (#164) — design
 
-**Status:** proposed (revision 1, 2026-08-10). Owner fixed four decisions at
-acceptance; they are recorded verbatim in §2 and are not re-litigated here.
-Depends on the `executor_meta` string fields merged as #169a (PR #171,
-`16150e5`). Explicitly does **not** include #165 (rework dangling deps /
-retry classification) — see §11.
+**Status:** approved (revision 2, 2026-08-10 — every §10 question answered by
+the owner and folded in; Copilot review on the revision-1 PR #172 raised no
+contract comments, which was the owner's stated condition for leaving
+`proposed`). Four acceptance decisions are recorded verbatim in §2 and are not
+re-litigated. Depends on the `executor_meta` string fields merged as #169a
+(PR #171, `16150e5`). Explicitly does **not** include #165 (rework dangling
+deps / retry classification) — see §11.
 
 ## 1. What the pilot saw, and why the exit code was not enough
 
@@ -112,7 +114,8 @@ existing gates answer "is this diff acceptable"; there is no point paying a
 finished. Completeness is a precondition of the diff being meaningful.
 
 It is **always-on**, like `_gate_scope` and unlike the opt-in `gates:` block.
-No config key turns it off. (Kill-switch discussion: §10, open question 3.)
+No config key and no env var turn it off; the audited manual approve is the
+only way past it (§10.3).
 
 ### 4.2 Semantics
 
@@ -168,11 +171,20 @@ For this gate:
   it is unknown provenance and irrelevant to the count. The version gate
   already pins ≥ 2.16.0 (`spec_runner.py:42`), so `None` here means a legacy
   on-disk file, not a legacy spec-runner.
-- **All-no-op is a separate signal, not a gate verdict.** A 9/9 run where
-  `noop_done == 9` produces an empty diff; the gate passes it, and
-  `_gate_scope` sees no changed paths. `progress_label` already renders
-  `9/9 done (9 no-op)`. Turning "nothing was produced" into a block belongs to
-  a productivity check, which this gate is not — recorded as open question 2.
+- **All-no-op passes, and emits a structured diagnostic** (owner decision,
+  §10.2). A 9/9 run where `noop_done == 9` produces an empty diff; the gate
+  passes it and `_gate_scope` sees no changed paths. Judging whether the work
+  was *substantively useful* belongs to verification — Stage B's domain
+  verifier in Mode 2, the verifier gate in Mode 1 — not to a completeness
+  check. What this gate owes the operator is visibility, not a verdict:
+  - a structured event through the obs pipeline,
+    `workstream.completeness.all_no_op`, with `workstream_id`, `execution_id`,
+    `done`, `planned` and `head_sha` as fields (not interpolated prose, so it
+    is queryable in the JSONL);
+  - `all_no_op: true` in the archive manifest (§6.1), so the fact survives in
+    the evidence and not only in a log stream;
+  - **not** a notification-channel event — that track has a single-owner
+    discipline per event and an advisory diagnostic does not earn one (§9).
 - The block message carries the no-op count so an operator reading
   `completed 8 of 9 (3 no-op)` is not misled into thinking three tasks were
   skipped by the gate.
@@ -238,13 +250,32 @@ architectural stage into #164. This spec therefore:
 
 - ships **approve** (§5.2) and **rework** (§5.3) as #164's exit paths;
 - names `RESUME_DELIVER` as the first member of a family that #166 extends
-  with an involuntary-interruption counterpart, so #166 does not have to
-  re-litigate the dispatch shape;
+  with a continuation counterpart, so #166 does not have to re-litigate the
+  dispatch shape;
 - records the operator cost honestly: until #166, finishing a partially
   completed workstream means paying one re-decomposition (`rework`) or
   delivering 1/9 (`approve`).
 
-Open question 1 asks the owner to confirm this boundary.
+**Boundary confirmed by the owner (2026-08-10):** #164 gets approve + rework
+only; "catch up the remaining tasks" is #166's responsibility, and the two
+meanings of READY are not introduced inside #164.
+
+**One naming correction to that confirmation.** The owner's wording named
+`RESUME_DELIVER` as the constant for "catch up the remaining tasks". In this
+spec `RESUME_DELIVER` is #164's *approve* path — resume into the delivery tail
+and ship the partial work as-is — which is what actually ships here. Letting
+one constant mean both "deliver as-is" and "run the missing tasks" would make
+the exhaustive READY dispatch ambiguous at the exact point it is designed to be
+total. So:
+
+| Constant | Meaning | Owner |
+|---|---|---|
+| `RESUME_DELIVER` | approved → resume into `_merge_and_pr`, deliver as-is, no regen | **#164 (this spec)** |
+| `RESUME_CONTINUE` | re-dispatch spec-runner against the existing `tasks.md` | **#166** (name reserved, not defined here) |
+
+The intent behind the confirmation is unaffected — continuation stays outside
+#164 either way. Only the label moves, and #166 may rename its own member
+freely.
 
 ## 6. Post-mortem archive
 
@@ -260,17 +291,28 @@ so the same "author cannot reach it" property holds:
     logs/<task_id>-*.log       # the .executor-<prefix>logs tree, verbatim
 ```
 
-`<db_dir>` is the directory of the active Maestro DB (default
-`~/.maestro/`), so a `--db` run keeps its own archives. `execution_id` in the
-directory name keys the archive to one execution attempt, which is what makes
-repeated attempts distinguishable and the gate's read unambiguous.
+**The archive root is anchored to `db_dir`, never to the process cwd** (owner
+decision, §10.4). `<db_dir>` is the directory of the active Maestro DB
+(default `~/.maestro/`), so a `--db` run keeps its own archives beside its own
+state. Two properties follow, and both are the reason for the rule: the
+archives travel with the database they describe (copy the DB directory and the
+evidence comes along), and recovery does not depend on where the operator
+happened to stand when the incident run was launched — a cwd-relative root
+would make the same DB resolve different archive sets from different
+directories, which is exactly the "undiagnosable after the fact" failure #164
+is about. Nothing in the archive path is derived from the project config's
+location or from `repo_path`.
 
 `manifest.json` (`maestro.postmortem-manifest/v1`) carries the run identity
 and the numbers the gate used, so the archive is self-describing without the
 DB: `workstream_id`, `execution_id`, `attempt`, `backend_id`, `transport`,
 `exit_code`, `done`, `noop_done`, `planned` (`subtask_total`), `state_total`,
-`last_run_stop_reason`, `last_run_stop_detail`, `branch`, `head_sha`,
-`captured_at`, `bytes_written`, and `truncated` (§6.3).
+`all_no_op` (§4.3), `last_run_stop_reason`, `last_run_stop_detail`, `branch`,
+`head_sha`, `captured_at`, `bytes_written`, and `truncated` (§6.3).
+
+`execution_id` in the directory name keys the archive to one execution
+attempt, which is what makes repeated attempts distinguishable and the gate's
+read unambiguous.
 
 ### 6.2 Consistency of the state snapshot
 
@@ -282,6 +324,15 @@ solved too — `SNAPSHOT_SCRIPT` + `mirror_once` produce a consistent snapshot
 over SSH.
 
 ### 6.3 Bounds and retention
+
+Config lives in a **top-level `postmortem:` block in the project config**
+(owner decision, §10.4). It holds retention/GC settings **only** — there is
+deliberately **no `enabled: false` key**: capture-before-destruction is the
+invariant this whole spec exists to establish, and a config switch that turns
+it off recreates the incident with one line of YAML. An absent `postmortem:`
+block therefore means *defaults*, not *off* — the same reading `gates:` does
+**not** have, and the difference is intentional: `gates:` is an optional
+policy, this is an invariant.
 
 Unbounded log copying would grow `<db_dir>/postmortem/` without limit, so:
 
@@ -402,6 +453,9 @@ not only unit invariants. Row 4 is that test.
 | 15 | **rework path** | block, then `workstream-rework` | `NEEDS_REVIEW -> READY` into re-decomposition, existing #124 behaviour unchanged |
 | 16 | **collect failure precedes the gate** | ssh collect conflict | existing `NEEDS_REVIEW` "remote workspace preserved"; gate never runs; no archive expected |
 | 17 | **totality** | — | every gate verdict has a message + a distinct reason code; unknown verdict is unrepresentable |
+| 18 | **all-no-op diagnostic** | 9 planned, 9 SUCCESS, all `no_op` | gate **passes**; `workstream.completeness.all_no_op` emitted with structured fields (asserted on the JSONL record, not on a formatted string); `all_no_op: true` in the manifest; **no** notification-channel event |
+| 19 | **archive root ignores cwd** | run the gate from two different working directories with the same `--db` | identical archive path both times; nothing under the project dir or `repo_path` |
+| 20 | **no off switch** | project config carrying `postmortem: {enabled: false}` | config rejected as an unknown key (the invariant has no opt-out); an absent `postmortem:` block yields defaults, not "off" |
 
 ## 9. Non-goals
 
@@ -409,35 +463,56 @@ not only unit invariants. Row 4 is that test.
   mixing it here was explicitly excluded by the owner. This spec only makes
   `stop_reason` available to it as recorded context.
 - **No resume-without-regen for involuntary interruption** — #166 (§5.4).
-- **No productivity check** ("the diff is empty though tasks were done") —
-  open question 2.
+- **No productivity check** ("the diff is empty though tasks were done"). An
+  all-no-op run is reported, not judged (§4.3); assessing substantive
+  usefulness is verification's job, per §10.2.
 - **No change to what DONE means once the gate passes.** The merge-gated DONE,
   the H-6 approval marker lifecycle, and Stage B verification are untouched.
 - **No new notification event.** The existing `NEEDS_REVIEW` notification
   carries the block; a dedicated event would need the notify-track's
   single-owner discipline and buys nothing here.
 
-## 10. Open questions for the owner
+## 10. Resolved (owner decisions, 2026-08-10)
 
-1. **§5.4 boundary.** Confirm that "continue the remaining tasks without
-   re-decomposition" belongs to #166 and that #164 ships approve + rework
-   only. If it should land here instead, this spec needs a section on the
-   second meaning of READY and #166 shrinks accordingly.
-2. **All-no-op / empty-diff productivity.** Should `9/9 done (9 no-op)` be a
-   block? It is a coherent "nothing was built" signal, but it is a different
-   question from completeness and would need its own reason code. Recommend:
-   not in v1; revisit if it is ever observed.
-3. **Kill-switch.** Every other fail-closed mechanism here has a documented
-   escape (`MAESTRO_APPROVER_DISABLED`, `MAESTRO_SPEC_RUNNER_ALLOW_UNVERIFIED`).
-   Should the completeness gate have one (e.g. `MAESTRO_COMPLETENESS_OFF=1`,
-   warning-level, never silent)? Recommend: **no** — the gate exists because a
-   silent pass merged wrong work, and an env var recreates exactly that
-   failure mode one keystroke away. Raising it explicitly because the
-   precedent cuts the other way.
-4. **`postmortem` config placement.** A new top-level `postmortem:` block, or
-   keys under the existing `spec_runner:`/orchestrator settings? Recommend
-   top-level, since it applies to both modes' futures and to failure paths
-   that have nothing to do with spec-runner.
+Revision 1 raised four questions; all four are answered. Nothing here is open.
+
+### 10.1 §5.4 boundary — confirmed
+
+#164 ships **approve + rework only**. "Catch up the remaining tasks" is #166's
+responsibility, and the second meaning of READY is not introduced inside #164.
+One naming correction attaches to this answer — see the table in §5.4:
+`RESUME_DELIVER` is #164's approve path (deliver as-is), and #166's
+continuation gets its own constant, because a single constant meaning both
+would make the exhaustive READY dispatch ambiguous exactly where it is designed
+to be total.
+
+### 10.2 All-no-op — do not block
+
+For a completeness gate, a no-op **is** completion. A fully-no-op result is
+reported through a structured event plus a manifest flag (§4.3), never blocked.
+Judging substantive usefulness belongs to **verification** — Stage B's domain
+verifier in Mode 2, the verifier gate in Mode 1 — not to this gate. That is the
+sharper form of revision 1's recommendation: not "defer the productivity
+check", but "it is already owned elsewhere".
+
+### 10.3 Kill-switch — none
+
+An invariant must not be globally disableable. The **audited manual approve**
+(§5.2) is the emergency exit, and it is the right shape for one: per-workstream,
+per-SHA, attributable, recorded in `gate_approvals`. This is a deliberate
+divergence from `MAESTRO_APPROVER_DISABLED` / `MAESTRO_SPEC_RUNNER_ALLOW_UNVERIFIED`
+— those switch off *optional policies*; this gate encodes an invariant, and an
+env var would recreate the incident one keystroke away with no audit trail.
+Test row 20 pins the absence of the switch so nobody reintroduces it as a
+convenience.
+
+### 10.4 `postmortem:` config — top-level, retention only, anchored to `db_dir`
+
+A top-level `postmortem:` block in the project config carrying **retention/GC
+settings only**. No `enabled: false` key (§6.3): an absent block means
+defaults, not off. The archive root is anchored to `db_dir` and never to the
+process cwd (§6.1), so archives travel with the database they describe and
+recovery does not depend on where the incident run was launched from.
 
 ## 11. Dependency and sequencing
 
