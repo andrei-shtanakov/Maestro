@@ -120,3 +120,68 @@ async def test_read_does_not_modify_main_db(tmp_path):
     # NOTE: -wal/-shm may appear/change (SQLite reading a WAL DB) — allowed,
     # not asserted; the invariant is "no writes to the database", not "no
     # new files".
+
+
+class TestNoConnectionOnAnUnopenableFile:
+    """A path that cannot be a database must not reach aiosqlite at all.
+
+    Not cosmetic. aiosqlite's failed-connect path calls `Connection.stop()` and
+    discards the future it returns, where `close()` awaits it; the worker thread
+    then signals completion into a loop the caller may already have closed,
+    which raises inside the thread. Never starting that thread is the fix, so
+    this test asserts the *absence of the attempt* rather than only the error.
+    """
+
+    @pytest.mark.anyio
+    async def test_missing_file_never_calls_connect(self, tmp_path, monkeypatch):
+        import maestro.database as dbmod
+
+        calls: list[object] = []
+
+        async def boom(*args, **kwargs):
+            calls.append(args)
+            raise AssertionError("aiosqlite.connect must not be attempted")
+
+        monkeypatch.setattr(dbmod.aiosqlite, "connect", boom)
+
+        with pytest.raises(DatabaseError, match="does not exist"):
+            await read_all_costs_readonly(tmp_path / "missing.db")
+
+        assert calls == []
+
+    @pytest.mark.anyio
+    async def test_directory_never_calls_connect(self, tmp_path, monkeypatch):
+        import maestro.database as dbmod
+
+        async def boom(*args, **kwargs):
+            raise AssertionError("aiosqlite.connect must not be attempted")
+
+        monkeypatch.setattr(dbmod.aiosqlite, "connect", boom)
+
+        with pytest.raises(DatabaseError, match="is a directory"):
+            await read_all_costs_readonly(tmp_path)
+
+    @pytest.mark.anyio
+    async def test_a_real_database_still_opens(self, tmp_path):
+        """The guard must not block the working path."""
+        p = tmp_path / "ok.db"
+        db = await create_database(p)
+        await db.close()
+
+        assert await read_all_costs_readonly(p) == []
+
+    @pytest.mark.anyio
+    async def test_special_file_is_not_reported_as_missing(self, tmp_path):
+        """A FIFO exists; calling it "does not exist" would misdirect the reader.
+
+        The message is what an operator acts on: missing means a typo or the
+        wrong `--db`, a directory usually means the repo root, and a special
+        file means neither.
+        """
+        import os
+
+        fifo = tmp_path / "pipe.db"
+        os.mkfifo(fifo)
+
+        with pytest.raises(DatabaseError, match="not a regular file"):
+            await read_all_costs_readonly(fifo)

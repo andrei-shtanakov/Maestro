@@ -4619,6 +4619,37 @@ async def read_all_costs_readonly(db_path: str | Path) -> list[TaskCost]:
     modify the DB (it may read pre-existing -wal/-shm). Raises DatabaseError for
     a missing / non-SQLite / schema-incompatible DB.
     """
+    # Refuse a path that cannot be a readable database BEFORE asking aiosqlite
+    # to open it. This is a lifecycle fix, not an optimisation: aiosqlite's
+    # failed-connect path calls `Connection.stop()` and DISCARDS the future it
+    # returns, unlike `close()`, which awaits it (aiosqlite/core.py — compare
+    # `_connect`'s `except BaseException: self.stop()` with `close`'s
+    # `future = self.stop(); await future`). The worker thread then signals
+    # completion with `future.get_loop().call_soon_threadsafe(...)`; if the
+    # caller's loop has already closed — and a CLI that exits immediately after
+    # the error closes it at once — that raises inside the thread, and the
+    # handler's own `call_soon_threadsafe` raises again, uncaught. It surfaces
+    # as a thread exception attributed to whichever test runs next, which is
+    # how it reached CI as an unrelated flaky failure.
+    #
+    # Not a meaningful TOCTOU: if the file appears between check and open we
+    # simply succeed, and if it vanishes we fall back to the old error path.
+    path = Path(db_path)
+    if not path.is_file():  # noqa: ASYNC240 — one fast stat, CLI context
+        # Three distinct cases, because the operator acts on this sentence: a
+        # missing path is a typo or the wrong --db, a directory is usually the
+        # repo root passed by mistake, and something that exists but is not a
+        # regular file (FIFO, socket, device, broken symlink target) is neither.
+        # Reporting "does not exist" for a FIFO that plainly does would send
+        # someone looking for the wrong problem.
+        if path.is_dir():  # noqa: ASYNC240 — same
+            detail = "is a directory"
+        elif path.exists():  # noqa: ASYNC240 — same
+            detail = "exists but is not a regular file"
+        else:
+            detail = "does not exist"
+        raise DatabaseError(f"cannot open database read-only: {path} {detail}")
+
     try:
         conn = await aiosqlite.connect(_ro_uri(db_path), uri=True)
     except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
