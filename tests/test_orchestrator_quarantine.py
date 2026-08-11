@@ -10,6 +10,7 @@ _pre_gate_check_still_stops_delivery` is the one that proves the guarantee
 rather than the optimisation.
 """
 
+import json
 import sqlite3
 import subprocess
 from datetime import UTC, datetime
@@ -421,5 +422,84 @@ class TestCasFailureIsNotAlwaysQuarantine:
             assert ws.status is WorkstreamStatus.RUNNING  # untouched
             assert "quarantined" not in (ws.error_message or "")
             merge.assert_not_called()
+        finally:
+            await db.close()
+
+
+class TestRecoveryCaptureCheckpoint:
+    """§4.4 — the checkpoint follows classification and skips a live orphan.
+
+    The ordering is the whole point: a process still writing its state and logs
+    would produce a torn snapshot that looks like evidence, so it goes back to
+    review/monitoring and its own finalization captures a consistent archive.
+    """
+
+    @pytest.mark.anyio
+    async def test_dead_stranded_run_is_captured_before_the_reset(
+        self, tmp_path: Path
+    ) -> None:
+        from maestro.postmortem import MANIFEST_FILENAME
+
+        orch, db, worktree, _mgr, _merge = await _build(tmp_path)
+        try:
+            _spec_dir(worktree)
+            # Stranded in RUNNING with no live pid — the provably-dead path.
+            await db.update_workstream_status(
+                WS, WorkstreamStatus.RUNNING, process_pid=None
+            )
+
+            await orch._recover_stranded_workstreams()
+
+            ws = await db.get_workstream(WS)
+            assert ws.status is WorkstreamStatus.READY  # reset happened
+            rows = await db.list_postmortem_archives(WS)
+            recovery_rows = [r for r in rows if "recovery" in r["execution_id"]]
+            assert recovery_rows, "recovery must archive the stranded run"
+            manifest = json.loads(
+                (Path(recovery_rows[0]["path"]) / MANIFEST_FILENAME).read_text()
+            )
+            assert manifest["captured_by"] == "recovery"
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_live_orphan_is_not_captured(self, tmp_path: Path) -> None:
+        """A live process bypasses the checkpoint entirely."""
+        import os
+
+        orch, db, worktree, _mgr, _merge = await _build(tmp_path)
+        try:
+            _spec_dir(worktree)
+            # Our own pid is unambiguously alive.
+            await db.update_workstream_status(
+                WS, WorkstreamStatus.RUNNING, process_pid=os.getpid()
+            )
+
+            await orch._recover_stranded_workstreams()
+
+            ws = await db.get_workstream(WS)
+            assert ws.status is WorkstreamStatus.NEEDS_REVIEW  # parked, not reset
+            rows = await db.list_postmortem_archives(WS)
+            assert [r for r in rows if "recovery" in r["execution_id"]] == []
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_capture_is_idempotent_across_repeated_recovery(
+        self, tmp_path: Path
+    ) -> None:
+        """A restart loop must reconcile, not multiply archives."""
+        orch, db, worktree, _mgr, _merge = await _build(tmp_path)
+        try:
+            _spec_dir(worktree)
+            for _ in range(2):
+                await db.update_workstream_status(
+                    WS, WorkstreamStatus.RUNNING, process_pid=None
+                )
+                await orch._recover_stranded_workstreams()
+
+            rows = await db.list_postmortem_archives(WS)
+            recovery_rows = [r for r in rows if "recovery" in r["execution_id"]]
+            assert len(recovery_rows) == 1
         finally:
             await db.close()

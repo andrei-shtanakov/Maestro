@@ -668,6 +668,8 @@ class Orchestrator:
                         # matching _handle_failure's NEEDS_REVIEW accounting.
                         self._stats.failed += 1
                     elif state is WorkstreamStatus.DECOMPOSING:
+                        # Spec generation was in flight: there is no executor
+                        # state to preserve, so no checkpoint applies.
                         self._logger.info(
                             "Recovering workstream '%s' from stranded "
                             "DECOMPOSING -> READY",
@@ -677,6 +679,21 @@ class Orchestrator:
                             w.id, WorkstreamStatus.READY, expected_status=state
                         )
                     else:
+                        # #166 B §4.4 — THE capture checkpoint. Reached only on
+                        # the provably-dead / stranded path: the live-orphan and
+                        # possibly-live-handle branches above returned this
+                        # workstream to review/monitoring and never arrive here,
+                        # because a process still writing its state and logs
+                        # would yield a torn snapshot that looks like evidence.
+                        #
+                        # The decision comes from the classification already
+                        # made above — not from a second probe, which could
+                        # disagree with it. Capture completes BEFORE the
+                        # FAILED -> READY reset below, since that reset is what
+                        # leads to the next dispatch overwriting the evidence.
+                        if not await self._recovery_capture(w):
+                            recovered += 1
+                            continue
                         # RUNNING (dead) / MERGING / PR_CREATED: cannot go
                         # directly to READY, reset via FAILED.
                         self._logger.info(
@@ -2310,6 +2327,7 @@ class Orchestrator:
         backend_id: str,
         transport: str,
         exit_code: int | None,
+        captured_by: str = "finalization",
     ) -> None:
         """Capture one execution's evidence and record it.
 
@@ -2341,6 +2359,7 @@ class Orchestrator:
             "branch": persisted.branch,
             "head_sha": await self._workspace_head(workspace_path),
             "captured_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "captured_by": captured_by,
             "last_run_stop_reason": state.last_run_stop_reason if state else None,
             "last_run_stop_detail": state.last_run_stop_detail if state else None,
         }
@@ -2798,6 +2817,62 @@ class Orchestrator:
             marker.sha[:12],
         )
         await self._handle_success(workstream.id, workspace)
+        return True
+
+    async def _recovery_capture(self, workstream: Workstream) -> bool:
+        """Archive a stranded run's evidence before anything overwrites it.
+
+        Called from ONE place — the checkpoint between recovery's classification
+        and the dead/stranded branch's action (#166 B §4.4). Not called for a
+        live orphan: that process is still writing, and an archive taken
+        mid-write is not evidence.
+
+        Idempotent for the same execution: the archive directory is keyed by
+        execution id and the row upserts, so a restart loop or a repeated
+        `--resume` reconciles instead of multiplying archives.
+
+        Returns:
+            True when recovery may proceed with its reset. False when capture
+            failed as expected (an unwritable archive root): the workstream is
+            parked with the recapture token instead, its worktree untouched,
+            because nothing that overwrites the evidence may run first.
+        """
+        workstream_id = workstream.id
+        if not self._workspace_mgr.workspace_exists(workstream_id):
+            return True  # nothing left to capture; the reset is harmless
+        workspace = self._workspace_mgr.get_workspace_path(workstream_id)
+        evidence_key = f"recovery-{workstream_id}-{workstream.retry_count}"
+        try:
+            await self._capture_evidence(
+                workstream_id,
+                workspace,
+                evidence_key=evidence_key,
+                backend_id="recovery",
+                transport="recovery",
+                exit_code=None,
+                captured_by="recovery",
+            )
+        except PostmortemCaptureError as exc:
+            reason = (
+                f"post-mortem capture at recovery failed: {exc}; "
+                f"{build_recapture_marker(evidence_key)}"
+            )
+            self._logger.error(
+                "workstream.recovery.capture_failed workstream=%s %s",
+                workstream_id,
+                exc,
+            )
+            await self._transition(
+                workstream_id,
+                WorkstreamStatus.NEEDS_REVIEW,
+                expected_status=workstream.status,
+                message="capture at recovery failed; workspace preserved",
+                error_message=reason,
+                process_pid=None,
+                generation_pid=None,
+            )
+            self._stats.failed += 1
+            return False
         return True
 
     async def _resume_continue_tasks(self, workstream: Workstream) -> None:
