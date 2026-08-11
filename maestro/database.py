@@ -17,7 +17,11 @@ from urllib.request import pathname2url
 import aiosqlite
 
 from maestro.completeness import COMPLETENESS_PHASE
-from maestro.domain.resume import RESUME_ACCEPT_PARTIAL, RESUME_RECAPTURE
+from maestro.domain.resume import (
+    RESUME_ACCEPT_PARTIAL,
+    RESUME_CONTINUE_TASKS,
+    RESUME_RECAPTURE,
+)
 from maestro.models import (
     AgentType,
     Complexity,
@@ -429,6 +433,7 @@ def _row_to_workstream(row: aiosqlite.Row) -> Workstream:
         subtask_total=row["subtask_total"],
         quarantined_at=_parse_datetime(row["quarantined_at"]),
         quarantine_reason=row["quarantine_reason"],
+        continuation_count=row["continuation_count"] or 0,
         depends_on=[],  # Populated separately
     )
 
@@ -600,6 +605,11 @@ class Database:
                 25,
                 "workstream_quarantine",
                 self._migrate_workstream_quarantine,
+            ),
+            (
+                26,
+                "workstream_continuation",
+                self._migrate_workstream_continuation,
             ),
         ]
 
@@ -1265,6 +1275,28 @@ class Database:
             )
             """
         )
+
+    async def _migrate_workstream_continuation(self) -> None:
+        """Migration 26: continuation counter (#166 B).
+
+        One additive column. It counts continuations the dispatcher ACCEPTED,
+        not continuations requested: queueing one is only a request, and
+        shutdown, quarantine, a crash or a failed pre-spawn re-check can all
+        intervene before anything runs. The increment therefore rides the
+        `READY -> RUNNING` CAS (see `update_workstream_status`), so a lost race
+        cannot record a run that never started.
+
+        A counter rather than a limit: continuations are explicit audited
+        operator actions, so they are surfaced and warned about, never capped.
+        """
+        assert self._connection is not None
+        cursor = await self._connection.execute("PRAGMA table_info(workstreams)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "continuation_count" not in columns:
+            await self._connection.execute(
+                "ALTER TABLE workstreams ADD COLUMN continuation_count "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
 
     async def _migrate_workstream_rework(self) -> None:
         """Migration 18: operator rework columns + audit tables (#124).
@@ -3284,9 +3316,16 @@ class Database:
         # Expressed as part of the same CAS rather than a read-then-write, so
         # exactly one of the two writers wins and the loser learns it here.
         quarantine_guard = bool(extra_fields.pop("require_not_quarantined", False))
+        # #166 B: the counter must move only when the dispatcher truly accepts a
+        # continuation, so the increment is part of THIS statement. A separate
+        # write would record runs that never started whenever the CAS lost.
+        increment_continuation = bool(extra_fields.pop("increment_continuation", False))
 
         set_clauses = ["status = ?"]
         params: list[Any] = [new_status.value]
+
+        if increment_continuation:
+            set_clauses.append("continuation_count = continuation_count + 1")
 
         # Handle timestamp updates
         if new_status == WorkstreamStatus.RUNNING:
@@ -3736,6 +3775,46 @@ class Database:
             (workstream_id,),
         )
         return [dict(row) for row in await cursor.fetchall()]
+
+    async def requeue_for_continuation(self, workstream_id: str) -> None:
+        """NEEDS_REVIEW -> READY with `resume_reason=RESUME_CONTINUE_TASKS`.
+
+        Queues a continuation; it does NOT count as one. The counter moves only
+        when the dispatcher accepts the continuation at `READY -> RUNNING`
+        (#166 B), because everything between here and there — shutdown,
+        quarantine, a crash, a failed pre-spawn re-check — can stop it, and a
+        count of runs that never started would be a lie.
+
+        Not an approval and not a rework: nothing about the result is accepted
+        and no spec is regenerated.
+
+        Raises:
+            WorkstreamNotFoundError: If the workstream does not exist.
+            ValueError: If the workstream is not in NEEDS_REVIEW.
+            DatabaseError: If database not connected.
+        """
+        if self._connection is None:
+            msg = "Database not connected"
+            raise DatabaseError(msg)
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                "UPDATE workstreams SET status = 'ready', resume_reason = ? "
+                "WHERE id = ? AND status = 'needs_review'",
+                (RESUME_CONTINUE_TASKS, workstream_id),
+            )
+            if cursor.rowcount == 0:
+                check = await conn.execute(
+                    "SELECT status FROM workstreams WHERE id = ?", (workstream_id,)
+                )
+                row = await check.fetchone()
+                if row is None:
+                    msg = f"Workstream with ID '{workstream_id}' not found"
+                    raise WorkstreamNotFoundError(msg)
+                msg = (
+                    f"workstream '{workstream_id}' is {row['status']}, "
+                    f"only NEEDS_REVIEW can be queued for continuation"
+                )
+                raise ValueError(msg)
 
     async def requeue_for_recapture(self, workstream_id: str) -> None:
         """NEEDS_REVIEW -> READY with `resume_reason=RESUME_RECAPTURE` (#164).
