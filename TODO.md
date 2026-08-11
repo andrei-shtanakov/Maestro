@@ -576,7 +576,7 @@
       каждому rework независимо от `--instructions`. Тайминг как признак
       детерминированности не используется даже как fallback.
 
-- [ ] **#166 collateral-workstream-kill: per-workstream quarantine и resume без regen** (P2, проектировать можно параллельно, внедрять последним) @owner:github:andrei-shtanakov @id:collateral-workstream-kill
+- [x] **#166 collateral-workstream-kill: per-workstream quarantine и resume без regen** (P2, проектировать можно параллельно, внедрять последним) (A: PR #180 `b6d2e54`; B: PR #182 `0e67918`) @owner:github:andrei-shtanakov @id:collateral-workstream-kill
       Границы дефекта (заданы автором issue): это НЕ про сам watchdog и НЕ про
       #164 — самостоятельная граница «глобальная остановка orchestration не
       должна уничтожать независимо здоровые workstream executions без per-WS
@@ -640,6 +640,14 @@
       recovery архивирует только мёртвые/stranded прогоны — живой орфан уходит
       под мониторинг без архива, потому что пишущий процесс дал бы порванный
       снапшот.
+      Влито: A — PR #180 (`b6d2e54`), B — PR #182 (`0e67918`); issue #166
+      закрыта. **Волна 4 закрыта полностью.** Находка разведки, которой не было
+      в репорте: штатный `maestro stop` уничтожал работу так же, как внешний
+      SIGKILL, — терминировал все handle и сбрасывал в плоский READY, то есть в
+      «Always regenerate»; чинить только жёсткий путь означало бы оставить
+      дефект в основном пользовательском сценарии. Второе: половина «сохранённые
+      логи» из acceptance **не** была закрыта #164 — тот архивирует при
+      финализации, которую жёсткий kill пропускает.
       **Половина A реализована** (ветка `feat/workstream-quarantine`): миграция
       25 (`quarantined_at`/`quarantine_reason` + аудит-таблица), guard
       `require_not_quarantined` внутри CAS ребра MERGING, пропуск в
