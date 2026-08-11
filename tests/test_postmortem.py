@@ -19,6 +19,7 @@ from maestro.postmortem import (
     MANIFEST_FILENAME,
     ArchiveResult,
     PostmortemCaptureError,
+    archive_is_committed,
     capture_archive,
     prune_archives,
 )
@@ -336,3 +337,43 @@ class TestRetention:
 
     def test_prune_on_unknown_workstream_is_a_noop(self, tmp_path: Path) -> None:
         assert prune_archives(tmp_path / "postmortem", "nobody", keep=1) == []
+
+
+class TestCommittedCheck:
+    """The cleanup guard's question: is there real evidence on disk?
+
+    A row in `postmortem_archives` is not the answer — the row can outlive
+    the directory (an operator prunes by hand, a volume is restored from an
+    older snapshot). Cleanup destroys the last copy of the logs, so it asks
+    the filesystem, not the bookkeeping.
+    """
+
+    def test_committed_archive_is_recognized(self, tmp_path: Path) -> None:
+        spec_dir = _make_spec_dir(tmp_path / "wt")
+        result = capture_archive(
+            spec_dir=spec_dir,
+            root=tmp_path / "postmortem",
+            identity=_identity(),
+            counters={"done": 1, "planned": 1, "noop_done": 0, "state_total": 1},
+            config=PostmortemConfig(),
+        )
+
+        assert archive_is_committed(result.path)
+
+    def test_missing_directory_is_not_committed(self, tmp_path: Path) -> None:
+        assert not archive_is_committed(tmp_path / "gone")
+
+    def test_directory_without_manifest_is_not_committed(self, tmp_path: Path) -> None:
+        """A `.partial/` renamed by hand, or a half-restored backup."""
+        bare = tmp_path / "postmortem" / "w" / "20260811T000000Z-exec-1"
+        bare.mkdir(parents=True)
+        (bare / "executor-state.db").write_bytes(b"")
+
+        assert not archive_is_committed(bare)
+
+    def test_partial_directory_is_not_committed(self, tmp_path: Path) -> None:
+        partial = tmp_path / "postmortem" / "w" / "20260811T000000Z-exec-1.partial"
+        partial.mkdir(parents=True)
+        (partial / MANIFEST_FILENAME).write_text("{}")
+
+        assert not archive_is_committed(partial)

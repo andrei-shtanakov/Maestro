@@ -11,6 +11,7 @@ from maestro.completeness import (
     CompletenessVerdict,
     build_completeness_block_reason,
     classify_completeness,
+    completeness_approval_is_fresh,
 )
 from maestro.gate_approvals import build_approval_marker, parse_approval_marker
 
@@ -122,11 +123,25 @@ class TestBlockReason:
 
         assert "stop_reason=task_failed_stop" in reason
 
+    def test_block_reason_binds_the_evidence_snapshot(self) -> None:
+        """The marker a real block writes must satisfy the freshness rule.
+
+        Without the evidence key the approval could never be honoured, so a
+        block would be unapprovable in practice while looking approvable.
+        """
+        verdict = classify_completeness(done=1, planned=9, noop_done=0)
+
+        reason = build_completeness_block_reason(verdict, SHA, evidence="exec-1")
+
+        marker = parse_approval_marker(reason)
+        assert marker is not None
+        assert completeness_approval_is_fresh(marker, current_evidence="exec-1")
+
     def test_unknown_total_block_is_still_approvable(self) -> None:
         """Decision 1 demands an explicit manual path out of this state."""
         verdict = classify_completeness(done=3, planned=None, noop_done=0)
 
-        reason = build_completeness_block_reason(verdict, SHA)
+        reason = build_completeness_block_reason(verdict, SHA, evidence="exec-1")
 
         assert parse_approval_marker(reason) is not None
 
@@ -145,3 +160,71 @@ class TestMarkerPhase:
             parsed = parse_approval_marker(build_approval_marker(phase, SHA))
             assert parsed is not None
             assert parsed.phase == phase
+
+
+class TestApprovalFreshness:
+    """An approval accepts *one* partial result, not the next one.
+
+    Binding to the worktree HEAD alone is not enough: a rework can leave the
+    tree at the same sha while the executor state underneath is a different
+    run — different tasks done, a different reason for stopping. The marker
+    therefore names the evidence snapshot it was granted against, and the
+    resume path refuses when that is no longer the current one.
+    """
+
+    def test_marker_carries_the_evidence_key(self) -> None:
+        marker = parse_approval_marker(
+            build_approval_marker(COMPLETENESS_PHASE, SHA, evidence="exec-1")
+        )
+
+        assert marker is not None
+        assert marker.evidence == "exec-1"
+
+    def test_legacy_marker_without_evidence_still_parses(self) -> None:
+        """Markers written before #164 carry no evidence key."""
+        marker = parse_approval_marker(build_approval_marker("ex_post", SHA))
+
+        assert marker is not None
+        assert marker.evidence is None
+
+    def test_fresh_when_the_evidence_is_still_current(self) -> None:
+        marker = parse_approval_marker(
+            build_approval_marker(COMPLETENESS_PHASE, SHA, evidence="exec-1")
+        )
+        assert marker is not None
+
+        assert completeness_approval_is_fresh(marker, current_evidence="exec-1")
+
+    def test_stale_after_a_new_collect_produced_new_evidence(self) -> None:
+        """A second run archives under a new execution id; the old approval
+        must not accept the result it never saw."""
+        marker = parse_approval_marker(
+            build_approval_marker(COMPLETENESS_PHASE, SHA, evidence="exec-1")
+        )
+        assert marker is not None
+
+        assert not completeness_approval_is_fresh(marker, current_evidence="exec-2")
+
+    def test_stale_when_no_evidence_exists_at_all(self) -> None:
+        """Nothing to compare against: refuse rather than assume (fail-closed)."""
+        marker = parse_approval_marker(
+            build_approval_marker(COMPLETENESS_PHASE, SHA, evidence="exec-1")
+        )
+        assert marker is not None
+
+        assert not completeness_approval_is_fresh(marker, current_evidence=None)
+
+    def test_marker_without_evidence_cannot_prove_freshness(self) -> None:
+        """A completeness marker predating this rule proves nothing about the
+        snapshot, so it does not unlock delivery."""
+        marker = parse_approval_marker(build_approval_marker(COMPLETENESS_PHASE, SHA))
+        assert marker is not None
+
+        assert not completeness_approval_is_fresh(marker, current_evidence="exec-1")
+
+    def test_a_non_completeness_marker_is_never_fresh_here(self) -> None:
+        """The ex-post approval answers a different question entirely."""
+        marker = parse_approval_marker(build_approval_marker("ex_post", SHA))
+        assert marker is not None
+
+        assert not completeness_approval_is_fresh(marker, current_evidence="exec-1")

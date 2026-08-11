@@ -130,6 +130,26 @@ def capture_archive(
     )
 
 
+def archive_is_committed(path: Path | str) -> bool:
+    """True only for a complete archive that is actually on disk.
+
+    The cleanup guard's question. A row in `postmortem_archives` is not the
+    answer: the row can outlive the directory (a hand-pruned archive, a
+    volume restored from an older snapshot), and cleanup destroys the last
+    copy of the logs — so it asks the filesystem, not the bookkeeping.
+
+    The manifest is the commit marker: `capture_archive` writes it inside the
+    `.partial/` directory before the atomic rename, so a directory holding
+    one is by construction a fully written archive. A `.partial/` name is
+    rejected outright even if it looks complete — it never survived the
+    rename, so nothing may be concluded from its contents.
+    """
+    archive = Path(path)
+    if archive.name.endswith(_PARTIAL_SUFFIX):
+        return False
+    return archive.is_dir() and (archive / MANIFEST_FILENAME).is_file()
+
+
 def prune_archives(root: Path, workstream_id: str, *, keep: int) -> list[Path]:
     """Remove archives for `workstream_id` beyond the newest `keep`.
 

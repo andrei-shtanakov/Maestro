@@ -14,7 +14,7 @@ completed 1 of 9 tasks was merged into the base branch.
 from dataclasses import dataclass
 from typing import Literal
 
-from maestro.gate_approvals import build_approval_marker
+from maestro.gate_approvals import ApprovalMarker, build_approval_marker
 
 
 COMPLETENESS_PHASE = "completeness"
@@ -102,6 +102,7 @@ def build_completeness_block_reason(
     verdict: CompletenessVerdict,
     sha: str,
     *,
+    evidence: str | None = None,
     stop_reason: str | None = None,
 ) -> str:
     """Marker-bearing block reason, so the block stays approvable.
@@ -110,13 +111,42 @@ def build_completeness_block_reason(
     `unknown_total`, because decision 1 requires an explicit manual way out
     of a fail-closed block rather than a dead end.
 
+    `evidence` binds the marker to the archive snapshot the verdict was
+    computed from; `completeness_approval_is_fresh` refuses a marker without
+    it, so omitting it here would produce a block that looks approvable and
+    can never actually be approved.
+
     `stop_reason` is appended as context only. The counters decided
     (owner decision 2); spec-runner's own reason is there to shorten the
     operator's diagnosis, never to change the verdict.
     """
-    marker = build_approval_marker(COMPLETENESS_PHASE, sha)
+    marker = build_approval_marker(COMPLETENESS_PHASE, sha, evidence=evidence)
     context = f" — stop_reason={stop_reason}" if stop_reason else ""
     return f"completeness: {verdict.message}{context}; re-queue to approve. {marker}"
+
+
+def completeness_approval_is_fresh(
+    marker: ApprovalMarker, *, current_evidence: str | None
+) -> bool:
+    """True when a completeness approval still refers to the current evidence.
+
+    The worktree sha is not sufficient here. The two gate edges judge the
+    tree, for which the sha is the whole story; completeness judges the
+    *executor state* behind that tree, and a rework or a re-collect can leave
+    the sha unchanged while the run underneath is a different one — different
+    tasks done, a different reason for stopping. An approval granted for
+    "1 of 9 in this snapshot" must not silently accept the next partial
+    result.
+
+    Fail-closed in both unprovable cases: a marker with no evidence key
+    (written before #164) proves nothing about the snapshot, and an absent
+    current archive leaves nothing to compare against.
+    """
+    if marker.phase != COMPLETENESS_PHASE:
+        return False
+    if marker.evidence is None or current_evidence is None:
+        return False
+    return marker.evidence == current_evidence
 
 
 def _progress_phrase(done: int, planned: int | None, noop_done: int) -> str:
