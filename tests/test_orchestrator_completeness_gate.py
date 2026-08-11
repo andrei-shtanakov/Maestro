@@ -452,6 +452,43 @@ class TestCleanupGuard:
         finally:
             await db.close()
 
+    @pytest.mark.anyio
+    async def test_a_vanished_newest_archive_does_not_fall_back(
+        self, tmp_path: Path
+    ) -> None:
+        """An older archive must not stand in for the newest run's evidence.
+
+        Two executions, both archived, then the newest directory disappears.
+        Falling back to the older one would evaluate completeness against a
+        different run AND let cleanup destroy the only remaining logs of the
+        newest — the exact invariant the archive exists to protect.
+        """
+        import shutil
+
+        orch, db, _repo, worktree, _base, ws_mgr, _merge = await _build(
+            tmp_path, subtask_total=9
+        )
+        try:
+            head = _run(worktree, "rev-parse", "HEAD")
+            # Older run: complete by its own (stale) numbers.
+            await _seed_archive(
+                db, worktree, done=9, planned=9, head_sha=head, execution_id="exec-1"
+            )
+            newest = await _seed_archive(
+                db, worktree, done=1, planned=9, head_sha=head, execution_id="exec-2"
+            )
+            shutil.rmtree(newest)
+
+            await orch._handle_success(WS, worktree)
+
+            ws = await db.get_workstream(WS)
+            assert ws.status is WorkstreamStatus.NEEDS_REVIEW
+            assert "no committed post-mortem archive" in (ws.error_message or "")
+            ws_mgr.cleanup_workspace.assert_not_called()
+            assert worktree.is_dir()
+        finally:
+            await db.close()
+
 
 class TestRecapture:
     @pytest.mark.anyio

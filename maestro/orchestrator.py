@@ -2354,15 +2354,32 @@ class Orchestrator:
         return await self._route_scope_block(workstream_id, reason)
 
     async def _newest_archive(self, workstream_id: str) -> dict[str, Any] | None:
-        """The freshest committed archive for a workstream, or None.
+        """This run's archive — the newest row, and only if it is committed.
+
+        Deliberately does NOT search past the newest row for an older archive
+        that happens to still be on disk. Falling back would be wrong twice
+        over: the gate would judge completeness from a different run's
+        counters, and the cleanup guard would see "evidence exists" and
+        destroy the only remaining logs of the run that actually just
+        finished. A missing newest archive means no archive for this run.
 
         "Committed" is decided by the filesystem, not the row: a row can
-        outlive its directory, and this answer gates both delivery and the
+        outlive its directory (hand-pruned archive, volume restored from an
+        older snapshot), and this answer gates both delivery and the
         destruction of the last copy of the logs.
         """
-        for row in await self._db.list_postmortem_archives(workstream_id):
-            if archive_is_committed(row["path"]):
-                return row
+        rows = await self._db.list_postmortem_archives(workstream_id)
+        if not rows:
+            return None
+        newest = rows[0]
+        if archive_is_committed(newest["path"]):
+            return newest
+        self._logger.warning(
+            "workstream '%s': newest post-mortem archive %s is recorded but "
+            "not on disk; refusing to fall back to an older run's evidence",
+            workstream_id,
+            newest["path"],
+        )
         return None
 
     async def _completeness_verdict(
