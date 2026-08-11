@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+### Added
+- **Per-workstream quarantine (#166 half A).**
+  `maestro workstream-quarantine <id> --reason "<why>"` forbids one
+  workstream's result from progressing, and **does not kill anything**: a
+  running execution finishes normally, because terminating work in order to
+  isolate it is precisely the loss this issue was filed about. What stops is
+  dispatch (a quarantined workstream never becomes ready) and delivery (a
+  finished quarantined workstream **parks in NEEDS_REVIEW** awaiting an
+  operator decision instead of merging). Nothing is reverted — the branch,
+  worktree and commits stay exactly as the author left them.
+  - It is **not a rework and not an approval.** Rework re-decomposes and
+    respawns the author; approve grants a gate. Quarantine grants nothing and
+    starts nothing.
+  - `maestro workstream-unquarantine <id> --reason "<why>"` **only lifts the
+    durable freeze.** It changes no status, records no approval, sets no resume
+    reason and starts nothing; whatever gate or review the workstream owed, it
+    still owes. The orchestrator picks it up on a later loop if its status makes
+    it eligible.
+  - **A row that has already entered delivery (MERGING/PR_CREATED/DONE) cannot
+    be quarantined** — the command refuses with a plain sentence, because after
+    delivery the remedy is a revert and accepting the quarantine would claim to
+    have prevented something that already happened.
+  - Both verbs are idempotent, and a repeat says which case it hit rather than
+    reporting the same success twice. `maestro workstreams` grows a
+    `Quarantined` column showing the flag **and the age** — a quarantine raised
+    a minute ago reads differently from one standing for two days.
+  - Durable via migration 25 (`workstreams.quarantined_at` +
+    `quarantine_reason`, plus a `workstream_quarantines` audit table).
+    Deliberately not a status: the process keeps running, so the row stays
+    RUNNING and every existing `expected_status=RUNNING` CAS keeps working.
+
+### Changed
+- **`maestro stop` now drains instead of destroying work (#166 half A).** The
+  first signal (SIGTERM/SIGINT) **forbids new dispatch and waits for live
+  executions to finish**, monitoring each to its own finalization; it
+  terminates nothing. Previously it terminated every running handle and reset
+  each workstream to READY, which meant "Always regenerate" — so a routine
+  stop discarded partial work exactly as an external SIGKILL did.
+  - **A second signal forces termination** and may leave work needing recovery
+    on the next start. That escalation is deliberate: without it the only
+    escape from a long drain would be SIGKILL, the hammer this change removes.
+    A forced shutdown is recorded distinctly (the structured
+    `orchestrator.shutdown.forced` event, and a human-readable cause on the
+    affected rows) so a deliberate stop is legible afterwards rather than
+    looking like a crash.
+  - Recovery's automatic behaviour is unchanged: it still classifies by
+    process/handle liveness. The cause is diagnostics for a person, not a
+    branch condition.
+
+
 ### Changed
 - **`spec-runner >= 2.24.0` is now required (#169b).** The floor moves from
   2.16.0 to the release that closed the false-green exit class: `run --all`

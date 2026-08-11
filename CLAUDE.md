@@ -40,6 +40,8 @@ uv run maestro workstreams                   # Show workstreams status
 uv run maestro workstream-approve <workstream-id>  # Approve a NEEDS_REVIEW workstream — records the durable gate approval (phase+sha) and re-queues
 uv run maestro workstream-rework <workstream-id> --reason "<why>" [--instructions "<next attempt>"] [--refresh-from project.yaml]  # Rework (NOT approve): NEEDS_REVIEW/FAILED -> READY into re-decomposition; fail-closed liveness proof; audited
 uv run maestro workstream-resolve-ambiguity <workstream-id> --statement "<how verified>"  # Resolve a recovery-ambiguity marker after manual cleanup (unblocks rework)
+uv run maestro workstream-quarantine <workstream-id> --reason "<why>"  # Forbid this workstream's result from progressing (#166): no new dispatch, delivery withheld (finished -> NEEDS_REVIEW). Does NOT kill a running execution; NOT a rework, NOT an approval. Refuses once delivery started (MERGING/PR_CREATED/DONE) — there the remedy is a revert
+uv run maestro workstream-unquarantine <workstream-id> --reason "<why>"  # Lift the durable freeze ONLY: no status change, no approval, no resume, nothing started
 uv run maestro workstream-recapture <workstream-id>  # Retry ONLY post-mortem evidence capture for the same execution after a `post-mortem capture failed` block (no executor, no decomposition); NOT an approval
 uv run maestro postmortem <project.yaml> --gc         # Apply the post-mortem retention policy (same one the orchestrator applies after each capture)
 uv run maestro check-scope <workstream-id> --base <base-branch>  # deterministic scope containment (exit 1 on escape)
@@ -221,6 +223,25 @@ missing archive or an unreadable manifest; no config key or env var disables
 it. An all-no-op run passes and is reported as a structured event —
 completeness is not productivity.
 
+**Quarantine (#166, always-on when set).** `quarantined_at` on the workstream
+row — deliberately not a status, because a quarantined workstream's process
+keeps running and the row must stay RUNNING for the existing
+`expected_status=RUNNING` CAS. While set: the workstream never becomes ready
+(no dispatch) and delivery is withheld — a finished quarantined workstream
+**parks in NEEDS_REVIEW for an operator decision** instead of merging. The
+guarantee is the CAS on `RUNNING -> MERGING` carrying
+`require_not_quarantined`; the check at the head of `_handle_success` is only
+an optimisation that avoids paying for a risk classification on a diff nobody
+will deliver. A row already in MERGING/PR_CREATED/DONE cannot be quarantined —
+the remedy after delivery is a revert.
+
+**Shutdown drains (#166).** The first SIGTERM/SIGINT forbids new dispatch and
+keeps the loop monitoring live executions until each finalizes
+(`_should_keep_looping`); it terminates nothing. A **second** signal forces
+termination and may leave work for recovery. Before #166 a routine
+`maestro stop` terminated everything and reset each workstream to plain READY,
+which means "Always regenerate" — the same destruction as an external SIGKILL.
+
 Two more always-on guards sit earlier in the lifecycle (#165): the generated
 `tasks.md` is validated for dangling dependencies **after spec-gen and before
 any spawner** (a violation blocks with no retry consumed; an unreadable file
@@ -238,6 +259,7 @@ policy — unclassified is not unfit.
 | `workstream-approve` on a completeness block | `completeness_accept_partial` | Nothing. Accepts the incomplete result and continues the existing delivery tail over the untouched worktree — no author respawn, no spec-gen, no new sha. Catching up the missing tasks is #166's concern and has no mechanism here. |
 | `workstream-recapture` after a capture failure | `postmortem_recapture` | Only the archive step, for the same execution, then the same delivery tail. Not an approval: nothing about the result is accepted. |
 | `workstream-rework` | `operator_rework` | An ordinary re-decomposition through DECOMPOSING — the author is respawned and the spec regenerated. |
+| `workstream-unquarantine` | *(none)* | Lifts the durable quarantine freeze and nothing else — no status change, no approval, no dispatch. Listed here because it is easy to mistake for a resume; it is not one. |
 
 The first two refuse rather than falling back to a respawn: a respawn would
 regenerate the spec and mint a new sha, voiding the very approval that got

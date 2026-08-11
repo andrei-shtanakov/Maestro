@@ -40,7 +40,7 @@ from maestro.completeness import (
     classify_completeness,
     completeness_approval_is_fresh,
 )
-from maestro.database import Database
+from maestro.database import ConcurrentModificationError, Database
 from maestro.decomposer import ProjectDecomposer
 from maestro.domain import (
     KNOWN_RESUME_REASONS,
@@ -433,6 +433,10 @@ class Orchestrator:
         self._verifying_orphans: dict[str, int] = {}
         self._shutdown_grace_seconds: float = 5.0
         self._shutdown_requested = False
+        # #166: the first signal drains (stop dispatching, terminate nothing);
+        # a second one forces. Without the escalation the only way out of a
+        # long drain would be SIGKILL — the very hammer this removes.
+        self._force_shutdown = False
         self._shutdown_event = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._logger = logging.getLogger(__name__)
@@ -1386,7 +1390,7 @@ class Orchestrator:
         """Main orchestration loop."""
         poll_interval = 2.0
 
-        while not self._shutdown_requested:
+        while self._should_keep_looping():
             # Get completed workstream IDs
             completed_ids = await self._get_completed_ids()
 
@@ -1443,6 +1447,24 @@ class Orchestrator:
 
         return True
 
+    def _should_keep_looping(self) -> bool:
+        """Whether the main loop runs another tick (#166 drain semantics).
+
+        A shutdown request stops *dispatch* but not *monitoring*: the loop
+        keeps iterating while executions are live, so each one reaches its own
+        finalization (reap → collect → capture → cleanup) and its normal
+        completion path. That is the difference between draining and merely not
+        calling `terminate()` — exiting the loop early would abandon live
+        handles unfinalized, leaving the work for recovery to reconcile instead
+        of letting it simply finish.
+
+        Only a forced (second-signal) shutdown stops the loop with work still
+        running, which is what makes forcing an explicit act.
+        """
+        if self._force_shutdown:
+            return False
+        return not self._shutdown_requested or bool(self._running)
+
     async def _resolve_ready(self, completed_ids: set[str]) -> list[str]:
         """Resolve workstreams that are ready to run.
 
@@ -1463,6 +1485,17 @@ class Orchestrator:
                 WorkstreamStatus.PENDING,
                 WorkstreamStatus.READY,
             ):
+                continue
+            if z.quarantined_at is not None:
+                # #166: quarantine forbids progression, and dispatch is
+                # progression. Checked here rather than at spawn time so a
+                # quarantined workstream never even counts as ready — it must
+                # not occupy a concurrency slot or look dispatchable in logs.
+                self._logger.debug(
+                    "workstream.quarantined.skipped workstream=%s reason=%s",
+                    z.id,
+                    z.quarantine_reason,
+                )
                 continue
 
             # Check all dependencies completed
@@ -2317,6 +2350,38 @@ class Orchestrator:
             await self._db.delete_postmortem_archive(
                 workstream_id, _execution_id_of_archive(path)
             )
+
+    async def _route_quarantined_completion(
+        self, workstream_id: str, frm: WorkstreamStatus
+    ) -> None:
+        """A finished quarantined workstream parks instead of delivering (#166).
+
+        Reached either from the pre-gate check or from the MERGING CAS losing
+        to a concurrent quarantine. The work is not lost and nothing is
+        reverted — the branch, the worktree and the commits stay exactly as the
+        author left them; only their progression stops.
+        """
+        workstream = await self._db.get_workstream(workstream_id)
+        reason = (
+            f"quarantined: {workstream.quarantine_reason or 'no reason recorded'}; "
+            f"delivery withheld. Lift with `maestro workstream-unquarantine "
+            f"{workstream_id}` once resolved."
+        )
+        self._logger.warning(
+            "workstream.quarantined.withheld workstream=%s frm=%s",
+            workstream_id,
+            frm.value,
+        )
+        await self._transition(
+            workstream_id,
+            WorkstreamStatus.NEEDS_REVIEW,
+            expected_status=frm,
+            message="quarantined; delivery withheld",
+            error_message=reason,
+            process_pid=None,
+            generation_pid=None,
+        )
+        self._stats.failed += 1
 
     async def _gate_completeness(
         self,
@@ -3508,6 +3573,17 @@ class Orchestrator:
         # last task must read "N/N done (1 no-op)", never "DONE N-1/N".
         await self._final_progress_refresh(workstream_id, workspace_path)
 
+        # #166: a quarantine forbids this result from progressing, so the
+        # delivery tail is not entered at all. Checked before the gates because
+        # classifying a diff nobody will deliver spends a steward call for
+        # nothing; the MERGING CAS remains the atomic backstop for a quarantine
+        # that lands after this point.
+        if workstream.quarantined_at is not None:
+            await self._route_quarantined_completion(
+                workstream_id, WorkstreamStatus.RUNNING
+            )
+            return
+
         # Completeness (#164, always-on, first): an incomplete run's diff is
         # not worth classifying, so this precedes both diff gates. DONE must
         # be a statement about the work, not just about the process.
@@ -3558,12 +3634,30 @@ class Orchestrator:
         Stage B finalization (`expected_status=VERIFYING`); the only
         difference is the state the workstream transitions into MERGING from.
         """
-        # Transition to MERGING
-        await self._transition(
-            workstream_id,
-            WorkstreamStatus.MERGING,
-            expected_status=expected_status,
-        )
+        # Transition to MERGING — the first step that touches the base branch
+        # and the git host, and therefore the point where a quarantine must
+        # provably win (#166 §3.3). The guard rides inside this CAS rather than
+        # being a preceding read, so a quarantine landing concurrently either
+        # stops delivery here or arrives too late and is refused at its own
+        # write. Exactly one of the two succeeds.
+        try:
+            await self._transition(
+                workstream_id,
+                WorkstreamStatus.MERGING,
+                expected_status=expected_status,
+                require_not_quarantined=True,
+            )
+        except ConcurrentModificationError:
+            # A failed CAS here has TWO possible causes and they must not be
+            # conflated: a quarantine that won the race, or an ordinary
+            # expected_status mismatch (a genuine concurrency fault). Labelling
+            # the second as "quarantined; delivery withheld" would hide a real
+            # bug behind an operator-facing explanation, so confirm which it was.
+            current = await self._db.get_workstream(workstream_id)
+            if current.quarantined_at is None:
+                raise
+            await self._route_quarantined_completion(workstream_id, expected_status)
+            return
 
         # Push branch and create PR
         if self._config.auto_pr:
@@ -4146,7 +4240,28 @@ class Orchestrator:
             self._loop.add_signal_handler(sig, self._handle_shutdown_signal)
 
     def _handle_shutdown_signal(self) -> None:
-        """Handle shutdown signal."""
+        """First signal drains; a second one forces termination (#166).
+
+        Draining means: dispatch nothing new, terminate nothing, and keep
+        monitoring live executions until they finalize on their own. Stopping
+        the orchestrator is not a licence to destroy work in progress — that
+        was the defect. Forced termination stays available, but it is now an
+        explicit second act rather than the default.
+        """
+        if self._shutdown_requested:
+            self._force_shutdown = True
+            self._logger.warning(
+                "orchestrator.shutdown.forced running=%d workstreams=%s — "
+                "forcing termination; in-flight work may be lost",
+                len(self._running),
+                ",".join(sorted(self._running)),
+            )
+        else:
+            self._logger.info(
+                "shutdown signal — draining: no new dispatch, %d running "
+                "execution(s) will be allowed to finish (signal again to force)",
+                len(self._running),
+            )
         self._shutdown_requested = True
         self._shutdown_event.set()
 
@@ -4156,12 +4271,37 @@ class Orchestrator:
         self._shutdown_event.set()
 
     async def _cleanup(self) -> None:
-        """Cleanup running processes and in-flight generations on shutdown."""
+        """Release resources on shutdown.
+
+        **Terminates nothing unless the shutdown was forced** (#166). A drained
+        shutdown reaches this point with `self._running` already empty, because
+        the main loop kept monitoring until every execution finalized; the
+        terminate-and-reset path below then has nothing to do. It runs only
+        after a forced (second-signal) shutdown, where the operator has
+        explicitly chosen to lose in-flight work.
+
+        In-flight spec generations are still cancelled either way: they hold no
+        committed work, so the cost is money rather than an author's progress,
+        and draining them could block shutdown for the whole spec-gen timeout.
+        """
         for _zid, task in list(self._generating.items()):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         self._generating.clear()
+
+        if self._running and not self._force_shutdown:
+            # Reached only if the loop exited with work still running for a
+            # reason other than a force — e.g. an unexpected break. Say so
+            # loudly rather than quietly terminating: a drain that silently
+            # kills is the defect #166 removes.
+            self._logger.warning(
+                "shutdown with %d execution(s) still running and no force "
+                "requested — leaving them alone; they will be reconciled by "
+                "recovery on the next start",
+                len(self._running),
+            )
+            self._running.clear()
 
         for zid, running in list(self._running.items()):
             try:
@@ -4178,12 +4318,21 @@ class Orchestrator:
                 # in _spawn_workstream, and _update_progress only patches
                 # subtask_progress, never status), matching the scheduler's
                 # analogous shutdown-cleanup transition (expected=RUNNING).
+                # Say WHY durably (#166): a forced shutdown is a deliberate
+                # act, and an operator or tool reading this row afterwards must
+                # be able to tell it from a process that simply died — the
+                # latter leaves the row in RUNNING for recovery to reconcile,
+                # the former lands here with this message.
+                forced_msg = (
+                    "orchestrator forced shutdown (second signal): execution "
+                    "terminated deliberately, not a crash"
+                )
                 await self._transition(
                     zid,
                     WorkstreamStatus.FAILED,
                     expected_status=WorkstreamStatus.RUNNING,
-                    message="Orchestrator shutdown",
-                    error_message="Orchestrator shutdown",
+                    message=forced_msg,
+                    error_message=forced_msg,
                 )
                 await self._transition(
                     zid,
