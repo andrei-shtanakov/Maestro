@@ -1390,12 +1390,7 @@ class Orchestrator:
         """Main orchestration loop."""
         poll_interval = 2.0
 
-        # Drain (#166): a shutdown request stops dispatch but keeps the loop
-        # monitoring live executions until they finalize; only a forced
-        # shutdown leaves the loop with work still running.
-        while not self._force_shutdown and (
-            not self._shutdown_requested or self._running
-        ):
+        while self._should_keep_looping():
             # Get completed workstream IDs
             completed_ids = await self._get_completed_ids()
 
@@ -1451,6 +1446,24 @@ class Orchestrator:
                 return False
 
         return True
+
+    def _should_keep_looping(self) -> bool:
+        """Whether the main loop runs another tick (#166 drain semantics).
+
+        A shutdown request stops *dispatch* but not *monitoring*: the loop
+        keeps iterating while executions are live, so each one reaches its own
+        finalization (reap → collect → capture → cleanup) and its normal
+        completion path. That is the difference between draining and merely not
+        calling `terminate()` — exiting the loop early would abandon live
+        handles unfinalized, leaving the work for recovery to reconcile instead
+        of letting it simply finish.
+
+        Only a forced (second-signal) shutdown stops the loop with work still
+        running, which is what makes forcing an explicit act.
+        """
+        if self._force_shutdown:
+            return False
+        return not self._shutdown_requested or bool(self._running)
 
     async def _resolve_ready(self, completed_ids: set[str]) -> list[str]:
         """Resolve workstreams that are ready to run.
