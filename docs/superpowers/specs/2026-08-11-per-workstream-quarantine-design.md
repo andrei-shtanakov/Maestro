@@ -1,8 +1,10 @@
 # Per-workstream quarantine + resume without regeneration (#166) — design
 
-**Status:** approved (revision 2, 2026-08-11 — all four §8 questions answered
-by the owner and folded in; one of them corrected the design: freeze is
-per-workstream, not process-wide). Boundary with #164 was fixed
+**Status:** approved (revision 3, 2026-08-11 — quarantine does **not**
+terminate a live handle, which reverses revision 2's "no new durable state"
+conclusion and reinstates a migration; §3 rewritten accordingly. Revision 2
+answered all four §8 questions, one of which corrected freeze from
+process-wide to per-workstream.) Boundary with #164 was fixed
 when that shipped: #164 gives approve (accept an incomplete result, execute
 nothing) and rework (ordinary re-decomposition); **catching up the remaining
 work is this document's subject**, and #164 deliberately left the naming free.
@@ -67,50 +69,90 @@ Three consequences the design has to respect:
 
 ## 3. Half A — quarantine one workstream instead of the process
 
-### 3.1 The operator verb
+### 3.1 What quarantine is, and what it deliberately is not
 
-`maestro workstream-quarantine <id> --reason "<why>"`: stop **that**
-workstream's execution, leave every other execution running, and leave its
-worktree intact for inspection. The workstream lands in NEEDS_REVIEW carrying
-the reason, exactly like every other block, so no new status is needed.
+`maestro workstream-quarantine <id> --reason "<why>"` forbids a workstream's
+result from progressing any further. **It does not terminate a live handle**
+(owner decision, revision 3).
 
-Deliberately a separate verb from `maestro stop`, which keeps meaning "stop
-the orchestrator". Overloading it with a scope argument would make the
-dangerous form the default one.
+That distinction is the whole point rather than a nicety. Killing a running
+execution to isolate it is exactly the loss of uncommitted work this issue
+was filed about; a quarantine that kills would reproduce the defect in a
+politer form. So:
 
-### 3.2 Quarantine atomically freezes that workstream
+- a RUNNING quarantined workstream **keeps running** to its natural end;
+- **no new dispatch** happens for it — not now, not after a restart;
+- when it finishes, it does **not** enter the delivery tail: it goes to
+  NEEDS_REVIEW with the quarantine reason;
+- **forced termination stays a separate, explicit operation.** Quarantine must
+  never be the thing that happens to kill work, because an operator reaching
+  for "isolate this" is not asking for that.
 
-Quarantine and "stop dispatching it" are **one transaction, never two**. A
-state where the quarantine is recorded but the dispatcher may still start the
-workstream is exactly the race the feature exists to remove, and a two-step
-version would leave a window for it on every crash.
+Lifting a quarantine is its own audited action
+(`maestro workstream-unquarantine <id> --reason "<why>"`), never a side effect
+of another verb. It records who lifted it and why, for the same reason the
+approval path does: an operator undoing a safety decision is a decision.
 
-This needs no new storage, which is the pleasant consequence of an existing
-invariant: **the dispatcher only ever picks up READY**, so a single guarded
-transition into NEEDS_REVIEW *is* the freeze. The quarantine reason rides in
-`error_message` like every other block, and the operator's exits are the verbs
-that already exist (rework, continue — §4, recapture).
+`maestro stop` keeps its own meaning — see §4.6 — and quarantine is not a
+scoped variant of it.
 
-**Freeze is per-workstream, not process-wide** (owner decision, §8.2). The
-process-wide switch proposed in revision 1 was unnecessary: a dependent cannot
-start while its dependency is not DONE, so the DAG already holds the subtree,
-and an automatic freeze of descendants would add durable state whose unfreezing
-is its own problem. Healthy independent workstreams keep running, which is the
-whole point.
+### 3.2 Why this needs durable state after all
 
-Revision 1 justified a global freeze with "stop everything before dependents
-start from a bad base". That rationale died with #164: dependents only started
-in the incident because the workstream reached a **false** DONE, and a DONE
-that lies is now blocked by the completeness gate. What is left is genuinely
-per-workstream.
+Revision 2 concluded that no new storage was required, because the dispatcher
+only picks up READY and so a transition into NEEDS_REVIEW *is* the freeze.
+**That conclusion is void under revision 3.** With the process left running,
+the row must stay RUNNING while it runs — the finalization path CASes with
+`expected_status=RUNNING` (`_handle_completion` → `_handle_success` /
+`_handle_failure`) and would raise `ConcurrentModificationError` against a row
+someone had quietly moved to NEEDS_REVIEW.
 
-### 3.3 Why this removes the reason to kill
+Overloading NEEDS_REVIEW would therefore mix two unrelated facts — *what the
+process is doing* and *what the operator has forbidden* — and break the CAS
+the whole state machine relies on. A migration is cheaper than that: one
+additive, nullable column,
 
-The pilot's sequence becomes: quarantine `w-adapters` (its execution stops,
-its dispatch is frozen by the same write) → `w-events` and `w-verifier` finish
+```
+workstreams.quarantined_at   TIMESTAMP   -- NULL = not quarantined
+workstreams.quarantine_reason TEXT
+```
+
+with the quarantine audit row alongside (actor, reason, lifted_at,
+lifted_by), mirroring `workstream_reworks` (#124).
+
+### 3.3 The race with completion, resolved by one CAS
+
+Quarantine and a finishing workstream can collide, and the resolution must be
+atomic in the strong sense: **either delivery has irreversibly begun and
+quarantine refuses, or quarantine wins and delivery is guaranteed not to
+start.** No third outcome, no "mostly quarantined" workstream whose branch
+lands anyway.
+
+The boundary is the MERGING transition — the first step that touches the base
+branch and the git host. Two writes, one row, existing machinery:
+
+1. **Quarantine's write** requires the workstream to be in a state that has
+   not begun delivering (`READY`, `RUNNING`, `DECOMPOSING`, `PENDING`,
+   `VERIFYING`, `FAILED`, `NEEDS_REVIEW`). A row already in `MERGING`,
+   `PR_CREATED` or `DONE` refuses with "delivery already started" — the
+   operator's remedy there is a revert, not a quarantine, and pretending
+   otherwise would be a lie about what was prevented.
+2. **The MERGING transition's CAS gains `AND quarantined_at IS NULL`.** If
+   quarantine landed first, that CAS fails and the completion path routes to
+   NEEDS_REVIEW instead of delivering.
+
+Because both are single-row writes under the same lock, exactly one wins, and
+the loser learns it did from its own failed CAS rather than from a read that
+could be stale. The gates (completeness, scope, ex-post) all run *before*
+MERGING, so a quarantine racing them simply blocks at the same edge.
+
+### 3.4 Why this removes the reason to kill
+
+The pilot's sequence becomes: quarantine `w-adapters` (its result stops
+progressing; if it is still running it finishes, and lands in NEEDS_REVIEW
+rather than delivery) → `w-events` and `w-verifier` finish and deliver
 normally → dependents of `w-adapters` stay blocked because it is not DONE. No
-healthy execution is interrupted, and the watchdog never needs the
-process-level hammer.
+healthy execution is interrupted, no uncommitted work is lost, and the
+watchdog never needs the process-level hammer.
 
 ## 4. Half B — resume an interrupted workstream without regeneration
 
@@ -206,7 +248,10 @@ their limits.
 The global stop keeps its meaning — stop the orchestrator — but must stop
 destroying healthy work (§2.1). Two acceptable shapes, in preference order:
 
-1. **Drain**: freeze new dispatch, let in-flight executions finish, then exit.
+1. **Drain (the required default).** Freeze new dispatch, **terminate
+   nothing**, let in-flight executions finish, then exit. This is the same
+   principle as quarantine: stopping the orchestrator is not a licence to
+   destroy work in progress.
 2. **Preserve the path**: if an execution must be ended before it finishes,
    the workstream is left able to continue — `resume_reason =
    RESUME_CONTINUE_TASKS` rather than the plain READY that today's `_cleanup`
@@ -219,14 +264,21 @@ not leave a workstream whose only way forward is a full regeneration.
 
 ## 5. State and storage
 
-**No new table.** Revision 1 proposed an `orchestration_freeze` row; the
-per-workstream decision removes the need, because NEEDS_REVIEW already stops
-dispatch and is already durable, CAS-guarded and audited.
+Revision 2 claimed no new table was needed; revision 3 reinstates a migration
+(§3.2) because leaving the process alive means the status column cannot carry
+the quarantine.
 
-- **Quarantine**: one guarded transition (RUNNING → NEEDS_REVIEW) carrying the
-  reason, plus termination of that workstream's execution. Atomic by
-  construction — the dispatcher cannot pick up a non-READY row.
-- **Continuation**: `resume_reason = RESUME_CONTINUE_TASKS`, set by
+- **Quarantine**: `workstreams.quarantined_at` + `quarantine_reason`
+  (additive, nullable) written under a CAS that refuses a row which has begun
+  delivering (§3.3), plus an audit row (actor, reason, lifted_at, lifted_by)
+  mirroring `workstream_reworks` (#124). The status column is untouched, so
+  every existing CAS keeps meaning what it meant.
+- **Dispatch suppression**: the READY dispatcher skips a row with
+  `quarantined_at IS NOT NULL`. Durable by construction — a restart re-reads
+  the column and does not silently resume.
+- **Delivery suppression**: the MERGING CAS carries
+  `AND quarantined_at IS NULL`.
+- **Continuation** (half B): `resume_reason = RESUME_CONTINUE_TASKS`, set by
   `maestro workstream-continue <id>` in one CAS transaction on NEEDS_REVIEW,
   mirroring `requeue_for_recapture` (#164) so a crash cannot leave a READY
   workstream that falls through to regeneration.
@@ -235,19 +287,27 @@ dispatch and is already durable, CAS-guarded and audited.
 - **Recovery capture**: reuses `postmortem_archives` (#164, migration 23);
   `captured_by` is a manifest field, not a schema change.
 
-Migration: only the continuation counter is additive schema. Number to be
-re-checked at implementation — a parallel session may claim one.
+Migration: one additive column pair plus the audit table for half A; the
+continuation counter for half B. Numbers to be re-checked at implementation —
+a parallel session may claim one.
 
 ## 6. Test matrix
 
 | # | Scenario | Expected |
 |---|---|---|
-| 1 | Quarantine one of three running | Only that execution stops; the other two keep running and reach DONE |
+| 1 | Quarantine does not terminate | The quarantined workstream's live handle keeps running; `terminate` is never called on it |
+| 1b | Neighbours unaffected | The other two executions keep running and reach DONE |
+| 1c | Finished quarantined workstream | Goes to NEEDS_REVIEW with the reason; **base branch unchanged**, no PR, no merge |
 | 2 | Quarantined workstream's worktree | Preserved, with the reason recorded |
-| 3 | Quarantine freezes atomically | The dispatcher never picks up the quarantined workstream, including immediately after the write |
+| 3 | No new dispatch | The READY dispatcher skips a quarantined workstream, including immediately after the write |
+| 3b | Race: quarantine wins | Quarantine lands while RUNNING; the MERGING CAS then fails and completion routes to NEEDS_REVIEW — the branch never merges |
+| 3c | Race: delivery wins | A row already in MERGING/PR_CREATED/DONE refuses the quarantine with "delivery already started"; no partial state |
+| 3d | Status column untouched | A quarantined RUNNING row is still RUNNING, so `_handle_completion`'s CAS does not raise |
 | 4 | Quarantine survives restart | Still quarantined and undispatched after a restart |
+| 4a | Lifting is audited | `workstream-unquarantine` records actor and reason; dispatch resumes only after it |
 | 4b | Dependents stay held | Dependents of a quarantined workstream do not start — it is not DONE — without any explicit subtree freeze |
-| 4c | `maestro stop` preserves the path | After a global stop, an interrupted workstream can continue; it is not left needing regeneration |
+| 4c | `maestro stop` drains | No new dispatch, and **no live handle is terminated**; in-flight executions finish |
+| 4c2 | `maestro stop` preserves the path | If an execution must still be ended, the workstream can continue; it is not left needing regeneration |
 | 4d | Recovery capture is idempotent | Running recovery twice yields one archive, marked `captured_by: recovery` |
 | 4e | Recovery capture failure | Worktree preserved; operator gets the `RESUME_RECAPTURE` path; no cleanup, no rework, no dispatch |
 | 5 | Continue after a graceful stop | spec-runner re-dispatched against the existing tasks.md; decomposer/spec-gen **never invoked** |
@@ -266,6 +326,10 @@ re-checked at implementation — a parallel session may claim one.
 
 - **No change to what the watchdog does.** External tooling may still kill the
   process; this makes that unnecessary, not impossible.
+- **No implicit forced termination.** Neither quarantine nor `maestro stop`
+  kills a running execution. Forcing one to stop stays a separate, explicit
+  operation, so that "isolate this" and "destroy this work" can never be the
+  same keystroke.
 - **No automatic continuation.** Every continuation is an operator decision,
   like every other resume in this family. An orchestrator that resumes
   interrupted work by itself would need a policy for "how many times", which
@@ -303,7 +367,17 @@ may be separate commands; establishing it may not be split (§3.2).
 automatic loop. Count and warn; do not forbid the N+1th without new knowledge.
 Automatic retries stay under the existing budget (§4.5).
 
-## 9. The four distinctions this design must preserve
+### 8.5 Quarantine does not terminate a live handle — reverses part of rev 2
+
+Confirmed literally by the owner: quarantine forbids the result from
+progressing, it does not destroy the current work. The consequence is a
+durable `quarantined_at` column rather than an overloaded NEEDS_REVIEW,
+because leaving the process alive means the status must stay RUNNING and the
+existing `expected_status=RUNNING` CAS must keep working (§3.2). The migration
+is cheaper than mixing process state with an operator prohibition. The
+quarantine/completion race is resolved by one CAS at the MERGING edge (§3.3).
+
+## 9. The five distinctions this design must preserve
 
 Stated separately because each is a place where an implementation could
 plausibly drift into the wrong behaviour:
@@ -320,3 +394,7 @@ plausibly drift into the wrong behaviour:
    a distinct reason — never a hidden fallback to a full regeneration. A
    silent regeneration is the failure mode this whole document exists to
    remove, and it must not reappear as an error path.
+5. **Nothing here terminates a running execution.** Quarantine forbids
+   progression; `maestro stop` drains. Forced termination is a separate
+   explicit operation. If an implementation ever finds itself calling
+   `terminate()` from either path, it has reintroduced the defect.
