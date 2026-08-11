@@ -510,8 +510,24 @@
       отключается, выход — аудируемый ручной approve); `postmortem:` —
       верхнеуровневая секция project config только с retention/GC, без
       `enabled`, корень архива привязан к `db_dir`. Осталась реализация
-      отдельным PR (гейт §4, exit-пути §5, архив §6, миграция 23, матрица
-      тестов §8 — 20 строк).
+      Реализация сделана (ветка `feat/done-completeness-gate`): `maestro/
+      completeness.py` (чистый вердикт, 4 причины блока, фаза одобрения
+      `completeness` + правило свежести evidence), `maestro/postmortem.py`
+      (захват в `on_collected`, `backup()`-снапшот, атомарный коммит
+      переименованием, retention), миграции **23** (`postmortem_archives`) и
+      **24** (расширение CHECK у `gate_approvals.phase`), контракт
+      `EvidenceCaptureFailed` в `finalize.py`, гейт первым guard'ом в
+      `_handle_success`, два операторских пути
+      (`completeness_accept_partial`, `postmortem_recapture`), страж cleanup,
+      `maestro workstream-recapture` и `maestro postmortem --gc`.
+      Побочно исправлен дефект, из-за которого одобрение молча терялось:
+      `INSERT OR IGNORE` глотал нарушение CHECK так же, как дубликат, —
+      переведено на целевой `ON CONFLICT(...) DO NOTHING`.
+      Зависимость от #169a подтверждена на практике: `stop_reason` доезжает в
+      сообщение блока и в манифест как контекст, вердикт по-прежнему решают
+      только счётчики. **Продолжение исполнения оставшихся задач (догон) в
+      этот объём НЕ входит и остаётся за #166** — здесь нет и не должно быть
+      механизма для него.
 
 - [ ] **#165 rework-dangling-deps-retries: dangling deps между ревизиями + детерминированный fail без ре-декомпозиции** (P1, зависит от сигнала #169a) @owner:github:andrei-shtanakov @id:rework-dangling-deps-retries @blocked_by:todo://maestro/spec-runner-exit-contract-bump
       Два наблюдения на живом rework-цикле (третья ревизия одного workstream).
@@ -550,6 +566,12 @@
       неизбежно, каждый прерванный WS оставляет durable resumable state и
       сохранённые логи, а возврат в работу **resume существующего `tasks.md`, а
       не regen**. Архитектурный этап — держать отдельно от трёх фиксов выше.
+      Граница с #164 зафиксирована при его реализации: #164 даёт только
+      approve (принять неполный результат, ничего не исполняя) и rework
+      (обычная ре-декомпозиция); «догнать оставшиеся задачи» — второй смысл
+      READY и целиком ответственность этого пункта. Имя для своего
+      resume_reason #166 выбирает сам: `completeness_accept_partial` занят
+      approve-путём и намеренно НЕ означает исполнение.
 
 ---
 

@@ -218,16 +218,31 @@ class TestRecordRework:
 
 class TestResumeConstants:
     def test_known_resume_reasons(self) -> None:
+        """The dispatch is exhaustive over this set, so additions are reviewed.
+
+        The five members are three different kinds of resume and must not be
+        confused: the two rework reasons re-decompose through DECOMPOSING and
+        respawn the author, `verification_reverify` re-enters VERIFYING, and
+        #164's two run NOTHING — `completeness_accept_partial` continues the
+        delivery tail over an accepted incomplete result, while
+        `postmortem_recapture` retries only the evidence capture.
+        """
         from maestro.domain.resume import (
             KNOWN_RESUME_REASONS,
+            RESUME_ACCEPT_PARTIAL,
             RESUME_OPERATOR_REWORK,
+            RESUME_RECAPTURE,
         )
 
         assert RESUME_OPERATOR_REWORK == "operator_rework"
+        assert RESUME_ACCEPT_PARTIAL == "completeness_accept_partial"
+        assert RESUME_RECAPTURE == "postmortem_recapture"
         assert {
             "verification_rework",
             "verification_reverify",
             "operator_rework",
+            "completeness_accept_partial",
+            "postmortem_recapture",
         } == KNOWN_RESUME_REASONS
 
 

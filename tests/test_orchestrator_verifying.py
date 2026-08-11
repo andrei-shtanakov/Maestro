@@ -11,6 +11,7 @@ tests that exercise the author respawn swap in a fake backend and assert on
 
 import hashlib
 import json
+import sqlite3
 import subprocess
 import sys
 from collections.abc import AsyncIterator
@@ -260,7 +261,59 @@ async def _create_workstream(
         **fields,  # type: ignore[arg-type]
     )
     await db.create_workstream(ws)
+    await _seed_completeness_evidence(db)
     return ws
+
+
+async def _seed_completeness_evidence(db: Database) -> None:
+    """Satisfy the always-on completeness gate (#164).
+
+    These are Stage-B tests: they drive `_handle_success` directly, so nothing
+    ran finalization and no post-mortem archive exists. Delivery is now gated
+    on that evidence, so a complete one is written here — the equivalent of
+    the capture a real run performs inside finalization. Written through the
+    production `capture_archive` so the gate reads a real manifest.
+    """
+    from maestro.models import PostmortemConfig
+    from maestro.postmortem import capture_archive
+
+    root = Path(db.db_path).parent / "postmortem"
+    source = root.parent / "seed-spec"
+    source.mkdir(parents=True, exist_ok=True)
+    state_db = source / ".executor-maestro-state.db"
+    if not state_db.exists():
+        conn = sqlite3.connect(str(state_db))
+        try:
+            conn.execute("CREATE TABLE tasks (task_id TEXT PRIMARY KEY)")
+            conn.commit()
+        finally:
+            conn.close()
+    archive = capture_archive(
+        spec_dir=source,
+        root=root,
+        identity={
+            "workstream_id": WORKSTREAM_ID,
+            "execution_id": "exec-seed",
+            "attempt": 0,
+            "backend_id": "local",
+            "transport": "local",
+            "exit_code": 0,
+            "branch": "feature/z1",
+            "head_sha": "c" * 40,
+            "captured_at": "2026-08-11T00:00:00Z",
+            "last_run_stop_reason": None,
+            "last_run_stop_detail": None,
+        },
+        counters={"done": 1, "planned": 1, "noop_done": 0, "state_total": 1},
+        config=PostmortemConfig(),
+    )
+    await db.record_postmortem_archive(
+        WORKSTREAM_ID,
+        "exec-seed",
+        path=str(archive.path),
+        bytes_written=archive.bytes_written,
+        truncated=archive.truncated,
+    )
 
 
 def _evidence_commits(worktree: Path, run_id: str) -> list[str]:

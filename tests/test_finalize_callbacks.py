@@ -2,7 +2,7 @@ from datetime import datetime
 
 import pytest
 
-from maestro.execution.finalize import finalize_handle
+from maestro.execution.finalize import EvidenceCaptureFailed, finalize_handle
 from maestro.execution.models import (
     CollectResult,
     ExecutionHandleRef,
@@ -70,6 +70,58 @@ async def test_collect_failure_skips_cleanup_and_preserves():
     assert not fin.collect_succeeded
     assert not fin.cleanup_attempted
     assert fin.collect_error == "conflict"
+
+
+@pytest.mark.anyio
+async def test_on_collected_failure_skips_cleanup_and_preserves():
+    """A failing `on_collected` preserves the workspace, like a failed collect.
+
+    #164 hangs post-mortem capture off this callback, and the capture runs at
+    the only moment the evidence still exists — after collect, before the
+    remote `rm -rf`. If capture fails and cleanup proceeded anyway, the run
+    would destroy the only copy of the logs and look successful doing it.
+    """
+    h = _Handle()
+
+    async def boom():
+        raise EvidenceCaptureFailed("archive unwritable")
+
+    fin = await finalize_handle(h, on_terminal=_acb(), on_collected=boom)
+
+    assert h.calls == ["wait", "collect"]  # NO cleanup
+    assert not fin.cleanup_attempted
+    assert fin.archive_error == "archive unwritable"
+    assert fin.collect_error is None  # collect itself was fine
+    assert fin.collect_succeeded
+
+
+@pytest.mark.anyio
+async def test_other_on_collected_errors_still_propagate():
+    """Only capture failures are absorbed; a failed durable write is a crash.
+
+    `on_collected` also persists the collected phase, and Mode 1's scheduler
+    depends on that failure surfacing so the handle is honestly left at
+    `terminal` instead of reporting a finalization that never happened.
+    """
+    h = _Handle()
+
+    async def boom():
+        raise RuntimeError("simulated crash before the collected write lands")
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await finalize_handle(h, on_terminal=_acb(), on_collected=boom)
+
+    assert h.calls == ["wait", "collect"]  # still NO cleanup
+
+
+@pytest.mark.anyio
+async def test_successful_finalization_reports_no_archive_error():
+    h = _Handle()
+
+    fin = await finalize_handle(h, on_terminal=_acb(), on_collected=_acb())
+
+    assert fin.archive_error is None
+    assert fin.cleaned
 
 
 async def _noop():

@@ -1699,6 +1699,34 @@ class GatesConfig(BaseModel):
     )
 
 
+class PostmortemConfig(BaseModel):
+    """Retention policy for post-mortem archives (#164, spec §6.3).
+
+    Retention/GC settings ONLY. There is deliberately no `enabled` key: the
+    capture-before-destruction rule is the invariant #164 exists to
+    establish, and a config switch that turns it off would recreate the
+    incident with one line of YAML. An absent `postmortem:` block therefore
+    means *defaults*, not *off* — the opposite reading to `gates:`, which is
+    an optional policy rather than an invariant.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    keep_per_workstream: int = Field(
+        default=5,
+        ge=1,
+        description="Archives retained per workstream; older ones are pruned",
+    )
+    max_archive_bytes: int = Field(
+        default=64 * 1024 * 1024,
+        ge=1,
+        description=(
+            "Byte cap for the copied logs. Logs are taken newest-first until "
+            "the cap; the manifest records the truncation."
+        ),
+    )
+
+
 class OrchestratorConfig(BaseModel):
     """Configuration for multi-process orchestration.
 
@@ -1767,6 +1795,13 @@ class OrchestratorConfig(BaseModel):
         description=(
             "Domain profile (Stage B). Absent -> legacy behavior, "
             "byte-identical: no VERIFYING phase, no evidence machinery."
+        ),
+    )
+    postmortem: PostmortemConfig = Field(
+        default_factory=PostmortemConfig,
+        description=(
+            "Post-mortem archive retention (#164). Not optional — an absent "
+            "block means defaults, not disabled."
         ),
     )
 

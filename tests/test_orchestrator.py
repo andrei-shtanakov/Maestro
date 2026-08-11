@@ -2515,12 +2515,14 @@ class TestHandleSuccessMergeGating:
         mock_workspace_mgr,
         mock_decomposer,
         mock_pr_manager,
+        seed_postmortem,
     ) -> None:
         orch, db = await self._orch_db(
             tmp_path, True, mock_workspace_mgr, mock_decomposer, mock_pr_manager
         )
         try:
             await db.create_workstream(self._seed("a"))
+            await seed_postmortem(db, "a")
             orch._merge_into_base = MagicMock()  # success = no raise
             await orch._handle_success("a", MagicMock())
             assert (await db.get_workstream("a")).status == WorkstreamStatus.DONE
@@ -2538,6 +2540,7 @@ class TestHandleSuccessMergeGating:
         mock_workspace_mgr,
         mock_decomposer,
         mock_pr_manager,
+        seed_postmortem,
     ) -> None:
         from maestro.git import MergeConflictError
 
@@ -2551,6 +2554,7 @@ class TestHandleSuccessMergeGating:
                 raise MergeConflictError("CONFLICT in README.md")
 
             orch._merge_into_base = boom
+            await seed_postmortem(db, "b")
             await orch._handle_success("b", MagicMock())
             w = await db.get_workstream("b")
             assert w.status == WorkstreamStatus.NEEDS_REVIEW
@@ -2568,6 +2572,7 @@ class TestHandleSuccessMergeGating:
         mock_workspace_mgr,
         mock_decomposer,
         mock_pr_manager,
+        seed_postmortem,
     ) -> None:
         orch, db = await self._orch_db(
             tmp_path, False, mock_workspace_mgr, mock_decomposer, mock_pr_manager
@@ -2575,6 +2580,7 @@ class TestHandleSuccessMergeGating:
         try:
             await db.create_workstream(self._seed("c"))
             orch._merge_into_base = MagicMock()
+            await seed_postmortem(db, "c")
             await orch._handle_success("c", MagicMock())
             assert (await db.get_workstream("c")).status == WorkstreamStatus.DONE
             # Merge is actually invoked even when no PR is created.
@@ -2590,6 +2596,7 @@ class TestHandleSuccessMergeGating:
         mock_workspace_mgr,
         mock_decomposer,
         mock_pr_manager,
+        seed_postmortem,
     ) -> None:
         orch, db = await self._orch_db(
             tmp_path, True, mock_workspace_mgr, mock_decomposer, mock_pr_manager
@@ -2603,6 +2610,7 @@ class TestHandleSuccessMergeGating:
                 captured["completed_at_merge"] = orch._stats.completed
 
             orch._merge_into_base = MagicMock(side_effect=record)
+            await seed_postmortem(db, "a")
             await orch._handle_success("a", MagicMock())
             # merge ran before completed++
             assert captured["completed_at_merge"] == 0
@@ -2732,7 +2740,12 @@ class TestExPostResume:
 
     @pytest.mark.anyio
     async def test_resume_reaches_done_without_respawn(
-        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        seed_postmortem,
     ) -> None:
         sha = "a" * 40
         orch, db = await self._orch_db(
@@ -2740,6 +2753,7 @@ class TestExPostResume:
         )
         try:
             await db.create_workstream(self._seed_ready("z1", sha))
+            await seed_postmortem(db, "z1", head_sha=sha)
             mock_workspace_mgr.workspace_exists.return_value = True
             orch._workspace_head = AsyncMock(return_value=sha)
             orch._merge_into_base = MagicMock()
@@ -2761,7 +2775,12 @@ class TestExPostResume:
 
     @pytest.mark.anyio
     async def test_marker_survives_until_done(
-        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        seed_postmortem,
     ) -> None:
         """error_message must still hold the marker at MERGING/PR_CREATED:
         recovery resets those states to READY, and the next run needs the
@@ -2778,6 +2797,7 @@ class TestExPostResume:
         )
         try:
             await db.create_workstream(self._seed_ready("z1", sha))
+            await seed_postmortem(db, "z1", head_sha=sha)
             mock_workspace_mgr.workspace_exists.return_value = True
             orch._workspace_head = AsyncMock(return_value=sha)
             orch._merge_into_base = MagicMock()
@@ -2804,7 +2824,12 @@ class TestExPostResume:
 
     @pytest.mark.anyio
     async def test_pr_manager_error_appends_note_preserves_marker(
-        self, tmp_path, mock_workspace_mgr, mock_decomposer, mock_pr_manager
+        self,
+        tmp_path,
+        mock_workspace_mgr,
+        mock_decomposer,
+        mock_pr_manager,
+        seed_postmortem,
     ) -> None:
         """Regression for Finding 2 (marker clobber): on `PRManagerError`,
         `_handle_success` used to overwrite `error_message` with just the
@@ -2823,6 +2848,7 @@ class TestExPostResume:
         )
         try:
             await db.create_workstream(self._seed_ready("z5", sha))
+            await seed_postmortem(db, "z5", head_sha=sha)
             mock_workspace_mgr.workspace_exists.return_value = True
             orch._workspace_head = AsyncMock(return_value=sha)
             orch._merge_into_base = MagicMock()

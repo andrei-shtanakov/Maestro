@@ -1693,6 +1693,140 @@ def workstream_approve_command(
     )
 
 
+@app.command("postmortem")
+def postmortem_command(
+    config_file: Annotated[Path, typer.Argument(help="Path to project.yaml")],
+    gc: Annotated[
+        bool,
+        typer.Option("--gc", help="Apply the retention policy and prune old archives"),
+    ] = False,
+    db: Annotated[
+        Path | None,
+        typer.Option("--db", "-d", help="Path to SQLite database file"),
+    ] = None,
+) -> None:
+    """Operator-driven post-mortem archive retention (#164, spec §6.3).
+
+    Applies the SAME policy the orchestrator applies after each successful
+    capture (`postmortem.keep_per_workstream`), for the case where archives
+    accumulated before the policy was tightened or a prune failed at the time.
+    Never touches the newest archive of any workstream.
+
+    Examples:
+        maestro postmortem project.yaml --gc
+        maestro postmortem project.yaml --gc --db run/maestro.db
+    """
+    if not gc:
+        console.print(
+            "[yellow]Nothing to do: pass --gc to apply the retention policy.[/yellow]"
+        )
+        raise typer.Exit(1)
+    db_path = db or DEFAULT_DB_PATH
+
+    async def _run() -> tuple[int, int]:
+        from maestro.config import load_orchestrator_config
+        from maestro.database import Database
+        from maestro.postmortem import prune_archives
+
+        config = load_orchestrator_config(config_file)
+        keep = config.postmortem.keep_per_workstream
+        root = Path(db_path).parent / "postmortem"
+        database = Database(db_path)
+        await database.connect()
+        try:
+            workstreams = await database.get_all_workstreams()
+            pruned = 0
+            for workstream in workstreams:
+                removed = prune_archives(root, workstream.id, keep=keep)
+                for path in removed:
+                    execution_id = (
+                        path.name.split("-", 1)[1] if "-" in path.name else path.name
+                    )
+                    await database.delete_postmortem_archive(
+                        workstream.id, execution_id
+                    )
+                pruned += len(removed)
+            return pruned, keep
+        finally:
+            await database.close()
+
+    try:
+        pruned, keep = asyncio.run(_run())
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(
+        f"[green]Pruned {pruned} post-mortem archive(s); "
+        f"keeping the newest {keep} per workstream.[/green]"
+    )
+
+
+@app.command("workstream-recapture")
+def workstream_recapture_command(
+    workstream_id: Annotated[str, typer.Argument(help="Workstream ID to recapture")],
+    db: Annotated[
+        Path | None,
+        typer.Option("--db", "-d", help="Path to SQLite database file"),
+    ] = None,
+) -> None:
+    """Retry ONLY post-mortem evidence capture for a blocked workstream (#164).
+
+    Use after a `post-mortem capture failed` block: the run itself finished and
+    its worktree is intact, only the archive write failed (an unwritable
+    archive root, no space). This re-runs that one step for the same execution
+    and then continues the normal success pipeline — no executor, no
+    decomposition, no new sha.
+
+    This is NOT an approval: nothing about the result is accepted here. Fix
+    whatever made the archive root unwritable first, then run this.
+
+    Examples:
+        maestro workstream-recapture w-contracts --db run/maestro.db
+    """
+    db_path = db or DEFAULT_DB_PATH
+
+    async def _run() -> str:
+        from maestro.database import Database
+        from maestro.models import WorkstreamStatus
+        from maestro.postmortem import parse_recapture_marker
+
+        database = Database(db_path)
+        await database.connect()
+        try:
+            workstream = await database.get_workstream(workstream_id)
+            if workstream is None:
+                raise ValueError(f"workstream '{workstream_id}' not found")
+            if workstream.status != WorkstreamStatus.NEEDS_REVIEW:
+                raise ValueError(
+                    f"workstream '{workstream_id}' is {workstream.status}, "
+                    f"only NEEDS_REVIEW can be requeued for recapture"
+                )
+            execution_id = parse_recapture_marker(workstream.error_message)
+            if execution_id is None:
+                raise ValueError(
+                    f"workstream '{workstream_id}' carries no recapture token — "
+                    f"it was not blocked by a post-mortem capture failure, so "
+                    f"there is no capture to retry"
+                )
+            await database.requeue_for_recapture(workstream_id)
+            return execution_id
+        finally:
+            await database.close()
+
+    try:
+        execution_id = asyncio.run(_run())
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(
+        f"[green]Workstream '{workstream_id}' requeued to recapture evidence "
+        f"for execution {execution_id} (NEEDS_REVIEW -> READY).[/green]"
+    )
+    console.print(
+        f"Resume with: maestro orchestrate <project.yaml> --db {db_path} --resume"
+    )
+
+
 async def _rework_workstream(
     db: "Database",
     workstream_id: str,

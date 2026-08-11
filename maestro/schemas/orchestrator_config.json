@@ -657,6 +657,28 @@
       "title": "NotificationConfig",
       "type": "object"
     },
+    "PostmortemConfig": {
+      "additionalProperties": false,
+      "description": "Retention policy for post-mortem archives (#164, spec \u00a76.3).\n\nRetention/GC settings ONLY. There is deliberately no `enabled` key: the\ncapture-before-destruction rule is the invariant #164 exists to\nestablish, and a config switch that turns it off would recreate the\nincident with one line of YAML. An absent `postmortem:` block therefore\nmeans *defaults*, not *off* \u2014 the opposite reading to `gates:`, which is\nan optional policy rather than an invariant.",
+      "properties": {
+        "keep_per_workstream": {
+          "default": 5,
+          "description": "Archives retained per workstream; older ones are pruned",
+          "minimum": 1,
+          "title": "Keep Per Workstream",
+          "type": "integer"
+        },
+        "max_archive_bytes": {
+          "default": 67108864,
+          "description": "Byte cap for the copied logs. Logs are taken newest-first until the cap; the manifest records the truncation.",
+          "minimum": 1,
+          "title": "Max Archive Bytes",
+          "type": "integer"
+        }
+      },
+      "title": "PostmortemConfig",
+      "type": "object"
+    },
     "RoleScopes": {
       "properties": {
         "write": {
@@ -1183,6 +1205,10 @@
       ],
       "default": null,
       "description": "Domain profile (Stage B). Absent -> legacy behavior, byte-identical: no VERIFYING phase, no evidence machinery."
+    },
+    "postmortem": {
+      "$ref": "#/$defs/PostmortemConfig",
+      "description": "Post-mortem archive retention (#164). Not optional \u2014 an absent block means defaults, not disabled."
     }
   },
   "required": [

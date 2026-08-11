@@ -17,7 +17,9 @@ from maestro.domain.profile import (
 )
 from maestro.domain.resume import (
     KNOWN_RESUME_REASONS,
+    RESUME_ACCEPT_PARTIAL,
     RESUME_OPERATOR_REWORK,
+    RESUME_RECAPTURE,
     RESUME_REVERIFY,
     RESUME_REWORK,
 )
@@ -40,7 +42,9 @@ from maestro.domain.verifier import (
 __all__ = [
     "ALLOWED_PLACEHOLDERS",
     "KNOWN_RESUME_REASONS",
+    "RESUME_ACCEPT_PARTIAL",
     "RESUME_OPERATOR_REWORK",
+    "RESUME_RECAPTURE",
     "RESUME_REVERIFY",
     "RESUME_REWORK",
     "CommandVerifier",
