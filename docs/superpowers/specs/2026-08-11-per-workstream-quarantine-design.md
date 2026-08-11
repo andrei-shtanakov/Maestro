@@ -1,6 +1,8 @@
 # Per-workstream quarantine + resume without regeneration (#166) — design
 
-**Status:** proposed (revision 1, 2026-08-11). Boundary with #164 was fixed
+**Status:** approved (revision 2, 2026-08-11 — all four §8 questions answered
+by the owner and folded in; one of them corrected the design: freeze is
+per-workstream, not process-wide). Boundary with #164 was fixed
 when that shipped: #164 gives approve (accept an incomplete result, execute
 nothing) and rework (ordinary re-decomposition); **catching up the remaining
 work is this document's subject**, and #164 deliberately left the naming free.
@@ -74,25 +76,39 @@ Deliberately a separate verb from `maestro stop`, which keeps meaning "stop
 the orchestrator". Overloading it with a scope argument would make the
 dangerous form the default one.
 
-### 3.2 Freeze dispatch
+### 3.2 Quarantine atomically freezes that workstream
 
-Quarantine alone is not enough: the reason to kill the process was usually
-"stop *everything* before dependents start from a bad base". So a second,
-process-level verb that is **not** a kill:
+Quarantine and "stop dispatching it" are **one transaction, never two**. A
+state where the quarantine is recorded but the dispatcher may still start the
+workstream is exactly the race the feature exists to remove, and a two-step
+version would leave a window for it on every crash.
 
-`maestro orchestrate --freeze` / `maestro freeze <project.yaml>`: no new
-workstream is dispatched; in-flight executions run to completion. The DAG
-stops advancing while the operator investigates. Unfreezing resumes dispatch.
+This needs no new storage, which is the pleasant consequence of an existing
+invariant: **the dispatcher only ever picks up READY**, so a single guarded
+transition into NEEDS_REVIEW *is* the freeze. The quarantine reason rides in
+`error_message` like every other block, and the operator's exits are the verbs
+that already exist (rework, continue — §4, recapture).
 
-Freeze is durable (a row, not a memory flag) so a restart does not silently
-resume dispatching into an unresolved incident.
+**Freeze is per-workstream, not process-wide** (owner decision, §8.2). The
+process-wide switch proposed in revision 1 was unnecessary: a dependent cannot
+start while its dependency is not DONE, so the DAG already holds the subtree,
+and an automatic freeze of descendants would add durable state whose unfreezing
+is its own problem. Healthy independent workstreams keep running, which is the
+whole point.
 
-### 3.3 Why this removes most kills
+Revision 1 justified a global freeze with "stop everything before dependents
+start from a bad base". That rationale died with #164: dependents only started
+in the incident because the workstream reached a **false** DONE, and a DONE
+that lies is now blocked by the completeness gate. What is left is genuinely
+per-workstream.
 
-The pilot's sequence becomes: freeze dispatch (dependents cannot start) →
-quarantine `w-adapters` (the false-DONE one stops) → `w-events` and
-`w-verifier` finish normally. No healthy execution is interrupted, and the
-watchdog never needs the process-level hammer.
+### 3.3 Why this removes the reason to kill
+
+The pilot's sequence becomes: quarantine `w-adapters` (its execution stops,
+its dispatch is frozen by the same write) → `w-events` and `w-verifier` finish
+normally → dependents of `w-adapters` stay blocked because it is not DONE. No
+healthy execution is interrupted, and the watchdog never needs the
+process-level hammer.
 
 ## 4. Half B — resume an interrupted workstream without regeneration
 
@@ -143,40 +159,81 @@ never to a silent regeneration.
 - It does not resurrect an approval. A continuation produces new commits,
   which move the SHA and void any prior approval — the existing rule.
 
-### 4.4 Evidence for an interrupted run
+### 4.4 Evidence for an interrupted run — captured at recovery
 
-A hard kill skips finalization, so no archive is written (§2.3). Two options,
-and the spec must pick one:
+A hard kill skips finalization, so #164's archive is never written (§2.3).
+Recovery therefore captures it (owner decision, §8.1), and the ordering is the
+load-bearing part: **capture runs before cleanup, before any rework, and
+before a new dispatch** — those are precisely the operations that destroy or
+overwrite what is being captured.
 
-- **(a) Capture at recovery.** When `_recover_stranded_workstreams` finds a
-  stranded RUNNING with a dead process, run the #164 capture before doing
-  anything else. The worktree is still there and the state DB is current, so
-  the evidence is real; the cost is one capture per stranded workstream at
-  startup.
-- **(b) Leave it.** The worktree is preserved anyway, so the data is not lost
-  — only unarchived.
+Four properties, each with a reason:
 
-Recommend **(a)**: the operator's complaint was that a kill left them doing
-manual worktree forensics, and an archive is exactly the artifact that removes
-that. It also makes "interrupted" and "finished" produce the same shape of
-evidence, which matters for #164's gate reading a manifest rather than a
-worktree. Open question 1 asks the owner to confirm.
+- **Through the existing post-mortem core**, not a second implementation.
+  `_capture_evidence` already takes an explicit evidence key and a workspace
+  (it was factored that way for `workstream-recapture`), so recovery is a
+  third caller rather than a parallel path that could drift.
+- **Idempotent.** Recovery can run repeatedly — a restart loop, an operator
+  re-running `orchestrate --resume` — and must not multiply archives or fail
+  on the second pass. The archive is keyed by execution and the row upserts,
+  so a repeat reconciles.
+- **Marked with its source.** The manifest records `captured_by: recovery`, so
+  an operator reading the evidence knows it was taken after an interruption
+  rather than at an orderly finalization; the two say different things about
+  how complete the executor state is.
+- **An expected capture failure preserves the worktree and hands the operator
+  `RESUME_RECAPTURE`** — the #164 path — instead of silently proceeding down a
+  destructive route. This is the same rule finalization already follows: if
+  the evidence cannot be saved, nothing that would destroy it may run.
+
+### 4.5 Counting continuations without capping them
+
+Every continuation is an explicit, audited operator action, not an automatic
+loop, so there is **no numeric ceiling** (owner decision, §8.4). Forbidding the
+N+1th without new knowledge would only move the operator to a workaround.
+
+Continuations are counted and surfaced: the count appears in
+`maestro workstreams`, and `workstream-continue` warns when it is already
+high. Automatic retries remain governed by the existing retry budget and the
+#165 classifier — this family is a different mechanism and does not borrow
+their limits.
+
+### 4.6 What `maestro stop` must do instead of killing
+
+The global stop keeps its meaning — stop the orchestrator — but must stop
+destroying healthy work (§2.1). Two acceptable shapes, in preference order:
+
+1. **Drain**: freeze new dispatch, let in-flight executions finish, then exit.
+2. **Preserve the path**: if an execution must be ended before it finishes,
+   the workstream is left able to continue — `resume_reason =
+   RESUME_CONTINUE_TASKS` rather than the plain READY that today's `_cleanup`
+   writes, which means regeneration.
+
+Today's `_cleanup` does neither: it terminates every handle and writes plain
+READY, so a routine `maestro stop` discards partial work exactly as the
+watchdog's SIGKILL did. Whichever shape is implemented, the shutdown path must
+not leave a workstream whose only way forward is a full regeneration.
 
 ## 5. State and storage
 
-- **Freeze**: one row per project (`orchestration_freeze`: project, frozen_at,
-  reason, actor) — durable, so a restart honours it.
-- **Quarantine**: no new storage. NEEDS_REVIEW + reason in `error_message` is
-  the existing vocabulary, and the operator's exits are the existing verbs
-  (approve / rework / recapture / — new — continue).
-- **Continuation**: `resume_reason = RESUME_CONTINUE_TASKS`, set by a new
-  `maestro workstream-continue <id>` in one guarded transaction, mirroring
-  `requeue_for_recapture` (#164): a CAS on NEEDS_REVIEW, and the reason
-  written in the same statement so a crash cannot leave a READY workstream
-  that falls through to regeneration.
+**No new table.** Revision 1 proposed an `orchestration_freeze` row; the
+per-workstream decision removes the need, because NEEDS_REVIEW already stops
+dispatch and is already durable, CAS-guarded and audited.
 
-Migration: one additive table (freeze). Next free number to be re-checked at
-implementation — a parallel session may claim one.
+- **Quarantine**: one guarded transition (RUNNING → NEEDS_REVIEW) carrying the
+  reason, plus termination of that workstream's execution. Atomic by
+  construction — the dispatcher cannot pick up a non-READY row.
+- **Continuation**: `resume_reason = RESUME_CONTINUE_TASKS`, set by
+  `maestro workstream-continue <id>` in one CAS transaction on NEEDS_REVIEW,
+  mirroring `requeue_for_recapture` (#164) so a crash cannot leave a READY
+  workstream that falls through to regeneration.
+- **Continuation count**: a counter on the workstream, for the warning in
+  §4.5. Not a limit (§8.4).
+- **Recovery capture**: reuses `postmortem_archives` (#164, migration 23);
+  `captured_by` is a manifest field, not a schema change.
+
+Migration: only the continuation counter is additive schema. Number to be
+re-checked at implementation — a parallel session may claim one.
 
 ## 6. Test matrix
 
@@ -184,8 +241,12 @@ implementation — a parallel session may claim one.
 |---|---|---|
 | 1 | Quarantine one of three running | Only that execution stops; the other two keep running and reach DONE |
 | 2 | Quarantined workstream's worktree | Preserved, with the reason recorded |
-| 3 | Freeze | No new dispatch; in-flight executions finish |
-| 4 | Freeze survives restart | Still frozen after the orchestrator restarts |
+| 3 | Quarantine freezes atomically | The dispatcher never picks up the quarantined workstream, including immediately after the write |
+| 4 | Quarantine survives restart | Still quarantined and undispatched after a restart |
+| 4b | Dependents stay held | Dependents of a quarantined workstream do not start — it is not DONE — without any explicit subtree freeze |
+| 4c | `maestro stop` preserves the path | After a global stop, an interrupted workstream can continue; it is not left needing regeneration |
+| 4d | Recovery capture is idempotent | Running recovery twice yields one archive, marked `captured_by: recovery` |
+| 4e | Recovery capture failure | Worktree preserved; operator gets the `RESUME_RECAPTURE` path; no cleanup, no rework, no dispatch |
 | 5 | Continue after a graceful stop | spec-runner re-dispatched against the existing tasks.md; decomposer/spec-gen **never invoked** |
 | 6 | Continue after a hard kill | Same, via the recovery path |
 | 7 | Continue with a live orphan | Refused → NEEDS_REVIEW with the ambiguity marker; no dispatch |
@@ -195,7 +256,8 @@ implementation — a parallel session may claim one.
 | 11 | Continuation that stops short | Completeness gate blocks it exactly like a first run |
 | 12 | Unknown resume_reason | Still fail-closed to NEEDS_REVIEW (dispatch totality) |
 | 13 | Graceful stop no longer kills healthy work | With freeze+quarantine available, `_cleanup` is reached only on a real shutdown; the shutdown path's own behaviour is asserted unchanged |
-| 14 | Recovery capture (if §4.4a) | A stranded RUNNING with a dead process produces a committed archive before reconciliation |
+| 14 | Recovery capture ordering | A stranded RUNNING with a dead process produces a committed archive BEFORE cleanup, rework or dispatch |
+| 15 | Continuation counter | Counted and surfaced; the N+1th is warned about, never refused |
 
 ## 7. Non-goals
 
@@ -205,20 +267,53 @@ implementation — a parallel session may claim one.
   like every other resume in this family. An orchestrator that resumes
   interrupted work by itself would need a policy for "how many times", which
   is the retry question #165 just answered for a different case.
-- **No partial-DAG scheduling changes.** Freeze is a stop-the-world switch for
-  *dispatch*, not a new scheduling mode.
+- **No new scheduling mode.** Quarantine removes one workstream from dispatch
+  by putting it in a status the dispatcher never picks up; it does not
+  introduce partial-DAG scheduling, priorities or a subtree freeze. Dependents
+  are held by the DAG invariant that already exists, not by new machinery.
 
-## 8. Open questions for the owner
+## 8. Resolved (owner decisions, 2026-08-11)
 
-1. **§4.4** — capture the post-mortem archive at recovery for stranded
-   workstreams (recommended), or leave interrupted runs unarchived?
-2. **Freeze granularity** — process-wide (proposed) or per-workstream-subtree?
-   Subtree freezing sounds more precise but needs a reachability rule over the
-   DAG, and the incident only ever needed "stop everything new".
-3. **Should quarantine imply freeze?** The pilot wanted both together every
-   time. Coupling them is convenient and slightly surprising; recommend
-   keeping them separate verbs with the sequence documented.
-4. **Continuation budget** — spec-runner enforces its own budget per run.
-   Should a continuation carry a Maestro-side ceiling on how many times one
-   workstream may be continued, or is that the operator's business (each
-   continuation being an explicit decision)? Recommend the latter for v1.
+### 8.1 Capture at recovery — yes
+
+Before cleanup, rework or a new dispatch; through the existing post-mortem
+core; idempotent; marked `captured_by: recovery`. An expected capture failure
+preserves the worktree and routes the operator to `RESUME_RECAPTURE` rather
+than silently continuing a destructive path (§4.4).
+
+### 8.2 Freeze is per-workstream — corrects revision 1
+
+The dependent subtree is already held by DAG invariants, so automatically
+freezing descendants would add durable state and a harder unfreeze for no
+gain. Healthy independent workstreams keep running (§3.2). Revision 1's
+process-wide proposal rested on a rationale that #164 had already removed.
+
+### 8.3 Quarantine always implies freeze, atomically
+
+A state where the quarantine is recorded but the dispatcher may still start
+the workstream is inadmissible. Lifting the quarantine and resuming afterwards
+may be separate commands; establishing it may not be split (§3.2).
+
+### 8.4 No numeric cap on continuations
+
+`RESUME_CONTINUE_TASKS` is an explicit audited operator action, not an
+automatic loop. Count and warn; do not forbid the N+1th without new knowledge.
+Automatic retries stay under the existing budget (§4.5).
+
+## 9. The four distinctions this design must preserve
+
+Stated separately because each is a place where an implementation could
+plausibly drift into the wrong behaviour:
+
+1. **Quarantining one workstream does not stop its neighbours.** Independent
+   executions keep running; only the quarantined one is terminated.
+2. **A global `maestro stop` freezes new dispatch and either lets in-flight
+   workstreams finish or preserves `RESUME_CONTINUE_TASKS` for them.** It
+   never leaves a workstream whose only way forward is regeneration.
+3. **Continuation uses the existing spec, worktree and execution state**,
+   passes `probe()` and the #165 validator, and **does not call
+   `generate_spec`**. "Continue" that regenerates is not continue.
+4. **If those preconditions are not proven, fail closed to NEEDS_REVIEW** with
+   a distinct reason — never a hidden fallback to a full regeneration. A
+   silent regeneration is the failure mode this whole document exists to
+   remove, and it must not reappear as an error path.
