@@ -1190,7 +1190,13 @@ class TestBackgroundGeneration:
         mock_db.update_workstream_status = AsyncMock(side_effect=hang_on_pid)
 
         await orchestrator._spawn_ready(["z1"])
-        await reached.wait()  # generation is now parked on the pid update
+        # Bounded: an exception raised inside the spawn path before this event
+        # is set would otherwise hang the whole suite instead of failing here.
+        # That has happened (the _dispatch_execution extraction), and a hang
+        # says nothing about which line broke.
+        await asyncio.wait_for(
+            reached.wait(), timeout=10
+        )  # generation is now parked on the pid update
         # Process is spawned + registered but the pid-update await is
         # still pending — the exact orphan window.
         assert "z1" in orchestrator._running
@@ -1242,7 +1248,11 @@ class TestBackgroundGeneration:
         mock_db.update_workstream_status = AsyncMock(side_effect=hang_on_pid)
 
         await orchestrator._spawn_ready(["z2"])
-        await reached.wait()
+        # Bounded: an exception raised inside the spawn path before this event
+        # is set would otherwise hang the whole suite instead of failing here.
+        # That has happened (the _dispatch_execution extraction), and a hang
+        # says nothing about which line broke.
+        await asyncio.wait_for(reached.wait(), timeout=10)
         assert "z2" in orchestrator._running
 
         await orchestrator._cleanup()

@@ -156,3 +156,58 @@ class TestCounterOnAcceptedDispatch:
             )
 
         assert (await db.get_workstream("w1")).continuation_count == 0
+
+
+class TestDenominatorSurvivesContinuation:
+    """`subtask_total=None` must mean "leave it alone", not "write NULL".
+
+    A continuation regenerates nothing, so the planned denominator is still the
+    one captured after the original spec generation. Writing NULL would make
+    the completeness gate (#164) see an uncaptured total and fail closed — a
+    continuation would then be unable to deliver, for a reason invented by the
+    continuation itself.
+    """
+
+    async def test_denominator_is_preserved_across_a_continuation(
+        self, db: Database
+    ) -> None:
+        await db.create_workstream(
+            Workstream(
+                id="w1",
+                title="W",
+                description="d",
+                branch="feature/w1",
+                status=WorkstreamStatus.READY,
+                subtask_total=9,
+            )
+        )
+
+        await db.update_workstream_status(
+            "w1",
+            WorkstreamStatus.RUNNING,
+            expected_status=WorkstreamStatus.READY,
+            increment_continuation=True,
+        )
+
+        ws = await db.get_workstream("w1")
+        assert ws.subtask_total == 9
+        assert ws.continuation_count == 1
+
+    async def test_an_explicit_none_is_not_silently_written(self, db: Database) -> None:
+        """The updater only writes fields it was given; absence != NULL."""
+        await db.create_workstream(
+            Workstream(
+                id="w1",
+                title="W",
+                description="d",
+                branch="feature/w1",
+                status=WorkstreamStatus.READY,
+                subtask_total=4,
+            )
+        )
+
+        await db.update_workstream_status(
+            "w1", WorkstreamStatus.RUNNING, expected_status=WorkstreamStatus.READY
+        )
+
+        assert (await db.get_workstream("w1")).subtask_total == 4

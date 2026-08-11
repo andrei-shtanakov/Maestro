@@ -40,11 +40,17 @@ from maestro.completeness import (
     classify_completeness,
     completeness_approval_is_fresh,
 )
+from maestro.continuation import (
+    ContinuationVerdict,
+    classify_continuation_readiness,
+    describe_continuation_count,
+)
 from maestro.database import ConcurrentModificationError, Database
 from maestro.decomposer import ProjectDecomposer
 from maestro.domain import (
     KNOWN_RESUME_REASONS,
     RESUME_ACCEPT_PARTIAL,
+    RESUME_CONTINUE_TASKS,
     RESUME_OPERATOR_REWORK,
     RESUME_RECAPTURE,
     RESUME_REVERIFY,
@@ -118,6 +124,7 @@ from maestro.scope_gate import build_scope_escape_reason, find_escapes, normaliz
 from maestro.spec_runner import read_executor_state, read_planned_total
 from maestro.tasks_spec import (
     SELF_CONTAINED_DEPENDENCIES_INSTRUCTION,
+    DanglingDependency,
     build_dangling_dependency_error,
     find_dangling_dependencies,
 )
@@ -1614,6 +1621,11 @@ class Orchestrator:
             )
             return
         rework_addendum: str | None = None
+        if workstream.resume_reason == RESUME_CONTINUE_TASKS:
+            # #166 B: run the tasks that are missing, over the existing
+            # tasks.md. No regeneration, no author respawn.
+            await self._resume_continue_tasks(workstream)
+            return
         if workstream.resume_reason == RESUME_RECAPTURE:
             # #164: retry ONLY the evidence capture for the same execution.
             await self._resume_recapture(workstream)
@@ -2787,6 +2799,137 @@ class Orchestrator:
         )
         await self._handle_success(workstream.id, workspace)
         return True
+
+    async def _resume_continue_tasks(self, workstream: Workstream) -> None:
+        """Re-dispatch spec-runner over the existing tasks.md (#166 B, §4.2).
+
+        The four preconditions were already checked when the operator ran
+        `workstream-continue`, and they are checked AGAIN here because that
+        earlier answer does not close the window: between the two, a live
+        process can appear, the worktree can vanish, or tasks.md can change.
+        The check that matters is this one — the earlier one only buys the
+        operator a fast, readable refusal.
+
+        A refusal parks the workstream back in NEEDS_REVIEW with the specific
+        reason, clears the resume marker so the next loop does NOT retry by
+        itself (only a fresh `workstream-continue` may), calls no spawner and
+        no spec generation, and does not touch the continuation counter.
+        """
+        workstream_id = workstream.id
+        verdict = await self._continuation_readiness(workstream)
+        if not verdict.ok:
+            reason = f"continuation refused ({verdict.reason}): {verdict.message}"
+            self._logger.warning(
+                "workstream.continuation.refused workstream=%s reason=%s",
+                workstream_id,
+                verdict.reason,
+            )
+            await self._transition(
+                workstream_id,
+                WorkstreamStatus.NEEDS_REVIEW,
+                expected_status=WorkstreamStatus.READY,
+                message=f"continuation refused: {verdict.reason}",
+                error_message=reason,
+                resume_reason=None,
+                process_pid=None,
+                generation_pid=None,
+            )
+            self._stats.failed += 1
+            return
+
+        workspace = self._workspace_mgr.get_workspace_path(workstream_id)
+        warning = describe_continuation_count(workstream.continuation_count)
+        if warning is not None:
+            self._logger.warning(
+                "workstream.continuation.repeated workstream=%s count=%d — %s",
+                workstream_id,
+                workstream.continuation_count,
+                warning,
+            )
+        self._logger.info(
+            "Continuing workstream '%s' over its existing tasks.md "
+            "(no regeneration, no author respawn)",
+            workstream_id,
+        )
+        # `subtask_total=None`: the plan did not change, so the denominator
+        # captured after the original generation still stands. The resume marker
+        # is cleared only AFTER the spawn is accepted — a crash before that must
+        # leave it set, so recovery re-picks the continuation path rather than
+        # treating the workstream as a plain READY and regenerating.
+        await self._dispatch_execution(
+            workstream_id,
+            workstream,
+            workspace,
+            subtask_total=None,
+            clear_resume_reason=True,
+            continuation=True,
+        )
+
+    async def _continuation_readiness(
+        self, workstream: Workstream
+    ) -> ContinuationVerdict:
+        """Gather the four facts and classify them (pure decision elsewhere).
+
+        Facts, not opinions: the worktree from the workspace manager, liveness
+        from the same isolation-aware probe recovery uses, the dangling-dep
+        finding from #165's validator, and the presence of spec-runner's state
+        database.
+        """
+        workstream_id = workstream.id
+        if not self._workspace_mgr.workspace_exists(workstream_id):
+            return classify_continuation_readiness(
+                worktree_exists=False,
+                live_execution=False,
+                dangling=[],
+                state_db_present=False,
+            )
+        workspace = self._workspace_mgr.get_workspace_path(workstream_id)
+        spec_dir = workspace / "spec"
+
+        # Same liveness test recovery uses, in the same order: a local pid
+        # first, then the isolation-aware backend probe for a durable handle.
+        # Reusing it rather than inventing a second answer is deliberate — two
+        # notions of "is it alive" would eventually disagree, and this one
+        # decides whether we start a second spec-runner over one worktree.
+        live = _maybe_live_orphan(workstream.process_pid)
+        if not live:
+            open_handles = await self._db.get_open_execution_handles()
+            workstream_handles = {
+                h["entity_id"]: h
+                for h in open_handles
+                if h["entity_kind"] == "workstream"
+                and h["state"] in ("prepared", "running")
+            }
+            live = await self._probe_open_handle(workstream_id, workstream_handles)
+
+        loop = asyncio.get_running_loop()
+        tasks_path = spec_dir / f"{SPEC_PREFIX}tasks.md"
+        dangling: list[DanglingDependency] = []
+        try:
+            text = await loop.run_in_executor(
+                None, functools.partial(tasks_path.read_text, encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError):
+            # Unreadable tasks.md is not "no dependencies": without the file
+            # there is nothing to continue, which `state_db_present` alone
+            # would not express. Report it as an invalid plan.
+            return classify_continuation_readiness(
+                worktree_exists=True,
+                live_execution=live,
+                dangling=[DanglingDependency(task_id="<file>", missing="tasks.md")],
+                state_db_present=False,
+            )
+        dangling = find_dangling_dependencies(text)
+
+        state_db = spec_dir / f".executor-{SPEC_PREFIX}state.db"
+        state_present = await loop.run_in_executor(None, state_db.is_file)
+
+        return classify_continuation_readiness(
+            worktree_exists=True,
+            live_execution=live,
+            dangling=dangling,
+            state_db_present=state_present,
+        )
 
     async def _resume_recapture(self, workstream: Workstream) -> None:
         """Retry evidence capture for the same execution, then continue.
