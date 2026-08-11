@@ -3,6 +3,65 @@
 ## Unreleased
 
 ### Added
+- **`maestro workstream-continue <id>` — finish an interrupted workstream
+  without starting over (#166 half B).** It re-dispatches spec-runner against
+  the **existing** `spec/maestro-tasks.md`: no regeneration, no author respawn,
+  no new SHA, and the partial work is kept. Before this, whatever ended a run —
+  a stop, a kill, a crash — left the workstream in READY, and READY means
+  "Always regenerate": a fresh spec, a fresh LLM lottery, fresh money.
+  - **It only queues the request.** The orchestrator dispatches it on its next
+    loop. The command checks the preconditions so a refusal is fast and
+    readable, but that answer is not the authority: between it and the spawn a
+    live process can appear, the worktree can vanish or tasks.md can change, so
+    the preconditions are re-checked immediately before spawning and **that
+    late check is the guarantee.**
+  - **Fail-closed on four preconditions**, each with its own reason because each
+    needs a different action: a live process or execution handle (never run a
+    second spec-runner over one worktree), a missing worktree, a tasks.md that
+    fails #165's dangling-dependency validation, and an unreadable executor
+    state database (without it "continue" is a fresh start wearing the wrong
+    name). A refusal parks the workstream in NEEDS_REVIEW, clears the resume
+    marker so the next loop does **not** retry by itself, spawns nothing,
+    generates nothing and leaves the counter untouched. A new explicit
+    `workstream-continue` is accepted once the cause is gone.
+  - **How it differs from its neighbours**, which is the distinction most worth
+    keeping straight:
+
+    | Verb | What it does |
+    |---|---|
+    | `workstream-continue` | Runs the tasks that are **missing**, over the existing plan |
+    | `workstream-approve` | **Accepts** the current incomplete result and delivers it; executes nothing |
+    | `workstream-rework` | **Re-decomposes** from scratch and respawns the author |
+    | `workstream-recapture` | Retries **only** the evidence archiving, for the same execution |
+
+  - **The counter records accepted dispatch attempts**, not requests: it moves
+    inside the `READY -> RUNNING` CAS, so a queued continuation that is later
+    refused, cancelled or lost to a race counts nothing. Past a threshold the
+    operator is **warned, never blocked** — an explicit audited action is not an
+    automatic loop, and forbidding the N+1th without new knowledge would only
+    invite a workaround. Migration 26 adds the column.
+- **Recovery now archives the evidence of interrupted runs (#166 half B).** A
+  hard kill skips finalization, so #164's post-mortem archive was never written
+  for exactly the runs an operator most needs to inspect. Recovery now captures
+  it, and **only for provably-dead / stranded executions**:
+  - a **live orphan** (or a possibly-live handle) is returned to
+    review/monitoring and is **not** archived — a process still writing its
+    state and logs would yield a torn snapshot that looks like evidence; its own
+    finalization captures a consistent archive later;
+  - a stranded **DECOMPOSING** is not archived either, having produced no
+    executor state to preserve;
+  - the decision comes from recovery's existing classification, not from a
+    second probe that could disagree with it.
+  - **Capture completes before anything that could overwrite the evidence** —
+    cleanup, requeue or the `FAILED -> READY` reset that leads to the next
+    dispatch. It records `captured_by: recovery` so interrupted evidence is
+    distinguishable from evidence taken at an orderly finalization, and it is
+    idempotent for the same execution, so a restart loop reconciles instead of
+    multiplying archives. An expected capture failure preserves the worktree and
+    hands the operator the `workstream-recapture` path instead of proceeding.
+
+
+### Added
 - **Per-workstream quarantine (#166 half A).**
   `maestro workstream-quarantine <id> --reason "<why>"` forbids one
   workstream's result from progressing, and **does not kill anything**: a

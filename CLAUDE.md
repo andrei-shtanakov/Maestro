@@ -42,6 +42,7 @@ uv run maestro workstream-rework <workstream-id> --reason "<why>" [--instruction
 uv run maestro workstream-resolve-ambiguity <workstream-id> --statement "<how verified>"  # Resolve a recovery-ambiguity marker after manual cleanup (unblocks rework)
 uv run maestro workstream-quarantine <workstream-id> --reason "<why>"  # Forbid this workstream's result from progressing (#166): no new dispatch, delivery withheld (finished -> NEEDS_REVIEW). Does NOT kill a running execution; NOT a rework, NOT an approval. Refuses once delivery started (MERGING/PR_CREATED/DONE) — there the remedy is a revert
 uv run maestro workstream-unquarantine <workstream-id> --reason "<why>"  # Lift the durable freeze ONLY: no status change, no approval, no resume, nothing started
+uv run maestro workstream-continue <workstream-id>  # Queue a continuation over the EXISTING tasks.md (#166 B): runs the MISSING tasks, regenerates nothing, respawns no author. Only queues — the orchestrator re-checks the preconditions right before spawning, and that late check is the guarantee
 uv run maestro workstream-recapture <workstream-id>  # Retry ONLY post-mortem evidence capture for the same execution after a `post-mortem capture failed` block (no executor, no decomposition); NOT an approval
 uv run maestro postmortem <project.yaml> --gc         # Apply the post-mortem retention policy (same one the orchestrator applies after each capture)
 uv run maestro check-scope <workstream-id> --base <base-branch>  # deterministic scope containment (exit 1 on escape)
@@ -235,6 +236,28 @@ an optimisation that avoids paying for a risk classification on a diff nobody
 will deliver. A row already in MERGING/PR_CREATED/DONE cannot be quarantined —
 the remedy after delivery is a revert.
 
+**Continuation (#166 B).** `resume_reason = continue_tasks` re-dispatches
+spec-runner over the existing plan. Four preconditions are **re-checked
+immediately before the spawn**, and that late check — not the one
+`workstream-continue` ran — is the guarantee: a live process or handle (never a
+second spec-runner over one worktree), a present worktree, a `tasks.md` that
+passes #165's validator, and a readable executor state DB. Any of them
+unproven → NEEDS_REVIEW with a distinct reason, resume marker cleared so the
+next loop does not retry itself, nothing spawned, nothing generated, counter
+untouched. `continuation_count` records **accepted dispatch attempts** (it
+moves inside the `READY -> RUNNING` CAS); past a threshold the operator is
+warned, never blocked.
+
+**Recovery capture is phased (#166 B).** `probe/classify` (unchanged) → decide
+whether capture is needed → one shared checkpoint → the branch's original
+action. Only **provably-dead / stranded** executions are archived: a live orphan
+returns to monitoring un-archived (a process still writing yields a torn
+snapshot), and a stranded DECOMPOSING has no executor state to keep. Capture
+runs **before** cleanup, requeue or the `FAILED -> READY` reset — each of which
+overwrites what is being captured — records `captured_by: recovery`, and is
+idempotent per execution. A capture failure preserves the worktree and routes
+to `workstream-recapture`.
+
 **Shutdown drains (#166).** The first SIGTERM/SIGINT forbids new dispatch and
 keeps the loop monitoring live executions until each finalizes
 (`_should_keep_looping`); it terminates nothing. A **second** signal forces
@@ -260,6 +283,7 @@ policy — unclassified is not unfit.
 | `workstream-recapture` after a capture failure | `postmortem_recapture` | Only the archive step, for the same execution, then the same delivery tail. Not an approval: nothing about the result is accepted. |
 | `workstream-rework` | `operator_rework` | An ordinary re-decomposition through DECOMPOSING — the author is respawned and the spec regenerated. |
 | `workstream-unquarantine` | *(none)* | Lifts the durable quarantine freeze and nothing else — no status change, no approval, no dispatch. Listed here because it is easy to mistake for a resume; it is not one. |
+| `workstream-continue` | `continue_tasks` | Runs the tasks that are **missing**, over the existing `tasks.md` — no regeneration, no author respawn. The only member of this family that executes work. |
 
 The first two refuse rather than falling back to a respawn: a respawn would
 regenerate the spec and mint a new sha, voiding the very approval that got

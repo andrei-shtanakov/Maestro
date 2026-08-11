@@ -2852,7 +2852,15 @@ class Orchestrator:
                 exit_code=None,
                 captured_by="recovery",
             )
-        except PostmortemCaptureError as exc:
+        except Exception as exc:
+            # Deliberately broad. An UNEXPECTED capture error must not silently
+            # prevent recovery from reconciling — that is what happened when
+            # this checkpoint first landed: a raise here escaped into the
+            # recovery loop's generic handler, which logged and moved on,
+            # leaving the workstream stuck in RUNNING forever. Parking it is
+            # fail-closed in the right direction: the evidence is preserved, the
+            # operator has `workstream-recapture`, and nothing that overwrites
+            # the archive has run.
             reason = (
                 f"post-mortem capture at recovery failed: {exc}; "
                 f"{build_recapture_marker(evidence_key)}"
