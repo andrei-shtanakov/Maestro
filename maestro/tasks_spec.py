@@ -115,3 +115,19 @@ def _parse_dependencies(text: str) -> dict[str, list[str]]:
             if body.strip() != _NO_DEPENDENCIES:
                 tasks[current] = _TASK_REF.findall(body)
     return tasks
+
+
+SELF_CONTAINED_DEPENDENCIES_INSTRUCTION = (
+    "Dependency constraint: this run REGENERATES spec/maestro-tasks.md from "
+    "scratch. Every `**Depends on:**` reference must name a task defined in "
+    "the file you are writing now. Do not reference task ids from an earlier "
+    "revision of this file, even when continuing work — they will not exist. "
+    "Carry forward anything still needed as a task in this revision instead."
+)
+"""Prevention only (#165).
+
+Appended to a rework decomposition's description so the model is told the
+constraint up front. It is NOT the guarantee — `find_dangling_dependencies`
+is, and it runs whether or not the instruction was honoured. Kept here, next
+to the validator, so the two never drift into describing different rules.
+"""

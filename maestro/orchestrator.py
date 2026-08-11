@@ -112,9 +112,15 @@ from maestro.postmortem import (
     read_manifest,
 )
 from maestro.pr_manager import PRManager, PRManagerError
+from maestro.retry_policy import describe_retry_decision, retry_is_unproductive
 from maestro.rework import build_operator_rework_addendum
 from maestro.scope_gate import build_scope_escape_reason, find_escapes, normalize
 from maestro.spec_runner import read_executor_state, read_planned_total
+from maestro.tasks_spec import (
+    SELF_CONTAINED_DEPENDENCIES_INSTRUCTION,
+    build_dangling_dependency_error,
+    find_dangling_dependencies,
+)
 from maestro.transitions import TransitionDispatcher
 from maestro.workspace import WorkspaceManager, ensure_harness_excludes
 
@@ -1645,9 +1651,18 @@ class Orchestrator:
         # from a previous run or different project phase.
         # On a Stage B rework respawn, the verifier's FAIL feedback is appended
         # to the description so spec generation can incorporate it (§7).
-        description = workstream.description
+        parts = [workstream.description]
         if rework_addendum is not None:
-            description = f"{workstream.description}\n\n{rework_addendum}"
+            parts.append(rework_addendum)
+        if is_rework_resume:
+            # Keyed on the rework RESUME itself, not on whether an addendum
+            # text exists: the risk comes from regenerating tasks.md over a
+            # revision the model remembers, and an operator rework with no
+            # instructions regenerates just the same. The instruction is
+            # prevention; `_validate_generated_tasks` is the guarantee and runs
+            # regardless of whether it was honoured (#165).
+            parts.append(SELF_CONTAINED_DEPENDENCIES_INSTRUCTION)
+        description = "\n\n".join(parts)
         workstream_config = WorkstreamConfig(
             id=workstream.id,
             title=workstream.title,
@@ -1674,6 +1689,14 @@ class Orchestrator:
         )
         if subtask_total is not None:
             await self._update_fields(workstream_id, subtask_total=subtask_total)
+
+        # #165: every dependency must resolve inside THIS revision of
+        # tasks.md. spec-runner validates the same thing when it runs and
+        # exits 1 — correct, but only after we have paid for generation and
+        # spawned a process. Checking here, before the READY transition and
+        # any spawner, turns that into a cheap block naming the exact ids.
+        if not await self._validate_generated_tasks(workstream_id, workspace):
+            return
 
         # Transition to READY then RUNNING
         await self._transition(
@@ -2353,6 +2376,28 @@ class Orchestrator:
         self._logger.warning("workstream '%s' blocked: %s", workstream_id, reason)
         return await self._route_scope_block(workstream_id, reason)
 
+    async def _last_stop_reason(self, workstream_id: str) -> str | None:
+        """spec-runner's typed stop reason for the run that just finished.
+
+        Read from the post-mortem archive's manifest — the same structured
+        source the completeness gate uses, and the reason #169a exists
+        (`executor_meta` string values used to be dropped by an int cast). NOT
+        parsed out of logs: the classification must not depend on wording.
+
+        None when there is no archive or no recorded reason, which keeps the
+        existing retry policy.
+        """
+        row = await self._newest_archive(workstream_id)
+        if row is None:
+            return None
+        manifest = await asyncio.get_running_loop().run_in_executor(
+            None, read_manifest, row["path"]
+        )
+        if manifest is None:
+            return None
+        reason = manifest.get("last_run_stop_reason")
+        return str(reason) if reason else None
+
     async def _newest_archive(self, workstream_id: str) -> dict[str, Any] | None:
         """This run's archive — the newest row, and only if it is committed.
 
@@ -2433,6 +2478,58 @@ class Orchestrator:
         if marker is None:
             return False
         return completeness_approval_is_fresh(marker, current_evidence=evidence)
+
+    async def _validate_generated_tasks(
+        self, workstream_id: str, workspace: Path
+    ) -> bool:
+        """Reject a generated tasks.md whose dependencies leave the revision.
+
+        A rework rewrites `spec/maestro-tasks.md` wholesale, and the decomposer
+        — told it is continuing after TASK-021 — emits a dependency on a task
+        that exists only in the file it replaced. The addendum asks it not to;
+        this makes it not matter (#165).
+
+        Blocks straight to NEEDS_REVIEW without consuming a retry: a retry
+        would re-decompose, which is exactly the spend the finding says is
+        wasted.
+
+        An unreadable file logs and PASSES. spec-runner still validates at run
+        time, so the guarantee survives — only the earliness is lost — whereas
+        blocking on our own inability to find a file would turn a path
+        assumption into an outage.
+        """
+        tasks_path = workspace / "spec" / f"{SPEC_PREFIX}tasks.md"
+        try:
+            text = await asyncio.get_running_loop().run_in_executor(
+                None, tasks_path.read_text
+            )
+        except OSError as exc:
+            self._logger.warning(
+                "workstream '%s': cannot read %s for dependency validation "
+                "(%s); spec-runner will still validate at run time",
+                workstream_id,
+                tasks_path,
+                exc,
+            )
+            return True
+
+        dangling = find_dangling_dependencies(text)
+        if not dangling:
+            return True
+
+        reason = build_dangling_dependency_error(dangling)
+        self._logger.error("workstream '%s' %s", workstream_id, reason)
+        await self._transition(
+            workstream_id,
+            WorkstreamStatus.NEEDS_REVIEW,
+            expected_status=WorkstreamStatus.DECOMPOSING,
+            message="generated tasks.md has dangling dependencies",
+            error_message=reason,
+            process_pid=None,
+            generation_pid=None,
+        )
+        self._stats.failed += 1
+        return False
 
     async def _gate_ex_ante(self, workstream_id: str, workstream: Workstream) -> bool:
         """Evaluate the ex-ante gate; on block route READY -> NEEDS_REVIEW."""
@@ -3373,6 +3470,7 @@ class Orchestrator:
             await self._handle_failure(
                 workstream_id,
                 f"spec-runner exited with code {return_code}",
+                stop_reason=await self._last_stop_reason(workstream_id),
             )
 
     async def _handle_success(
@@ -3917,8 +4015,16 @@ class Orchestrator:
         self,
         workstream_id: str,
         error_message: str,
+        *,
+        stop_reason: str | None = None,
     ) -> None:
-        """Handle workstream failure with retry logic."""
+        """Handle workstream failure with retry logic.
+
+        `stop_reason` is spec-runner's typed reason for ending the run (#169a),
+        supplied by callers that have it. Callers that cannot — a
+        spec-generation failure never produced executor state — pass None,
+        which keeps the existing retry policy: unclassified is not unfit.
+        """
         workstream = await self._db.get_workstream(workstream_id)
 
         # H-6 position retention (not authority — that lives in
@@ -3926,6 +4032,30 @@ class Orchestrator:
         # error_message so an ordinary failure overwrite doesn't force a
         # full respawn on the next approved retry.
         preserved = preserve_approval_marker(error_message, workstream.error_message)
+
+        # #165: a retry that cannot change the outcome still pays a full
+        # re-decomposition. The pilot burned three on one validation error.
+        # Classified ONLY from the typed stop_reason — never from stop_detail
+        # prose, never from how fast the run failed.
+        if retry_is_unproductive(stop_reason):
+            verdict = describe_retry_decision(stop_reason)
+            self._logger.warning(
+                "workstream.retry.skipped workstream=%s stop_reason=%s",
+                workstream_id,
+                stop_reason,
+            )
+            blocked = f"{preserved} — {verdict}"
+            await self._transition(
+                workstream_id,
+                WorkstreamStatus.NEEDS_REVIEW,
+                expected_status=workstream.status,
+                message=verdict,
+                error_message=blocked,
+                process_pid=None,
+                generation_pid=None,
+            )
+            self._stats.failed += 1
+            return
 
         if workstream.can_retry():
             new_count = workstream.retry_count + 1
