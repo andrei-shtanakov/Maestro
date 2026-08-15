@@ -1,14 +1,23 @@
 # Per-project, per-run state databases — design
 
-**Status:** revision 2 (2026-08-15). Revision 1 was reviewed and found not
-implementation-ready: it bound the database to a telemetry `pipeline_id` that is minted
-per CLI invocation, which would have broken `--resume`; it treated `ended_at IS NULL` as
-meaning *interrupted*, which erases a live run; and its identity rule was unavailable in
-Mode 1. This revision adds §A–§C (run identity, liveness, selection), resolves a circular
-identity found during verification (§A.4), and narrows the layout to Mode 2 with an
-explicit rule for Mode 1 (§3.3). Owner decisions carried forward from revision 1: the
-legacy database is **not** migrated, and `dispatcher#147` is filed first but does **not**
-block this change.
+**Status:** revision 3 (2026-08-15).
+
+Revision 2 closed the run/invocation confusion but left four contradictions, all found in
+review and all verified against the code before this rewrite. The stage lock is keyed
+`(repo, stage)` and so could not attribute liveness to a *run* — an interrupted run read
+as running whenever any other run of the same repository held the lock (§B.3). Putting
+`needs_human` in the terminal enum contradicted §A.1, since the database outlives a human
+pause (§B.1.1, confirmed by `decide.py:30`). The selection table quietly turned plain
+`orchestrate` — which clears state by design, `cli.py:1436` — into an implicit resume
+(§C.2). And `_local/<name>` collided for two remoteless checkouts sharing a basename
+(§3.3).
+
+Revision 1 had bound the database to a `pipeline_id` minted per CLI invocation, which
+would have broken `--resume`.
+
+Owner decisions carried through: the legacy database is **not** migrated; `dispatcher#147`
+is filed first but does **not** block this change; retention gets a trigger rather than a
+policy, and cross-run cost aggregation is out of scope at two rows in `task_costs`.
 
 ## 1. What the layout is today, and the failure it produced
 
@@ -123,15 +132,33 @@ have to keep writing the legacy database, which contradicts "legacy, never writt
 again".
 
 Mode 1 therefore derives the same identity **at runtime from the checkout**:
-`git -C <repo> remote get-url origin`, parsed by the same rule as §3.2. A checkout with
-no `origin` resolves into an explicitly local namespace,
-`projects/_local/<sanitised-repo-name>/`, which is a *namespace*, not a path-as-identity:
-it says "this repository has no remote identity" rather than pretending a path is one.
+`git -C <repo> remote get-url origin`, parsed by the same rule as §3.2.
 
-### 3.4 A run with no resolvable identity refuses to start
+A checkout with **no** `origin` resolves into an explicitly local namespace:
 
-Falling back to `project:` would be a silent downgrade to the ambiguous identifier, which
-is the defect, not the mitigation.
+```
+projects/_local/<sanitised-name>-<hash of the canonical git common dir>/
+```
+
+The bare name alone would collide — `/tmp/a/project` and `/work/b/project` are two
+independent repositories with one basename, which is the mixing this whole design
+removes. The path therefore appears as a **local fingerprint**, never as identity: a
+local-only repository genuinely has no portable identity, and the honest encoding says
+"this locator, on this machine" rather than inventing a portable-looking name. The hash
+is taken over the canonical git common dir so that worktrees of one repository resolve
+together.
+
+### 3.4 What "refuses to start" covers, and what it does not
+
+An absent remote in Mode 1 is **resolvable** — it lands in `_local/` (§3.3) and is not a
+refusal.
+
+The refusal is for the cases where identity cannot be established at all: a `repo_url`
+that does not parse, a `repo:` path that is not a git checkout, a remote the parser
+cannot map to host/owner/repo. In those cases the run stops with the reason stated.
+
+What is never done is falling back to `project:`. That would be a silent downgrade to the
+ambiguous identifier, which is the defect, not the mitigation.
 
 ## A. Run, invocation and service-tick identity
 
@@ -206,19 +233,44 @@ The current schema is entirely per-entity — `workstreams`, `tasks`, `gate_appr
 
 ```sql
 CREATE TABLE run (
-    run_id      TEXT PRIMARY KEY,   -- the ULID; equals the directory name
-    repo_key    TEXT NOT NULL,      -- <host>/<owner>/<repo>, as resolved in §3
-    started_at  TEXT NOT NULL,
-    outcome     TEXT CHECK (outcome IN
-                  ('completed','needs_human','failed','cancelled','superseded')),
-    ended_at    TEXT,
-    reason      TEXT                -- free-form detail, never load-bearing
+    run_id       TEXT PRIMARY KEY,  -- the ULID; equals the directory name
+    repo_key     TEXT NOT NULL,     -- <host>/<owner>/<repo>, as resolved in §3
+    started_at   TEXT NOT NULL,
+    outcome      TEXT CHECK (outcome IN
+                   ('completed','cancelled','superseded','failed')),
+    ended_at     TEXT,              -- set with outcome, never alone
+    reason       TEXT,              -- free-form detail, never load-bearing
+    suspended_at TEXT,              -- a human pause; NOT an ending
+    suspend_reason TEXT
 );
 ```
 
 `outcome` is typed and separate from `reason` because a consumer that has to infer
-"failed" from prose will infer it differently each time. `outcome IS NULL` means **no
-terminal record was written** — which §B.3 shows is not the same as *interrupted*.
+"failed" from prose will infer it differently each time.
+
+### B.1.1 Three levels of outcome, and why `needs_human` is not one of them here
+
+Revision 2 put `needs_human` in the terminal enum, which contradicted §A.1: the database
+belongs to the logical run and survives resume, but a terminal row ends it. After a human
+approval the code would then have to either rewrite a finished row or mint a new run and
+lose the resume identity. Both are wrong.
+
+`decide.py:30` already states the correct semantics: *"DONE/ABANDONED are terminal;
+NEEDS_REVIEW is terminal **for the loop** … but is reported separately."* A human pause
+ends a tick, not a run.
+
+| Level | Values | Where it lives |
+|---|---|---|
+| logical run outcome | `completed`, `cancelled`, `superseded`, `failed` | `run.outcome` + `ended_at` |
+| current suspension | waiting on a human | `run.suspended_at` + `suspend_reason`, **no** `ended_at` |
+| invocation / tick outcome | `ok`, `needs_human`, `failed`, `infra_error` | already exists in the tick result |
+
+`failed` is admitted as a run outcome only when the run cannot be advanced further. A
+failure that workstream rework can still address leaves the run non-terminal — otherwise
+rework would face the same rewrite-a-finished-row problem.
+
+`outcome IS NULL` means **no terminal record was written**, which §B.3 shows is not the
+same as *interrupted*, and is also not the same as *suspended*.
 
 **Deriving the terminal state from workstream statuses instead was considered and
 rejected**, on evidence from the runs this design exists because of. `maestro-run3.db`
@@ -239,16 +291,32 @@ that matters most: a **running** run also has `ended_at IS NULL`. Fail-closed mu
 mean discarding a knowable fact.
 
 Liveness is read from the lock, reusing the model `locks.py` already establishes —
-*flock is the authority; the pid file is diagnostics only*:
+*flock is the authority; the pid file is diagnostics only*.
 
-| `outcome` | stage lock held | Reported as |
-|---|---|---|
-| not NULL | — | terminal, with the typed outcome |
-| NULL | held | **running** |
-| NULL | free | **interrupted / unknown** |
+**But the lock alone attributes liveness to the wrong run.** After §A.4 the lock is keyed
+`(repo-identity, stage)`, not by run. So: run A is interrupted with `outcome` NULL; run B
+of the same repository starts and holds the orchestration lock; a collector classifying A
+sees the lock held and reports A as running. The lock proves *"an orchestration stage is
+live in this repository"* — never *"this run is live"*.
 
-The pid, host and boot identity stay diagnostics: they explain *which* process, never
-*whether* one is alive.
+Attribution therefore needs the holder's identity, and the mechanism already exists:
+`locks.py:157` writes a `<stage>.pid` sidecar under the held lock. That sidecar gains the
+holder's `run_id`, and a run is **running** only when both hold:
+
+| `outcome` | stage lock | holder `run_id` | Reported as |
+|---|---|---|---|
+| not NULL | — | — | terminal, with the typed outcome |
+| NULL | held | equals this run | **running** |
+| NULL | held | a different run | **interrupted / unknown** |
+| NULL | free | — (ignored) | **interrupted / unknown** |
+
+The conjunction is what makes this safe. A sidecar file outlives the process that wrote
+it, so it can never grant liveness on its own; it only *attributes* liveness that the
+lock has already proven. When the lock is free the sidecar is not read at all.
+
+This does change one line of the `locks.py` contract — "nothing branches on it" — for the
+`run_id` field specifically. The pid, host and boot identity stay diagnostics: they
+explain *which process*, never *whether one is alive*.
 
 ## C. Run selection and command resolution
 
@@ -269,17 +337,33 @@ maximum, and the run that actually needs a human disappears from the default vie
 `started_at`. Commands choose by their own question, and the defaults differ because the
 questions differ:
 
-| Caller | Default selection |
+| Caller | Selection |
 |---|---|
-| `orchestrate` (no flag) | the live run if one exists, else the newest non-terminal run |
-| `orchestrate --resume` | the newest non-terminal run; refuses if several are non-terminal |
-| service tick | same as `--resume`, then `decide_orchestrate` over it |
+| `orchestrate` (no flag) | **starts a fresh run** — unchanged semantics; refuses if a run is live, and lists any non-terminal runs so the operator chooses explicitly |
+| `orchestrate --resume` | the single resumable run; refuses if there are several |
+| `orchestrate --run <id> --resume` | that run, explicitly |
+| service tick | its own policy — `decide_orchestrate` over the selected run |
 | dashboard / collector | all runs, newest first, each with its state |
 | any command | `--run <run-id>` overrides |
 
-"Refuses if several are non-terminal" is deliberate: two advanceable runs on one
-repository is an operator-visible anomaly, and picking one silently is how the current
-layout lost a week.
+**Plain `orchestrate` must not become an implicit resume.** Today it deliberately does the
+opposite: without `--resume` it *clears* existing workstreams, and says so —
+`"Clearing N existing workstreams state (use --resume to continue where you left off)"`
+(`cli.py:1436`). An earlier draft of this section had plain `orchestrate` pick up the
+newest non-terminal run, which would have changed a destructive-by-design command into an
+auto-resuming one as a side effect of a storage change. Storage layout does not get to
+redefine CLI semantics.
+
+What does change is that clearing is no longer *in place*: a fresh run gets its own
+directory, so the previous run survives as evidence instead of being erased. That is the
+whole point of §1, and it is achieved without touching what the command means.
+
+Automatic resume-or-fresh selection stays where it already lives — the service tick, which
+owns that decision today via `decide_orchestrate`.
+
+"Refuses if several are resumable" is deliberate: two advanceable runs on one repository
+is an operator-visible anomaly, and picking one silently is how the current layout lost a
+week.
 
 ### C.3 Workstream commands need a project and a run
 
@@ -290,10 +374,20 @@ by accident, which is the defect in a new place.
 
 ## D. Durability, permissions and growth
 
-**A run directory becomes discoverable only when it is complete.** The directory is
-created under a temporary name, the `run` row is written, and only then is it renamed
-into `runs/`. A collector enumerating the directory must never observe a database without
-its `run` row — that state is indistinguishable from a corrupted run.
+**A run directory becomes discoverable only when it is complete**, and the ordering is
+load-bearing:
+
+1. create the directory under a temporary name;
+2. create `state.db` and write the `run` row;
+3. **close the database** — WAL and shm included;
+4. rename the directory into `runs/`;
+5. reopen `state.db` at its final path for the run itself.
+
+Step 3 is not caution for its own sake: renaming a directory out from under an open
+SQLite connection leaves the WAL and shm files associated with a path that no longer
+exists, and the failure mode is a torn database rather than an error. A collector
+enumerating `runs/` must never observe a database without its `run` row — that state is
+indistinguishable from a corrupted run.
 
 **Permissions.** `~/.maestro/` and everything under it is created `0700` / `0600`. The
 state carries prompts, absolute paths, costs and operator decisions; the current
@@ -319,8 +413,16 @@ to a project, and for the July demo tasks (`greet`, `compute`, `summarize`) the 
 answer is "none". The file stays where it is, readable, and Maestro stops writing to it.
 
 `--db` survives unchanged as an escape hatch. It is not the defect; the absent default key
-was. When `--db` is given, it selects the database directly and the run directory is its
-parent — the escape hatch stays an escape hatch and does not acquire a second meaning.
+was. When `--db` is given it selects that database directly, and the resolver of §3 is not
+consulted at all.
+
+**A database reached through `--db` may have no `run` row** — every database written
+before this change is in that state, including the three that motivated it. Such a
+database is read as a single anonymous run: `run_id` unknown, `outcome` unknown, liveness
+unknown, and it is labelled *legacy* rather than silently rendered as interrupted. It is
+never written a `run` row retroactively, because inventing a `started_at` and a `repo_key`
+for rows whose origin is exactly what is in question would manufacture the evidence this
+design exists to preserve.
 
 ## F. Sequencing, and the window this opens
 
@@ -345,8 +447,9 @@ Identity:
 - parsing `repo_url` across forms: `https://`, `git@`, trailing `.git`, and a non-GitHub host;
 - two hosts with identical `owner/repo` resolve to different directories;
 - case folding applies on a case-insensitive host and does **not** merge two repositories on a case-sensitive one;
-- Mode 1 derives the same key from `git remote get-url origin`, and a checkout with no remote lands in `_local/` rather than failing or using a path;
-- an unresolvable identity refuses to start, with a stated reason and no fallback to `project:`.
+- Mode 1 derives the same key from `git remote get-url origin`, and a checkout with no remote lands in `_local/` rather than failing;
+- **two remoteless checkouts sharing a basename (`/tmp/a/project`, `/work/b/project`) resolve to different `_local/` directories**, and two worktrees of one repository resolve to the same one;
+- an unresolvable identity — unparseable remote, non-git `repo:` — refuses to start, with a stated reason and no fallback to `project:`.
 
 Run identity and lifecycle:
 
@@ -354,11 +457,15 @@ Run identity and lifecycle:
 - a resumed run writes its logs under the original run directory, not a new one;
 - a service tick creates no run directory;
 - the `run` row is written at start with `outcome` NULL and completed exactly once;
-- each terminal `outcome` value round-trips.
+- each terminal `outcome` value round-trips;
+- **a needs-human pause sets `suspended_at` and leaves `ended_at` NULL; after the human acts, the same `run_id` resumes in the same database** — no new run, no rewritten terminal row;
+- a failure that rework can still address leaves the run non-terminal.
 
 Liveness and selection (§B.3, §C):
 
-- `outcome` NULL with the stage lock held reports **running**; with the lock free, **interrupted**;
+- `outcome` NULL with the stage lock held **by this run** reports running; with the lock free, interrupted;
+- **run A interrupted while run B of the same repository holds the lock: A reports interrupted, not running** — the case the lock alone gets wrong;
+- **plain `orchestrate` performs no implicit resume**: it starts a fresh run, and refuses while a run is live;
 - selection does **not** assume ULID ordering within a millisecond — the test asserts the documented policy (live, else newest non-terminal), never that the lexicographic maximum is the newest started;
 - two non-terminal runs make `--resume` refuse rather than choose;
 - `--run` overrides every default.
@@ -366,8 +473,9 @@ Liveness and selection (§B.3, §C):
 Durability:
 
 - a run directory is never visible in `runs/` without its `run` row (interrupt between create and rename);
+- the database is closed before the directory is renamed, and reopened after — asserted on the ordering, not only on the end state;
 - created files and directories are `0600` / `0700`;
-- `--db` still overrides the resolver;
+- `--db` still overrides the resolver, and a database with no `run` row is reported as *legacy* rather than as interrupted, and is not written a row retroactively;
 - `~/.maestro/maestro.db` is not opened for writing by any code path after the change.
 
 ## H. Non-goals
