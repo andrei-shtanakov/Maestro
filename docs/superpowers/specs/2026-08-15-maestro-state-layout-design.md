@@ -4,11 +4,11 @@
 
 Revision 2 closed the run/invocation confusion but left four contradictions, all found in
 review and all verified against the code before this rewrite. The stage lock is keyed
-`(repo, stage)` and so could not attribute liveness to a *run* — an interrupted run read
+`(repo, stage)` and so could not attribute liveness to a *run* — an interrupted run was read
 as running whenever any other run of the same repository held the lock (§B.3). Putting
 `needs_human` in the terminal enum contradicted §A.1, since the database outlives a human
-pause (§B.1.1, confirmed by `decide.py:30`). The selection table quietly turned plain
-`orchestrate` — which clears state by design, `cli.py:1436` — into an implicit resume
+pause (§B.1.1, confirmed by `maestro/service/decide.py:30`). The selection table quietly turned plain
+`orchestrate` — which clears state by design, `maestro/cli.py:1437` — into an implicit resume
 (§C.2). And `_local/<name>` collided for two remoteless checkouts sharing a basename
 (§3.3).
 
@@ -21,7 +21,7 @@ policy, and cross-run cost aggregation is out of scope at two rows in `task_cost
 
 ## 1. What the layout is today, and the failure it produced
 
-`cli.py:115-116` fixes one database for everything:
+`maestro/cli.py:115-116` fixes one database for everything:
 
 ```python
 DEFAULT_DB_DIR = Path.home() / ".maestro"
@@ -76,7 +76,7 @@ because it was reading the file it was told to read.
 content of the product being built. In product-delivery mode the target repository
 belongs to someone else, and writing orchestrator bookkeeping into it is a `write_scope`
 violation in spirit (ADR-ECO-007 D2). The codebase already takes this position:
-`execution/models.py:22` excludes `.maestro/**` from synchronisation.
+`maestro/execution/models.py:22` excludes `.maestro/**` from synchronisation.
 
 **spec-runner's execution state does not move, and must not.**
 `spec-runner/docs/state-schema.md` declares `spec/.executor-state.db` a **stable contract
@@ -121,12 +121,12 @@ already inconsistent across two live configs — `project: disputatio` against
 `project: kapelle-s2`, where the second names a pilot rather than a repository.
 
 The key is parsed from `repo_url`, which `OrchestratorConfig` already requires
-(`models.py:1765`, `Field(..., min_length=1)`).
+(`maestro/models.py:1765`, `Field(..., min_length=1)`).
 
 ### 3.3 Mode 1 is in scope, and needs a derivation of its own
 
 Mode 1 (`maestro run <tasks.yaml>`) loads a different model: `load_config` →
-`ProjectConfig` (`models.py:863`), which carries `repo:` — a **local path** — and no
+`ProjectConfig` (`maestro/models.py:863`), which carries `repo:` — a **local path** — and no
 `repo_url`. A path cannot be the identity (ADR-ECO-007 D2), so Mode 1 would otherwise
 have to keep writing the legacy database, which contradicts "legacy, never written
 again".
@@ -183,8 +183,8 @@ Binding a database to each CLI invocation would have broken exactly this.
 
 ### A.2 `run_id` is the telemetry `pipeline_id`, pinned rather than minted
 
-`ORCHESTRA_PIPELINE_ID` is already the contract: `_vendor/obs.py:144,164` reads it and
-falls back to `ulid.new()`, and `gates.py:174` reads it too. So this design does not
+`ORCHESTRA_PIPELINE_ID` is already the contract: `maestro/_vendor/obs.py:144,164` reads it and
+falls back to `ulid.new()`, and `maestro/gates.py:174` reads it too. So this design does not
 introduce a correlation id — it stops the fallback from firing per invocation.
 
 For a fresh run the id is minted once and exported. **For a resume it is read out of the
@@ -194,7 +194,7 @@ selected run's `run` row and exported**, so every invocation of one logical run 
 ### A.3 Startup order
 
 The database path can no longer be resolved before the configuration is read, which
-reverses today's order (`_service_run` at `cli.py:2434` opens `Database(db_path)` first):
+reverses today's order (`_service_run` at `maestro/cli.py:2437` opens `Database(db_path)` first):
 
 1. load config;
 2. resolve repository identity (§3);
@@ -207,9 +207,9 @@ reverses today's order (`_service_run` at `cli.py:2434` opens `Database(db_path)
 Step 6 must precede step 7: logging reads the variable at setup, and a late export leaves
 the first records under a different id.
 
-### A.4 Resolving the circular identity in `locks.py`
+### A.4 Resolving the circular identity in `maestro/service/locks.py`
 
-`project_key(project, db_path)` (`locks.py:55`) hashes the database path into the lock
+`project_key(project, db_path)` (`maestro/service/locks.py:55`) hashes the database path into the lock
 identity, deliberately: *"the same project name against two databases is two independent
 instances."* Once the database path is derived from the project identity, that is
 circular — the key would depend on the path that depends on the key.
@@ -255,7 +255,7 @@ belongs to the logical run and survives resume, but a terminal row ends it. Afte
 approval the code would then have to either rewrite a finished row or mint a new run and
 lose the resume identity. Both are wrong.
 
-`decide.py:30` already states the correct semantics: *"DONE/ABANDONED are terminal;
+`maestro/service/decide.py:30` already states the correct semantics: *"DONE/ABANDONED are terminal;
 NEEDS_REVIEW is terminal **for the loop** … but is reported separately."* A human pause
 ends a tick, not a run.
 
@@ -290,7 +290,7 @@ Revision 1 said a run without a terminal record is *interrupted*. That erases th
 that matters most: a **running** run also has `ended_at IS NULL`. Fail-closed must not
 mean discarding a knowable fact.
 
-Liveness is read from the lock, reusing the model `locks.py` already establishes —
+Liveness is read from the lock, reusing the model `maestro/service/locks.py` already establishes —
 *flock is the authority; the pid file is diagnostics only*.
 
 **But the lock alone attributes liveness to the wrong run.** After §A.4 the lock is keyed
@@ -300,7 +300,7 @@ sees the lock held and reports A as running. The lock proves *"an orchestration 
 live in this repository"* — never *"this run is live"*.
 
 Attribution therefore needs the holder's identity, and the mechanism already exists:
-`locks.py:157` writes a `<stage>.pid` sidecar under the held lock. That sidecar gains the
+`maestro/service/locks.py:157` writes a `<stage>.pid` sidecar under the held lock. That sidecar gains the
 holder's `run_id`, and a run is **running** only when both hold:
 
 | `outcome` | stage lock | holder `run_id` | Reported as |
@@ -314,7 +314,7 @@ The conjunction is what makes this safe. A sidecar file outlives the process tha
 it, so it can never grant liveness on its own; it only *attributes* liveness that the
 lock has already proven. When the lock is free the sidecar is not read at all.
 
-This does change one line of the `locks.py` contract — "nothing branches on it" — for the
+This does change one line of the `maestro/service/locks.py` contract — "nothing branches on it" — for the
 `run_id` field specifically. The pid, host and boot identity stay diagnostics: they
 explain *which process*, never *whether one is alive*.
 
@@ -349,7 +349,7 @@ questions differ:
 **Plain `orchestrate` must not become an implicit resume.** Today it deliberately does the
 opposite: without `--resume` it *clears* existing workstreams, and says so —
 `"Clearing N existing workstreams state (use --resume to continue where you left off)"`
-(`cli.py:1436`). An earlier draft of this section had plain `orchestrate` pick up the
+(`maestro/cli.py:1437`). An earlier draft of this section had plain `orchestrate` pick up the
 newest non-terminal run, which would have changed a destructive-by-design command into an
 auto-resuming one as a side effect of a storage change. Storage layout does not get to
 redefine CLI semantics.
