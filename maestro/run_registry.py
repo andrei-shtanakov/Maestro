@@ -58,8 +58,10 @@ async def resolve_runs(
         if not entry.is_dir() or not db_path.exists():
             continue
         db = await create_database(db_path)
-        mapping = await db.get_run_row()
-        await db.close()
+        try:
+            mapping = await db.get_run_row()
+        finally:
+            await db.close()
         row = run_row_from_mapping(mapping) if mapping is not None else None
         infos.append(
             RunInfo(

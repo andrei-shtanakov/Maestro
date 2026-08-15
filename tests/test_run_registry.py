@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 
 from maestro.database import create_database
@@ -80,3 +82,23 @@ async def test_an_interrupted_run_is_not_running_while_another_holds_the_lock(tm
         }
     assert runs["BBB"] == "running"
     assert runs["AAA"] == "interrupted"
+
+
+async def test_a_read_failure_still_closes_the_database_and_propagates(tmp_path):
+    """The bug this test pins: `get_run_row()` raising must not skip `close()`.
+
+    A leaked aiosqlite connection keeps a background thread alive, and this
+    suite runs with `filterwarnings=error` — the symptom of a missing
+    try/finally here is not a failing assertion but a hung test run. We pin
+    it by corrupting one run's `run` table so the read raises, and asserting
+    that the failure surfaces (it is not silently swallowed into a
+    normal-looking result) while the process does not hang doing it.
+    """
+    path = await _make(tmp_path, "AAA", "2026-08-15T09:00:00+00:00")
+    conn = sqlite3.connect(path)
+    conn.execute("DROP TABLE run")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(sqlite3.OperationalError):
+        await resolve_runs(KEY, home=tmp_path, lock_root=tmp_path)
