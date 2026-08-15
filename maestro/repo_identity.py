@@ -6,8 +6,11 @@ filesystem path and never by the operator-chosen `project:` field.
 
 from __future__ import annotations
 
+import hashlib
 import re
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 
 class IdentityError(Exception):
@@ -74,3 +77,46 @@ def parse_remote_url(url: str) -> RepoKey:
 
     host, owner, repo = _fold(host, owner, repo)
     return RepoKey(host=host, owner=owner, repo=repo)
+
+
+def identity_from_remote_url(url: str) -> RepoKey:
+    """Alias for `parse_remote_url`, for callers that read better this way."""
+    return parse_remote_url(url)
+
+
+def local_key(repo_path: Path) -> RepoKey:
+    """Identity for a checkout with no remote — a local fingerprint (spec §3.3).
+
+    The hash is over the canonical *git common dir*, so worktrees of one
+    repository resolve together while two unrelated checkouts that happen to
+    share a basename do not.
+    """
+    common = _git_output(
+        repo_path, "rev-parse", "--path-format=absolute", "--git-common-dir"
+    )
+    digest = hashlib.sha256(str(Path(common).resolve()).encode()).hexdigest()[:12]
+    name = _UNSAFE.sub("-", repo_path.resolve().name).strip("-") or "repo"
+    return RepoKey(host="_local", owner="", repo=f"{name}-{digest}", local=True)
+
+
+def identity_from_checkout(repo_path: Path) -> RepoKey:
+    """Identity for Mode 1: the checkout's `origin`, else a local key."""
+    try:
+        url = _git_output(repo_path, "remote", "get-url", "origin")
+    except IdentityError:
+        # No `origin` is resolvable (spec §3.4) — not a refusal.
+        return local_key(repo_path)
+    return parse_remote_url(url)
+
+
+def _git_output(repo_path: Path, *args: str) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_path), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise IdentityError(f"git {' '.join(args)} failed in {repo_path}") from exc
+    return proc.stdout.strip()
