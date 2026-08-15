@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from maestro.repo_identity import RepoKey
 
 
-_TERMINAL: frozenset[str] = frozenset(
+TERMINAL_RUN_STATUSES: frozenset[str] = frozenset(
     {"completed", "cancelled", "superseded", "failed"}
 )
 
@@ -86,7 +86,11 @@ def live_run(runs: list[RunInfo]) -> RunInfo | None:
 
 def select_resumable(runs: list[RunInfo]) -> RunInfo:
     """The one resumable run, or a refusal. Never a silent pick (spec §C.2)."""
-    candidates = [r for r in runs if r.status not in _TERMINAL and r.status != "legacy"]
+    candidates = [
+        r
+        for r in runs
+        if r.status not in TERMINAL_RUN_STATUSES and r.status != "legacy"
+    ]
     if not candidates:
         raise NoResumableRun("no non-terminal run to resume")
     if len(candidates) > 1:

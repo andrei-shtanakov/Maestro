@@ -84,7 +84,12 @@ from maestro.review_workspace import (
     recover_push,
 )
 from maestro.run_bootstrap import RunIsLive, bootstrap_run
-from maestro.run_registry import AmbiguousRun, NoResumableRun, resolve_runs
+from maestro.run_registry import (
+    TERMINAL_RUN_STATUSES,
+    AmbiguousRun,
+    NoResumableRun,
+    resolve_runs,
+)
 from maestro.scaffold import ScaffoldError, generate_project_yaml
 from maestro.service.locks import Stage  # noqa: TC001 — runtime cast target
 from maestro.service.tick import TickResult, run_argv, run_tick
@@ -1398,9 +1403,6 @@ def _resolve_orchestrator_paths(
     return repo_path, workspace_base, resolved_log_dir
 
 
-_TERMINAL_RUN_STATUSES = frozenset({"completed", "cancelled", "superseded", "failed"})
-
-
 async def _run_orchestrator(
     config_path: Path,
     db_path: Path | None,
@@ -1456,7 +1458,7 @@ async def _run_orchestrator(
                 r
                 for r in await resolve_runs(bootstrap.key)
                 if r.run_id != bootstrap.run_id
-                and r.status not in _TERMINAL_RUN_STATUSES
+                and r.status not in TERMINAL_RUN_STATUSES
             ]
             if leftover:
                 ids = ", ".join(f"{r.run_id} ({r.status})" for r in leftover)
@@ -1479,6 +1481,29 @@ async def _run_orchestrator(
             console.print(
                 f"[cyan]Resuming with {len(existing_workstreams)} existing workstreams[/cyan]"
             )
+    elif db_path is not None:
+        # `--db` bypasses the resolver and names one file directly (Task
+        # 9's contract) — there is no per-run directory here for a
+        # previous run to survive in, so a plain (`--db`, no `--resume`)
+        # start must still clear, exactly as it always has. Without this,
+        # `orchestrate --db x.db` would silently continue an existing DAG
+        # through this door — the same destructive-by-design-turned-
+        # auto-resume this task exists to prevent, just reached
+        # differently than the resolver path below.
+        #
+        # The resolver path (db_path is None) never reaches here with
+        # state to clear: a fresh run gets its own empty directory by
+        # construction, and a run reached via `--resume` or `--run <id>`
+        # must never be cleared — that would delete exactly the state the
+        # operator asked to act on.
+        existing_workstreams = await db.get_all_workstreams()
+        if existing_workstreams:
+            console.print(
+                f"[yellow]Clearing {len(existing_workstreams)} existing workstreams "
+                "state (use --resume to continue where you left off).[/yellow]"
+            )
+            for workstream in existing_workstreams:
+                await db.delete_workstream(workstream.id)
 
     repo_path, workspace_base, log_dir = _resolve_orchestrator_paths(config, log_dir)
 
