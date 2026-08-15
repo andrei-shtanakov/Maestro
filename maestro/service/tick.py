@@ -18,7 +18,6 @@ import ulid
 
 from maestro.models import WorkstreamStatus
 from maestro.notifications.base import Notification, NotificationEvent
-from maestro.repo_identity import RepoKey
 from maestro.service.decide import decide_orchestrate, decide_review
 from maestro.service.locks import AlreadyRunning, ScopedLock, Stage
 from maestro.service.sweep import sweep_stale_worktrees
@@ -28,6 +27,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from maestro.database import Database
+    from maestro.repo_identity import RepoKey
 
 
 logger = logging.getLogger(__name__)
@@ -83,6 +83,7 @@ async def run_argv(argv: list[str], *, log_path: Path | None = None) -> int:
 async def run_tick(
     *,
     db: Database,
+    key: RepoKey,
     project: str,
     config_path: Path,
     db_path: Path,
@@ -97,6 +98,10 @@ async def run_tick(
 ) -> TickResult:
     """Execute one tick of `stage` and return its result.
 
+    `key` is the caller's already-resolved repository identity (spec §3) —
+    this wrapper does not derive one on its own, so every acquirer of the
+    stage lock for one repository uses the same key.
+
     The lock decides `skipped_running` before anything else happens, and
     a skip is still recorded — an unattended run must leave evidence
     even when it did nothing.
@@ -110,10 +115,6 @@ async def run_tick(
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        # TODO: thread the resolved RepoKey through instead of deriving a
-        # local one from `project` — tracked for the task that migrates
-        # this wrapper onto repository identity end to end.
-        key = RepoKey(host="_local", owner="", repo=project, local=True)
         lock = ScopedLock(key=key, stage=stage, root=root)
         lock.__enter__()
     except AlreadyRunning as exc:

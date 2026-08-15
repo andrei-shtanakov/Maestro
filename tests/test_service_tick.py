@@ -17,7 +17,7 @@ from maestro.service.locks import ScopedLock, Stage
 from maestro.service.tick import EXIT_INFRA, TickResult, run_tick
 
 
-# Matches the local key `run_tick` derives internally from `project="p"`.
+# The resolved identity `_tick()` passes to `run_tick` for project "p".
 _KEY = RepoKey(host="_local", owner="", repo="p", local=True)
 
 
@@ -71,6 +71,7 @@ async def _tick(
 ):
     return await run_tick(
         db=db,
+        key=_KEY,
         project="p",
         config_path=Path("/tmp/project.yaml"),
         db_path=Path("/tmp/s.db"),

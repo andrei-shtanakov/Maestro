@@ -67,6 +67,7 @@ from maestro.preflight import (
     ValidationReport,
     validate_project,
 )
+from maestro.repo_identity import parse_remote_url
 from maestro.review_pr import PrRef, parse_pr_url
 from maestro.review_runner import (
     EXIT_ALREADY_RUNNING,
@@ -82,6 +83,7 @@ from maestro.review_workspace import (
     materialize,
     recover_push,
 )
+from maestro.run_bootstrap import bootstrap_run
 from maestro.scaffold import ScaffoldError, generate_project_yaml
 from maestro.service.locks import Stage  # noqa: TC001 — runtime cast target
 from maestro.service.tick import TickResult, run_argv, run_tick
@@ -1397,7 +1399,7 @@ def _resolve_orchestrator_paths(
 
 async def _run_orchestrator(
     config_path: Path,
-    db_path: Path,
+    db_path: Path | None,
     resume: bool,
     log_dir: Path | None,
 ) -> None:
@@ -1418,11 +1420,23 @@ async def _run_orchestrator(
         )
         raise typer.Exit(1)
 
+    # Identity and the run must be resolved — and ORCHESTRA_PIPELINE_ID
+    # exported — before logging initializes (obs.py falls back to a fresh
+    # ULID otherwise). `--db` is an explicit override that skips the
+    # resolver entirely.
+    if db_path is not None:
+        resolved_db_path = db_path
+    else:
+        bootstrap = await bootstrap_run(config, resume=resume, run_id_override=None)
+        resolved_db_path = bootstrap.db_path
+
+    setup_logging("maestro")
+
     # Ensure DB directory exists
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Create or connect to database
-    db = await create_database(db_path)
+    db = await create_database(resolved_db_path)
 
     if resume:
         existing_workstreams = await db.get_all_workstreams()
@@ -1612,11 +1626,8 @@ def orchestrate_command(
         maestro orchestrate project.yaml
         maestro orchestrate project.yaml --resume
     """
-    setup_logging("maestro")
-    db_path = db or DEFAULT_DB_PATH
-
     try:
-        asyncio.run(_run_orchestrator(config, db_path, resume, log_dir))
+        asyncio.run(_run_orchestrator(config, db, resume, log_dir))
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user[/yellow]")
         raise typer.Exit(130) from None
@@ -2423,7 +2434,7 @@ def service_run_command(
         _service_run(
             config_path=config,
             stage=cast("Stage", stage),
-            db_path=db_path or DEFAULT_DB_PATH,
+            db_path=db_path,
             sweep=not no_sweep,
         )
     )
@@ -2431,18 +2442,31 @@ def service_run_command(
 
 
 async def _service_run(
-    *, config_path: Path, stage: "Stage", db_path: Path, sweep: bool
+    *, config_path: Path, stage: "Stage", db_path: Path | None, sweep: bool
 ) -> int:
     project = load_orchestrator_config(config_path)
-    db = Database(db_path)
+
+    # `--db` is an explicit override that skips the resolver entirely; a
+    # scheduled tick always resumes an existing run and must never mint one
+    # (spec §A.1).
+    if db_path is not None:
+        resolved_db_path = db_path
+        key = parse_remote_url(project.repo_url)
+    else:
+        bootstrap = await bootstrap_run(project, resume=True, run_id_override=None)
+        resolved_db_path = bootstrap.db_path
+        key = bootstrap.key
+
+    db = Database(resolved_db_path)
     await db.connect()
     notifications = create_notification_manager(project.notifications)
     try:
         result: TickResult = await run_tick(
             db=db,
+            key=key,
             project=project.project,
             config_path=config_path,
-            db_path=db_path,
+            db_path=resolved_db_path,
             repo_path=Path(project.repo_path).expanduser(),  # noqa: ASYNC240
             base_branch=project.base_branch,
             stage=stage,
