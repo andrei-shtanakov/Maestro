@@ -67,7 +67,7 @@ from maestro.preflight import (
     ValidationReport,
     validate_project,
 )
-from maestro.repo_identity import parse_remote_url
+from maestro.repo_identity import IdentityError, parse_remote_url
 from maestro.review_pr import PrRef, parse_pr_url
 from maestro.review_runner import (
     EXIT_ALREADY_RUNNING,
@@ -84,6 +84,7 @@ from maestro.review_workspace import (
     recover_push,
 )
 from maestro.run_bootstrap import bootstrap_run
+from maestro.run_registry import AmbiguousRun, NoResumableRun
 from maestro.scaffold import ScaffoldError, generate_project_yaml
 from maestro.service.locks import Stage  # noqa: TC001 — runtime cast target
 from maestro.service.tick import TickResult, run_argv, run_tick
@@ -2446,16 +2447,36 @@ async def _service_run(
 ) -> int:
     project = load_orchestrator_config(config_path)
 
-    # `--db` is an explicit override that skips the resolver entirely; a
-    # scheduled tick always resumes an existing run and must never mint one
-    # (spec §A.1).
-    if db_path is not None:
-        resolved_db_path = db_path
-        key = parse_remote_url(project.repo_url)
-    else:
-        bootstrap = await bootstrap_run(project, resume=True, run_id_override=None)
-        resolved_db_path = bootstrap.db_path
-        key = bootstrap.key
+    # `--db` overrides run and database-path resolution — but NOT identity:
+    # the lock key below must always be the repository's real RepoKey, never
+    # a fabricated one (that fabrication is exactly what Task 6 removed from
+    # service/tick.py). A scheduled tick always resumes an existing run and
+    # must never mint one (spec §A.1); an unattended entry point must refuse
+    # with a clear reason rather than a raw traceback.
+    try:
+        if db_path is not None:
+            resolved_db_path = db_path
+            key = parse_remote_url(project.repo_url)
+        else:
+            bootstrap = await bootstrap_run(project, resume=True, run_id_override=None)
+            resolved_db_path = bootstrap.db_path
+            key = bootstrap.key
+    except IdentityError as e:
+        err_console.print(f"[red]Cannot resolve repository identity:[/red] {e}")
+        raise typer.Exit(1) from e
+    except NoResumableRun as e:
+        err_console.print(
+            f"[red]No resumable run for '{project.project}':[/red] {e}\n"
+            "Run 'maestro orchestrate <config>' once to establish a run, "
+            "or pass --db <path> to point at an existing database directly."
+        )
+        raise typer.Exit(1) from e
+    except AmbiguousRun as e:
+        err_console.print(
+            f"[red]Several runs could be resumed for '{project.project}':[/red] {e}\n"
+            "Pass --db <path> to pick one directly."
+        )
+        raise typer.Exit(1) from e
 
     db = Database(resolved_db_path)
     await db.connect()
