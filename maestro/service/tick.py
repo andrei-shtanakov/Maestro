@@ -18,6 +18,7 @@ import ulid
 
 from maestro.models import WorkstreamStatus
 from maestro.notifications.base import Notification, NotificationEvent
+from maestro.repo_identity import RepoKey
 from maestro.service.decide import decide_orchestrate, decide_review
 from maestro.service.locks import AlreadyRunning, ScopedLock, Stage
 from maestro.service.sweep import sweep_stale_worktrees
@@ -109,7 +110,11 @@ async def run_tick(
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        lock = ScopedLock(project=project, db_path=db_path, stage=stage, root=root)
+        # TODO: thread the resolved RepoKey through instead of deriving a
+        # local one from `project` — tracked for the task that migrates
+        # this wrapper onto repository identity end to end.
+        key = RepoKey(host="_local", owner="", repo=project, local=True)
+        lock = ScopedLock(key=key, stage=stage, root=root)
         lock.__enter__()
     except AlreadyRunning as exc:
         logger.info("service: %s tick skipped — %s", stage, exc)

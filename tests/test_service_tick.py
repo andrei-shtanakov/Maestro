@@ -12,8 +12,13 @@ import pytest
 from maestro.database import Database
 from maestro.models import Workstream, WorkstreamStatus
 from maestro.notifications.base import NotificationEvent  # noqa: TC001
+from maestro.repo_identity import RepoKey
 from maestro.service.locks import ScopedLock, Stage
 from maestro.service.tick import EXIT_INFRA, TickResult, run_tick
+
+
+# Matches the local key `run_tick` derives internally from `project="p"`.
+_KEY = RepoKey(host="_local", owner="", repo="p", local=True)
 
 
 @pytest.fixture
@@ -177,9 +182,7 @@ async def test_review_without_prs_is_noop(db, root) -> None:
 
 async def test_locked_stage_is_skipped_with_exit_0(db, root) -> None:
     runner = _Runner(0)
-    with ScopedLock(
-        project="p", db_path=Path("/tmp/s.db"), stage="orchestrate", root=root
-    ):
+    with ScopedLock(key=_KEY, stage="orchestrate", root=root):
         result = await _tick(db, root, runner=runner)
     assert result == TickResult(decision="skipped_running", outcome="ok", exit_code=0)
     assert runner.calls == []
@@ -191,9 +194,7 @@ async def test_stages_do_not_block_each_other(db, root) -> None:
     await db.create_workstream(
         _ws(WorkstreamStatus.DONE, pr_url="https://github.com/o/r/pull/7")
     )
-    with ScopedLock(
-        project="p", db_path=Path("/tmp/s.db"), stage="orchestrate", root=root
-    ):
+    with ScopedLock(key=_KEY, stage="orchestrate", root=root):
         result = await _tick(db, root, stage="review", runner=_Runner(0))
     assert result.decision == "review"  # different lock — not skipped
 

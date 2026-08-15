@@ -11,24 +11,30 @@ scoped holder's shared one, and vice versa. A one-way "scoped also
 checks the global lock" design would miss a legacy process starting
 *after* a scoped one.
 
-The scoped lock's identity is **(project-key, stage)**, so an
-orchestrate tick and a review tick of the same project run in parallel
-while the same (project, stage) is serialized. flock is the authority;
-the `<stage>.pid` file is diagnostics only — nothing branches on it.
+The scoped lock's identity is **(repository identity, stage)**, so an
+orchestrate tick and a review tick of the same repository run in
+parallel while the same (repository, stage) is serialized. flock is
+the authority; the `<stage>.pid` file is diagnostics only — nothing
+branches on it. The `<stage>.holder` file names the run holding the
+lock and is load-bearing for attribution; `<stage>.pid` remains
+diagnostics only.
 """
 
 from __future__ import annotations
 
 import fcntl
-import hashlib
+import json
 import os
-import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
+
+from maestro.state_paths import maestro_home
 
 
 if TYPE_CHECKING:
     from types import TracebackType
+
+    from maestro.repo_identity import RepoKey
 
 
 __all__ = [
@@ -37,7 +43,7 @@ __all__ = [
     "ScopedLock",
     "Stage",
     "global_lock_path",
-    "project_key",
+    "read_holder_run_id",
     "stage_lock_path",
 ]
 
@@ -45,23 +51,9 @@ Stage = Literal["orchestrate", "review"]
 
 DEFAULT_ROOT = Path.home() / ".maestro"
 
-_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
-
 
 class AlreadyRunning(RuntimeError):
     """Another process holds a conflicting lock (spec §3.1)."""
-
-
-def project_key(project: str, db_path: Path) -> str:
-    """Filesystem key for (project, db) — sanitized slug plus a hash.
-
-    The hash keeps `a-b` + `/c` from colliding with `a` + `/b-c`, and
-    makes the db path part of the identity: the same project name
-    against two databases is two independent instances.
-    """
-    slug = _UNSAFE.sub("-", project).strip("-") or "project"
-    digest = hashlib.sha256(f"{project}\x00{db_path}".encode()).hexdigest()[:8]
-    return f"{slug}-{digest}"
 
 
 def global_lock_path(*, root: Path | None = None) -> Path:
@@ -69,12 +61,26 @@ def global_lock_path(*, root: Path | None = None) -> Path:
     return (root or DEFAULT_ROOT) / "locks" / "global.lock"
 
 
-def stage_lock_path(
-    project: str, db_path: Path, stage: Stage, *, root: Path | None = None
-) -> Path:
-    """Per-(project, stage) exclusive lock file."""
-    base = root or DEFAULT_ROOT
-    return base / "instances" / project_key(project, db_path) / f"{stage}.lock"
+def stage_lock_path(key: RepoKey, stage: Stage, *, root: Path | None = None) -> Path:
+    """Lock identity is (repository, stage) — no database path (spec §A.4)."""
+    base = root if root is not None else maestro_home()
+    return base.joinpath("locks", *key.as_path_parts(), f"{stage}.lock")
+
+
+def read_holder_run_id(
+    key: RepoKey, stage: Stage, *, root: Path | None = None
+) -> str | None:
+    """The run id of the current holder, or None when the file is absent.
+
+    Never consulted on its own: a holder file outlives the process that wrote
+    it, so it attributes liveness the lock has already proven, and grants
+    none.
+    """
+    path = stage_lock_path(key, stage, root=root).with_suffix(".holder")
+    try:
+        return json.loads(path.read_text())["run_id"]
+    except (OSError, ValueError, KeyError):
+        return None
 
 
 def _flock(handle, operation: int, what: str) -> None:
@@ -117,19 +123,20 @@ class LegacyLock:
 
 
 class ScopedLock:
-    """Per-(project, stage) lock, plus a shared hold on the global lock."""
+    """Per-(repository, stage) lock, plus a shared hold on the global lock."""
 
     def __init__(
         self,
         *,
-        project: str,
-        db_path: Path,
+        key: RepoKey,
         stage: Stage,
+        run_id: str | None = None,
         root: Path | None = None,
     ) -> None:
         self._stage = stage
+        self._run_id = run_id
         self._global_path = global_lock_path(root=root)
-        self._stage_path = stage_lock_path(project, db_path, stage, root=root)
+        self._stage_path = stage_lock_path(key, stage, root=root)
         self._global_handle = None
         self._stage_handle = None
 
@@ -137,6 +144,11 @@ class ScopedLock:
     def pid_file(self) -> Path:
         """Diagnostics only — `maestro service status` reads it, nothing else."""
         return self._stage_path.with_suffix(".pid")
+
+    @property
+    def holder_file(self) -> Path:
+        """Attribution for `read_holder_run_id`; meaningless without the lock."""
+        return self._stage_path.with_suffix(".holder")
 
     def __enter__(self) -> ScopedLock:
         self._global_path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,12 +161,17 @@ class ScopedLock:
 
         stage_handle = self._stage_path.open("w")
         try:
-            _flock(stage_handle, fcntl.LOCK_EX, f"this project's {self._stage} tick")
+            _flock(stage_handle, fcntl.LOCK_EX, f"this repository's {self._stage} tick")
         except AlreadyRunning:
             self._release_global()
             raise
         self._stage_handle = stage_handle
         self.pid_file.write_text(str(os.getpid()))
+        if self._run_id is not None:
+            self.holder_file.write_text(
+                json.dumps({"pid": os.getpid(), "run_id": self._run_id})
+            )
+            self.holder_file.chmod(0o600)
         return self
 
     def _release_global(self) -> None:
@@ -169,6 +186,7 @@ class ScopedLock:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
+        self.holder_file.unlink(missing_ok=True)
         if self._stage_handle is not None:
             fcntl.flock(self._stage_handle, fcntl.LOCK_UN)
             self._stage_handle.close()
