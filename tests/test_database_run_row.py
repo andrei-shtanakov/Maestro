@@ -1,3 +1,4 @@
+import sqlite3
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
@@ -48,7 +49,7 @@ async def test_every_terminal_outcome_round_trips(db: Database, outcome: str) ->
 
 async def test_needs_human_is_not_a_valid_outcome(db: Database) -> None:
     await db.create_run_row(run_id="01ABC", repo_key="k", started_at=STARTED)
-    with pytest.raises(Exception):  # noqa: B017 - sqlite3.IntegrityError (CHECK)
+    with pytest.raises(sqlite3.IntegrityError):
         await db.set_run_outcome(outcome="needs_human", ended_at="x", reason=None)
 
 
@@ -66,5 +67,5 @@ async def test_suspension_does_not_end_the_run(db: Database) -> None:
 
 async def test_only_one_run_row_per_database(db: Database) -> None:
     await db.create_run_row(run_id="01ABC", repo_key="k", started_at=STARTED)
-    with pytest.raises(Exception):  # noqa: B017 - sqlite3.IntegrityError (UNIQUE)
+    with pytest.raises(sqlite3.IntegrityError):
         await db.create_run_row(run_id="01XYZ", repo_key="k", started_at=STARTED)
