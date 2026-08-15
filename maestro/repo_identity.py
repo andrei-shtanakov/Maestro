@@ -94,8 +94,9 @@ def local_key(repo_path: Path) -> RepoKey:
     common = _git_output(
         repo_path, "rev-parse", "--path-format=absolute", "--git-common-dir"
     )
-    digest = hashlib.sha256(str(Path(common).resolve()).encode()).hexdigest()[:12]
-    name = _UNSAFE.sub("-", repo_path.resolve().name).strip("-") or "repo"
+    common_path = Path(common).resolve()
+    digest = hashlib.sha256(str(common_path).encode()).hexdigest()[:12]
+    name = _UNSAFE.sub("-", common_path.parent.name).strip("-") or "repo"
     return RepoKey(host="_local", owner="", repo=f"{name}-{digest}", local=True)
 
 

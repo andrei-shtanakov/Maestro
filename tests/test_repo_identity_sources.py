@@ -51,3 +51,17 @@ def test_non_git_directory_refuses(tmp_path):
     plain.mkdir()
     with pytest.raises(IdentityError):
         identity_from_checkout(plain)
+
+
+def test_worktrees_of_one_repo_resolve_together(tmp_path):
+    main = _init_repo(tmp_path / "main")
+    # a commit is required before `git worktree add`
+    (main / "f.txt").write_text("x")
+    _git(main, "add", "f.txt")
+    _git(main, "-c", "user.email=t@e", "-c", "user.name=t", "commit", "-qm", "init")
+    linked = tmp_path / "wt-copy"
+    _git(main, "worktree", "add", "-q", str(linked), "-b", "wt")
+    assert (
+        identity_from_checkout(main).as_path_parts()
+        == identity_from_checkout(linked).as_path_parts()
+    )
