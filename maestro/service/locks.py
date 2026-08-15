@@ -25,13 +25,13 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from maestro.state_paths import maestro_home
+from maestro.state_paths import locks_dir, maestro_home
 
 
 if TYPE_CHECKING:
+    from pathlib import Path
     from types import TracebackType
 
     from maestro.repo_identity import RepoKey
@@ -49,22 +49,28 @@ __all__ = [
 
 Stage = Literal["orchestrate", "review"]
 
-DEFAULT_ROOT = Path.home() / ".maestro"
-
 
 class AlreadyRunning(RuntimeError):
     """Another process holds a conflicting lock (spec §3.1)."""
 
 
 def global_lock_path(*, root: Path | None = None) -> Path:
-    """The compatibility lock legacy takes exclusively, scoped shares."""
-    return (root or DEFAULT_ROOT) / "locks" / "global.lock"
+    """The compatibility lock legacy takes exclusively, scoped shares.
+
+    Resolves against `maestro_home()` — the same rule `stage_lock_path`
+    uses — so the two trees never diverge when `$MAESTRO_HOME` is set.
+    """
+    base = root if root is not None else maestro_home()
+    return base / "locks" / "global.lock"
 
 
 def stage_lock_path(key: RepoKey, stage: Stage, *, root: Path | None = None) -> Path:
-    """Lock identity is (repository, stage) — no database path (spec §A.4)."""
-    base = root if root is not None else maestro_home()
-    return base.joinpath("locks", *key.as_path_parts(), f"{stage}.lock")
+    """Lock identity is (repository, stage) — no database path (spec §A.4).
+
+    Lives under the canonical per-repository `locks_dir` (spec §3), not a
+    hand-rolled sibling tree.
+    """
+    return locks_dir(key, home=root) / f"{stage}.lock"
 
 
 def read_holder_run_id(

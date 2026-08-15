@@ -19,6 +19,16 @@ def test_holder_is_cleared_on_release(tmp_path):
     assert read_holder_run_id(KEY, "orchestrate", root=tmp_path) is None
 
 
+def test_holder_is_cleared_when_the_body_raises(tmp_path):
+    """__exit__ unlinks unconditionally — cleanup must not become conditional."""
+    with (
+        pytest.raises(ValueError, match="boom"),
+        ScopedLock(key=KEY, stage="orchestrate", run_id="RUN-A", root=tmp_path),
+    ):
+        raise ValueError("boom")
+    assert read_holder_run_id(KEY, "orchestrate", root=tmp_path) is None
+
+
 def test_same_repo_and_stage_is_exclusive(tmp_path):
     with (
         ScopedLock(key=KEY, stage="orchestrate", run_id="RUN-A", root=tmp_path),
