@@ -16,7 +16,7 @@ import ulid
 
 from maestro.repo_identity import RepoKey, parse_remote_url
 from maestro.run_publish import create_run
-from maestro.run_registry import resolve_runs, select_resumable
+from maestro.run_registry import live_run, resolve_runs, select_resumable
 
 
 if TYPE_CHECKING:
@@ -24,6 +24,10 @@ if TYPE_CHECKING:
 
 
 PIPELINE_ID_ENV = "ORCHESTRA_PIPELINE_ID"
+
+
+class RunIsLive(Exception):
+    """A run of this repository is live; refuse to start a second one."""
 
 
 @dataclass(frozen=True)
@@ -52,6 +56,13 @@ async def bootstrap_run(
             chosen = select_resumable(runs)
         run_id, db_path, fresh = chosen.run_id, chosen.db_path, False
     else:
+        existing = await resolve_runs(key, home=home, lock_root=home)
+        alive = live_run(existing)
+        if alive is not None:
+            raise RunIsLive(
+                f"run {alive.run_id} is live for {repo_key_text}; "
+                "wait for it, or pass --run <run-id> --resume"
+            )
         run_id = str(ulid.new())
         db_path = await create_run(
             key,

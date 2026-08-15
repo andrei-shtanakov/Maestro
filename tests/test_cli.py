@@ -305,14 +305,19 @@ class TestOrchestratorResumeFlag:
                 config_path=config_path,
                 db_path=db_path,
                 resume=resume,
+                run=None,
                 log_dir=None,
             )
 
     @pytest.mark.anyio
-    async def test_run_orchestrator_clears_state_without_resume(
+    async def test_run_orchestrator_preserves_state_without_resume_with_explicit_db(
         self,
         temp_dir: Path,
     ) -> None:
+        """`--db` names a file directly — no run directory is minted, so
+        there is nothing else for a fresh start to leave behind. Clearing on
+        plain `orchestrate` was removed (Task 10): existing state is neither
+        the resolver's concern here nor deleted out from under the caller."""
         config_path = _write_orchestrator_config(temp_dir)
         db_path = temp_dir / "state.db"
         await _seed_workstream(db_path, "existing")
@@ -322,7 +327,8 @@ class TestOrchestratorResumeFlag:
         db = await create_database(db_path)
         try:
             workstreams = await db.get_all_workstreams()
-            assert workstreams == []
+            assert len(workstreams) == 1
+            assert workstreams[0].id == "existing"
         finally:
             await db.close()
 
@@ -377,6 +383,7 @@ class TestOrchestratorResumeFlag:
                 config_path=config_path,
                 db_path=db_path,
                 resume=False,
+                run=None,
                 log_dir=None,
             )
 
@@ -417,6 +424,7 @@ class TestOrchestratorResumeFlag:
                 config_path=config_path,
                 db_path=db_path,
                 resume=False,
+                run=None,
                 log_dir=None,
             )
 

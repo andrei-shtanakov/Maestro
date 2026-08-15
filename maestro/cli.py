@@ -83,8 +83,8 @@ from maestro.review_workspace import (
     materialize,
     recover_push,
 )
-from maestro.run_bootstrap import bootstrap_run
-from maestro.run_registry import AmbiguousRun, NoResumableRun
+from maestro.run_bootstrap import RunIsLive, bootstrap_run
+from maestro.run_registry import AmbiguousRun, NoResumableRun, resolve_runs
 from maestro.scaffold import ScaffoldError, generate_project_yaml
 from maestro.service.locks import Stage  # noqa: TC001 — runtime cast target
 from maestro.service.tick import TickResult, run_argv, run_tick
@@ -1398,10 +1398,14 @@ def _resolve_orchestrator_paths(
     return repo_path, workspace_base, resolved_log_dir
 
 
+_TERMINAL_RUN_STATUSES = frozenset({"completed", "cancelled", "superseded", "failed"})
+
+
 async def _run_orchestrator(
     config_path: Path,
     db_path: Path | None,
     resume: bool,
+    run: str | None,
     log_dir: Path | None,
 ) -> None:
     """Run the multi-process orchestrator."""
@@ -1428,8 +1432,38 @@ async def _run_orchestrator(
     if db_path is not None:
         resolved_db_path = db_path
     else:
-        bootstrap = await bootstrap_run(config, resume=resume, run_id_override=None)
+        try:
+            bootstrap = await bootstrap_run(config, resume=resume, run_id_override=run)
+        except IdentityError as e:
+            err_console.print(f"[red]Cannot resolve repository identity:[/red] {e}")
+            raise typer.Exit(1) from e
+        except RunIsLive as e:
+            err_console.print(f"[red]Refusing to start a second run:[/red] {e}")
+            raise typer.Exit(1) from e
+        except NoResumableRun as e:
+            err_console.print(f"[red]No resumable run:[/red] {e}")
+            raise typer.Exit(1) from e
+        except AmbiguousRun as e:
+            err_console.print(f"[red]Several runs could be resumed:[/red] {e}")
+            raise typer.Exit(1) from e
         resolved_db_path = bootstrap.db_path
+
+        # A fresh run gets its own directory; the previous run is not
+        # touched. Say what is being left behind so the operator sees it
+        # here rather than discovering it later.
+        if bootstrap.fresh:
+            leftover = [
+                r
+                for r in await resolve_runs(bootstrap.key)
+                if r.run_id != bootstrap.run_id
+                and r.status not in _TERMINAL_RUN_STATUSES
+            ]
+            if leftover:
+                ids = ", ".join(f"{r.run_id} ({r.status})" for r in leftover)
+                console.print(
+                    f"[yellow]Starting a fresh run; leaving {len(leftover)} "
+                    f"non-terminal run(s) behind: {ids}[/yellow]"
+                )
 
     setup_logging("maestro")
 
@@ -1445,15 +1479,6 @@ async def _run_orchestrator(
             console.print(
                 f"[cyan]Resuming with {len(existing_workstreams)} existing workstreams[/cyan]"
             )
-    else:
-        existing_workstreams = await db.get_all_workstreams()
-        if existing_workstreams:
-            console.print(
-                f"[yellow]Clearing {len(existing_workstreams)} existing workstreams "
-                "state (use --resume to continue where you left off).[/yellow]"
-            )
-            for workstream in existing_workstreams:
-                await db.delete_workstream(workstream.id)
 
     repo_path, workspace_base, log_dir = _resolve_orchestrator_paths(config, log_dir)
 
@@ -1608,6 +1633,13 @@ def orchestrate_command(
             help="Resume from existing database state",
         ),
     ] = False,
+    run: Annotated[
+        str | None,
+        typer.Option(
+            "--run",
+            help="Act on this run id instead of the resolver's choice.",
+        ),
+    ] = None,
     log_dir: Annotated[
         Path | None,
         typer.Option(
@@ -1628,7 +1660,7 @@ def orchestrate_command(
         maestro orchestrate project.yaml --resume
     """
     try:
-        asyncio.run(_run_orchestrator(config, db, resume, log_dir))
+        asyncio.run(_run_orchestrator(config, db, resume, run, log_dir))
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user[/yellow]")
         raise typer.Exit(130) from None
