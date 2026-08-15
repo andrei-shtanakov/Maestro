@@ -1450,6 +1450,7 @@ class TestSchemaMigrationsJournal:
                 (24, "gate_approvals_completeness"),
                 (25, "workstream_quarantine"),
                 (26, "workstream_continuation"),
+                (27, "run_table"),
             ]
         finally:
             await db.close()
@@ -1473,7 +1474,7 @@ class TestSchemaMigrationsJournal:
             )
             row = await cursor.fetchone()
             assert row is not None
-            assert row["n"] == 26
+            assert row["n"] == 27
         finally:
             await db2.close()
 
@@ -1572,6 +1573,7 @@ class TestSchemaMigrationsJournal:
                 (24, "gate_approvals_completeness"),
                 (25, "workstream_quarantine"),
                 (26, "workstream_continuation"),
+                (27, "run_table"),
             ]
             # Sanity: the idempotent ALTERs must not have fired twice.
             cursor = await db._connection.execute("PRAGMA table_info(tasks)")

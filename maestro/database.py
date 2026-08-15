@@ -611,6 +611,7 @@ class Database:
                 "workstream_continuation",
                 self._migrate_workstream_continuation,
             ),
+            (27, "run_table", self._migrate_run_table),
         ]
 
         for version, name, fn in ordered:
@@ -1297,6 +1298,31 @@ class Database:
                 "ALTER TABLE workstreams ADD COLUMN continuation_count "
                 "INTEGER NOT NULL DEFAULT 0"
             )
+
+    async def _migrate_run_table(self) -> None:
+        """Spec §B.1 — the run's own row: identity, start, typed outcome.
+
+        `needs_human` is deliberately absent from the CHECK: a human pause
+        ends a tick, not a logical run (maestro/service/decide.py:30), and the
+        database outlives it.
+        """
+        assert self._connection is not None
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS run (
+                run_id         TEXT PRIMARY KEY,
+                repo_key       TEXT NOT NULL,
+                started_at     TEXT NOT NULL,
+                outcome        TEXT CHECK (outcome IN
+                                 ('completed','cancelled','superseded','failed')),
+                ended_at       TEXT,
+                reason         TEXT,
+                suspended_at   TEXT,
+                suspend_reason TEXT,
+                singleton      INTEGER NOT NULL DEFAULT 1 UNIQUE CHECK (singleton = 1)
+            )
+            """
+        )
 
     async def _migrate_workstream_rework(self) -> None:
         """Migration 18: operator rework columns + audit tables (#124).
@@ -4625,6 +4651,46 @@ class Database:
                     "operator — resolution refused"
                 )
                 raise ValueError(msg)
+
+    async def create_run_row(
+        self, *, run_id: str, repo_key: str, started_at: str
+    ) -> None:
+        """Write the run's own row. Exactly once per database."""
+        assert self._connection is not None
+        await self._connection.execute(
+            "INSERT INTO run (run_id, repo_key, started_at) VALUES (?, ?, ?)",
+            (run_id, repo_key, started_at),
+        )
+        await self._connection.commit()
+
+    async def get_run_row(self) -> dict[str, object] | None:
+        """Return the run's own row, or `None` on a fresh database."""
+        assert self._connection is not None
+        cursor = await self._connection.execute("SELECT * FROM run LIMIT 1")
+        row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    async def set_run_outcome(
+        self, *, outcome: str, ended_at: str, reason: str | None = None
+    ) -> None:
+        """Record the run's terminal outcome (spec §B.1)."""
+        assert self._connection is not None
+        await self._connection.execute(
+            "UPDATE run SET outcome = ?, ended_at = ?, reason = ?",
+            (outcome, ended_at, reason),
+        )
+        await self._connection.commit()
+
+    async def set_run_suspended(
+        self, *, suspended_at: str, suspend_reason: str
+    ) -> None:
+        """A human pause. Never sets `ended_at` (spec §B.1.1)."""
+        assert self._connection is not None
+        await self._connection.execute(
+            "UPDATE run SET suspended_at = ?, suspend_reason = ?",
+            (suspended_at, suspend_reason),
+        )
+        await self._connection.commit()
 
 
 # Convenience function for creating and initializing a database
