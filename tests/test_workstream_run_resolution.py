@@ -645,6 +645,34 @@ def test_cli_a_finished_run_is_still_listable(
     assert "run RUN-A" in result.stdout
 
 
+def test_cli_unknown_run_refusal_escapes_the_operators_own_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal quotes `--run` back; unescaped, it quotes something else.
+
+    `orchestrate` got this escape with its own test; the fifteen resolving
+    commands print the same message from `select_run_for_command` and did
+    not. Unescaped, `--run '[bold]x'` is answered with "no run x" — a wrong
+    fact about the operator's input, in the one sentence whose whole job is
+    to name that input back to them.
+    """
+    monkeypatch.setenv("MAESTRO_HOME", str(tmp_path / "home"))
+    asyncio.run(
+        create_run(
+            KEY, "RUN-A", repo_key_text="k", started_at="2026-08-15T09:00:00+00:00"
+        )
+    )
+    checkout = _checkout(tmp_path, "https://github.com/acme/app")
+    monkeypatch.chdir(checkout)
+
+    result = runner.invoke(app, ["workstreams", "--run", "[bold]x"])
+
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "no run [bold]x" in result.stderr
+    assert "known runs: RUN-A" in result.stderr
+
+
 def test_cli_db_announcement_escapes_bracket_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

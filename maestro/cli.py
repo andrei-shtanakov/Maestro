@@ -2169,7 +2169,12 @@ def _resolved_db_path(
         runs = asyncio.run(resolve_runs(key))
         info = select_run_for_command(runs, key, run_id=run)
     except NoResumableRun as e:
-        err_console.print(f"[red]No resumable run:[/red] {e}", soft_wrap=True)
+        # Escaped because the message quotes the operator's own `--run` value:
+        # unescaped, `--run '[bold]x'` is answered with "no run x", a wrong
+        # fact about their input in the one sentence meant to name it back.
+        err_console.print(
+            f"[red]No resumable run:[/red] {escape(str(e))}", soft_wrap=True
+        )
         err_console.print(origin, soft_wrap=True)
         if run is None and not runs:
             # A genuinely fresh repository — not a wrong-identity accident,

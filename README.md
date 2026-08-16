@@ -234,8 +234,31 @@ rows predate any project key, and for the July demo tasks the honest owner is
 maestro state-usage    # runs and bytes per repository, plus the legacy file
 ```
 
-There is deliberately no retention policy yet; a run directory holds its
-database and its logs together and is removable as a unit.
+There is deliberately no retention policy yet.
+
+A run directory holds `state.db` and an empty `logs/`. **Logs do not live there
+yet** — they are still written next to the working directory (`logs/<run-id>/`)
+and, for the service, under `~/.maestro/service-logs/`. So a run directory is
+not yet removable as a unit, and `maestro state-usage` does not see the logs.
+Moving them is follow-up work, not part of this change.
+
+**Ending a run.** A run records its own ending: `completed` when everything is
+terminal, `failed` only when it cannot advance, `cancelled` on Ctrl-C. A
+needs-human pause sets `suspended_at` and leaves the run resumable under the
+same id. What Maestro will *not* do is decide on your behalf that an
+interrupted run is obsolete — orchestrating again leaves the older run marked
+`interrupted`, because that is the one fact saying it died mid-flight, and
+overwriting it would replace evidence about that run with a claim about a
+different one. When you have decided, say so:
+
+```bash
+maestro run-end <run-id> --outcome superseded   # or: cancelled
+```
+
+`completed` and `failed` are refused there deliberately: those are observations
+a finishing run makes about itself from its own workstream table, not
+assertions an operator can make by hand. Until an older run is ended, two open
+runs make every run-resolving command ask for `--run`.
 
 One more trap, since it reads like a contradiction when you hit it: `chmod
 0500` on the directory holding a database — the natural way to protect
