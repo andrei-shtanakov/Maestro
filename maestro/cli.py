@@ -1988,8 +1988,15 @@ def workstreams_command(
 ) -> None:
     """Show status of all workstreams.
 
+    Resolves `(repository, run)` from the checkout in the current
+    directory — or from `--config <project.yaml>` — before it opens
+    anything, and says what it resolved. `--run` picks between two runs;
+    `--db` names a database directly and skips resolution entirely.
+
     Examples:
-        maestro workstreams
+        cd <repo> && maestro workstreams
+        maestro workstreams --config ../other/project.yaml
+        maestro workstreams --run 01J8Z...
         maestro workstreams --db /path/to/state.db
     """
     db_path = _resolved_db_path(db, run, config_flag=config)
@@ -2046,7 +2053,14 @@ def workstream_approve_command(
 ) -> None:
     """Approve a NEEDS_REVIEW workstream (gates re-queue) back to READY.
 
+    Resolves `(repository, run)` from the checkout in the current
+    directory — or from `--config <project.yaml>` — before it opens
+    anything, and says what it resolved. `--run` picks between two runs;
+    `--db` names a database directly and skips resolution entirely.
+
     Examples:
+        cd <repo> && maestro workstream-approve risk-model-docs-rule
+        maestro workstream-approve risk-model-docs-rule --run 01J8Z...
         maestro workstream-approve risk-model-docs-rule --db run/maestro.db
     """
     db_path = _resolved_db_path(db, run, config_flag=config)
@@ -2194,8 +2208,14 @@ def workstream_quarantine_command(
     Idempotent — a second call keeps the original timestamp, which reads as the
     age of the incident.
 
+    Resolves `(repository, run)` from the checkout in the current
+    directory — or from `--config <project.yaml>` — before it opens
+    anything, and says what it resolved. `--run` picks between two runs;
+    `--db` names a database directly and skips resolution entirely.
+
     Examples:
-        maestro workstream-quarantine w-adapters --reason "false DONE, 1/9"
+        cd <repo> && maestro workstream-quarantine w-adapters --reason "1/9"
+        maestro workstream-quarantine w-adapters --reason "1/9" --run 01J8Z...
     """
     db_path = _resolved_db_path(db, run, config_flag=config)
 
@@ -2270,8 +2290,14 @@ def workstream_unquarantine_command(
     still owes. The orchestrator picks it up on its own next loop if its status
     makes it eligible.
 
+    Resolves `(repository, run)` from the checkout in the current
+    directory — or from `--config <project.yaml>` — before it opens
+    anything, and says what it resolved. `--run` picks between two runs;
+    `--db` names a database directly and skips resolution entirely.
+
     Examples:
-        maestro workstream-unquarantine w-adapters --reason "false DONE fixed"
+        cd <repo> && maestro workstream-unquarantine w-adapters --reason "fixed"
+        maestro workstream-unquarantine w-adapters --reason "fixed" --run 01J8Z...
     """
     db_path = _resolved_db_path(db, run, config_flag=config)
 
@@ -2346,8 +2372,14 @@ def workstream_continue_command(
     Not an approval and not a rework: nothing about the result is accepted and
     no spec is regenerated.
 
+    Resolves `(repository, run)` from the checkout in the current
+    directory — or from `--config <project.yaml>` — before it opens
+    anything, and says what it resolved. `--run` picks between two runs;
+    `--db` names a database directly and skips resolution entirely.
+
     Examples:
-        maestro workstream-continue w-adapters
+        cd <repo> && maestro workstream-continue w-adapters
+        maestro workstream-continue w-adapters --run 01J8Z...
     """
     db_path = _resolved_db_path(db, run, config_flag=config)
 
@@ -2472,7 +2504,14 @@ def workstream_recapture_command(
     This is NOT an approval: nothing about the result is accepted here. Fix
     whatever made the archive root unwritable first, then run this.
 
+    Resolves `(repository, run)` from the checkout in the current
+    directory — or from `--config <project.yaml>` — before it opens
+    anything, and says what it resolved. `--run` picks between two runs;
+    `--db` names a database directly and skips resolution entirely.
+
     Examples:
+        cd <repo> && maestro workstream-recapture w-contracts
+        maestro workstream-recapture w-contracts --run 01J8Z...
         maestro workstream-recapture w-contracts --db run/maestro.db
     """
     db_path = _resolved_db_path(db, run, config_flag=config)
@@ -2626,9 +2665,16 @@ def workstream_rework_command(
     worktree with new instructions. NOT an approval — the ex-post gate
     re-evaluates the new work from scratch.
 
+    Resolves `(repository, run)` from the checkout in the current
+    directory — or from `--config <project.yaml>` — before it opens
+    anything, and says what it resolved. `--run` picks between two runs;
+    `--db` names a database directly and skips resolution entirely.
+
     Examples:
-        maestro workstream-rework my-ws --reason "review rejected the diff" \\
+        cd <repo> && maestro workstream-rework my-ws \\
+            --reason "review rejected the diff" \\
             --instructions "split the migration into two steps"
+        maestro workstream-rework my-ws --reason "..." --run 01J8Z...
     """
     from maestro.rework import ReworkRefused
 
@@ -2699,9 +2745,16 @@ def workstream_resolve_ambiguity_command(
     live-handle) `workstream-rework` refuses until this explicit, audited
     resolution.
 
+    Resolves `(repository, run)` from the checkout in the current
+    directory — or from `--config <project.yaml>` — before it opens
+    anything, and says what it resolved. `--run` picks between two runs;
+    `--db` names a database directly and skips resolution entirely.
+
     Examples:
-        maestro workstream-resolve-ambiguity my-ws \\
+        cd <repo> && maestro workstream-resolve-ambiguity my-ws \\
             --statement "checked ps/docker on the runner: nothing left"
+        maestro workstream-resolve-ambiguity my-ws --statement "..." \\
+            --run 01J8Z...
     """
     db_path = _resolved_db_path(db, run, config_flag=config)
 

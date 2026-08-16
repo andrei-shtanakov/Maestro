@@ -3,6 +3,47 @@
 ## Unreleased
 
 ### Changed
+- **BREAKING (state layout): orchestration state moved to
+  `~/.maestro/projects/<host>/<owner>/<repo>/runs/<run-id>/`.** One database
+  held everything before, with no project key anywhere in the path, and on
+  2026-08-15 the single file held three unrelated projects at once and was a
+  week stale. State is now per repository and per run: `state.db` and that
+  run's `logs/` live together under the run directory, and `locks/` beside
+  `runs/`. Identity is the repository's `origin` remote — host, owner, name —
+  never `project:` and never a filesystem path; a checkout with no remote lands
+  in `projects/_local/<name>-<hash>/`, fingerprinted by its git common dir. Run
+  `maestro state-usage` to see what a machine holds. Consumers that pinned
+  `~/.maestro/maestro.db` must enumerate
+  `~/.maestro/projects/*/*/*/runs/*/state.db` instead (`dispatcher#147`); until
+  they do, a dashboard reading the old path **freezes** rather than lying, which
+  is the smaller of the two failures.
+- **BREAKING (CLI): commands that fell back to `~/.maestro/maestro.db` now
+  resolve a run, and refuse when they cannot.** `run`, `status`, `retry`,
+  `approve`, `postmortem`, `check-scope`, `costs` and the eight `workstream*`
+  commands take identity from the config the invocation names — `maestro run
+  tasks.yaml`, `maestro orchestrate project.yaml`, or the new optional
+  `--config` — and otherwise from the checkout in the current directory. So a
+  bare `maestro workstreams` run from an unrelated directory, which used to
+  succeed against the shared database, now refuses and names the key it derived
+  and where it derived it from. `--run <run-id>` disambiguates two runs;
+  `--db <path>` still names a database directly and now refuses to be combined
+  with `--run` or `--config`, which it would otherwise silently ignore.
+- **BREAKING (locks): lock identity no longer includes the database path.**
+  Stage locks are keyed `(repository, stage)`, so two runs of one project
+  against two different `--db` files now serialise per stage instead of
+  proceeding in parallel.
+- `~/.maestro/maestro.db` is **frozen, not migrated**: it stays readable and is
+  named by `maestro state-usage`, and no default path writes to it. "Frozen"
+  means "never the default", not "immutable" — an explicit
+  `--db ~/.maestro/maestro.db` still opens it for writing and initialises the
+  schema, so copy it first if you want it untouched.
+- `maestro service install` no longer bakes a database path into the generated
+  unit. A unit outlives every run it starts, so a pinned path would make a
+  03:00 tick act on a run that has since ended; each tick now resolves the
+  current run for itself. An explicit `--db` is still honoured and still pinned.
+- `maestro run --clean` now only means anything together with `--db`. A
+  resolved fresh run gets its own empty database by construction, and clearing
+  a resumed one would delete the `run` row that is its identity.
 - **BREAKING (verdict log): `maestro.gate-verdict-record/v1` -> `/v2` — the
   `obligation` field is now `enforcement` (#160).** The two names denote
   different axes and v1 used steward's name for ours: `obligation`
