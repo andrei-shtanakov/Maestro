@@ -483,6 +483,50 @@ class Database:
 
         await self.initialize_schema()
 
+    async def connect_readonly(self) -> None:
+        """Open the database READ-ONLY: no schema, no migrations, no bytes.
+
+        `connect()` calls `initialize_schema()`, so *opening* a database is
+        also upgrading it. That is a precondition of a write and defensible
+        for a command the operator aimed at a file to change it. It is not
+        defensible for a view: `maestro workstreams --db <legacy>` asked to
+        *look at* the evidence and rewrote it — 1 table becomes 21, and the
+        file's provenance, which is the whole reason spec §E keeps it, is
+        gone.
+
+        `mode=ro` never creates a missing file, runs no DDL, and writes
+        nothing. It also cannot set `journal_mode` or `foreign_keys`, and
+        neither matters with no writes in flight.
+
+        The `is_file()` check ahead of `aiosqlite.connect` is the lifecycle
+        fix `read_all_costs_readonly` documents at length: aiosqlite's
+        failed-connect path discards the future returned by `stop()`, and the
+        worker thread's `call_soon_threadsafe` then raises into whatever test
+        runs next. Refusing before the connect keeps that path unreached.
+        """
+        if self._connection is not None:
+            return
+
+        path = Path(self._db_path)
+        # Three fast stats in a CLI context, as in `read_all_costs_readonly`:
+        # the operator acts on this sentence, and "does not exist" for a FIFO
+        # that plainly does sends them looking for the wrong problem.
+        if not path.is_file():  # noqa: ASYNC240
+            if path.is_dir():  # noqa: ASYNC240
+                detail = "is a directory"
+            elif path.exists():  # noqa: ASYNC240
+                detail = "exists but is not a regular file"
+            else:
+                detail = "does not exist"
+            raise DatabaseError(f"cannot open database read-only: {path} {detail}")
+
+        try:
+            connection = await aiosqlite.connect(_ro_uri(self._db_path), uri=True)
+        except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+            raise DatabaseError(f"cannot open database read-only: {exc}") from exc
+        connection.row_factory = aiosqlite.Row
+        self._connection = connection
+
     async def close(self) -> None:
         """Close database connection."""
         if self._connection is not None:
@@ -611,6 +655,7 @@ class Database:
                 "workstream_continuation",
                 self._migrate_workstream_continuation,
             ),
+            (27, "run_table", self._migrate_run_table),
         ]
 
         for version, name, fn in ordered:
@@ -1297,6 +1342,31 @@ class Database:
                 "ALTER TABLE workstreams ADD COLUMN continuation_count "
                 "INTEGER NOT NULL DEFAULT 0"
             )
+
+    async def _migrate_run_table(self) -> None:
+        """Spec §B.1 — the run's own row: identity, start, typed outcome.
+
+        `needs_human` is deliberately absent from the CHECK: a human pause
+        ends a tick, not a logical run (maestro/service/decide.py:30), and the
+        database outlives it.
+        """
+        assert self._connection is not None
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS run (
+                run_id         TEXT PRIMARY KEY,
+                repo_key       TEXT NOT NULL,
+                started_at     TEXT NOT NULL,
+                outcome        TEXT CHECK (outcome IN
+                                 ('completed','cancelled','superseded','failed')),
+                ended_at       TEXT,
+                reason         TEXT,
+                suspended_at   TEXT,
+                suspend_reason TEXT,
+                singleton      INTEGER NOT NULL DEFAULT 1 UNIQUE CHECK (singleton = 1)
+            )
+            """
+        )
 
     async def _migrate_workstream_rework(self) -> None:
         """Migration 18: operator rework columns + audit tables (#124).
@@ -4626,6 +4696,46 @@ class Database:
                 )
                 raise ValueError(msg)
 
+    async def create_run_row(
+        self, *, run_id: str, repo_key: str, started_at: str
+    ) -> None:
+        """Write the run's own row. Exactly once per database."""
+        assert self._connection is not None
+        await self._connection.execute(
+            "INSERT INTO run (run_id, repo_key, started_at) VALUES (?, ?, ?)",
+            (run_id, repo_key, started_at),
+        )
+        await self._connection.commit()
+
+    async def get_run_row(self) -> dict[str, object] | None:
+        """Return the run's own row, or `None` on a fresh database."""
+        assert self._connection is not None
+        cursor = await self._connection.execute("SELECT * FROM run LIMIT 1")
+        row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    async def set_run_outcome(
+        self, *, outcome: str, ended_at: str, reason: str | None = None
+    ) -> None:
+        """Record the run's terminal outcome (spec §B.1)."""
+        assert self._connection is not None
+        await self._connection.execute(
+            "UPDATE run SET outcome = ?, ended_at = ?, reason = ?",
+            (outcome, ended_at, reason),
+        )
+        await self._connection.commit()
+
+    async def set_run_suspended(
+        self, *, suspended_at: str, suspend_reason: str
+    ) -> None:
+        """A human pause. Never sets `ended_at` (spec §B.1.1)."""
+        assert self._connection is not None
+        await self._connection.execute(
+            "UPDATE run SET suspended_at = ?, suspend_reason = ?",
+            (suspended_at, suspend_reason),
+        )
+        await self._connection.commit()
+
 
 # Convenience function for creating and initializing a database
 async def create_database(db_path: str | Path) -> Database:
@@ -4640,6 +4750,22 @@ async def create_database(db_path: str | Path) -> Database:
     db = Database(db_path)
     # Database.connect() auto-runs initialize_schema(); no separate call needed.
     await db.connect()
+    return db
+
+
+async def create_database_readonly(db_path: str | Path) -> Database:
+    """Open an existing database READ-ONLY, for commands that only look.
+
+    The counterpart of `create_database` for the view-only half of the CLI
+    (`status`, `workstreams`, `check-scope`, `service status`) — see
+    `Database.connect_readonly` for why the two must not be the same call.
+
+    Raises:
+        DatabaseError: the path is missing, is not a regular file, or is not
+            a database SQLite can open.
+    """
+    db = Database(db_path)
+    await db.connect_readonly()
     return db
 
 

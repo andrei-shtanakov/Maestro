@@ -58,11 +58,15 @@ tasks:
 ```
 
 ```bash
-uv run maestro run config.yaml           # Run tasks
+uv run maestro run config.yaml           # Run tasks (mints a run)
 uv run maestro run config.yaml --resume  # Resume after crash
 uv run maestro status                    # Check progress
 uv run maestro retry <task-id>           # Retry a failed task
 ```
+
+Run these from the repository `repo:` points at, or add `--config config.yaml`
+— state is keyed by that checkout's git remote. See
+[Where state lives](#where-state-lives).
 
 ## Mode 2: Multi-Process Orchestrator
 
@@ -76,10 +80,16 @@ Decompose a project into isolated work units ("workstreams"), each running in it
 See [`examples/project.yaml`](examples/project.yaml) for a fully annotated config.
 
 ```bash
-uv run maestro orchestrate project.yaml  # Run orchestrator
-uv run maestro workstreams                   # Check workstreams status
-uv run maestro workspaces                # List active worktrees
+uv run maestro orchestrate project.yaml           # Run orchestrator
+cd <repo> && uv run maestro workstreams           # Check workstreams status
+uv run maestro workstreams --config project.yaml  # ...or name the repository
+uv run maestro workstreams --run 01J8Z...         # ...or disambiguate two runs
+uv run maestro workspaces                         # List active worktrees
 ```
+
+`workstreams` and its siblings resolve `(repository, run)` before they open
+anything, so they need the repository's checkout, a `--config`, or a `--db`.
+See [Where state lives](#where-state-lives).
 
 ### Config authoring: `init` and `validate`
 
@@ -139,13 +149,122 @@ the version check to a warning (the `--spec-prefix` capability probe stays
 mandatory). A `spec/.gitignore` deliberately tracked by the user remains a
 user file and is checked by the normal scope rules.
 
-### Where the state DB lives
+### Where state lives
 
-All state-reading commands (`status`, `workstreams`, `retry`, `approve`,
-`costs`, ...) default to `~/.maestro/maestro.db`, and `maestro run` /
-`maestro orchestrate` write there by default too. Pass `--db <path>` on both
-sides when you want a reproducible, per-project DB instead of the shared
-default.
+State is per project and per run:
+
+```
+~/.maestro/
+  projects/<host>/<owner>/<repo>/
+    runs/<run-id>/
+      state.db
+      logs/
+    locks/
+  maestro.db          # legacy, frozen — see below
+  service.env
+```
+
+**Identity comes from the git remote, never from `project:` and never from a
+filesystem path.** `project:` is operator-chosen and has named a pilot rather
+than a repository in live configs; a path is not portable. The key is the
+`origin` remote — host included, because `github.com/acme/app` and
+`gitlab.com/acme/app` are two repositories with one `owner/repo`. A checkout
+with no `origin` lands in `projects/_local/<name>-<hash>/`, fingerprinted by its
+git common dir so two unrelated checkouts sharing a basename stay apart and two
+worktrees of one repository come together.
+
+**One rule for naming the repository, in every command.** The invocation names
+it either with a config or with the current directory:
+
+1. `--db <path>` names a database directly and skips resolution entirely;
+2. otherwise the config — `maestro run tasks.yaml`, `maestro orchestrate
+   project.yaml`, or `--config project.yaml` on the commands that carry none —
+   supplies identity (`repo_url` when the config declares it, else the `origin`
+   of the checkout `repo:` points at);
+3. otherwise the checkout in the current directory.
+
+So the commands that used to work from anywhere must now be run **from the
+repository's checkout**, or be told which repository they mean:
+
+```bash
+cd ~/labs/app && maestro workstreams            # resolves ~/labs/app's run
+maestro workstreams --config ~/labs/app/project.yaml
+maestro workstreams --run 01J8Z...              # disambiguate two runs
+maestro workstreams --db ~/labs/app-run3.db     # name the database outright
+```
+
+Every one of them says what it resolved before it acts, and refuses — with the
+key and where the key came from — rather than guessing. `--db` cannot be
+combined with `--run` or `--config`: it skips the resolver those steer, and
+acting while silently dropping them is exactly the wrong-database success this
+layout removes.
+
+**`~/.maestro/maestro.db` is a frozen legacy file.** It is not migrated (its
+rows predate any project key, and for the July demo tasks the honest owner is
+"none") and no default path writes to it any more. It is still readable, and
+`maestro state-usage` names it. Two caveats worth knowing:
+
+- *Frozen means "never the default", not "immutable" — for the commands that
+  change things.* An explicit `--db ~/.maestro/maestro.db` at a **mutating**
+  command (`retry`, `approve`, `workstream-*`, `orchestrate`, `run`) opens it
+  like any other database, which runs schema initialisation and therefore
+  writes. If you want it untouched under one of those, copy it first. The
+  **view-only** commands — `status`, `workstreams`, `check-scope`,
+  `service status`, `costs` — open `--db` read-only and never initialise a
+  schema, so listing this file no longer rewrites it. The cost of that
+  honesty is that a pre-split file has no `workstreams` table to list, and
+  those commands say so instead of creating one.
+- *If you installed a service unit before this change, reinstall it.* The old
+  `maestro service install` baked `--db ~/.maestro/maestro.db` into the
+  generated unit. `service run` is a mutating command, so an existing unit
+  keeps opening — and rewriting — the legacy file on **every tick**, and
+  nothing on the machine will tell you. Run `maestro service uninstall
+  project.yaml` and `maestro service install project.yaml …` again so the
+  tick resolves the current run instead.
+- *Reading a WAL-mode database read-only legitimately creates `-wal` and `-shm`
+  beside it.* The real `~/.maestro/maestro.db` is WAL-mode, so merely
+  describing it drops two sidecars next to it. The database itself is
+  untouched — the connection is `SQLITE_OPEN_READONLY`, no frame is appended
+  and no checkpoint runs — but anyone hashing the *directory listing* rather
+  than the file will see a change.
+
+**Growth is visible before it is a problem:**
+
+```bash
+maestro state-usage    # runs and bytes per repository, plus the legacy file
+```
+
+There is deliberately no retention policy yet.
+
+A run directory holds `state.db` and an empty `logs/`. **Logs do not live there
+yet** — they are still written next to the working directory (`logs/<run-id>/`)
+and, for the service, under `~/.maestro/service-logs/`. So a run directory is
+not yet removable as a unit, and `maestro state-usage` does not see the logs.
+Moving them is follow-up work, not part of this change.
+
+**Ending a run.** A run records its own ending: `completed` when everything is
+terminal, `failed` only when it cannot advance, `cancelled` on Ctrl-C. A
+needs-human pause sets `suspended_at` and leaves the run resumable under the
+same id. What Maestro will *not* do is decide on your behalf that an
+interrupted run is obsolete — orchestrating again leaves the older run marked
+`interrupted`, because that is the one fact saying it died mid-flight, and
+overwriting it would replace evidence about that run with a claim about a
+different one. When you have decided, say so:
+
+```bash
+maestro run-end <run-id> --outcome superseded   # or: cancelled
+```
+
+`completed` and `failed` are refused there deliberately: those are observations
+a finishing run makes about itself from its own workstream table, not
+assertions an operator can make by hand. Until an older run is ended, two open
+runs make every run-resolving command ask for `--run`.
+
+One more trap, since it reads like a contradiction when you hit it: `chmod
+0500` on the directory holding a database — the natural way to protect
+evidence — makes *reading* it fail with `attempt to write a readonly database`.
+SQLite needs to create its journal beside the file. Protect the file, not the
+directory.
 
 ## Examples
 

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from maestro.database import Database
+    from maestro.repo_identity import RepoKey
 
 
 logger = logging.getLogger(__name__)
@@ -82,12 +83,14 @@ async def run_argv(argv: list[str], *, log_path: Path | None = None) -> int:
 async def run_tick(
     *,
     db: Database,
+    key: RepoKey,
     project: str,
     config_path: Path,
     db_path: Path,
     repo_path: Path,
     base_branch: str,
     stage: Stage,
+    run_id: str | None = None,
     runner: Callable[..., Awaitable[int]],
     notifier: _Notifier | None = None,
     root: Path | None = None,
@@ -95,6 +98,24 @@ async def run_tick(
     sweep: bool = True,
 ) -> TickResult:
     """Execute one tick of `stage` and return its result.
+
+    `key` is the caller's already-resolved repository identity (spec §3) —
+    this wrapper does not derive one on its own, so every acquirer of the
+    stage lock for one repository uses the same key.
+
+    `run_id` is the run this tick is advancing, and it is what makes
+    liveness *observable* (spec §B.3): the stage lock proves only that
+    "an orchestration stage is live in this repository", so without the
+    holder's id a collector cannot tell the live run from an interrupted
+    one and classifies **both** as interrupted — which is exactly what
+    `select_resumable` then offers up for a second, concurrent resume.
+    It is resolved by the caller for the same reason `key` is; this
+    wrapper must never derive it, least of all from the database's parent
+    directory name, which for a legacy `--db` would fabricate the run id
+    `maestro` out of `~/.maestro/maestro.db`. `None` is therefore the
+    honest value whenever the caller has no run identity: the holder
+    sidecar stays unwritten and liveness stays *unobserved*, which reads
+    as interrupted — conservative, and never a fabricated attribution.
 
     The lock decides `skipped_running` before anything else happens, and
     a skip is still recorded — an unattended run must leave evidence
@@ -109,7 +130,7 @@ async def run_tick(
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        lock = ScopedLock(project=project, db_path=db_path, stage=stage, root=root)
+        lock = ScopedLock(key=key, stage=stage, run_id=run_id, root=root)
         lock.__enter__()
     except AlreadyRunning as exc:
         logger.info("service: %s tick skipped — %s", stage, exc)

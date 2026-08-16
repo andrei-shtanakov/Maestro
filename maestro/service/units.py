@@ -106,7 +106,10 @@ class UnitSpec:
     project: str
     stage: Literal["orchestrate", "review"]
     config_path: Path
-    db_path: Path
+    #: `None` means the unit carries no `--db` and each tick resolves the
+    #: current run for itself. A unit outlives every run it starts, so a
+    #: pinned path would make a tick act on a run that has since ended.
+    db_path: Path | None
     maestro_bin: str
     path: str
     env_file: Path
@@ -126,16 +129,17 @@ def unit_name(
 
 
 def _program_arguments(spec: UnitSpec) -> list[str]:
-    return [
+    argv = [
         spec.maestro_bin,
         "service",
         "run",
         str(spec.config_path),
         "--stage",
         spec.stage,
-        "--db",
-        str(spec.db_path),
     ]
+    if spec.db_path is not None:
+        argv += ["--db", str(spec.db_path)]
+    return argv
 
 
 def _parse_schedule(schedule: str) -> tuple[int, int]:

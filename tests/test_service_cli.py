@@ -129,6 +129,46 @@ def test_run_rejects_an_unknown_stage(project_yaml: Path, db_path: Path) -> None
 
 
 # =============================================================================
+# `service run` without `--db` — unattended entry point refuses cleanly
+# =============================================================================
+
+
+def test_run_without_db_refuses_when_no_resumable_run_exists(
+    project_yaml: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scheduled tick never mints a run (spec §A.1); with none to resume it
+    must print the reason on stderr and exit non-zero, not dump a traceback."""
+    monkeypatch.setenv("MAESTRO_HOME", str(tmp_path / "home"))
+    result = runner.invoke(app, ["service", "run", str(project_yaml)])
+    assert result.exit_code == 1
+    assert "No resumable run" in result.stderr
+    assert "maestro orchestrate" in result.stderr  # points at how to establish one
+
+
+def test_run_refuses_an_unresolvable_identity_even_with_db(
+    tmp_path: Path, db_path: Path
+) -> None:
+    """`--db` overrides run/database-path resolution but never identity: the
+    lock key must always be real, so a bad `repo_url` must still refuse
+    (Task 6) — not fall back to a fabricated key."""
+    bad_yaml = tmp_path / "bad-project.yaml"
+    bad_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "project": "demo",
+                "repo_url": "not-a-url",
+                "repo_path": str(tmp_path),
+                "workspace_base": str(tmp_path / "ws"),
+                "workstreams": [],
+            }
+        )
+    )
+    result = runner.invoke(app, ["service", "run", str(bad_yaml), "--db", str(db_path)])
+    assert result.exit_code == 1
+    assert "Cannot resolve repository identity" in result.stderr
+
+
+# =============================================================================
 # `service install` (§2, §3.6)
 # =============================================================================
 
@@ -168,7 +208,7 @@ def test_dry_run_previews_even_with_a_broken_environment(
     empty_env.write_text("# none\n")
     with (
         patch("maestro.cli.platform_units_dir", return_value=units_dir),
-        patch("maestro.cli.DEFAULT_SERVICE_ENV_FILE", empty_env),
+        patch("maestro.cli.service_env_file", lambda: empty_env),
         patch(
             "maestro.service.units.CREDENTIAL_STORES_BY_ENV",
             {"ANTHROPIC_API_KEY": [tmp_path / "no"]},
@@ -196,7 +236,7 @@ def test_install_accepts_a_harness_credential_store(
     store.write_text("{}")
     with (
         patch("maestro.cli.platform_units_dir", return_value=units_dir),
-        patch("maestro.cli.DEFAULT_SERVICE_ENV_FILE", empty_env),
+        patch("maestro.cli.service_env_file", lambda: empty_env),
         patch(
             "maestro.service.units.CREDENTIAL_STORES_BY_ENV",
             {"ANTHROPIC_API_KEY": [store]},
@@ -272,7 +312,7 @@ def test_install_refuses_when_credentials_are_missing(
     empty_env.write_text("# no credentials here\n")
     with (
         patch("maestro.cli.platform_units_dir", return_value=units),
-        patch("maestro.cli.DEFAULT_SERVICE_ENV_FILE", empty_env),
+        patch("maestro.cli.service_env_file", lambda: empty_env),
         patch(
             "maestro.service.units.CREDENTIAL_STORES_BY_ENV",
             {"ANTHROPIC_API_KEY": [tmp_path / "no"]},
@@ -295,7 +335,7 @@ def test_install_escape_hatch_warns_and_proceeds(
     empty_env.write_text("# none\n")
     with (
         patch("maestro.cli.platform_units_dir", return_value=units),
-        patch("maestro.cli.DEFAULT_SERVICE_ENV_FILE", empty_env),
+        patch("maestro.cli.service_env_file", lambda: empty_env),
     ):
         result = _run(
             project_yaml,

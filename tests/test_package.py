@@ -183,9 +183,22 @@ class TestEnvironmentCleanup:
     """Tests for environment cleanup fixture."""
 
     def test_maestro_env_vars_cleaned(self) -> None:
-        """Test that MAESTRO_ prefixed env vars are cleaned up."""
-        import os
+        """Test that MAESTRO_ prefixed env vars are cleaned up.
 
-        # The autouse cleanup_environment fixture should have run
+        `MAESTRO_HOME` is the one exception, and it is deliberate: the
+        `fenced_maestro_home` fixture points it at a temporary tree for the
+        whole session, because clearing it would send any command that resolves
+        state on its own at the developer's real `~/.maestro`. Cleared, it is
+        not absent — it falls back to the operator's home.
+        """
+        import os
+        from pathlib import Path
+
         maestro_vars = [k for k in os.environ if k.startswith("MAESTRO_")]
-        assert len(maestro_vars) == 0
+        assert maestro_vars == ["MAESTRO_HOME"]
+        # The invariant is not "not this one default path" — it's that the
+        # fence sits somewhere outside the real home entirely. `!= ~/.maestro`
+        # alone would still pass for `~/.maestro-old` or any other sibling
+        # under the developer's actual home.
+        home_dir = Path(os.environ["MAESTRO_HOME"])
+        assert not home_dir.is_relative_to(Path.home())

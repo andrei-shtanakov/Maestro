@@ -11,14 +11,18 @@ from pathlib import Path
 
 import pytest
 
+from maestro.repo_identity import RepoKey
 from maestro.service.locks import (
     AlreadyRunning,
     LegacyLock,
     ScopedLock,
     Stage,
-    project_key,
     stage_lock_path,
 )
+
+
+KEY = RepoKey(host="github.com", owner="acme", repo="app")
+OTHER_KEY = RepoKey(host="github.com", owner="acme", repo="other")
 
 
 @pytest.fixture
@@ -26,33 +30,22 @@ def root(tmp_path: Path) -> Path:
     return tmp_path / "maestro-home"
 
 
-def _scoped(root: Path, project: str = "p", stage: Stage = "orchestrate") -> ScopedLock:
-    return ScopedLock(
-        project=project, db_path=Path("/tmp/x.db"), stage=stage, root=root
-    )
+def _scoped(root: Path, key: RepoKey = KEY, stage: Stage = "orchestrate") -> ScopedLock:
+    return ScopedLock(key=key, stage=stage, root=root)
 
 
 # =============================================================================
-# Identity (§3.1): keyed on (project-key, stage)
+# Identity (§3.1, §A.4): keyed on (repository identity, stage)
 # =============================================================================
-
-
-def test_project_key_is_stable_and_collision_free() -> None:
-    a = project_key("proj", Path("/a/maestro.db"))
-    assert a == project_key("proj", Path("/a/maestro.db"))
-    assert a != project_key("proj", Path("/b/maestro.db"))  # db is part of it
-    assert a != project_key("proj2", Path("/a/maestro.db"))
-    # sanitization alone would collide: 'a-b'+'c' vs 'a'+'b-c'
-    assert project_key("a-b", Path("/c")) != project_key("a", Path("/b-c"))
 
 
 def test_stage_is_part_of_the_lock_path(root: Path) -> None:
-    o = stage_lock_path("p", Path("/tmp/x.db"), "orchestrate", root=root)
-    r = stage_lock_path("p", Path("/tmp/x.db"), "review", root=root)
+    o = stage_lock_path(KEY, "orchestrate", root=root)
+    r = stage_lock_path(KEY, "review", root=root)
     assert o != r
     assert o.name == "orchestrate.lock"
     assert r.name == "review.lock"
-    assert o.parent == r.parent  # same project instance dir
+    assert o.parent == r.parent  # same repository instance dir
 
 
 # =============================================================================
@@ -60,19 +53,19 @@ def test_stage_is_part_of_the_lock_path(root: Path) -> None:
 # =============================================================================
 
 
-def test_same_project_and_stage_is_serialized(root: Path) -> None:
+def test_same_repo_and_stage_is_serialized(root: Path) -> None:
     with _scoped(root), pytest.raises(AlreadyRunning), _scoped(root):
         pass
 
 
-def test_same_project_different_stages_run_in_parallel(root: Path) -> None:
+def test_same_repo_different_stages_run_in_parallel(root: Path) -> None:
     """The whole point of stage separation — must NOT block."""
     with _scoped(root, stage="orchestrate"), _scoped(root, stage="review"):
         pass
 
 
-def test_different_projects_run_in_parallel(root: Path) -> None:
-    with _scoped(root, project="a"), _scoped(root, project="b"):
+def test_different_repos_run_in_parallel(root: Path) -> None:
+    with _scoped(root, key=KEY), _scoped(root, key=OTHER_KEY):
         pass
 
 
@@ -110,7 +103,7 @@ def test_locks_are_reacquirable_after_release(root: Path) -> None:
 
 
 def test_lock_released_when_holder_dies(root: Path) -> None:
-    path = stage_lock_path("p", Path("/tmp/x.db"), "orchestrate", root=root)
+    path = stage_lock_path(KEY, "orchestrate", root=root)
     path.parent.mkdir(parents=True, exist_ok=True)
     script = (
         "import fcntl, time\n"

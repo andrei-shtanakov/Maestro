@@ -14,8 +14,6 @@ import yaml
 from typer.testing import CliRunner
 
 from maestro.cli import (
-    DEFAULT_DB_DIR,
-    PID_FILE,
     _acquire_pid_lock,
     _display_summary,
     _display_tasks_table,
@@ -26,9 +24,14 @@ from maestro.cli import (
     _run_orchestrator,
     _run_scheduler,
     app,
+    legacy_db_path,
+    pid_file,
+    service_env_file,
+    service_log_dir,
 )
 from maestro.database import create_database
 from maestro.models import AgentType, Task, TaskStatus, Workstream, WorkstreamConfig
+from maestro.state_paths import maestro_home
 
 
 runner = CliRunner()
@@ -305,6 +308,7 @@ class TestOrchestratorResumeFlag:
                 config_path=config_path,
                 db_path=db_path,
                 resume=resume,
+                run=None,
                 log_dir=None,
             )
 
@@ -313,6 +317,14 @@ class TestOrchestratorResumeFlag:
         self,
         temp_dir: Path,
     ) -> None:
+        """`--db` names a file directly — it bypasses the resolver entirely
+        (Task 9's contract), so there is no per-run directory for a previous
+        run to survive in. A plain (`--db`, no `--resume`) start must still
+        clear, or `orchestrate --db x.db` silently continues an existing DAG
+        instead of starting fresh (Fix Round 1: this was wrongly removed for
+        this path when the resolver's own fresh-by-directory guarantee was
+        added — that guarantee only covers the resolver path, db_path is
+        None)."""
         config_path = _write_orchestrator_config(temp_dir)
         db_path = temp_dir / "state.db"
         await _seed_workstream(db_path, "existing")
@@ -377,6 +389,7 @@ class TestOrchestratorResumeFlag:
                 config_path=config_path,
                 db_path=db_path,
                 resume=False,
+                run=None,
                 log_dir=None,
             )
 
@@ -417,6 +430,7 @@ class TestOrchestratorResumeFlag:
                 config_path=config_path,
                 db_path=db_path,
                 resume=False,
+                run=None,
                 log_dir=None,
             )
 
@@ -684,8 +698,8 @@ class TestStopCommand:
     def test_stop_no_running_scheduler(self, temp_dir: Path) -> None:
         """Test stop command when no scheduler is running."""
         # Ensure no PID file exists
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+        if pid_file().exists():
+            pid_file().unlink()
 
         result = runner.invoke(app, ["stop"])
 
@@ -695,8 +709,8 @@ class TestStopCommand:
     def test_stop_stale_pid(self, temp_dir: Path) -> None:
         """Test stop command with stale PID file."""
         # Write a PID that doesn't exist
-        DEFAULT_DB_DIR.mkdir(parents=True, exist_ok=True)
-        PID_FILE.write_text("999999")
+        maestro_home().mkdir(parents=True, exist_ok=True)
+        pid_file().write_text("999999")
 
         result = runner.invoke(app, ["stop"])
 
@@ -714,23 +728,23 @@ class TestPIDFileManagement:
 
     def test_read_pid_file_not_exists(self) -> None:
         """Test reading PID file when it doesn't exist."""
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+        if pid_file().exists():
+            pid_file().unlink()
 
         result = _read_pid_file()
         assert result is None
 
     def test_read_pid_file_invalid_content(self) -> None:
         """Test reading PID file with invalid content."""
-        DEFAULT_DB_DIR.mkdir(parents=True, exist_ok=True)
-        PID_FILE.write_text("not a number")
+        maestro_home().mkdir(parents=True, exist_ok=True)
+        pid_file().write_text("not a number")
 
         try:
             result = _read_pid_file()
             assert result is None
         finally:
-            if PID_FILE.exists():
-                PID_FILE.unlink()
+            if pid_file().exists():
+                pid_file().unlink()
 
 
 class TestPidFileLocking:
@@ -1057,8 +1071,8 @@ class TestSchedulerAlreadyRunning:
         import fcntl
 
         # Hold an exclusive lock on the PID file
-        DEFAULT_DB_DIR.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(PID_FILE), os.O_CREAT | os.O_RDWR)
+        maestro_home().mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(pid_file()), os.O_CREAT | os.O_RDWR)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         os.write(fd, str(os.getpid()).encode())
 
@@ -1079,7 +1093,7 @@ class TestSchedulerAlreadyRunning:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
             with contextlib.suppress(FileNotFoundError):
-                PID_FILE.unlink()
+                pid_file().unlink()
 
 
 class TestStopSchedulerScenarios:
@@ -1090,8 +1104,8 @@ class TestStopSchedulerScenarios:
         import signal
 
         # Write our own PID (exists)
-        DEFAULT_DB_DIR.mkdir(parents=True, exist_ok=True)
-        PID_FILE.write_text(str(os.getpid()))
+        maestro_home().mkdir(parents=True, exist_ok=True)
+        pid_file().write_text(str(os.getpid()))
 
         # Mock os.kill to avoid actually sending signals
         kill_called = []
@@ -1112,8 +1126,8 @@ class TestStopSchedulerScenarios:
         """Test stop command when permission is denied."""
 
         # Write a PID file
-        DEFAULT_DB_DIR.mkdir(parents=True, exist_ok=True)
-        PID_FILE.write_text("12345")
+        maestro_home().mkdir(parents=True, exist_ok=True)
+        pid_file().write_text("12345")
 
         # Mock os.kill to raise PermissionError
         def mock_kill(pid: int, sig: int) -> None:
@@ -1191,8 +1205,8 @@ class TestStatusWithPID:
         db_path = _setup_db_with_pending_task(temp_dir)
 
         # Write a PID file directly
-        DEFAULT_DB_DIR.mkdir(parents=True, exist_ok=True)
-        PID_FILE.write_text("12345")
+        maestro_home().mkdir(parents=True, exist_ok=True)
+        pid_file().write_text("12345")
 
         try:
             result = runner.invoke(app, ["status", "--db", str(db_path)])
@@ -1200,7 +1214,7 @@ class TestStatusWithPID:
             assert "12345" in result.output or "running" in result.output.lower()
         finally:
             with contextlib.suppress(FileNotFoundError):
-                PID_FILE.unlink()
+                pid_file().unlink()
 
 
 def _setup_db_with_existing_task(temp_dir: Path) -> Path:
@@ -1725,3 +1739,71 @@ class TestInitCommand:
         result = runner.invoke(app, ["init", "--force"])
         assert result.exit_code == 0
         assert (tmp_path / "project.yaml").read_text() != "existing"
+
+
+# =============================================================================
+# Test: $MAESTRO_HOME fencing of the process-wide default paths
+# =============================================================================
+
+
+class TestMaestroHomeFencing:
+    """Every `~/.maestro` path is resolved per call, under `$MAESTRO_HOME`.
+
+    These were module constants evaluated at import from `Path.home()`, so the
+    session fence in `conftest.py` could not reach them: the suite wrote and
+    **unlinked** the operator's real `~/.maestro/maestro.pid`. That is a
+    data-integrity hazard, not untidiness — `_acquire_pid_lock` holds an
+    `fcntl` lock on the pid file's *inode*, so unlinking the path leaves a live
+    scheduler holding a lock nothing can contend for, and the next `maestro
+    run` starts a **second** scheduler on the same project.
+    """
+
+    def test_pid_file_follows_maestro_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MAESTRO_HOME", str(tmp_path / "home"))
+        assert pid_file() == tmp_path / "home" / "maestro.pid"
+
+    def test_service_paths_follow_maestro_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MAESTRO_HOME", str(tmp_path / "home"))
+        assert service_env_file() == tmp_path / "home" / "service.env"
+        assert service_log_dir() == tmp_path / "home" / "service-logs"
+
+    def test_legacy_db_path_follows_maestro_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MAESTRO_HOME", str(tmp_path / "home"))
+        assert legacy_db_path() == tmp_path / "home" / "maestro.db"
+
+    def test_stop_reads_the_fenced_pid_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`maestro stop` acts on `$MAESTRO_HOME`'s pid file, not the real one.
+
+        The behavioural half: the identity assertions above would still pass if
+        a caller had captured the old constant, and this would not.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "maestro.pid").write_text("999999")
+        monkeypatch.setenv("MAESTRO_HOME", str(home))
+
+        result = runner.invoke(app, ["stop"])
+
+        assert "999999" in result.output
+        assert not (home / "maestro.pid").exists()  # stale pid file removed
+
+    def test_acquire_lock_creates_the_pid_file_under_maestro_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The lock — and the directory it needs — lands inside the fence."""
+        home = tmp_path / "home"
+        monkeypatch.setenv("MAESTRO_HOME", str(home))
+
+        fd = _acquire_pid_lock()
+        try:
+            assert (home / "maestro.pid").read_text().strip() == str(os.getpid())
+        finally:
+            _release_pid_lock(fd)

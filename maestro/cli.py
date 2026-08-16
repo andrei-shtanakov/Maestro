@@ -14,6 +14,7 @@ import fcntl
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -54,7 +55,11 @@ from maestro.config import load_orchestrator_config
 from maestro.coordination.arbiter_client import ArbiterClient, ArbiterClientConfig
 from maestro.coordination.routing import RoutingStrategy, make_routing_strategy
 from maestro.dag import DAG
-from maestro.database import verifier_requeue_block_reason
+from maestro.database import (
+    DatabaseError,
+    create_database_readonly,
+    verifier_requeue_block_reason,
+)
 from maestro.decomposer import ProjectDecomposer, resolve_spec_gen_settings
 from maestro.event_log import create_event_logger
 from maestro.git import GitManager
@@ -66,6 +71,13 @@ from maestro.preflight import (
     ValidationIssue,
     ValidationReport,
     validate_project,
+)
+from maestro.repo_identity import (
+    IdentityError,
+    RepoKey,
+    identity_from_checkout,
+    identity_from_config,
+    parse_remote_url,
 )
 from maestro.review_pr import PrRef, parse_pr_url
 from maestro.review_runner import (
@@ -81,6 +93,26 @@ from maestro.review_workspace import (
     gc_pr,
     materialize,
     recover_push,
+)
+from maestro.run_bootstrap import RunIsLive, bootstrap_run
+from maestro.run_lifecycle import (
+    OPERATOR_ENDINGS,
+    RunConclusion,
+    conclusion_for_tasks,
+    conclusion_for_workstreams,
+    record_cancelled,
+    record_conclusion,
+    record_superseded,
+)
+from maestro.run_registry import (
+    TERMINAL_RUN_STATUSES,
+    AllRunsTerminal,
+    AmbiguousRun,
+    NoResumableRun,
+    describe_database,
+    home_usage,
+    resolve_runs,
+    select_run_for_command,
 )
 from maestro.scaffold import ScaffoldError, generate_project_yaml
 from maestro.service.locks import Stage  # noqa: TC001 — runtime cast target
@@ -103,18 +135,56 @@ from maestro.spawners import (
     OpencodeSpawner,
 )
 from maestro.spawners.base import AgentSpawner
+from maestro.state_paths import maestro_home
 from maestro.workspace import WorkspaceManager
 
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from maestro.cost_tracker import CostReport
     from maestro.gates import ApprovalMarker
+    from maestro.run_registry import RunInfo
 
 
-# Default paths
-DEFAULT_DB_DIR = Path.home() / ".maestro"
-DEFAULT_DB_PATH = DEFAULT_DB_DIR / "maestro.db"
-PID_FILE = DEFAULT_DB_DIR / "maestro.pid"
+# Default paths.
+#
+# **Functions, not module constants.** These were `Path.home() / ".maestro"`
+# evaluated at import, which no `$MAESTRO_HOME` override can reach: a value
+# computed once at import escapes the fence for the whole process. The cost was
+# not theoretical — the test suite created and *unlinked* the operator's real
+# `~/.maestro/maestro.pid`, and `_acquire_pid_lock` holds an `fcntl` lock on
+# that file's **inode**. Unlinking the name leaves a live scheduler holding a
+# lock nothing can contend for, so the next `maestro run` acquires a fresh one
+# and orchestrates the same project **twice, concurrently**. Mutual exclusion is
+# destroyed, not merely misreported.
+
+
+def legacy_db_path() -> Path:
+    """`~/.maestro/maestro.db` — the frozen pre-split database (spec §E).
+
+    Kept for reading (an explicit `--db` still reaches it) and for naming it in
+    reports. **No code path writes to it**; see
+    `tests/test_legacy_default_frozen.py` for the evidence.
+    """
+    return maestro_home() / "maestro.db"
+
+
+def pid_file() -> Path:
+    """The scheduler's lock file. One per `$MAESTRO_HOME`."""
+    return maestro_home() / "maestro.pid"
+
+
+#: `--run` for every resolving command; the text is one string so the family
+#: cannot drift apart.
+_RUN_OPTION_HELP = "Act on this run id instead of the resolver's choice."
+
+#: `--config` for the resolving commands that carry no config of their own.
+_CONFIG_OPTION_HELP = (
+    "Take repository identity from this project.yaml (or tasks.yaml) instead "
+    "of the checkout in the current directory."
+)
+
 
 # Rich console for pretty output
 console = Console()
@@ -257,15 +327,15 @@ def _format_status(status: TaskStatus) -> Text:
 
 
 def _ensure_db_dir() -> None:
-    """Ensure the default database directory exists."""
-    DEFAULT_DB_DIR.mkdir(parents=True, exist_ok=True)
+    """Ensure `$MAESTRO_HOME` exists."""
+    maestro_home().mkdir(parents=True, exist_ok=True)
 
 
-def _acquire_pid_lock(pid_file: Path | None = None) -> int:
+def _acquire_pid_lock(path: Path | None = None) -> int:
     """Acquire exclusive lock on PID file.
 
     Args:
-        pid_file: Path to PID file. Defaults to PID_FILE.
+        path: Path to PID file. Defaults to `pid_file()`.
 
     Returns:
         File descriptor for the lock (caller must keep it open).
@@ -273,10 +343,10 @@ def _acquire_pid_lock(pid_file: Path | None = None) -> int:
     Raises:
         SystemExit: If another Maestro instance is already running.
     """
-    if pid_file is None:
-        pid_file = PID_FILE
+    if path is None:
+        path = pid_file()
     _ensure_db_dir()
-    fd = os.open(str(pid_file), os.O_CREAT | os.O_RDWR)
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -296,25 +366,26 @@ def _acquire_pid_lock(pid_file: Path | None = None) -> int:
     return fd
 
 
-def _release_pid_lock(fd: int, pid_file: Path | None = None) -> None:
+def _release_pid_lock(fd: int, path: Path | None = None) -> None:
     """Release PID file lock and remove the file."""
-    if pid_file is None:
-        pid_file = PID_FILE
+    if path is None:
+        path = pid_file()
     try:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
     except OSError:
         pass
     with contextlib.suppress(FileNotFoundError):
-        pid_file.unlink()
+        path.unlink()
 
 
 def _read_pid_file() -> int | None:
     """Read PID from file, return None if not found."""
-    if not PID_FILE.exists():
+    path = pid_file()
+    if not path.exists():
         return None
     try:
-        return int(PID_FILE.read_text().strip())
+        return int(path.read_text().strip())
     except (ValueError, OSError):
         return None
 
@@ -483,10 +554,11 @@ def _print_validation_report(report: ValidationReport) -> None:
 
 async def _run_scheduler(
     config_path: Path,
-    db_path: Path,
+    db_path: Path | None,
     resume: bool,
     log_dir: Path | None,
     clean: bool = False,
+    run: str | None = None,
 ) -> None:
     """Run the scheduler with the given configuration."""
     # Load configuration
@@ -506,16 +578,61 @@ async def _run_scheduler(
         err_console.print(f"[red]DAG error:[/red] {e}")
         raise typer.Exit(1) from e
 
+    # Identity, the run, and `ORCHESTRA_PIPELINE_ID` are resolved before
+    # logging initializes — obs.py mints a fresh ULID otherwise (spec §A.3).
+    # Mode 1's identity comes from the `repo:` checkout's `origin` (spec §3.3),
+    # which `bootstrap_run` reaches through the same `identity_from_config`
+    # rule Mode 2 uses. `--db` is an explicit override that skips the resolver.
+    resolved_db_path = db_path
+    if resolved_db_path is None:
+        try:
+            bootstrap = await bootstrap_run(config, resume=resume, run_id_override=run)
+        except IdentityError as e:
+            err_console.print(f"[red]Cannot resolve repository identity:[/red] {e}")
+            raise typer.Exit(1) from e
+        except RunIsLive as e:
+            err_console.print(f"[red]Refusing to start a second run:[/red] {e}")
+            raise typer.Exit(1) from e
+        except NoResumableRun as e:
+            # `--run <id>` puts an operator-controlled string in this message
+            # (see `run_bootstrap._run_by_id`), and a value like `[bold]` would
+            # otherwise be parsed as Rich markup instead of printed.
+            err_console.print(
+                f"[red]No resumable run:[/red] {escape(str(e))}", soft_wrap=True
+            )
+            raise typer.Exit(1) from e
+        except AmbiguousRun as e:
+            err_console.print(f"[red]Several runs could be resumed:[/red] {e}")
+            raise typer.Exit(1) from e
+        resolved_db_path = bootstrap.db_path
+        console.print(
+            f"[dim]acting on {escape('/'.join(bootstrap.key.as_path_parts()))}, "
+            f"run {escape(bootstrap.run_id)}[/dim]",
+            soft_wrap=True,
+        )
+
     # Ensure DB directory exists
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Clean existing state if requested
-    if clean and db_path.exists():  # noqa: ASYNC240
-        db_path.unlink()  # noqa: ASYNC240
-        console.print("[yellow]Cleaned database for fresh start[/yellow]")
+    if clean:
+        if db_path is None:
+            # A resolved fresh run is empty by construction and a resumed one
+            # must never be cleared — unlinking it would delete the `run` row
+            # that is the run's identity, which is exactly the evidence spec
+            # §E exists to preserve. `--clean` therefore only means anything
+            # against an explicitly named `--db`.
+            console.print(
+                "[yellow]--clean has no effect without --db: a fresh run gets "
+                "its own empty database, and a resumed one must not be "
+                "cleared.[/yellow]"
+            )
+        elif resolved_db_path.exists():
+            resolved_db_path.unlink()
+            console.print("[yellow]Cleaned database for fresh start[/yellow]")
 
     # Create or connect to database
-    db = await create_database(db_path)
+    db = await create_database(resolved_db_path)
     lock_fd: int | None = None
     notifications: NotificationManager | None = None
 
@@ -687,6 +804,11 @@ async def _run_scheduler(
         _display_tasks_table(all_tasks, "Final Status")
         _display_summary(all_tasks)
 
+        # Same rule as mode 2 (`orchestrate`): the run records its own ending
+        # before the failure exit, or it is reported `interrupted` forever
+        # (spec §B.1, §B.3).
+        await _announce_conclusion(db, conclusion_for_tasks(all_tasks))
+
         # Check for failures
         failed_tasks = [
             t
@@ -701,6 +823,9 @@ async def _run_scheduler(
 
         console.print("\n[green]All tasks completed successfully![/green]")
 
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        await record_cancelled(db, "interrupted by the operator")
+        raise
     finally:
         if routing is not None:
             await routing.aclose()
@@ -712,18 +837,74 @@ async def _run_scheduler(
             _release_pid_lock(lock_fd)
 
 
-async def _show_status(db_path: Path) -> None:
-    """Show status of all tasks in the database."""
-    # Path.exists() is fast sync I/O, acceptable in async context
-    if not db_path.exists():  # noqa: ASYNC240
-        err_console.print(f"[red]Database not found:[/red] {db_path}")
-        err_console.print("Run 'maestro run <config>' first to create tasks.")
-        raise typer.Exit(1)
+#: The commands whose whole act is *look at the evidence*, and which must
+#: therefore never rewrite it. `costs` reached this rule first, through
+#: `read_all_costs_readonly`; the rest arrive here.
+#:
+#: The line is drawn at the operator's intent, not at convenience. For a
+#: mutating command aimed at a file — `workstream-approve`, `retry`,
+#: `orchestrate --db` — "frozen means never the default, not immutable"
+#: holds: schema init is a precondition of the write they asked for. For a
+#: view it does not: `maestro workstreams --db ~/.maestro/maestro.db` grew a
+#: 1-table, 12 288-byte file into 21 tables and 200 704 bytes, which is the
+#: act of looking destroying what was looked at.
+READONLY_COMMANDS: tuple[str, ...] = (
+    "status",
+    "workstreams",
+    "check-scope",
+    "service status",
+    "costs",
+)
 
-    db = Database(db_path)
-    await db.connect()
 
+@contextlib.asynccontextmanager
+async def _open_readonly(
+    db_path: Path, *, hint: str | None = None, exit_code: int = 1
+) -> "AsyncIterator[Database]":
+    """Open `db_path` for a view-only command, and close it on every path.
+
+    Two failures are translated into operator sentences rather than
+    tracebacks: a path that is not a readable database, and a database whose
+    schema cannot answer the question. The second is the honest outcome for a
+    pre-split file (spec §E) — a read-only view will not upgrade it, and
+    upgrading it silently is the defect this replaces.
+
+    `exit_code` exists because not every view spends exit 1 on "cannot
+    read": `check-scope` documents 1 as *escapes found*, so reporting an
+    unreadable database with it would report a scope escape that was never
+    measured. It passes 2, its own "invalid input".
+    """
     try:
+        db = await create_database_readonly(db_path)
+    except DatabaseError as exc:
+        # The missing-file case keeps its own words: an operator who mistyped
+        # a path is looking for "not found", not for a read-mode diagnosis.
+        if not db_path.exists():  # noqa: ASYNC240 — one stat on the error path
+            err_console.print(f"[red]Database not found:[/red] {escape(str(db_path))}")
+        else:
+            err_console.print(f"[red]Cannot read database:[/red] {escape(str(exc))}")
+        if hint is not None:
+            err_console.print(hint)
+        raise typer.Exit(exit_code) from exc
+    try:
+        yield db
+    except sqlite3.DatabaseError as exc:
+        err_console.print(
+            f"[red]This database cannot answer that:[/red] {escape(str(exc))}\n"
+            "A database written before the state-layout change carries a "
+            "different schema, and a read-only view does not upgrade it "
+            "(spec §E). Copy it first if you want it migrated."
+        )
+        raise typer.Exit(exit_code) from exc
+    finally:
+        await db.close()
+
+
+async def _show_status(db_path: Path) -> None:
+    """Show status of all tasks in the database — read-only."""
+    async with _open_readonly(
+        db_path, hint="Run 'maestro run <config>' first to create tasks."
+    ) as db:
         tasks = await db.get_all_tasks()
         _display_tasks_table(tasks, "Task Status")
         _display_summary(tasks)
@@ -734,9 +915,6 @@ async def _show_status(db_path: Path) -> None:
             console.print(f"\n[cyan]Scheduler running (PID: {pid})[/cyan]")
         else:
             console.print("\n[dim]Scheduler not running[/dim]")
-
-    finally:
-        await db.close()
 
 
 async def _retry_task(db_path: Path, task_id: str) -> None:
@@ -852,7 +1030,7 @@ def _stop_scheduler() -> None:
             f"[yellow]Process {pid} not found, removing stale PID file[/yellow]"
         )
         with contextlib.suppress(FileNotFoundError):
-            PID_FILE.unlink()
+            pid_file().unlink()
     except PermissionError:
         err_console.print(f"[red]Permission denied to stop process {pid}[/red]")
         raise typer.Exit(1) from None
@@ -905,26 +1083,31 @@ def run_command(
         bool,
         typer.Option(
             "--clean",
-            help="Reset all tasks and start fresh",
+            help="Reset all tasks and start fresh (only meaningful with --db)",
         ),
     ] = False,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Run tasks from a YAML configuration file.
 
     The scheduler will execute tasks respecting their dependencies,
-    up to the configured concurrency limit.
+    up to the configured concurrency limit. State lives under
+    `~/.maestro/projects/<host>/<owner>/<repo>/runs/<run-id>/`, keyed by the
+    `origin` remote of the checkout `repo:` names (spec §3.3).
 
     Examples:
         maestro run tasks.yaml
         maestro run tasks.yaml --resume
-        maestro run tasks.yaml --clean
+        maestro run tasks.yaml --resume --run 01J...
         maestro run tasks.yaml --db /path/to/state.db
     """
     setup_logging("maestro")
-    db_path = db or DEFAULT_DB_PATH
 
     try:
-        asyncio.run(_run_scheduler(config, db_path, resume, log_dir, clean))
+        asyncio.run(_run_scheduler(config, db, resume, log_dir, clean, run))
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user[/yellow]")
         raise typer.Exit(130) from None
@@ -943,17 +1126,27 @@ def status_command(
             resolve_path=True,
         ),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help=_CONFIG_OPTION_HELP),
+    ] = None,
 ) -> None:
-    """Show status of all tasks.
+    """Show status of all tasks of the resolved run.
 
     Displays a table of all tasks with their current status,
     retry counts, and any error messages.
 
     Examples:
         maestro status
+        maestro status --run 01J...
+        maestro status --config ../other/project.yaml
         maestro status --db /path/to/state.db
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _resolved_db_path(db, run, config_flag=config)
     asyncio.run(_show_status(db_path))
 
 
@@ -974,17 +1167,26 @@ def retry_command(
             resolve_path=True,
         ),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help=_CONFIG_OPTION_HELP),
+    ] = None,
 ) -> None:
-    """Retry a failed task.
+    """Retry a failed task of the resolved run.
 
     Resets the task status to READY and clears the retry count,
     allowing it to be picked up by the scheduler again.
 
     Examples:
         maestro retry task-001
+        maestro retry task-001 --run 01J...
         maestro retry task-001 --db /path/to/state.db
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _resolved_db_path(db, run, config_flag=config)
     asyncio.run(_retry_task(db_path, task_id))
 
 
@@ -1018,17 +1220,26 @@ def approve_command(
             resolve_path=True,
         ),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help=_CONFIG_OPTION_HELP),
+    ] = None,
 ) -> None:
-    """Approve a task waiting for approval.
+    """Approve a task of the resolved run waiting for approval.
 
     Approves a task that has requires_approval=true and is in
     AWAITING_APPROVAL status, allowing the scheduler to execute it.
 
     Examples:
         maestro approve task-001
+        maestro approve task-001 --run 01J...
         maestro approve task-001 --db /path/to/state.db
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _resolved_db_path(db, run, config_flag=config)
     asyncio.run(_approve_task(db_path, task_id))
 
 
@@ -1395,10 +1606,36 @@ def _resolve_orchestrator_paths(
     return repo_path, workspace_base, resolved_log_dir
 
 
+async def _announce_conclusion(db: "Database", conclusion: RunConclusion) -> None:
+    """Record the run's ending and say what was recorded (spec §B.1).
+
+    Said out loud because an operator who is never told the run ended has no
+    way to tell "this run is finished" from "this run died and nobody wrote
+    it down" — which is precisely the distinction §B.3 exists to preserve.
+    A database with no `run` row (`--db` at a pre-split file, spec §E) is
+    left alone and nothing is printed.
+    """
+    if not await record_conclusion(db, conclusion):
+        return
+    if conclusion.outcome is not None:
+        console.print(
+            f"[dim]run recorded as {conclusion.outcome}: "
+            f"{escape(conclusion.reason)}[/dim]",
+            soft_wrap=True,
+        )
+        return
+    console.print(
+        f"[yellow]Run suspended for a human: {escape(conclusion.reason)}. "
+        "It stays resumable under the same run id.[/yellow]",
+        soft_wrap=True,
+    )
+
+
 async def _run_orchestrator(
     config_path: Path,
-    db_path: Path,
+    db_path: Path | None,
     resume: bool,
+    run: str | None,
     log_dir: Path | None,
 ) -> None:
     """Run the multi-process orchestrator."""
@@ -1418,11 +1655,70 @@ async def _run_orchestrator(
         )
         raise typer.Exit(1)
 
+    # Identity and the run must be resolved — and ORCHESTRA_PIPELINE_ID
+    # exported — before logging initializes (obs.py falls back to a fresh
+    # ULID otherwise). `--db` is an explicit override that skips the
+    # resolver entirely.
+    if db_path is not None:
+        resolved_db_path = db_path
+    else:
+        try:
+            bootstrap = await bootstrap_run(config, resume=resume, run_id_override=run)
+        except IdentityError as e:
+            err_console.print(f"[red]Cannot resolve repository identity:[/red] {e}")
+            raise typer.Exit(1) from e
+        except RunIsLive as e:
+            err_console.print(f"[red]Refusing to start a second run:[/red] {e}")
+            raise typer.Exit(1) from e
+        except NoResumableRun as e:
+            # `--run <id>` puts an operator-controlled string in this message
+            # (see `run_bootstrap._run_by_id`), and a value like `[bold]` would
+            # otherwise be parsed as Rich markup instead of printed.
+            err_console.print(
+                f"[red]No resumable run:[/red] {escape(str(e))}", soft_wrap=True
+            )
+            raise typer.Exit(1) from e
+        except AmbiguousRun as e:
+            err_console.print(f"[red]Several runs could be resumed:[/red] {e}")
+            raise typer.Exit(1) from e
+        resolved_db_path = bootstrap.db_path
+
+        # A fresh run gets its own directory; the previous run is not
+        # touched. Say what is being left behind so the operator sees it
+        # here rather than discovering it later.
+        if bootstrap.fresh:
+            leftover = [
+                r
+                for r in await resolve_runs(bootstrap.key)
+                if r.run_id != bootstrap.run_id
+                and r.status not in TERMINAL_RUN_STATUSES
+            ]
+            if leftover:
+                ids = ", ".join(f"{r.run_id} ({r.status})" for r in leftover)
+                # Deliberately NOT marked `superseded` here. A fresh
+                # orchestration is evidence about the *new* run; writing a
+                # terminal row on the old one would replace `interrupted` —
+                # the one fact that says it died mid-flight — with a fact
+                # about something else (spec §B.3, and §E's refusal to
+                # backfill for the same reason). The remedy is named instead,
+                # so the operator resolves the ambiguity by deciding rather
+                # than by having it decided for them.
+                console.print(
+                    f"[yellow]Starting a fresh run; leaving {len(leftover)} "
+                    f"non-terminal run(s) behind: {escape(ids)}[/yellow]\n"
+                    "[dim]They stay resumable, so resolving commands will ask "
+                    "for --run. End one with "
+                    "'maestro run-end <run-id> --outcome superseded'.[/dim]",
+                    soft_wrap=True,
+                )
+
+    setup_logging("maestro")
+
     # Ensure DB directory exists
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Create or connect to database
-    db = await create_database(db_path)
+    db = await create_database(resolved_db_path)
 
     if resume:
         existing_workstreams = await db.get_all_workstreams()
@@ -1430,7 +1726,21 @@ async def _run_orchestrator(
             console.print(
                 f"[cyan]Resuming with {len(existing_workstreams)} existing workstreams[/cyan]"
             )
-    else:
+    elif db_path is not None:
+        # `--db` bypasses the resolver and names one file directly (Task
+        # 9's contract) — there is no per-run directory here for a
+        # previous run to survive in, so a plain (`--db`, no `--resume`)
+        # start must still clear, exactly as it always has. Without this,
+        # `orchestrate --db x.db` would silently continue an existing DAG
+        # through this door — the same destructive-by-design-turned-
+        # auto-resume this task exists to prevent, just reached
+        # differently than the resolver path below.
+        #
+        # The resolver path (db_path is None) never reaches here with
+        # state to clear: a fresh run gets its own empty directory by
+        # construction, and a run reached via `--resume` or `--run <id>`
+        # must never be cleared — that would delete exactly the state the
+        # operator asked to act on.
         existing_workstreams = await db.get_all_workstreams()
         if existing_workstreams:
             console.print(
@@ -1536,9 +1846,21 @@ async def _run_orchestrator(
             )
         )
 
+        # The run records its own ending here, before the failure exit below:
+        # nothing else in the process ever reaches this database again, and a
+        # run that never writes an outcome is reported `interrupted` forever
+        # (spec §B.1, §B.3).
+        await _announce_conclusion(db, conclusion_for_workstreams(workstreams))
+
         if stats.failed > 0:
             raise typer.Exit(1)
 
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # Operator cancellation is a run outcome, not an interruption: the
+        # person who stopped it knows it is over, and `cancelled` is what
+        # keeps the next `orchestrate` from finding two open runs (spec §B.1).
+        await record_cancelled(db, "interrupted by the operator")
+        raise
     finally:
         if notifications is not None:
             # Bounded drain of queued notification deliveries (webhook).
@@ -1549,19 +1871,10 @@ async def _run_orchestrator(
 
 
 async def _show_workstreams_status(db_path: Path) -> None:
-    """Show status of all workstreams."""
-    if not db_path.exists():  # noqa: ASYNC240
-        err_console.print(f"[red]Database not found:[/red] {db_path}")
-        raise typer.Exit(1)
-
-    db = Database(db_path)
-    await db.connect()
-
-    try:
+    """Show status of all workstreams — read-only."""
+    async with _open_readonly(db_path) as db:
         workstreams = await db.get_all_workstreams()
         _display_workstreams_table(workstreams, "Workstreams Status")
-    finally:
-        await db.close()
 
 
 @app.command("orchestrate")
@@ -1593,6 +1906,13 @@ def orchestrate_command(
             help="Resume from existing database state",
         ),
     ] = False,
+    run: Annotated[
+        str | None,
+        typer.Option(
+            "--run",
+            help="Act on this run id instead of the resolver's choice.",
+        ),
+    ] = None,
     log_dir: Annotated[
         Path | None,
         typer.Option(
@@ -1612,14 +1932,282 @@ def orchestrate_command(
         maestro orchestrate project.yaml
         maestro orchestrate project.yaml --resume
     """
-    setup_logging("maestro")
-    db_path = db or DEFAULT_DB_PATH
-
     try:
-        asyncio.run(_run_orchestrator(config, db_path, resume, log_dir))
+        asyncio.run(_run_orchestrator(config, db, resume, run, log_dir))
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user[/yellow]")
         raise typer.Exit(130) from None
+
+
+@app.command("run-end")
+def run_end_command(
+    run_id: Annotated[str, typer.Argument(help="Run id to end")],
+    outcome: Annotated[
+        str,
+        typer.Option("--outcome", help="cancelled | superseded"),
+    ],
+    reason: Annotated[
+        str | None,
+        typer.Option("--reason", help="Free-form detail stored with the outcome"),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help=_CONFIG_OPTION_HELP),
+    ] = None,
+) -> None:
+    """Record an operator's decision that a run is over (spec §B.1).
+
+    The two endings a run cannot observe about itself. `completed` and
+    `failed` are facts a finishing invocation reports; `cancelled` and
+    `superseded` are decisions, and nothing infers them — a fresh
+    `orchestrate` deliberately leaves the previous run non-terminal rather
+    than overwriting its `interrupted` with a fact about a different run
+    (§B.3). This is how that residue is resolved, and how two non-terminal
+    runs stop making every resolving command ask for `--run`.
+
+    Refuses a run that already ended: §G asks that a run is completed exactly
+    once, and moving `ended_at` onto a finished run rewrites evidence.
+
+    Examples:
+        maestro run-end 01J8Z... --outcome superseded
+        maestro run-end 01J8Z... --outcome cancelled --reason "wrong branch"
+    """
+    if outcome not in OPERATOR_ENDINGS:
+        err_console.print(
+            f"[red]Unknown outcome:[/red] {escape(outcome)}. "
+            f"Choose one of: {', '.join(sorted(OPERATOR_ENDINGS))}. "
+            "'completed' and 'failed' are recorded by the run itself."
+        )
+        raise typer.Exit(1)
+    db_path = _resolved_db_path(None, run_id, config_flag=config)
+
+    async def _end() -> None:
+        db = Database(db_path)
+        await db.connect()
+        try:
+            detail = reason or f"ended by the operator as {outcome}"
+            # Two named writers rather than one parameterised by a string:
+            # `RunEnding` is a Literal, and widening it to `str` here to save
+            # a branch would take a `cast` to put back.
+            if outcome == "cancelled":
+                written = await record_cancelled(db, detail)
+            else:
+                written = await record_superseded(db, detail)
+        finally:
+            await db.close()
+        if not written:
+            err_console.print(
+                f"[red]Run {escape(run_id)} was not ended:[/red] it has no run "
+                "row, or it already recorded an outcome."
+            )
+            raise typer.Exit(1)
+        console.print(
+            f"[green]Run {escape(run_id)} recorded as {outcome}:[/green] "
+            f"{escape(detail)}",
+            soft_wrap=True,
+        )
+
+    asyncio.run(_end())
+
+
+def _config_identity(path: Path) -> RepoKey:
+    """Identity from a config file, whichever of the two models it is.
+
+    `--config` is documented as "project.yaml (or tasks.yaml)" and the operator
+    should not have to say which: both name one repository, and
+    `identity_from_config` derives the same key from either (spec §3.2, §3.3).
+    A file that is neither is a refusal that names both failures, because
+    "not a valid config" alone sends someone looking at the wrong schema.
+    """
+    try:
+        return identity_from_config(load_orchestrator_config(path))
+    except ConfigError as as_project:
+        try:
+            return identity_from_config(load_config(path))
+        except ConfigError as as_tasks:
+            msg = (
+                f"{path} is not a usable config — as a project.yaml: "
+                f"{as_project}; as a tasks.yaml: {as_tasks}"
+            )
+            raise IdentityError(msg) from as_tasks
+
+
+def _announce_db_target(db: Path) -> None:
+    """Say what the `--db` file *is*, without changing a byte of it (spec §E).
+
+    `--db` skips the resolver entirely, identity included, so there is no
+    stage lock to read and liveness is genuinely unobserved — which is
+    exactly the case `describe_database(key=None)` documents. It opens the
+    file read-only through a percent-encoded URI and never initialises a
+    schema, so asking what a pre-split database is does not upgrade it. Such
+    a file is reported *legacy* rather than silently rendered *interrupted*,
+    and is never written a `run` row.
+
+    Silent on a path that does not exist yet — `orchestrate --db new.db`
+    legitimately creates one — and silent on a file this cannot read, because
+    the command's own open reports that failure with the right words.
+    """
+    if not db.exists():
+        return
+    try:
+        info = asyncio.run(describe_database(db, key=None))
+    except (OSError, sqlite3.DatabaseError):
+        return
+    if info.row is None:
+        console.print(
+            "[yellow]This database has no run row: it predates the per-run "
+            "layout (spec §E). It is read as a single anonymous run and is "
+            "never backfilled.[/yellow]",
+            soft_wrap=True,
+        )
+        return
+    # `interrupted` here means "not known to be live" rather than "died":
+    # with no identity there is no lock to observe.
+    console.print(
+        f"[dim]run {escape(str(info.run_id))}, {escape(info.status)}[/dim]",
+        soft_wrap=True,
+    )
+
+
+def _resolved_db_path(
+    db: Path | None,
+    run: str | None,
+    *,
+    config_flag: Path | None = None,
+    config_arg: Path | None = None,
+) -> Path:
+    """The database a resolving command must act on (spec §C.3).
+
+    A workstream id — and a task id — is unique per database, not per
+    repository: once state is per-run, the same id exists in several databases,
+    so the command resolves `(repository, run)` before it opens anything.
+    `--db` is the escape hatch of spec §E — given, it selects that database
+    directly and the resolver is not consulted at all, identity included.
+
+    **The identity rule, one for all fifteen commands.** Identity is the
+    repository's `origin` remote, and the invocation names the repository in
+    exactly one of two ways: a config, when one is given, or the checkout in
+    `$PWD` when none is. `identity_from_config` reduces both config models to
+    the same remote (§3.2, §3.3), so there is a single rule rather than one
+    for the commands that happen to take a config and another for the rest.
+    Commands that carried no config gained an optional `--config` so that the
+    rule is *available* everywhere, not only stated everywhere: without it,
+    `maestro orchestrate ../b/project.yaml` and a later `maestro workstreams`
+    reach two different trees with no way to say so.
+
+    `config_flag` is that optional `--config`, whose only job is identity;
+    `config_arg` is a config the command needs anyway (`postmortem`,
+    `review-pr`, `service status`). The distinction is not cosmetic: `--db`
+    makes an identity-only flag inert and so refuses it, while a config the
+    command reads for its own purposes remains perfectly legitimate alongside
+    `--db`.
+
+    Every refusal is an operator-facing message plus exit 1, never a
+    traceback (the pattern of `_run_orchestrator` and `_service_run`).
+
+    **What was resolved is always said out loud.** Resolving silently relocates
+    the accident §C.3 exists to remove rather than removing it: an operator
+    whose shell sits in one checkout while the run they mean belongs to another
+    repository gets the wrong database, and — workstream ids in this ecosystem
+    being short and repeated — quite possibly a workstream of the same name in
+    it, with a success message on top.
+    """
+    if db is not None:
+        if run is not None:
+            # `--db` selects a database directly and the resolver is not
+            # consulted at all (spec §E), so `--run` has nothing to steer.
+            # Acting on `--db` while quietly dropping `--run` would be the
+            # same wrong-database success this function exists to prevent.
+            err_console.print(
+                "[red]--db and --run cannot be combined:[/red] --db names a "
+                "database directly (spec §E), so the resolver --run steers is "
+                "never consulted. Drop one."
+            )
+            raise typer.Exit(1)
+        if config_flag is not None:
+            err_console.print(
+                "[red]--db and --config cannot be combined:[/red] --db names a "
+                "database directly (spec §E), so the identity --config supplies "
+                "is never consulted. Drop one."
+            )
+            raise typer.Exit(1)
+        console.print(
+            f"[dim]acting on database {escape(str(db))}[/dim]", soft_wrap=True
+        )
+        _announce_db_target(db)
+        return db
+
+    config_path = config_flag if config_flag is not None else config_arg
+    try:
+        if config_path is not None:
+            key = _config_identity(config_path)
+            source = f"the config at {escape(str(config_path))}"
+        else:
+            cwd = Path.cwd()
+            key = identity_from_checkout(cwd)
+            source = f"the checkout at {escape(str(cwd))}"
+    except IdentityError as e:
+        err_console.print(
+            f"[red]Cannot resolve repository identity:[/red] {e}\n"
+            "Run this from the repository's checkout, name it with --config "
+            "<project.yaml>, or pass --db <path>."
+        )
+        raise typer.Exit(1) from e
+
+    repo = "/".join(key.as_path_parts())
+    # The key and where it came from are named on every refusal: the operator
+    # acts on this sentence, and a wrong identity is cheapest to catch here.
+    origin = f"Resolved {escape(repo)} from {source}."
+    # Fetched once and reused by `select_run_for_command` below: the refusal
+    # branch needs to know whether *any* run exists at all, and asking
+    # `resolve_runs` a second time to find out would be dishonest about what
+    # "fetched once" means. Bound ahead of the `try` — `resolve_runs` itself
+    # never raises `NoResumableRun`, but nothing in its type says so, and the
+    # except clause below reads `runs` regardless.
+    runs: list[RunInfo] = []
+    try:
+        runs = asyncio.run(resolve_runs(key))
+        info = select_run_for_command(runs, key, run_id=run)
+    except NoResumableRun as e:
+        # Escaped because the message quotes the operator's own `--run` value:
+        # unescaped, `--run '[bold]x'` is answered with "no run x", a wrong
+        # fact about their input in the one sentence meant to name it back.
+        err_console.print(
+            f"[red]No resumable run:[/red] {escape(str(e))}", soft_wrap=True
+        )
+        err_console.print(origin, soft_wrap=True)
+        if run is None and not runs:
+            # A genuinely fresh repository — not a wrong-identity accident,
+            # since there is nothing here yet for a wrong identity to have
+            # produced. `orchestrate` is a safe forward path in this one
+            # case; the key and its origin above stay visible so a wrong
+            # identity is still caught before the operator acts on it.
+            err_console.print(
+                f"Nothing has been orchestrated for {escape(repo)} yet: "
+                "`maestro orchestrate <project.yaml>` creates the first run. "
+                "If that is not the repository you meant, run this from that "
+                "repository's checkout instead, name it with --config "
+                "<project.yaml>, or pass --db <path> to name the database "
+                "directly.",
+                soft_wrap=True,
+            )
+        else:
+            err_console.print(
+                "If that is not the repository you meant, run this from that "
+                "repository's checkout, name it with --config <project.yaml>, or "
+                "pass --db <path> to name the database directly."
+            )
+        raise typer.Exit(1) from e
+    except AmbiguousRun as e:
+        err_console.print(f"[red]Several runs could be resumed:[/red] {e}")
+        err_console.print(origin, soft_wrap=True)
+        err_console.print("Pass --run <run-id>, or --db <path> to pick one directly.")
+        raise typer.Exit(1) from e
+    console.print(
+        f"[dim]acting on {escape(repo)}, run {escape(str(info.run_id))}[/dim]",
+        soft_wrap=True,
+    )
+    return info.db_path
 
 
 @app.command("workstreams")
@@ -1632,14 +2220,29 @@ def workstreams_command(
             help="Path to SQLite database file",
         ),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help=_CONFIG_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Show status of all workstreams.
 
+    Resolves `(repository, run)` from the checkout in the current
+    directory — or from `--config <project.yaml>` — before it opens
+    anything, and says what it resolved. `--run` picks between two runs;
+    `--db` names a database directly and skips resolution entirely.
+
     Examples:
-        maestro workstreams
+        cd <repo> && maestro workstreams
+        maestro workstreams --config ../other/project.yaml
+        maestro workstreams --run 01J8Z...
         maestro workstreams --db /path/to/state.db
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _resolved_db_path(db, run, config_flag=config)
     asyncio.run(_show_workstreams_status(db_path))
 
 
@@ -1682,13 +2285,28 @@ def workstream_approve_command(
         Path | None,
         typer.Option("--db", "-d", help="Path to SQLite database file"),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help=_CONFIG_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Approve a NEEDS_REVIEW workstream (gates re-queue) back to READY.
 
+    Resolves `(repository, run)` from the checkout in the current
+    directory — or from `--config <project.yaml>` — before it opens
+    anything, and says what it resolved. `--run` picks between two runs;
+    `--db` names a database directly and skips resolution entirely.
+
     Examples:
+        cd <repo> && maestro workstream-approve risk-model-docs-rule
+        maestro workstream-approve risk-model-docs-rule --run 01J8Z...
         maestro workstream-approve risk-model-docs-rule --db run/maestro.db
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _resolved_db_path(db, run, config_flag=config)
 
     async def _run() -> "ApprovalMarker | None":
         from maestro.database import Database
@@ -1733,6 +2351,10 @@ def postmortem_command(
         Path | None,
         typer.Option("--db", "-d", help="Path to SQLite database file"),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Operator-driven post-mortem archive retention (#164, spec §6.3).
 
@@ -1743,6 +2365,7 @@ def postmortem_command(
 
     Examples:
         maestro postmortem project.yaml --gc
+        maestro postmortem project.yaml --gc --run 01J...
         maestro postmortem project.yaml --gc --db run/maestro.db
     """
     if not gc:
@@ -1750,7 +2373,11 @@ def postmortem_command(
             "[yellow]Nothing to do: pass --gc to apply the retention policy.[/yellow]"
         )
         raise typer.Exit(1)
-    db_path = db or DEFAULT_DB_PATH
+    # The project.yaml is a positional argument this command needs anyway (it
+    # reads the retention policy from it), so it supplies identity as
+    # `config_arg` — legitimate alongside `--db`, unlike the identity-only
+    # `--config` flag.
+    db_path = _resolved_db_path(db, run, config_arg=config_file)
 
     async def _run() -> tuple[int, int]:
         from maestro.config import load_orchestrator_config
@@ -1800,6 +2427,14 @@ def workstream_quarantine_command(
         Path | None,
         typer.Option("--db", "-d", help="Path to SQLite database file"),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help=_CONFIG_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Forbid a workstream's result from progressing (#166).
 
@@ -1816,10 +2451,16 @@ def workstream_quarantine_command(
     Idempotent — a second call keeps the original timestamp, which reads as the
     age of the incident.
 
+    Resolves `(repository, run)` from the checkout in the current
+    directory — or from `--config <project.yaml>` — before it opens
+    anything, and says what it resolved. `--run` picks between two runs;
+    `--db` names a database directly and skips resolution entirely.
+
     Examples:
-        maestro workstream-quarantine w-adapters --reason "false DONE, 1/9"
+        cd <repo> && maestro workstream-quarantine w-adapters --reason "1/9"
+        maestro workstream-quarantine w-adapters --reason "1/9" --run 01J8Z...
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _resolved_db_path(db, run, config_flag=config)
 
     async def _run() -> str:
         import getpass
@@ -1875,6 +2516,14 @@ def workstream_unquarantine_command(
         Path | None,
         typer.Option("--db", "-d", help="Path to SQLite database file"),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help=_CONFIG_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Lift a quarantine — an audited action, and nothing more (#166).
 
@@ -1884,10 +2533,16 @@ def workstream_unquarantine_command(
     still owes. The orchestrator picks it up on its own next loop if its status
     makes it eligible.
 
+    Resolves `(repository, run)` from the checkout in the current
+    directory — or from `--config <project.yaml>` — before it opens
+    anything, and says what it resolved. `--run` picks between two runs;
+    `--db` names a database directly and skips resolution entirely.
+
     Examples:
-        maestro workstream-unquarantine w-adapters --reason "false DONE fixed"
+        cd <repo> && maestro workstream-unquarantine w-adapters --reason "fixed"
+        maestro workstream-unquarantine w-adapters --reason "fixed" --run 01J8Z...
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _resolved_db_path(db, run, config_flag=config)
 
     async def _run() -> str:
         import getpass
@@ -1935,6 +2590,14 @@ def workstream_continue_command(
         Path | None,
         typer.Option("--db", "-d", help="Path to SQLite database file"),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help=_CONFIG_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Queue a continuation over the workstream's EXISTING tasks.md (#166).
 
@@ -1952,10 +2615,16 @@ def workstream_continue_command(
     Not an approval and not a rework: nothing about the result is accepted and
     no spec is regenerated.
 
+    Resolves `(repository, run)` from the checkout in the current
+    directory — or from `--config <project.yaml>` — before it opens
+    anything, and says what it resolved. `--run` picks between two runs;
+    `--db` names a database directly and skips resolution entirely.
+
     Examples:
-        maestro workstream-continue w-adapters
+        cd <repo> && maestro workstream-continue w-adapters
+        maestro workstream-continue w-adapters --run 01J8Z...
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _resolved_db_path(db, run, config_flag=config)
 
     async def _run() -> tuple[int, str | None]:
         from maestro.continuation import (
@@ -2058,6 +2727,14 @@ def workstream_recapture_command(
         Path | None,
         typer.Option("--db", "-d", help="Path to SQLite database file"),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help=_CONFIG_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Retry ONLY post-mortem evidence capture for a blocked workstream (#164).
 
@@ -2070,10 +2747,17 @@ def workstream_recapture_command(
     This is NOT an approval: nothing about the result is accepted here. Fix
     whatever made the archive root unwritable first, then run this.
 
+    Resolves `(repository, run)` from the checkout in the current
+    directory — or from `--config <project.yaml>` — before it opens
+    anything, and says what it resolved. `--run` picks between two runs;
+    `--db` names a database directly and skips resolution entirely.
+
     Examples:
+        cd <repo> && maestro workstream-recapture w-contracts
+        maestro workstream-recapture w-contracts --run 01J8Z...
         maestro workstream-recapture w-contracts --db run/maestro.db
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _resolved_db_path(db, run, config_flag=config)
 
     async def _run() -> str:
         from maestro.database import Database
@@ -2211,18 +2895,33 @@ def workstream_rework_command(
         Path | None,
         typer.Option("--db", "-d", help="Path to SQLite database file"),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help=_CONFIG_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Rework a NEEDS_REVIEW/FAILED workstream: re-decompose in the same
     worktree with new instructions. NOT an approval — the ex-post gate
     re-evaluates the new work from scratch.
 
+    Resolves `(repository, run)` from the checkout in the current
+    directory — or from `--config <project.yaml>` — before it opens
+    anything, and says what it resolved. `--run` picks between two runs;
+    `--db` names a database directly and skips resolution entirely.
+
     Examples:
-        maestro workstream-rework my-ws --reason "review rejected the diff" \\
+        cd <repo> && maestro workstream-rework my-ws \\
+            --reason "review rejected the diff" \\
             --instructions "split the migration into two steps"
+        maestro workstream-rework my-ws --reason "..." --run 01J8Z...
     """
     from maestro.rework import ReworkRefused
 
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _resolved_db_path(db, run, config_flag=config)
 
     async def _run() -> int:
         from maestro.database import Database
@@ -2273,6 +2972,14 @@ def workstream_resolve_ambiguity_command(
         Path | None,
         typer.Option("--db", "-d", help="Path to SQLite database file"),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help=_CONFIG_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Resolve a recovery-ambiguity marker after manual cleanup (#124).
 
@@ -2281,11 +2988,18 @@ def workstream_resolve_ambiguity_command(
     live-handle) `workstream-rework` refuses until this explicit, audited
     resolution.
 
+    Resolves `(repository, run)` from the checkout in the current
+    directory — or from `--config <project.yaml>` — before it opens
+    anything, and says what it resolved. `--run` picks between two runs;
+    `--db` names a database directly and skips resolution entirely.
+
     Examples:
-        maestro workstream-resolve-ambiguity my-ws \\
+        cd <repo> && maestro workstream-resolve-ambiguity my-ws \\
             --statement "checked ps/docker on the runner: nothing left"
+        maestro workstream-resolve-ambiguity my-ws --statement "..." \\
+            --run 01J8Z...
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _resolved_db_path(db, run, config_flag=config)
 
     async def _run() -> None:
         from maestro.database import Database
@@ -2317,6 +3031,14 @@ def check_scope_command(
     db: Annotated[
         Path | None, typer.Option("--db", "-d", help="Path to SQLite database file")
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help=_CONFIG_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Raw scope-containment check for a workstream's worktree.
 
@@ -2328,15 +3050,18 @@ def check_scope_command(
         maestro check-scope my-ws --base main --db run/maestro.db
     """
     from maestro.changed_paths import changed_paths_since
-    from maestro.database import Database, WorkstreamNotFoundError
+    from maestro.database import WorkstreamNotFoundError
     from maestro.scope_gate import find_escapes, normalize
 
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _resolved_db_path(db, run, config_flag=config)
 
     async def _run() -> int:
-        database = Database(db_path)
-        await database.connect()
-        try:
+        # Read-only: this reports the containment fact and records nothing —
+        # not even the approval note, which it only reads back. Exit 2 on an
+        # unreadable database: 1 is this command's "escapes found", and
+        # spending it on a database it never opened would announce an escape
+        # nothing measured.
+        async with _open_readonly(db_path, exit_code=2) as database:
             try:
                 ws = await database.get_workstream(workstream_id)
             except WorkstreamNotFoundError:
@@ -2376,14 +3101,24 @@ def check_scope_command(
                     console.print(f"[dim]note: approved (ex_post, {sha[:12]})[/dim]")
                     break
             return 1
-        finally:
-            await database.close()
 
     raise typer.Exit(asyncio.run(_run()))
 
 
-DEFAULT_SERVICE_LOG_DIR = DEFAULT_DB_DIR / "service-logs"
-DEFAULT_SERVICE_ENV_FILE = DEFAULT_DB_DIR / "service.env"
+def service_log_dir() -> Path:
+    """Where scheduled ticks write their stdout/stderr."""
+    return maestro_home() / "service-logs"
+
+
+def service_env_file() -> Path:
+    """The operator-owned credential file a generated unit sources.
+
+    Resolved per call for the same reason as `pid_file()`: `service install`
+    `mkdir -p`s and `chmod 0600`s this path **before** any refusal, so an
+    import-time constant made every install test touch the operator's real
+    `~/.maestro/service.env`.
+    """
+    return maestro_home() / "service.env"
 
 
 def platform_units_dir(platform: str) -> Path:
@@ -2423,7 +3158,7 @@ def service_run_command(
         _service_run(
             config_path=config,
             stage=cast("Stage", stage),
-            db_path=db_path or DEFAULT_DB_PATH,
+            db_path=db_path,
             sweep=not no_sweep,
         )
     )
@@ -2431,24 +3166,80 @@ def service_run_command(
 
 
 async def _service_run(
-    *, config_path: Path, stage: "Stage", db_path: Path, sweep: bool
+    *, config_path: Path, stage: "Stage", db_path: Path | None, sweep: bool
 ) -> int:
     project = load_orchestrator_config(config_path)
-    db = Database(db_path)
+
+    # `--db` overrides run and database-path resolution — but NOT identity:
+    # the lock key below must always be the repository's real RepoKey, never
+    # a fabricated one (that fabrication is exactly what Task 6 removed from
+    # service/tick.py). A scheduled tick always resumes an existing run and
+    # must never mint one (spec §A.1); an unattended entry point must refuse
+    # with a clear reason rather than a raw traceback.
+    try:
+        if db_path is not None:
+            resolved_db_path = db_path
+            key = parse_remote_url(project.repo_url)
+            # No run identity exists on this path: `--db` names a database
+            # directly and the resolver is never consulted (spec §E), so the
+            # tick has nothing honest to attribute the lock to. `None` leaves
+            # the holder sidecar unwritten and liveness *unobserved* — the
+            # alternative, deriving an id from the file's parent directory,
+            # answers `~/.maestro/maestro.db` with the run id `maestro`,
+            # which is the invented provenance §E exists to refuse.
+            run_id = None
+        else:
+            bootstrap = await bootstrap_run(project, resume=True, run_id_override=None)
+            resolved_db_path = bootstrap.db_path
+            key = bootstrap.key
+            # The resolved run, carried into the lock so a collector can see
+            # that *this* run — not merely some stage of this repository — is
+            # live (spec §B.3).
+            run_id = bootstrap.run_id
+    except IdentityError as e:
+        err_console.print(f"[red]Cannot resolve repository identity:[/red] {e}")
+        raise typer.Exit(1) from e
+    except AllRunsTerminal as e:
+        # Every run of this repository recorded its ending, so there is
+        # nothing for a scheduled tick to advance. That is a no-op, not a
+        # failure: a cron entry that turns permanently red the moment the
+        # work it watches finishes is the same defect as one that turns red
+        # on a second orchestration, reached from the other side. Starting a
+        # run is `orchestrate`'s job, never a tick's (spec §A.1).
+        console.print(f"{project.project} [{stage}]: noop_complete -> ok (exit 0)")
+        console.print(f"[dim]{escape(str(e))}[/dim]", soft_wrap=True)
+        return 0
+    except NoResumableRun as e:
+        err_console.print(
+            f"[red]No resumable run for '{project.project}':[/red] {e}\n"
+            "Run 'maestro orchestrate <config>' once to establish a run, "
+            "or pass --db <path> to point at an existing database directly."
+        )
+        raise typer.Exit(1) from e
+    except AmbiguousRun as e:
+        err_console.print(
+            f"[red]Several runs could be resumed for '{project.project}':[/red] {e}\n"
+            "Pass --db <path> to pick one directly."
+        )
+        raise typer.Exit(1) from e
+
+    db = Database(resolved_db_path)
     await db.connect()
     notifications = create_notification_manager(project.notifications)
     try:
         result: TickResult = await run_tick(
             db=db,
+            key=key,
             project=project.project,
             config_path=config_path,
-            db_path=db_path,
+            db_path=resolved_db_path,
             repo_path=Path(project.repo_path).expanduser(),  # noqa: ASYNC240
             base_branch=project.base_branch,
             stage=stage,
+            run_id=run_id,
             runner=run_argv,
             notifier=notifications,
-            log_dir=DEFAULT_SERVICE_LOG_DIR,
+            log_dir=service_log_dir(),
             sweep=sweep,
         )
         console.print(
@@ -2509,9 +3300,16 @@ def service_install_command(
         raise typer.Exit(1)
     target_platform = platform or _default_platform()
     project = load_orchestrator_config(config)
-    resolved_db = db_path or DEFAULT_DB_PATH
+    # No fallback to the legacy database, and no fallback to a resolved run
+    # either: the unit outlives every run it will ever start, so pinning one
+    # run's database into it at install time would make the scheduled tick
+    # act on a run that has since ended. `db_path=None` omits `--db` from the
+    # generated argv, and each tick resolves the current run for itself
+    # (`_service_run`, spec §A.1). An explicit `--db` is still honoured and
+    # still pinned — that is what the escape hatch is for.
+    resolved_db = db_path
 
-    env_file = DEFAULT_SERVICE_ENV_FILE
+    env_file = service_env_file()
     if not dry_run:
         ensure_env_file(env_file)
     # Maestro never calls a model API itself — it spawns harness CLIs
@@ -2558,7 +3356,7 @@ def service_install_command(
         maestro_bin=preflight.maestro_bin,
         path=preflight.path,
         env_file=env_file,
-        log_dir=DEFAULT_SERVICE_LOG_DIR,
+        log_dir=service_log_dir(),
         schedule=schedule if every is None else None,
         every_minutes=every,
     )
@@ -2635,6 +3433,10 @@ def service_status_command(
     db_path: Annotated[
         Path | None, typer.Option("--db", help="Path to state database")
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Show recent ticks for this project."""
     asyncio.run(
@@ -2642,7 +3444,10 @@ def service_status_command(
             config_path=config,
             stage=stage,
             limit=limit,
-            db_path=db_path or DEFAULT_DB_PATH,
+            # The project YAML is required for its own sake (it names the
+            # project whose ticks are listed), so it supplies identity as
+            # `config_arg` and remains legitimate alongside `--db`.
+            db_path=_resolved_db_path(db_path, run, config_arg=config),
         )
     )
 
@@ -2651,12 +3456,8 @@ async def _service_status(
     *, config_path: Path, stage: str | None, limit: int, db_path: Path
 ) -> None:
     project = load_orchestrator_config(config_path)
-    db = Database(db_path)
-    await db.connect()
-    try:
+    async with _open_readonly(db_path) as db:
         rows = await db.list_service_ticks(project.project, stage=stage, limit=limit)
-    finally:
-        await db.close()
     if not rows:
         console.print("[dim]No ticks recorded yet.[/dim]")
         return
@@ -2725,6 +3526,10 @@ def review_pr_command(
     db_path: Annotated[
         Path | None, typer.Option("--db", help="Path to state database")
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Drive the spec-runner review-bot loop over Maestro-created PRs.
 
@@ -2749,7 +3554,12 @@ def review_pr_command(
             review_all=review_all,
             gc=gc,
             discard_local=discard_local,
-            db_path=db_path or DEFAULT_DB_PATH,
+            # `review-pr` is reached both by hand and from a scheduled tick,
+            # and the tick always passes `--db` explicitly (service/tick.py),
+            # so it never depends on the resolver. Interactively it resolves
+            # like every other command, from the project YAML it already
+            # requires.
+            db_path=_resolved_db_path(db_path, run, config_arg=config),
         )
     )
 
@@ -2966,10 +3776,93 @@ def merge_logs_cmd(
     raise SystemExit(_merge_logs.main([target]))
 
 
+def _runs(count: int) -> str:
+    return f"{count} run" if count == 1 else f"{count} runs"
+
+
+def _repositories(count: int) -> str:
+    return f"{count} repository" if count == 1 else f"{count} repositories"
+
+
+def _format_bytes(size: int) -> str:
+    """A size an operator can read at a glance, in powers of 1024."""
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024 or unit == "GiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+@app.command("state-usage")
+def state_usage_command() -> None:
+    """Report what `~/.maestro` holds, per repository (spec §D).
+
+    Retention is deliberately not a policy here — this is the trigger for
+    one: growth becomes visible before it becomes a problem. The size counts
+    the whole project directory, `locks/` and any leftover `.staging/`
+    included, not just `runs/`.
+
+    On a machine that predates the split there is no `projects/` at all and
+    the legacy `maestro.db` of spec §E is the whole of `~/.maestro` — it is
+    named here rather than reported as an empty home. It is sized by `stat`
+    and never opened.
+
+    Examples:
+        maestro state-usage
+    """
+    usage = home_usage()
+    if usage.repositories:
+        total = 0
+        for repo in usage.repositories:
+            total += repo.size
+            unread = f"  ({len(repo.unreadable)} unreadable)" if repo.unreadable else ""
+            console.print(
+                f"{'/'.join(repo.key.as_path_parts())}  {_runs(repo.run_count)}  "
+                f"{_format_bytes(repo.size)}{unread}",
+                soft_wrap=True,
+            )
+        console.print(
+            f"TOTAL  {_repositories(len(usage.repositories))}  "
+            f"{_runs(sum(r.run_count for r in usage.repositories))}  "
+            f"{_format_bytes(total)}"
+        )
+    else:
+        console.print(f"No project state under {maestro_home()}.")
+
+    if usage.legacy_db is not None:
+        console.print(
+            f"Legacy database (spec §E, not counted above): {usage.legacy_db}  "
+            f"{_format_bytes(usage.legacy_db_size)}",
+            soft_wrap=True,
+        )
+
+    skipped = [p for repo in usage.repositories for p in repo.unreadable]
+    skipped.extend(usage.unreadable)
+    if skipped:
+        # A skipped subtree that just vanishes from the byte total is an
+        # unknown rendered as clean. Say what was missed, and say the totals
+        # are short because of it.
+        console.print(
+            f"[yellow]{len(skipped)} path(s) could not be read; their bytes are "
+            f"NOT in the totals above:[/yellow]"
+        )
+        for path in skipped:
+            console.print(f"  {path}", soft_wrap=True)
+
+
 @app.command("costs")
 def costs_command(
     db: Annotated[
         Path | None, typer.Option("--db", "-d", help="Path to SQLite database file")
+    ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help=_CONFIG_OPTION_HELP),
     ] = None,
 ) -> None:
     """Database-wide cost summary (read-only) over recorded task costs.
@@ -2987,7 +3880,7 @@ def costs_command(
     from maestro.cost_tracker import summarize_costs
     from maestro.database import DatabaseError, read_all_costs_readonly
 
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _resolved_db_path(db, run, config_flag=config)
 
     async def _run() -> int:
         try:
