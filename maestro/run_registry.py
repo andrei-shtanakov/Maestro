@@ -8,16 +8,16 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from maestro.database import create_database
+from maestro.repo_identity import RepoKey
 from maestro.run_state import RunRow, RunStatus, classify_run, run_row_from_mapping
 from maestro.service.locks import read_holder_run_id
-from maestro.state_paths import runs_dir
+from maestro.state_paths import maestro_home, runs_dir
 
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
     from pathlib import Path
 
-    from maestro.repo_identity import RepoKey
     from maestro.service.locks import Stage
 
 
@@ -172,3 +172,75 @@ def select_resumable(runs: list[RunInfo]) -> RunInfo:
         ids = ", ".join(r.run_id for r in candidates if r.run_id is not None)
         raise AmbiguousRun(f"several runs could be resumed: {ids}; pass --run <run-id>")
     return candidates[0]
+
+
+async def resolve_run_for_command(
+    key: RepoKey,
+    *,
+    run_id: str | None = None,
+    home: Path | None = None,
+    lock_root: Path | None = None,
+) -> RunInfo:
+    """The run a workstream command should act on (spec §C.3).
+
+    Workstream ids are unique per database, not per repository, so a command
+    that skipped this would open a database by accident.
+    """
+    runs = await resolve_runs(key, home=home, lock_root=lock_root)
+    if run_id is not None:
+        for info in runs:
+            if info.run_id == run_id:
+                return info
+        raise NoResumableRun(f"no run {run_id} for {'/'.join(key.as_path_parts())}")
+    return select_resumable(runs)
+
+
+def _project_dirs(base: Path) -> Iterator[tuple[Path, RepoKey]]:
+    """Every project directory under `base`, with the key it encodes.
+
+    The layout is fixed and known — `projects/<host>/<owner>/<repo>/` or
+    `projects/_local/<name>/` — so it is walked at exactly those depths. A
+    recursive glob would also descend into a run's own contents and mistake
+    something there for a project.
+    """
+    for host_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+        if host_dir.name == "_local":
+            for repo_dir in sorted(p for p in host_dir.iterdir() if p.is_dir()):
+                yield (
+                    repo_dir,
+                    RepoKey(host="_local", owner="", repo=repo_dir.name, local=True),
+                )
+            continue
+        for owner_dir in sorted(p for p in host_dir.iterdir() if p.is_dir()):
+            for repo_dir in sorted(p for p in owner_dir.iterdir() if p.is_dir()):
+                yield (
+                    repo_dir,
+                    RepoKey(
+                        host=host_dir.name, owner=owner_dir.name, repo=repo_dir.name
+                    ),
+                )
+
+
+def home_usage(*, home: Path | None = None) -> list[tuple[RepoKey, int, int]]:
+    """`(key, run count, bytes)` per repository — growth made visible (spec §D).
+
+    The size covers the **whole** project directory, not just `runs/`:
+    `locks/` and a leftover `.staging/` are exactly the growth an operator
+    needs to see. Rows are ordered by path parts so the report is stable.
+    """
+    base = (home if home is not None else maestro_home()) / "projects"
+    if not base.is_dir():
+        return []
+
+    report: list[tuple[RepoKey, int, int]] = []
+    for project_path, key in _project_dirs(base):
+        runs_path = project_path / "runs"
+        run_count = (
+            sum(1 for d in runs_path.iterdir() if d.is_dir())
+            if runs_path.is_dir()
+            else 0
+        )
+        size = sum(f.stat().st_size for f in project_path.rglob("*") if f.is_file())
+        report.append((key, run_count, size))
+    report.sort(key=lambda row: row[0].as_path_parts())
+    return report
