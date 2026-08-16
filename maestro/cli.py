@@ -67,7 +67,11 @@ from maestro.preflight import (
     ValidationReport,
     validate_project,
 )
-from maestro.repo_identity import IdentityError, parse_remote_url
+from maestro.repo_identity import (
+    IdentityError,
+    identity_from_checkout,
+    parse_remote_url,
+)
 from maestro.review_pr import PrRef, parse_pr_url
 from maestro.review_runner import (
     EXIT_ALREADY_RUNNING,
@@ -88,6 +92,8 @@ from maestro.run_registry import (
     TERMINAL_RUN_STATUSES,
     AmbiguousRun,
     NoResumableRun,
+    home_usage,
+    resolve_run_for_command,
     resolve_runs,
 )
 from maestro.scaffold import ScaffoldError, generate_project_yaml
@@ -111,6 +117,7 @@ from maestro.spawners import (
     OpencodeSpawner,
 )
 from maestro.spawners.base import AgentSpawner
+from maestro.state_paths import maestro_home
 from maestro.workspace import WorkspaceManager
 
 
@@ -1691,6 +1698,50 @@ def orchestrate_command(
         raise typer.Exit(130) from None
 
 
+#: `--run` for the workstream command family; the text is one string so the
+#: eight commands cannot drift apart.
+_RUN_OPTION_HELP = "Act on this run id instead of the resolver's choice."
+
+
+def _workstream_db_path(db: Path | None, run: str | None) -> Path:
+    """The database a workstream command must act on (spec §C.3).
+
+    A workstream id is unique per database, not per repository: once state is
+    per-run, the same id exists in several databases, so the command resolves
+    `(repository, run)` before it opens anything. `--db` is the escape hatch
+    of spec §E — given, it selects that database directly and the resolver is
+    not consulted at all, identity included.
+
+    Every refusal is an operator-facing message plus exit 1, never a
+    traceback (the pattern of `_run_orchestrator` and `_service_run`).
+    """
+    if db is not None:
+        return db
+    try:
+        key = identity_from_checkout(Path.cwd())
+        info = asyncio.run(resolve_run_for_command(key, run_id=run))
+    except IdentityError as e:
+        err_console.print(
+            f"[red]Cannot resolve repository identity:[/red] {e}\n"
+            "Run this from the repository's checkout, or pass --db <path>."
+        )
+        raise typer.Exit(1) from e
+    except NoResumableRun as e:
+        err_console.print(
+            f"[red]No resumable run:[/red] {e}\n"
+            "Run 'maestro orchestrate <config>' once to establish a run, "
+            "or pass --db <path> to point at an existing database directly."
+        )
+        raise typer.Exit(1) from e
+    except AmbiguousRun as e:
+        err_console.print(
+            f"[red]Several runs could be resumed:[/red] {e}\n"
+            "Pass --run <run-id>, or --db <path> to pick one directly."
+        )
+        raise typer.Exit(1) from e
+    return info.db_path
+
+
 @app.command("workstreams")
 def workstreams_command(
     db: Annotated[
@@ -1701,6 +1752,10 @@ def workstreams_command(
             help="Path to SQLite database file",
         ),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Show status of all workstreams.
 
@@ -1708,7 +1763,7 @@ def workstreams_command(
         maestro workstreams
         maestro workstreams --db /path/to/state.db
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _workstream_db_path(db, run)
     asyncio.run(_show_workstreams_status(db_path))
 
 
@@ -1751,13 +1806,17 @@ def workstream_approve_command(
         Path | None,
         typer.Option("--db", "-d", help="Path to SQLite database file"),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Approve a NEEDS_REVIEW workstream (gates re-queue) back to READY.
 
     Examples:
         maestro workstream-approve risk-model-docs-rule --db run/maestro.db
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _workstream_db_path(db, run)
 
     async def _run() -> "ApprovalMarker | None":
         from maestro.database import Database
@@ -1869,6 +1928,10 @@ def workstream_quarantine_command(
         Path | None,
         typer.Option("--db", "-d", help="Path to SQLite database file"),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Forbid a workstream's result from progressing (#166).
 
@@ -1888,7 +1951,7 @@ def workstream_quarantine_command(
     Examples:
         maestro workstream-quarantine w-adapters --reason "false DONE, 1/9"
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _workstream_db_path(db, run)
 
     async def _run() -> str:
         import getpass
@@ -1944,6 +2007,10 @@ def workstream_unquarantine_command(
         Path | None,
         typer.Option("--db", "-d", help="Path to SQLite database file"),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Lift a quarantine — an audited action, and nothing more (#166).
 
@@ -1956,7 +2023,7 @@ def workstream_unquarantine_command(
     Examples:
         maestro workstream-unquarantine w-adapters --reason "false DONE fixed"
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _workstream_db_path(db, run)
 
     async def _run() -> str:
         import getpass
@@ -2004,6 +2071,10 @@ def workstream_continue_command(
         Path | None,
         typer.Option("--db", "-d", help="Path to SQLite database file"),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Queue a continuation over the workstream's EXISTING tasks.md (#166).
 
@@ -2024,7 +2095,7 @@ def workstream_continue_command(
     Examples:
         maestro workstream-continue w-adapters
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _workstream_db_path(db, run)
 
     async def _run() -> tuple[int, str | None]:
         from maestro.continuation import (
@@ -2127,6 +2198,10 @@ def workstream_recapture_command(
         Path | None,
         typer.Option("--db", "-d", help="Path to SQLite database file"),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Retry ONLY post-mortem evidence capture for a blocked workstream (#164).
 
@@ -2142,7 +2217,7 @@ def workstream_recapture_command(
     Examples:
         maestro workstream-recapture w-contracts --db run/maestro.db
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _workstream_db_path(db, run)
 
     async def _run() -> str:
         from maestro.database import Database
@@ -2280,6 +2355,10 @@ def workstream_rework_command(
         Path | None,
         typer.Option("--db", "-d", help="Path to SQLite database file"),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Rework a NEEDS_REVIEW/FAILED workstream: re-decompose in the same
     worktree with new instructions. NOT an approval — the ex-post gate
@@ -2291,7 +2370,7 @@ def workstream_rework_command(
     """
     from maestro.rework import ReworkRefused
 
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _workstream_db_path(db, run)
 
     async def _run() -> int:
         from maestro.database import Database
@@ -2342,6 +2421,10 @@ def workstream_resolve_ambiguity_command(
         Path | None,
         typer.Option("--db", "-d", help="Path to SQLite database file"),
     ] = None,
+    run: Annotated[
+        str | None,
+        typer.Option("--run", help=_RUN_OPTION_HELP),
+    ] = None,
 ) -> None:
     """Resolve a recovery-ambiguity marker after manual cleanup (#124).
 
@@ -2354,7 +2437,7 @@ def workstream_resolve_ambiguity_command(
         maestro workstream-resolve-ambiguity my-ws \\
             --statement "checked ps/docker on the runner: nothing left"
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = _workstream_db_path(db, run)
 
     async def _run() -> None:
         from maestro.database import Database
@@ -3066,6 +3149,49 @@ def merge_logs_cmd(
 ) -> None:
     """Time-sort per-pid JSONL under a pipeline directory into merged.jsonl."""
     raise SystemExit(_merge_logs.main([target]))
+
+
+def _runs(count: int) -> str:
+    return f"{count} run" if count == 1 else f"{count} runs"
+
+
+def _format_bytes(size: int) -> str:
+    """A size an operator can read at a glance, in powers of 1024."""
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024 or unit == "GiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+@app.command("state-usage")
+def state_usage_command() -> None:
+    """Report what `~/.maestro` holds, per repository (spec §D).
+
+    Retention is deliberately not a policy here — this is the trigger for
+    one: growth becomes visible before it becomes a problem. The size counts
+    the whole project directory, `locks/` and any leftover `.staging/`
+    included, not just `runs/`.
+
+    Examples:
+        maestro state-usage
+    """
+    usage = home_usage()
+    if not usage:
+        console.print(f"No project state under {maestro_home()}.")
+        return
+    total = 0
+    for key, run_count, size in usage:
+        total += size
+        console.print(
+            f"{'/'.join(key.as_path_parts())}  {_runs(run_count)}  "
+            f"{_format_bytes(size)}"
+        )
+    console.print(
+        f"TOTAL  {len(usage)} repositories  "
+        f"{_runs(sum(r for _, r, _ in usage))}  {_format_bytes(total)}"
+    )
 
 
 @app.command("costs")
