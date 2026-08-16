@@ -3180,10 +3180,22 @@ async def _service_run(
         if db_path is not None:
             resolved_db_path = db_path
             key = parse_remote_url(project.repo_url)
+            # No run identity exists on this path: `--db` names a database
+            # directly and the resolver is never consulted (spec §E), so the
+            # tick has nothing honest to attribute the lock to. `None` leaves
+            # the holder sidecar unwritten and liveness *unobserved* — the
+            # alternative, deriving an id from the file's parent directory,
+            # answers `~/.maestro/maestro.db` with the run id `maestro`,
+            # which is the invented provenance §E exists to refuse.
+            run_id = None
         else:
             bootstrap = await bootstrap_run(project, resume=True, run_id_override=None)
             resolved_db_path = bootstrap.db_path
             key = bootstrap.key
+            # The resolved run, carried into the lock so a collector can see
+            # that *this* run — not merely some stage of this repository — is
+            # live (spec §B.3).
+            run_id = bootstrap.run_id
     except IdentityError as e:
         err_console.print(f"[red]Cannot resolve repository identity:[/red] {e}")
         raise typer.Exit(1) from e
@@ -3224,6 +3236,7 @@ async def _service_run(
             repo_path=Path(project.repo_path).expanduser(),  # noqa: ASYNC240
             base_branch=project.base_branch,
             stage=stage,
+            run_id=run_id,
             runner=run_argv,
             notifier=notifications,
             log_dir=service_log_dir(),

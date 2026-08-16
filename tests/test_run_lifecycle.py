@@ -23,9 +23,11 @@ import yaml
 from typer.testing import CliRunner
 
 from maestro.cli import app
+from maestro.config import load_orchestrator_config
 from maestro.database import create_database
 from maestro.models import Workstream, WorkstreamStatus
 from maestro.repo_identity import RepoKey
+from maestro.run_bootstrap import RunIsLive, bootstrap_run
 from maestro.run_lifecycle import (
     RunConclusion,
     conclude_run,
@@ -36,9 +38,11 @@ from maestro.run_publish import create_run
 from maestro.run_registry import (
     AllRunsTerminal,
     AmbiguousRun,
+    describe_database,
     resolve_runs,
     select_resumable,
 )
+from maestro.service.locks import read_holder_run_id, stage_lock_path
 
 
 if TYPE_CHECKING:
@@ -440,6 +444,136 @@ def test_service_run_still_refuses_when_no_run_exists(
 
     assert result.exit_code == 1
     assert "No resumable run" in result.stderr
+
+
+# =============================================================================
+# Liveness is observed, not inferred from a NULL (spec §B.3) — and observing
+# it requires a *production* code path that writes the holder.
+#
+# `ScopedLock` has taken a `run_id` since the layout landed, and
+# `tests/test_locks_run_attribution.py` proved the sidecar semantics by
+# constructing the lock with one by hand. Nothing in the product passed it:
+# `service/tick.py` built the only production `ScopedLock` with `key` and
+# `stage` alone, so `read_holder_run_id` returned `None` on every machine,
+# `classify_run` could never return `running`, and a run a tick was actively
+# executing read as `interrupted` — which `select_resumable` then hands to a
+# second invocation as a resumable candidate. Two orchestrators on one
+# database is the exact hazard §B.3 was written to prevent, so the test that
+# matters drives the real command, not the lock.
+# =============================================================================
+
+
+def test_a_run_a_tick_is_executing_is_reported_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """While `maestro service run` holds the stage lock, its run is `running`.
+
+    Observed from inside the tick's own subprocess call — the window in
+    which a second invocation would otherwise resume this database.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    config_path = _write_orchestrator_config(tmp_path, "https://github.com/acme/app")
+    # FAILED transitions back to READY, so the run stays non-terminal and the
+    # tick has something to advance (`decide_orchestrate` -> "resume").
+    _invoke_orchestrate(
+        config_path, seed=_seed_workstream("z-1", WorkstreamStatus.FAILED), failed=1
+    )
+    before = asyncio.run(resolve_runs(KEY, home=home, lock_root=home))
+    assert [r.status for r in before] == ["interrupted"]
+    run_id = before[0].run_id
+
+    observed: list[tuple[str | None, str]] = []
+    refused: list[str] = []
+
+    async def _observe(_argv: list[str], **_kwargs: object) -> int:
+        observed.extend(
+            (info.run_id, info.status)
+            for info in await resolve_runs(KEY, home=home, lock_root=home)
+        )
+        # The operator-facing half of the same fact: a fresh orchestration
+        # of a repository whose run is live must refuse. `RunIsLive` is
+        # raised off `live_run()`, so with no holder ever written it was
+        # unreachable code — the refusal existed and never fired.
+        try:
+            await bootstrap_run(
+                load_orchestrator_config(config_path),
+                resume=False,
+                run_id_override=None,
+                home=home,
+            )
+        except RunIsLive as exc:
+            refused.append(str(exc))
+        return 0
+
+    with patch("maestro.cli.run_argv", _observe):
+        result = runner.invoke(app, ["service", "run", str(config_path)])
+
+    assert result.exit_code == 0, result.output + result.stderr
+    assert observed == [(run_id, "running")]
+    assert refused and run_id is not None and run_id in refused[0]
+
+    # And the claim does not outlive the tick: a sidecar left behind would
+    # grant liveness to a dead run, which is the mirror-image failure.
+    after = asyncio.run(resolve_runs(KEY, home=home, lock_root=home))
+    assert [r.status for r in after] == ["interrupted"]
+
+
+def test_a_legacy_db_tick_attributes_the_lock_to_no_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `--db` tick has no run identity, and must not invent one.
+
+    Deriving the run id from the database's parent directory would answer
+    `~/.maestro/maestro.db` with the run id `maestro`. The honest value is
+    `None`: no holder is written, and liveness stays *unobserved* (§B.3, §E).
+    """
+    home = tmp_path / "home"
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    config_path = _write_orchestrator_config(tmp_path, "https://github.com/acme/app")
+    legacy = tmp_path / ".maestro" / "maestro.db"
+    legacy.parent.mkdir()
+
+    async def _seed_legacy() -> None:
+        db = await create_database(legacy)
+        try:
+            await db.create_workstream(
+                Workstream(
+                    id="z-1",
+                    title="z-1",
+                    description="seeded by the test",
+                    branch="feature/z-1",
+                    status=WorkstreamStatus.FAILED,
+                )
+            )
+        finally:
+            await db.close()
+
+    asyncio.run(_seed_legacy())
+
+    holder_file = stage_lock_path(KEY, "orchestrate", root=home).with_suffix(".holder")
+    observed: list[object] = []
+
+    async def _observe(_argv: list[str], **_kwargs: object) -> int:
+        # Non-vacuous: the stage lock IS held here, so a holder file would
+        # have been read rather than merely missing.
+        observed.append(stage_lock_path(KEY, "orchestrate", root=home).exists())
+        observed.append(holder_file.exists())
+        observed.append(read_holder_run_id(KEY, "orchestrate", root=home))
+        return 0
+
+    with patch("maestro.cli.run_argv", _observe):
+        result = runner.invoke(
+            app, ["service", "run", str(config_path), "--db", str(legacy)]
+        )
+
+    assert result.exit_code == 0, result.output + result.stderr
+    assert observed == [True, False, None]
+
+    # Nor is the database itself given an identity by having been ticked.
+    info = asyncio.run(describe_database(legacy, key=KEY, lock_root=home))
+    assert info.run_id is None
+    assert info.status == "legacy"
 
 
 # =============================================================================
