@@ -549,16 +549,15 @@ def test_cli_db_refuses_to_swallow_run(
     assert "--db and --run cannot be combined" in result.stderr
 
 
-def test_cli_no_run_names_the_key_and_where_it_came_from(
+def test_cli_no_runs_at_all_gets_a_forward_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A failed resolution must expose the identity it resolved.
-
-    `bootstrap_run` derives identity from `config.repo_url` while these eight
-    derive it from the checkout, and the two diverge for a fork or for
-    `maestro orchestrate ../b/project.yaml`. The old advice — run
-    `orchestrate` — mints a *second* project tree under the wrong key, so the
-    mismatch has to be legible at the moment it bites.
+    """A genuinely fresh repository — no runs anywhere for the key — is not
+    the wrong-identity accident the old advice was pulled for: there is
+    nothing here yet that a wrong identity could have produced, so pointing
+    at `orchestrate` is safe. The resolved key and its origin still print
+    first, so a wrong identity remains visible before the operator acts on
+    the advice.
     """
     monkeypatch.setenv("MAESTRO_HOME", str(tmp_path / "home"))
     checkout = _checkout(tmp_path, "https://github.com/acme/app")
@@ -570,7 +569,138 @@ def test_cli_no_run_names_the_key_and_where_it_came_from(
     assert "No resumable run" in result.stderr
     assert "Resolved github.com/acme/app" in result.stderr
     assert "from the checkout at" in result.stderr
+    assert "orchestrate" in result.stderr
+
+
+def test_cli_runs_exist_but_none_resumable_gets_no_orchestrate_advice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When runs exist but none is resumable, `orchestrate` stays withheld.
+
+    `bootstrap_run` derives identity from `config.repo_url` while these eight
+    derive it from the checkout, and the two diverge for a fork or for
+    `maestro orchestrate ../b/project.yaml`. Advising `orchestrate` here would
+    mint a *second* project tree under the wrong key, so the mismatch has to
+    be legible at the moment it bites instead.
+    """
+    monkeypatch.setenv("MAESTRO_HOME", str(tmp_path / "home"))
+    db_path = asyncio.run(
+        create_run(
+            KEY, "RUN-A", repo_key_text="k", started_at="2026-08-15T09:00:00+00:00"
+        )
+    )
+
+    async def _finish() -> None:
+        from maestro.database import create_database
+
+        db = await create_database(db_path)
+        try:
+            await db.set_run_outcome(
+                outcome="completed", ended_at="2026-08-15T12:00:00+00:00"
+            )
+        finally:
+            await db.close()
+
+    asyncio.run(_finish())
+    checkout = _checkout(tmp_path, "https://github.com/acme/app")
+    monkeypatch.chdir(checkout)
+
+    result = runner.invoke(app, ["workstreams"])
+
+    assert result.exit_code == 1
+    assert "No resumable run" in result.stderr
+    assert "Resolved github.com/acme/app" in result.stderr
+    assert "from the checkout at" in result.stderr
     assert "orchestrate" not in result.stderr
+
+
+def test_cli_db_announcement_escapes_bracket_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path segment that looks like Rich markup must print verbatim.
+
+    `--db` takes the path straight from the operator; interpolating it into a
+    `[dim]...[/dim]` string unescaped lets a segment like `[bold]` be parsed
+    as a tag instead of printed as text — the announced path then silently
+    diverges from the path actually acted on.
+    """
+    monkeypatch.setenv("MAESTRO_HOME", str(tmp_path / "ho[bold]me"))
+    db_path = asyncio.run(
+        create_run(
+            KEY, "RUN-A", repo_key_text="k", started_at="2026-08-15T09:00:00+00:00"
+        )
+    )
+    assert "[bold]" in str(db_path)
+
+    result = runner.invoke(app, ["workstreams", "--db", str(db_path)])
+
+    assert result.exit_code == 0, result.stderr
+    assert result.exception is None
+    assert f"acting on database {db_path}" in result.stdout
+
+
+def test_cli_db_announcement_survives_an_unbalanced_closing_tag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path segment like `[/red]` must not raise `rich.errors.MarkupError`.
+
+    Every refusal (and every announcement) is documented to be an
+    operator-facing message plus exit 1, never a traceback; an unescaped
+    closing tag with no opener broke that promise with a bare stack trace and
+    no output at all.
+    """
+    monkeypatch.setenv("MAESTRO_HOME", str(tmp_path / "ho[/red]me"))
+    db_path = asyncio.run(
+        create_run(
+            KEY, "RUN-A", repo_key_text="k", started_at="2026-08-15T09:00:00+00:00"
+        )
+    )
+    assert "[/red]" in str(db_path)
+
+    result = runner.invoke(app, ["workstreams", "--db", str(db_path)])
+
+    assert result.exit_code == 0, result.stderr
+    assert result.exception is None
+    assert f"acting on database {db_path}" in result.stdout
+
+
+def test_cli_resolver_origin_escapes_bracket_checkout_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The resolver's refusal names the checkout path too, and it is exactly
+    as operator-controlled as `--db` — a checkout at `~/work/[2026-08] proj/`
+    must be named verbatim, not partly consumed as a markup tag.
+    """
+    monkeypatch.setenv("MAESTRO_HOME", str(tmp_path / "home"))
+    bracket_base = tmp_path / "work[2026-08]"
+    checkout = _checkout(bracket_base, "https://github.com/acme/app")
+    monkeypatch.chdir(checkout)
+
+    result = runner.invoke(app, ["workstreams"])
+
+    # A refusal exits via `typer.Exit(1)`, which itself surfaces as a
+    # `SystemExit` — that is the documented, deliberate control flow, not the
+    # bug. The bug is any *other* exception (a `rich.errors.MarkupError`
+    # first among them) sneaking out instead of an operator-facing message.
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    assert f"from the checkout at {checkout}" in result.stderr
+
+
+def test_cli_resolver_origin_survives_an_unbalanced_closing_tag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same as above, for the `[/red]`-raises-`MarkupError` case."""
+    monkeypatch.setenv("MAESTRO_HOME", str(tmp_path / "home"))
+    bracket_base = tmp_path / "work[/red]"
+    checkout = _checkout(bracket_base, "https://github.com/acme/app")
+    monkeypatch.chdir(checkout)
+
+    result = runner.invoke(app, ["workstreams"])
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    assert f"from the checkout at {checkout}" in result.stderr
 
 
 def _capture_database_paths() -> tuple[list[Path], AbstractContextManager[object]]:

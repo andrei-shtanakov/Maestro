@@ -93,8 +93,8 @@ from maestro.run_registry import (
     AmbiguousRun,
     NoResumableRun,
     home_usage,
-    resolve_run_for_command,
     resolve_runs,
+    select_run_for_command,
 )
 from maestro.scaffold import ScaffoldError, generate_project_yaml
 from maestro.service.locks import Stage  # noqa: TC001 — runtime cast target
@@ -124,6 +124,7 @@ from maestro.workspace import WorkspaceManager
 if TYPE_CHECKING:
     from maestro.cost_tracker import CostReport
     from maestro.gates import ApprovalMarker
+    from maestro.run_registry import RunInfo
 
 
 # Default paths
@@ -1734,7 +1735,9 @@ def _workstream_db_path(db: Path | None, run: str | None) -> Path:
                 "never consulted. Drop one."
             )
             raise typer.Exit(1)
-        console.print(f"[dim]acting on database {db}[/dim]", soft_wrap=True)
+        console.print(
+            f"[dim]acting on database {escape(str(db))}[/dim]", soft_wrap=True
+        )
         return db
 
     cwd = Path.cwd()
@@ -1756,24 +1759,50 @@ def _workstream_db_path(db: Path | None, run: str | None) -> Path:
     # the mismatch visible while it is still one command's worth of damage.
     # (Unifying the identity source is Task 13's, which owns the remaining
     # `DEFAULT_DB_PATH` call sites.)
-    origin = f"Resolved {repo} from the checkout at {cwd}."
+    origin = f"Resolved {escape(repo)} from the checkout at {escape(str(cwd))}."
+    # Fetched once and reused by `select_run_for_command` below: the refusal
+    # branch needs to know whether *any* run exists at all, and asking
+    # `resolve_runs` a second time to find out would be dishonest about what
+    # "fetched once" means. Bound ahead of the `try` — `resolve_runs` itself
+    # never raises `NoResumableRun`, but nothing in its type says so, and the
+    # except clause below reads `runs` regardless.
+    runs: list[RunInfo] = []
     try:
-        info = asyncio.run(resolve_run_for_command(key, run_id=run))
+        runs = asyncio.run(resolve_runs(key))
+        info = select_run_for_command(runs, key, run_id=run)
     except NoResumableRun as e:
         err_console.print(f"[red]No resumable run:[/red] {e}", soft_wrap=True)
         err_console.print(origin, soft_wrap=True)
-        err_console.print(
-            "If that is not the repository you meant, run this from that "
-            "repository's checkout, or pass --db <path> to name the database "
-            "directly."
-        )
+        if run is None and not runs:
+            # A genuinely fresh repository — not a wrong-identity accident,
+            # since there is nothing here yet for a wrong identity to have
+            # produced. `orchestrate` is a safe forward path in this one
+            # case; the key and its origin above stay visible so a wrong
+            # identity is still caught before the operator acts on it.
+            err_console.print(
+                f"Nothing has been orchestrated for {escape(repo)} yet: "
+                "`maestro orchestrate <project.yaml>` creates the first run. "
+                "If that is not the repository you meant, run this from that "
+                "repository's checkout instead, or pass --db <path> to name "
+                "the database directly.",
+                soft_wrap=True,
+            )
+        else:
+            err_console.print(
+                "If that is not the repository you meant, run this from that "
+                "repository's checkout, or pass --db <path> to name the database "
+                "directly."
+            )
         raise typer.Exit(1) from e
     except AmbiguousRun as e:
         err_console.print(f"[red]Several runs could be resumed:[/red] {e}")
         err_console.print(origin, soft_wrap=True)
         err_console.print("Pass --run <run-id>, or --db <path> to pick one directly.")
         raise typer.Exit(1) from e
-    console.print(f"[dim]acting on {repo}, run {info.run_id}[/dim]", soft_wrap=True)
+    console.print(
+        f"[dim]acting on {escape(repo)}, run {escape(str(info.run_id))}[/dim]",
+        soft_wrap=True,
+    )
     return info.db_path
 
 

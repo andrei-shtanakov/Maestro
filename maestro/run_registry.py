@@ -175,19 +175,17 @@ def select_resumable(runs: list[RunInfo]) -> RunInfo:
     return candidates[0]
 
 
-async def resolve_run_for_command(
-    key: RepoKey,
-    *,
-    run_id: str | None = None,
-    home: Path | None = None,
-    lock_root: Path | None = None,
+def select_run_for_command(
+    runs: list[RunInfo], key: RepoKey, *, run_id: str | None = None
 ) -> RunInfo:
-    """The run a workstream command should act on (spec §C.3).
+    """The run a workstream command should act on, given an already-fetched
+    run list (spec §C.3).
 
-    Workstream ids are unique per database, not per repository, so a command
-    that skipped this would open a database by accident.
+    Split out of `resolve_run_for_command` so a caller that needs the run
+    list for its own purposes — e.g. to tell "no runs exist" from "runs exist
+    but none is resumable" on a refusal — can fetch it once with
+    `resolve_runs` and reuse it here, rather than resolving twice.
     """
-    runs = await resolve_runs(key, home=home, lock_root=lock_root)
     if run_id is not None:
         for info in runs:
             if info.run_id == run_id:
@@ -201,6 +199,22 @@ async def resolve_run_for_command(
             f"no run {run_id} for {'/'.join(key.as_path_parts())}; known runs: {known}"
         )
     return select_resumable(runs)
+
+
+async def resolve_run_for_command(
+    key: RepoKey,
+    *,
+    run_id: str | None = None,
+    home: Path | None = None,
+    lock_root: Path | None = None,
+) -> RunInfo:
+    """The run a workstream command should act on (spec §C.3).
+
+    Workstream ids are unique per database, not per repository, so a command
+    that skipped this would open a database by accident.
+    """
+    runs = await resolve_runs(key, home=home, lock_root=lock_root)
+    return select_run_for_command(runs, key, run_id=run_id)
 
 
 #: The pre-split database of spec §E. It is never opened — only `stat`-ed.
