@@ -46,10 +46,17 @@ async def create_run(
     if final_dir.exists():
         raise FileExistsError(f"run already exists: {final_dir}")
 
+    # `home=` is forwarded to every `ensure_private_dir` below: it is what
+    # bounds the privacy repair (`state_paths._private_chain`), so without it
+    # the boundary silently falls back to `maestro_home()` while the paths
+    # come from the caller's `home`. Under an explicitly-passed home the two
+    # then disagree, the repair sees a path "outside the home", and a
+    # pre-existing 0755 ancestor — the compounding failure `ensure_private_dir`
+    # was widened to fix — keeps its mode.
     staging_root = project_dir(key, home=home) / ".staging"
-    staging = ensure_private_dir(staging_root / run_id)
+    staging = ensure_private_dir(staging_root / run_id, home=home)
     try:
-        ensure_private_dir(staging / "logs")
+        ensure_private_dir(staging / "logs", home=home)
 
         db_path = staging / "state.db"
         db = await create_database(db_path)
@@ -62,7 +69,7 @@ async def create_run(
         shutil.rmtree(staging, ignore_errors=True)
         raise
 
-    ensure_private_dir(runs_dir(key, home=home))
+    ensure_private_dir(runs_dir(key, home=home), home=home)
     staging.rename(final_dir)  # only now is the run discoverable
     with contextlib.suppress(OSError):
         staging_root.rmdir()  # best-effort: only succeeds when empty

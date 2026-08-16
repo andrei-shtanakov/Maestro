@@ -3,7 +3,7 @@ import stat
 from maestro.database import Database, create_database
 from maestro.repo_identity import RepoKey
 from maestro.run_publish import create_run
-from maestro.state_paths import runs_dir
+from maestro.state_paths import project_dir, runs_dir
 
 
 KEY = RepoKey(host="github.com", owner="acme", repo="app")
@@ -42,6 +42,31 @@ async def test_nothing_is_visible_under_runs_until_complete(tmp_path):
     assert [e.name for e in entries] == ["RUN-A"]
     # every published directory has its row
     assert (entries[0] / "state.db").exists()
+
+
+async def test_an_explicitly_passed_home_gets_the_privacy_repair(tmp_path):
+    """`home=` must reach `ensure_private_dir`, not just the path builders.
+
+    The repair is bounded by the maestro home, so a `home=` that stops at
+    `create_run` leaves the boundary at `maestro_home()`. Every path then
+    looks "outside the home", only the leaf is chmod-ed, and a pre-existing
+    0755 ancestor stays 0755 — the exact compounding this repair exists for,
+    reintroduced for anyone who injects a home.
+    """
+    home = tmp_path / "home"
+    project = project_dir(KEY, home=home)
+    project.mkdir(parents=True)
+    for wrong in (home, home / "projects", project):
+        wrong.chmod(0o755)
+
+    await create_run(KEY, "RUN-A", repo_key_text="k", started_at=STARTED, home=home)
+
+    offenders = {
+        str(p): oct(stat.S_IMODE(p.stat().st_mode))
+        for p in (home, home / "projects", project, runs_dir(KEY, home=home))
+        if stat.S_IMODE(p.stat().st_mode) != 0o700
+    }
+    assert offenders == {}
 
 
 async def test_permissions_are_private(tmp_path):
