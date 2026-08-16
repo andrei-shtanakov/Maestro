@@ -47,6 +47,16 @@
   is now a green no-op rather than exit 1, and a resolving command with no
   `--run` falls back to the newest run when every run is terminal (selecting
   is not resuming) while still refusing when several runs are open.
+- **`~/.maestro` and everything under it is 0700/0600 — including what the
+  locks create.** `create_run` honoured this; `maestro/service/locks.py` used a
+  bare `mkdir` and `open("w")` and so left `locks/` and
+  `projects/<host>/<owner>/<repo>/` world-readable at 0755 and every lock file
+  at 0644. Because a mode was only ever set at creation, whichever path got
+  there first decided it permanently — and on a fresh machine
+  `maestro service run <config> --db <path>` takes the lock without any
+  `create_run` running, which is how `~/.maestro` itself ended up 0755. An
+  existing directory under the maestro home is now repaired to 0700 as well;
+  nothing above the home is ever touched.
 - **BREAKING (locks): lock identity no longer includes the database path.**
   Stage locks are keyed `(repository, stage)`, so two runs of one project
   against two different `--db` files now serialise per stage instead of

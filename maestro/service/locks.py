@@ -27,7 +27,7 @@ import json
 import os
 from typing import TYPE_CHECKING, Literal
 
-from maestro.state_paths import locks_dir, maestro_home
+from maestro.state_paths import FILE_MODE, ensure_private_dir, locks_dir, maestro_home
 
 
 if TYPE_CHECKING:
@@ -89,6 +89,33 @@ def read_holder_run_id(
         return None
 
 
+def _open_private(path: Path):
+    """Open (creating if needed) a lock file that ends up 0600.
+
+    `Path.open("w")` creates at 0666 minus the umask — 0644 on a default
+    machine — which is what left `locks/global.lock` and every `<stage>.lock`
+    world-readable, against spec §G bullet 22. `fchmod` on the open
+    descriptor rather than `chmod` on the name: the file is already ours, and
+    there is no window in which a different file could be hit.
+
+    A lock file holds no secrets itself, but its *path* names the repository,
+    and the directory rule it lives under is the one that does.
+    """
+    handle = path.open("w")
+    try:
+        os.fchmod(handle.fileno(), FILE_MODE)
+    except OSError:
+        handle.close()
+        raise
+    return handle
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Write a lock sidecar (`.pid`, `.holder`) at 0600."""
+    path.write_text(text)
+    path.chmod(FILE_MODE)
+
+
 def _flock(handle, operation: int, what: str) -> None:
     try:
         fcntl.flock(handle, operation | fcntl.LOCK_NB)
@@ -106,12 +133,13 @@ class LegacyLock:
     """
 
     def __init__(self, *, root: Path | None = None) -> None:
+        self._root = root
         self._path = global_lock_path(root=root)
         self._handle = None
 
     def __enter__(self) -> LegacyLock:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        handle = self._path.open("w")
+        ensure_private_dir(self._path.parent, home=self._root)
+        handle = _open_private(self._path)
         _flock(handle, fcntl.LOCK_EX, "the global Maestro lock")
         self._handle = handle
         return self
@@ -141,6 +169,7 @@ class ScopedLock:
     ) -> None:
         self._stage = stage
         self._run_id = run_id
+        self._root = root
         self._global_path = global_lock_path(root=root)
         self._stage_path = stage_lock_path(key, stage, root=root)
         self._global_handle = None
@@ -157,27 +186,31 @@ class ScopedLock:
         return self._stage_path.with_suffix(".holder")
 
     def __enter__(self) -> ScopedLock:
-        self._global_path.parent.mkdir(parents=True, exist_ok=True)
-        self._stage_path.parent.mkdir(parents=True, exist_ok=True)
+        # `ensure_private_dir`, not a bare `mkdir`: this is the code path that
+        # created `~/.maestro` and `projects/<host>/<owner>/<repo>/` at 0755
+        # on a fresh machine, and — because a mode is only ever set at
+        # creation — left them that way for good (spec §G bullet 22).
+        ensure_private_dir(self._global_path.parent, home=self._root)
+        ensure_private_dir(self._stage_path.parent, home=self._root)
 
-        global_handle = self._global_path.open("w")
+        global_handle = _open_private(self._global_path)
         # Shared: coexists with other scoped stages, conflicts with legacy.
         _flock(global_handle, fcntl.LOCK_SH, "a legacy Maestro run")
         self._global_handle = global_handle
 
-        stage_handle = self._stage_path.open("w")
+        stage_handle = _open_private(self._stage_path)
         try:
             _flock(stage_handle, fcntl.LOCK_EX, f"this repository's {self._stage} tick")
         except AlreadyRunning:
             self._release_global()
             raise
         self._stage_handle = stage_handle
-        self.pid_file.write_text(str(os.getpid()))
+        _write_private(self.pid_file, str(os.getpid()))
         if self._run_id is not None:
-            self.holder_file.write_text(
-                json.dumps({"pid": os.getpid(), "run_id": self._run_id})
+            _write_private(
+                self.holder_file,
+                json.dumps({"pid": os.getpid(), "run_id": self._run_id}),
             )
-            self.holder_file.chmod(0o600)
         return self
 
     def _release_global(self) -> None:
