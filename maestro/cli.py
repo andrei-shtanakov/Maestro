@@ -127,10 +127,33 @@ if TYPE_CHECKING:
     from maestro.run_registry import RunInfo
 
 
-# Default paths
-DEFAULT_DB_DIR = Path.home() / ".maestro"
-DEFAULT_DB_PATH = DEFAULT_DB_DIR / "maestro.db"
-PID_FILE = DEFAULT_DB_DIR / "maestro.pid"
+# Default paths.
+#
+# **Functions, not module constants.** These were `Path.home() / ".maestro"`
+# evaluated at import, which no `$MAESTRO_HOME` override can reach: a value
+# computed once at import escapes the fence for the whole process. The cost was
+# not theoretical — the test suite created and *unlinked* the operator's real
+# `~/.maestro/maestro.pid`, and `_acquire_pid_lock` holds an `fcntl` lock on
+# that file's **inode**. Unlinking the name leaves a live scheduler holding a
+# lock nothing can contend for, so the next `maestro run` acquires a fresh one
+# and orchestrates the same project **twice, concurrently**. Mutual exclusion is
+# destroyed, not merely misreported.
+
+
+def legacy_db_path() -> Path:
+    """`~/.maestro/maestro.db` — the frozen pre-split database (spec §E).
+
+    Kept for reading (an explicit `--db` still reaches it) and for naming it in
+    reports. **No code path writes to it**; see
+    `tests/test_legacy_default_frozen.py` for the evidence.
+    """
+    return maestro_home() / "maestro.db"
+
+
+def pid_file() -> Path:
+    """The scheduler's lock file. One per `$MAESTRO_HOME`."""
+    return maestro_home() / "maestro.pid"
+
 
 # Rich console for pretty output
 console = Console()
@@ -273,15 +296,15 @@ def _format_status(status: TaskStatus) -> Text:
 
 
 def _ensure_db_dir() -> None:
-    """Ensure the default database directory exists."""
-    DEFAULT_DB_DIR.mkdir(parents=True, exist_ok=True)
+    """Ensure `$MAESTRO_HOME` exists."""
+    maestro_home().mkdir(parents=True, exist_ok=True)
 
 
-def _acquire_pid_lock(pid_file: Path | None = None) -> int:
+def _acquire_pid_lock(path: Path | None = None) -> int:
     """Acquire exclusive lock on PID file.
 
     Args:
-        pid_file: Path to PID file. Defaults to PID_FILE.
+        path: Path to PID file. Defaults to `pid_file()`.
 
     Returns:
         File descriptor for the lock (caller must keep it open).
@@ -289,10 +312,10 @@ def _acquire_pid_lock(pid_file: Path | None = None) -> int:
     Raises:
         SystemExit: If another Maestro instance is already running.
     """
-    if pid_file is None:
-        pid_file = PID_FILE
+    if path is None:
+        path = pid_file()
     _ensure_db_dir()
-    fd = os.open(str(pid_file), os.O_CREAT | os.O_RDWR)
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -312,25 +335,26 @@ def _acquire_pid_lock(pid_file: Path | None = None) -> int:
     return fd
 
 
-def _release_pid_lock(fd: int, pid_file: Path | None = None) -> None:
+def _release_pid_lock(fd: int, path: Path | None = None) -> None:
     """Release PID file lock and remove the file."""
-    if pid_file is None:
-        pid_file = PID_FILE
+    if path is None:
+        path = pid_file()
     try:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
     except OSError:
         pass
     with contextlib.suppress(FileNotFoundError):
-        pid_file.unlink()
+        path.unlink()
 
 
 def _read_pid_file() -> int | None:
     """Read PID from file, return None if not found."""
-    if not PID_FILE.exists():
+    path = pid_file()
+    if not path.exists():
         return None
     try:
-        return int(PID_FILE.read_text().strip())
+        return int(path.read_text().strip())
     except (ValueError, OSError):
         return None
 
@@ -868,7 +892,7 @@ def _stop_scheduler() -> None:
             f"[yellow]Process {pid} not found, removing stale PID file[/yellow]"
         )
         with contextlib.suppress(FileNotFoundError):
-            PID_FILE.unlink()
+            pid_file().unlink()
     except PermissionError:
         err_console.print(f"[red]Permission denied to stop process {pid}[/red]")
         raise typer.Exit(1) from None
@@ -937,7 +961,7 @@ def run_command(
         maestro run tasks.yaml --db /path/to/state.db
     """
     setup_logging("maestro")
-    db_path = db or DEFAULT_DB_PATH
+    db_path = db or legacy_db_path()
 
     try:
         asyncio.run(_run_scheduler(config, db_path, resume, log_dir, clean))
@@ -969,7 +993,7 @@ def status_command(
         maestro status
         maestro status --db /path/to/state.db
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = db or legacy_db_path()
     asyncio.run(_show_status(db_path))
 
 
@@ -1000,7 +1024,7 @@ def retry_command(
         maestro retry task-001
         maestro retry task-001 --db /path/to/state.db
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = db or legacy_db_path()
     asyncio.run(_retry_task(db_path, task_id))
 
 
@@ -1044,7 +1068,7 @@ def approve_command(
         maestro approve task-001
         maestro approve task-001 --db /path/to/state.db
     """
-    db_path = db or DEFAULT_DB_PATH
+    db_path = db or legacy_db_path()
     asyncio.run(_approve_task(db_path, task_id))
 
 
@@ -1942,7 +1966,7 @@ def postmortem_command(
             "[yellow]Nothing to do: pass --gc to apply the retention policy.[/yellow]"
         )
         raise typer.Exit(1)
-    db_path = db or DEFAULT_DB_PATH
+    db_path = db or legacy_db_path()
 
     async def _run() -> tuple[int, int]:
         from maestro.config import load_orchestrator_config
@@ -2547,7 +2571,7 @@ def check_scope_command(
     from maestro.database import Database, WorkstreamNotFoundError
     from maestro.scope_gate import find_escapes, normalize
 
-    db_path = db or DEFAULT_DB_PATH
+    db_path = db or legacy_db_path()
 
     async def _run() -> int:
         database = Database(db_path)
@@ -2598,8 +2622,20 @@ def check_scope_command(
     raise typer.Exit(asyncio.run(_run()))
 
 
-DEFAULT_SERVICE_LOG_DIR = DEFAULT_DB_DIR / "service-logs"
-DEFAULT_SERVICE_ENV_FILE = DEFAULT_DB_DIR / "service.env"
+def service_log_dir() -> Path:
+    """Where scheduled ticks write their stdout/stderr."""
+    return maestro_home() / "service-logs"
+
+
+def service_env_file() -> Path:
+    """The operator-owned credential file a generated unit sources.
+
+    Resolved per call for the same reason as `pid_file()`: `service install`
+    `mkdir -p`s and `chmod 0600`s this path **before** any refusal, so an
+    import-time constant made every install test touch the operator's real
+    `~/.maestro/service.env`.
+    """
+    return maestro_home() / "service.env"
 
 
 def platform_units_dir(platform: str) -> Path:
@@ -2697,7 +2733,7 @@ async def _service_run(
             stage=stage,
             runner=run_argv,
             notifier=notifications,
-            log_dir=DEFAULT_SERVICE_LOG_DIR,
+            log_dir=service_log_dir(),
             sweep=sweep,
         )
         console.print(
@@ -2758,9 +2794,9 @@ def service_install_command(
         raise typer.Exit(1)
     target_platform = platform or _default_platform()
     project = load_orchestrator_config(config)
-    resolved_db = db_path or DEFAULT_DB_PATH
+    resolved_db = db_path or legacy_db_path()
 
-    env_file = DEFAULT_SERVICE_ENV_FILE
+    env_file = service_env_file()
     if not dry_run:
         ensure_env_file(env_file)
     # Maestro never calls a model API itself — it spawns harness CLIs
@@ -2807,7 +2843,7 @@ def service_install_command(
         maestro_bin=preflight.maestro_bin,
         path=preflight.path,
         env_file=env_file,
-        log_dir=DEFAULT_SERVICE_LOG_DIR,
+        log_dir=service_log_dir(),
         schedule=schedule if every is None else None,
         every_minutes=every,
     )
@@ -2891,7 +2927,7 @@ def service_status_command(
             config_path=config,
             stage=stage,
             limit=limit,
-            db_path=db_path or DEFAULT_DB_PATH,
+            db_path=db_path or legacy_db_path(),
         )
     )
 
@@ -2998,7 +3034,7 @@ def review_pr_command(
             review_all=review_all,
             gc=gc,
             discard_local=discard_local,
-            db_path=db_path or DEFAULT_DB_PATH,
+            db_path=db_path or legacy_db_path(),
         )
     )
 
@@ -3311,7 +3347,7 @@ def costs_command(
     from maestro.cost_tracker import summarize_costs
     from maestro.database import DatabaseError, read_all_costs_readonly
 
-    db_path = db or DEFAULT_DB_PATH
+    db_path = db or legacy_db_path()
 
     async def _run() -> int:
         try:
