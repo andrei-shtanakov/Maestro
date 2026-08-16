@@ -100,6 +100,35 @@ def local_key(repo_path: Path) -> RepoKey:
     return RepoKey(host="_local", owner="", repo=f"{name}-{digest}", local=True)
 
 
+def identity_from_config(config: object) -> RepoKey:
+    """Identity of the repository a config names (spec §3.2, §3.3).
+
+    **One rule, two ways of reaching the same fact.** The identity is always
+    the repository's `origin` remote, parsed by `parse_remote_url`; the two
+    config models differ only in whether they carry that remote themselves:
+
+    - `OrchestratorConfig.repo_url` *declares* it, so it is parsed directly
+      (§3.2);
+    - `ProjectConfig.repo` is a local path, and a path is never identity
+      (ADR-ECO-007 D2), so that checkout's `origin` is read at runtime and
+      parsed by the very same rule (§3.3).
+
+    A config that names neither is a refusal, never a fallback to `project:`
+    (§3.4): that would be a silent downgrade to the ambiguous identifier this
+    layout exists to remove.
+    """
+    repo_url = getattr(config, "repo_url", None)
+    if isinstance(repo_url, str):
+        return parse_remote_url(repo_url)
+    repo = getattr(config, "repo", None)
+    if isinstance(repo, str):
+        return identity_from_checkout(Path(repo).expanduser())
+    raise IdentityError(
+        "config names no repository: it has neither `repo_url` (spec §3.2) "
+        "nor `repo` (spec §3.3)"
+    )
+
+
 def identity_from_checkout(repo_path: Path) -> RepoKey:
     """Identity for Mode 1: the checkout's `origin`, else a local key."""
     try:

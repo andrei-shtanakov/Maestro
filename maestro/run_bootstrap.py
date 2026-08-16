@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import ulid
 
-from maestro.repo_identity import RepoKey, parse_remote_url
+from maestro.repo_identity import RepoKey, identity_from_config
 from maestro.run_publish import create_run
 from maestro.run_registry import (
     NoResumableRun,
@@ -50,7 +50,12 @@ async def bootstrap_run(
     run_id_override: str | None,
     home: Path | None = None,
 ) -> BootstrapResult:
-    key = parse_remote_url(getattr(config, "repo_url"))  # noqa: B009
+    # One identity rule for both modes: `identity_from_config` reads
+    # `repo_url` when the config declares one (spec §3.2) and the `repo:`
+    # checkout's `origin` when it does not (§3.3), so Mode 1 (`maestro run`)
+    # reaches the same tree as Mode 2 instead of keeping the legacy database
+    # alive.
+    key = identity_from_config(config)
     repo_key_text = "/".join(key.as_path_parts())
 
     if resume or run_id_override is not None:
