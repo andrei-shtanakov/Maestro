@@ -31,6 +31,17 @@ class NoResumableRun(Exception):
     """There is nothing to resume."""
 
 
+class AllRunsTerminal(NoResumableRun):
+    """Runs exist and every one of them recorded its ending (spec §B.1).
+
+    A *subclass*, so every caller that only cares about "nothing to resume"
+    keeps working unchanged. The distinction exists for the one caller whose
+    answer differs: an unattended `service run` tick over a repository whose
+    work is finished has nothing to do, which is a no-op and green — not the
+    setup gap ("run `orchestrate` once") that an empty `runs/` really is.
+    """
+
+
 class AmbiguousRun(Exception):
     """More than one run could be resumed; the operator must choose."""
 
@@ -168,6 +179,11 @@ def select_resumable(runs: list[RunInfo]) -> RunInfo:
         and r.run_id is not None
     ]
     if not candidates:
+        if runs and all(r.status in TERMINAL_RUN_STATUSES for r in runs):
+            ended = ", ".join(
+                f"{r.run_id} ({r.status})" for r in runs if r.run_id is not None
+            )
+            raise AllRunsTerminal(f"every run has ended: {ended}")
         raise NoResumableRun("no non-terminal run to resume")
     if len(candidates) > 1:
         ids = ", ".join(r.run_id for r in candidates if r.run_id is not None)
@@ -198,7 +214,21 @@ def select_run_for_command(
         raise NoResumableRun(
             f"no run {run_id} for {'/'.join(key.as_path_parts())}; known runs: {known}"
         )
-    return select_resumable(runs)
+    try:
+        return select_resumable(runs)
+    except AllRunsTerminal:
+        # **Selecting is not resuming.** `select_resumable` answers spec §C.2's
+        # question — "which run can be advanced" — and refusing there is right:
+        # `orchestrate --resume` and a service tick have nothing to advance.
+        # A workstream command asks §C.3's question instead, "which run do I
+        # act on", and the answer for a repository whose work is finished is
+        # its newest run, not a refusal. Before runs recorded their endings at
+        # all this branch was unreachable, which is why it did not exist.
+        #
+        # `resolve_runs` sorts by `started_at`, so this is "newest started" —
+        # never the lexicographic maximum §C.1 rules out. Ambiguity between
+        # *several non-terminal* runs still refuses, untouched.
+        return runs[0]
 
 
 async def resolve_run_for_command(

@@ -90,8 +90,18 @@ from maestro.review_workspace import (
     recover_push,
 )
 from maestro.run_bootstrap import RunIsLive, bootstrap_run
+from maestro.run_lifecycle import (
+    OPERATOR_ENDINGS,
+    RunConclusion,
+    conclusion_for_tasks,
+    conclusion_for_workstreams,
+    record_cancelled,
+    record_conclusion,
+    record_superseded,
+)
 from maestro.run_registry import (
     TERMINAL_RUN_STATUSES,
+    AllRunsTerminal,
     AmbiguousRun,
     NoResumableRun,
     home_usage,
@@ -781,6 +791,11 @@ async def _run_scheduler(
         _display_tasks_table(all_tasks, "Final Status")
         _display_summary(all_tasks)
 
+        # Same rule as mode 2 (`orchestrate`): the run records its own ending
+        # before the failure exit, or it is reported `interrupted` forever
+        # (spec §B.1, §B.3).
+        await _announce_conclusion(db, conclusion_for_tasks(all_tasks))
+
         # Check for failures
         failed_tasks = [
             t
@@ -795,6 +810,9 @@ async def _run_scheduler(
 
         console.print("\n[green]All tasks completed successfully![/green]")
 
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        await record_cancelled(db, "interrupted by the operator")
+        raise
     finally:
         if routing is not None:
             await routing.aclose()
@@ -1522,6 +1540,31 @@ def _resolve_orchestrator_paths(
     return repo_path, workspace_base, resolved_log_dir
 
 
+async def _announce_conclusion(db: "Database", conclusion: RunConclusion) -> None:
+    """Record the run's ending and say what was recorded (spec §B.1).
+
+    Said out loud because an operator who is never told the run ended has no
+    way to tell "this run is finished" from "this run died and nobody wrote
+    it down" — which is precisely the distinction §B.3 exists to preserve.
+    A database with no `run` row (`--db` at a pre-split file, spec §E) is
+    left alone and nothing is printed.
+    """
+    if not await record_conclusion(db, conclusion):
+        return
+    if conclusion.outcome is not None:
+        console.print(
+            f"[dim]run recorded as {conclusion.outcome}: "
+            f"{escape(conclusion.reason)}[/dim]",
+            soft_wrap=True,
+        )
+        return
+    console.print(
+        f"[yellow]Run suspended for a human: {escape(conclusion.reason)}. "
+        "It stays resumable under the same run id.[/yellow]",
+        soft_wrap=True,
+    )
+
+
 async def _run_orchestrator(
     config_path: Path,
     db_path: Path | None,
@@ -1581,9 +1624,21 @@ async def _run_orchestrator(
             ]
             if leftover:
                 ids = ", ".join(f"{r.run_id} ({r.status})" for r in leftover)
+                # Deliberately NOT marked `superseded` here. A fresh
+                # orchestration is evidence about the *new* run; writing a
+                # terminal row on the old one would replace `interrupted` —
+                # the one fact that says it died mid-flight — with a fact
+                # about something else (spec §B.3, and §E's refusal to
+                # backfill for the same reason). The remedy is named instead,
+                # so the operator resolves the ambiguity by deciding rather
+                # than by having it decided for them.
                 console.print(
                     f"[yellow]Starting a fresh run; leaving {len(leftover)} "
-                    f"non-terminal run(s) behind: {ids}[/yellow]"
+                    f"non-terminal run(s) behind: {escape(ids)}[/yellow]\n"
+                    "[dim]They stay resumable, so resolving commands will ask "
+                    "for --run. End one with "
+                    "'maestro run-end <run-id> --outcome superseded'.[/dim]",
+                    soft_wrap=True,
                 )
 
     setup_logging("maestro")
@@ -1720,9 +1775,21 @@ async def _run_orchestrator(
             )
         )
 
+        # The run records its own ending here, before the failure exit below:
+        # nothing else in the process ever reaches this database again, and a
+        # run that never writes an outcome is reported `interrupted` forever
+        # (spec §B.1, §B.3).
+        await _announce_conclusion(db, conclusion_for_workstreams(workstreams))
+
         if stats.failed > 0:
             raise typer.Exit(1)
 
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # Operator cancellation is a run outcome, not an interruption: the
+        # person who stopped it knows it is over, and `cancelled` is what
+        # keeps the next `orchestrate` from finding two open runs (spec §B.1).
+        await record_cancelled(db, "interrupted by the operator")
+        raise
     finally:
         if notifications is not None:
             # Bounded drain of queued notification deliveries (webhook).
@@ -1808,6 +1875,77 @@ def orchestrate_command(
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user[/yellow]")
         raise typer.Exit(130) from None
+
+
+@app.command("run-end")
+def run_end_command(
+    run_id: Annotated[str, typer.Argument(help="Run id to end")],
+    outcome: Annotated[
+        str,
+        typer.Option("--outcome", help="cancelled | superseded"),
+    ],
+    reason: Annotated[
+        str | None,
+        typer.Option("--reason", help="Free-form detail stored with the outcome"),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help=_CONFIG_OPTION_HELP),
+    ] = None,
+) -> None:
+    """Record an operator's decision that a run is over (spec §B.1).
+
+    The two endings a run cannot observe about itself. `completed` and
+    `failed` are facts a finishing invocation reports; `cancelled` and
+    `superseded` are decisions, and nothing infers them — a fresh
+    `orchestrate` deliberately leaves the previous run non-terminal rather
+    than overwriting its `interrupted` with a fact about a different run
+    (§B.3). This is how that residue is resolved, and how two non-terminal
+    runs stop making every resolving command ask for `--run`.
+
+    Refuses a run that already ended: §G asks that a run is completed exactly
+    once, and moving `ended_at` onto a finished run rewrites evidence.
+
+    Examples:
+        maestro run-end 01J8Z... --outcome superseded
+        maestro run-end 01J8Z... --outcome cancelled --reason "wrong branch"
+    """
+    if outcome not in OPERATOR_ENDINGS:
+        err_console.print(
+            f"[red]Unknown outcome:[/red] {escape(outcome)}. "
+            f"Choose one of: {', '.join(sorted(OPERATOR_ENDINGS))}. "
+            "'completed' and 'failed' are recorded by the run itself."
+        )
+        raise typer.Exit(1)
+    db_path = _resolved_db_path(None, run_id, config_flag=config)
+
+    async def _end() -> None:
+        db = Database(db_path)
+        await db.connect()
+        try:
+            detail = reason or f"ended by the operator as {outcome}"
+            # Two named writers rather than one parameterised by a string:
+            # `RunEnding` is a Literal, and widening it to `str` here to save
+            # a branch would take a `cast` to put back.
+            if outcome == "cancelled":
+                written = await record_cancelled(db, detail)
+            else:
+                written = await record_superseded(db, detail)
+        finally:
+            await db.close()
+        if not written:
+            err_console.print(
+                f"[red]Run {escape(run_id)} was not ended:[/red] it has no run "
+                "row, or it already recorded an outcome."
+            )
+            raise typer.Exit(1)
+        console.print(
+            f"[green]Run {escape(run_id)} recorded as {outcome}:[/green] "
+            f"{escape(detail)}",
+            soft_wrap=True,
+        )
+
+    asyncio.run(_end())
 
 
 def _config_identity(path: Path) -> RepoKey:
@@ -2943,6 +3081,16 @@ async def _service_run(
     except IdentityError as e:
         err_console.print(f"[red]Cannot resolve repository identity:[/red] {e}")
         raise typer.Exit(1) from e
+    except AllRunsTerminal as e:
+        # Every run of this repository recorded its ending, so there is
+        # nothing for a scheduled tick to advance. That is a no-op, not a
+        # failure: a cron entry that turns permanently red the moment the
+        # work it watches finishes is the same defect as one that turns red
+        # on a second orchestration, reached from the other side. Starting a
+        # run is `orchestrate`'s job, never a tick's (spec §A.1).
+        console.print(f"{project.project} [{stage}]: noop_complete -> ok (exit 0)")
+        console.print(f"[dim]{escape(str(e))}[/dim]", soft_wrap=True)
+        return 0
     except NoResumableRun as e:
         err_console.print(
             f"[red]No resumable run for '{project.project}':[/red] {e}\n"

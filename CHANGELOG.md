@@ -28,6 +28,25 @@
   and where it derived it from. `--run <run-id>` disambiguates two runs;
   `--db <path>` still names a database directly and now refuses to be combined
   with `--run` or `--config`, which it would otherwise silently ignore.
+- **A run now records its own ending, and `maestro run-end` is new.** The
+  `run` row gained `outcome`/`ended_at` with the layout, but nothing wrote
+  them: every finished run kept `outcome` NULL, was classified `interrupted`,
+  and a second `maestro orchestrate` of the same repository left two runs that
+  looked open — after which every resolving command, and **every
+  `maestro service run` tick**, exited 1 asking for `--run`. Both `run` and
+  `orchestrate` now write `completed`, `failed` (only when nothing can advance
+  — an `abandoned` work item), or `cancelled` (Ctrl-C) before they exit, and a
+  needs-human pause writes `suspended_at` **without** `ended_at`, so the same
+  run id stays resumable in the same database. A failure that rework can still
+  address deliberately leaves the run non-terminal. Starting a fresh run does
+  **not** mark the previous one `superseded`: that would replace
+  `interrupted` — the one fact that says a run died mid-flight — with a fact
+  about a different run, so the operator decides instead, with
+  `maestro run-end <run-id> --outcome superseded|cancelled`. Two consequences
+  worth knowing: a scheduled tick over a repository whose every run has ended
+  is now a green no-op rather than exit 1, and a resolving command with no
+  `--run` falls back to the newest run when every run is terminal (selecting
+  is not resuming) while still refusing when several runs are open.
 - **BREAKING (locks): lock identity no longer includes the database path.**
   Stage locks are keyed `(repository, stage)`, so two runs of one project
   against two different `--db` files now serialise per stage instead of

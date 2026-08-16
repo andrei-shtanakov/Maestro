@@ -582,6 +582,40 @@ def test_cli_runs_exist_but_none_resumable_gets_no_orchestrate_advice(
     `maestro orchestrate ../b/project.yaml`. Advising `orchestrate` here would
     mint a *second* project tree under the wrong key, so the mismatch has to
     be legible at the moment it bites instead.
+
+    Reached through an unknown `--run` since the run lifecycle was wired: a
+    repository whose every run has *ended* is no longer a refusal at all (see
+    `test_cli_a_finished_run_is_still_listable` below), so the scenario that
+    still exercises this branch is a run id that does not exist.
+    """
+    monkeypatch.setenv("MAESTRO_HOME", str(tmp_path / "home"))
+    asyncio.run(
+        create_run(
+            KEY, "RUN-A", repo_key_text="k", started_at="2026-08-15T09:00:00+00:00"
+        )
+    )
+    checkout = _checkout(tmp_path, "https://github.com/acme/app")
+    monkeypatch.chdir(checkout)
+
+    result = runner.invoke(app, ["workstreams", "--run", "RUN-NOPE"])
+
+    assert result.exit_code == 1
+    assert "No resumable run" in result.stderr
+    assert "Resolved github.com/acme/app" in result.stderr
+    assert "from the checkout at" in result.stderr
+    assert "orchestrate" not in result.stderr
+
+
+def test_cli_a_finished_run_is_still_listable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repository whose only run recorded `completed` is still inspectable.
+
+    Selecting is not resuming (spec §C.3 vs §C.2). Before the run lifecycle
+    was wired no run ever recorded an ending, so "every run is terminal" was
+    unreachable outside a test; now it is the *normal* end state, and
+    refusing it would mean an operator could never look at the results of a
+    finished run without `--run`.
     """
     monkeypatch.setenv("MAESTRO_HOME", str(tmp_path / "home"))
     db_path = asyncio.run(
@@ -607,11 +641,8 @@ def test_cli_runs_exist_but_none_resumable_gets_no_orchestrate_advice(
 
     result = runner.invoke(app, ["workstreams"])
 
-    assert result.exit_code == 1
-    assert "No resumable run" in result.stderr
-    assert "Resolved github.com/acme/app" in result.stderr
-    assert "from the checkout at" in result.stderr
-    assert "orchestrate" not in result.stderr
+    assert result.exit_code == 0, result.stderr
+    assert "run RUN-A" in result.stdout
 
 
 def test_cli_db_announcement_escapes_bracket_paths(
