@@ -16,7 +16,12 @@ import ulid
 
 from maestro.repo_identity import RepoKey, parse_remote_url
 from maestro.run_publish import create_run
-from maestro.run_registry import live_run, resolve_runs, select_resumable
+from maestro.run_registry import (
+    NoResumableRun,
+    live_run,
+    resolve_runs,
+    select_resumable,
+)
 
 
 if TYPE_CHECKING:
@@ -54,6 +59,13 @@ async def bootstrap_run(
             chosen = next(r for r in runs if r.run_id == run_id_override)
         else:
             chosen = select_resumable(runs)
+        if chosen.run_id is None:
+            # `RunInfo.run_id` is unknown only for a legacy database (spec §E),
+            # which `resolve_runs` never produces — resuming one would mean
+            # inventing the identity that is exactly what is in question.
+            raise NoResumableRun(
+                f"{chosen.db_path} has no run identity; it cannot be resumed"
+            )
         run_id, db_path, fresh = chosen.run_id, chosen.db_path, False
     else:
         existing = await resolve_runs(key, home=home, lock_root=home)
