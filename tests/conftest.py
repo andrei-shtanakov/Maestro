@@ -202,8 +202,31 @@ def mock_subprocess(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 # =============================================================================
 
 
+@pytest.fixture(scope="session", autouse=True)
+def fenced_maestro_home(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Generator[Path, None, None]:
+    """Point `$MAESTRO_HOME` at a temporary tree for the whole suite.
+
+    Without this, any test that invokes a workstream command without `--db`
+    resolves identity from the pytest cwd — the maestro checkout itself, which
+    orchestrates itself — and then reads (and could write) the developer's real
+    `~/.maestro/projects/…`. A test suite must not touch the operator's state.
+
+    Session-scoped so it is in place before the first test, and re-asserted
+    per test by `cleanup_environment`, which clears every `MAESTRO_*` variable
+    and would otherwise unset this one straight back to `~/.maestro`.
+    """
+    home = tmp_path_factory.mktemp("maestro-home")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("MAESTRO_HOME", str(home))
+        yield home
+
+
 @pytest.fixture(autouse=True)
-def cleanup_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+def cleanup_environment(
+    monkeypatch: pytest.MonkeyPatch, fenced_maestro_home: Path
+) -> None:
     """Clean up environment variables that might affect tests."""
     # Remove any MAESTRO_ prefixed env vars that could affect tests
     import os
@@ -211,6 +234,10 @@ def cleanup_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in list(os.environ.keys()):
         if key.startswith("MAESTRO_"):
             monkeypatch.delenv(key, raising=False)
+    # MAESTRO_HOME is the one that must NOT fall back to the real `~/.maestro`;
+    # restore the session fence the loop above just cleared. A test that wants
+    # its own home sets it later and wins.
+    monkeypatch.setenv("MAESTRO_HOME", str(fenced_maestro_home))
     monkeypatch.delenv("ATP_CATALOG", raising=False)
 
 
