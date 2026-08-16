@@ -155,6 +155,48 @@ def test_cli_reports_no_resumable_run(
     assert "No resumable run" in result.stderr
 
 
+def test_cli_reports_an_unknown_run_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--run <typo>` must refuse with the known ids, not a raw traceback.
+
+    `run_bootstrap` selected the override with a bare `next(...)`, whose
+    `StopIteration` the event loop re-raises as `RuntimeError: coroutine
+    raised StopIteration` — caught by none of the four handlers around
+    `bootstrap_run`. Task 12 fixed the identical case for the workstream
+    family (`select_run_for_command`); this path never got it.
+    """
+    monkeypatch.setenv("MAESTRO_HOME", str(tmp_path / "home"))
+    asyncio.run(
+        create_run(
+            KEY, "RUN-A", repo_key_text="k", started_at="2026-08-15T09:00:00+00:00"
+        )
+    )
+    config_path = _write_orchestrator_config(tmp_path, "https://github.com/acme/app")
+
+    result = runner.invoke(app, ["orchestrate", str(config_path), "--run", "RUN-Z"])
+
+    assert result.exit_code == 1, result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "No resumable run" in result.stderr
+    assert "RUN-Z" in result.stderr
+    assert "known runs: RUN-A" in result.stderr
+
+
+def test_cli_unknown_run_id_is_escaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The id comes straight from the operator, so it must print verbatim
+    rather than being parsed as Rich markup."""
+    monkeypatch.setenv("MAESTRO_HOME", str(tmp_path / "home"))
+    config_path = _write_orchestrator_config(tmp_path, "https://github.com/acme/app")
+
+    result = runner.invoke(app, ["orchestrate", str(config_path), "--run", "[bold]x"])
+
+    assert result.exit_code == 1
+    assert "[bold]x" in result.stderr
+
+
 def test_cli_reports_an_unresolvable_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

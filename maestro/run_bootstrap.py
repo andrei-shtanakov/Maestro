@@ -18,6 +18,7 @@ from maestro.repo_identity import RepoKey, identity_from_config
 from maestro.run_publish import create_run
 from maestro.run_registry import (
     NoResumableRun,
+    RunInfo,
     live_run,
     resolve_runs,
     select_resumable,
@@ -43,6 +44,15 @@ class BootstrapResult:
     fresh: bool
 
 
+def _run_by_id(runs: list[RunInfo], run_id: str, repo_key_text: str) -> RunInfo:
+    """The run `--run` names, or a refusal that names what exists instead."""
+    for info in runs:
+        if info.run_id == run_id:
+            return info
+    known = ", ".join(i.run_id for i in runs if i.run_id is not None) or "none"
+    raise NoResumableRun(f"no run {run_id} for {repo_key_text}; known runs: {known}")
+
+
 async def bootstrap_run(
     config: object,
     *,
@@ -61,7 +71,17 @@ async def bootstrap_run(
     if resume or run_id_override is not None:
         runs = await resolve_runs(key, home=home, lock_root=home)
         if run_id_override is not None:
-            chosen = next(r for r in runs if r.run_id == run_id_override)
+            # A bare `next` raised `StopIteration` inside a coroutine, which
+            # the event loop turns into `RuntimeError: coroutine raised
+            # StopIteration` — a traceback for a typo, and one none of
+            # `_run_orchestrator`'s four handlers catch. Task 12 already fixed
+            # the identical case for the workstream family
+            # (`run_registry.select_run_for_command`); this path never got it.
+            # The known ids go in the message for the same reason they do
+            # there: withholding them sends the operator to `orchestrate`,
+            # which mints a second run and makes every later command
+            # ambiguous.
+            chosen = _run_by_id(runs, run_id_override, repo_key_text)
         else:
             chosen = select_resumable(runs)
         if chosen.run_id is None:

@@ -594,7 +594,12 @@ async def _run_scheduler(
             err_console.print(f"[red]Refusing to start a second run:[/red] {e}")
             raise typer.Exit(1) from e
         except NoResumableRun as e:
-            err_console.print(f"[red]No resumable run:[/red] {e}")
+            # `--run <id>` puts an operator-controlled string in this message
+            # (see `run_bootstrap._run_by_id`), and a value like `[bold]` would
+            # otherwise be parsed as Rich markup instead of printed.
+            err_console.print(
+                f"[red]No resumable run:[/red] {escape(str(e))}", soft_wrap=True
+            )
             raise typer.Exit(1) from e
         except AmbiguousRun as e:
             err_console.print(f"[red]Several runs could be resumed:[/red] {e}")
@@ -1666,7 +1671,12 @@ async def _run_orchestrator(
             err_console.print(f"[red]Refusing to start a second run:[/red] {e}")
             raise typer.Exit(1) from e
         except NoResumableRun as e:
-            err_console.print(f"[red]No resumable run:[/red] {e}")
+            # `--run <id>` puts an operator-controlled string in this message
+            # (see `run_bootstrap._run_by_id`), and a value like `[bold]` would
+            # otherwise be parsed as Rich markup instead of printed.
+            err_console.print(
+                f"[red]No resumable run:[/red] {escape(str(e))}", soft_wrap=True
+            )
             raise typer.Exit(1) from e
         except AmbiguousRun as e:
             err_console.print(f"[red]Several runs could be resumed:[/red] {e}")

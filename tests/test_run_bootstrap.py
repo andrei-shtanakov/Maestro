@@ -60,6 +60,43 @@ async def test_resume_with_no_runs_refuses(tmp_path):
         )
 
 
+async def test_unknown_run_override_refuses_and_names_the_known_ids(tmp_path):
+    """A typo in `--run` is a refusal, never `RuntimeError: coroutine raised
+    StopIteration` — which is what a bare `next(...)` produced here."""
+    from maestro.run_registry import NoResumableRun
+
+    await create_run(
+        KEY,
+        "RUN-A",
+        repo_key_text="k",
+        started_at="2026-08-15T09:00:00+00:00",
+        home=tmp_path,
+    )
+
+    with pytest.raises(NoResumableRun) as excinfo:
+        await bootstrap_run(
+            _Config("https://github.com/acme/app"),
+            resume=False,
+            run_id_override="RUN-Z",
+            home=tmp_path,
+        )
+
+    assert "RUN-Z" in str(excinfo.value)
+    assert "known runs: RUN-A" in str(excinfo.value)
+
+
+async def test_unknown_run_override_on_an_empty_repository_says_none(tmp_path):
+    from maestro.run_registry import NoResumableRun
+
+    with pytest.raises(NoResumableRun, match="known runs: none"):
+        await bootstrap_run(
+            _Config("https://github.com/acme/app"),
+            resume=False,
+            run_id_override="RUN-Z",
+            home=tmp_path,
+        )
+
+
 async def test_unresolvable_identity_refuses(tmp_path):
     from maestro.repo_identity import IdentityError
 
