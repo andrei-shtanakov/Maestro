@@ -54,8 +54,28 @@
 - `~/.maestro/maestro.db` is **frozen, not migrated**: it stays readable and is
   named by `maestro state-usage`, and no default path writes to it. "Frozen"
   means "never the default", not "immutable" — an explicit
-  `--db ~/.maestro/maestro.db` still opens it for writing and initialises the
-  schema, so copy it first if you want it untouched.
+  `--db ~/.maestro/maestro.db` at a **mutating** command (`retry`, `approve`,
+  the `workstream*` family, `orchestrate`, `run`, `service run`) still opens it
+  for writing and initialises the schema, so copy it first if you want it
+  untouched under one of those.
+- **The view-only commands no longer rewrite what they list.** `status`,
+  `workstreams`, `check-scope`, `service status` and `costs` open `--db`
+  read-only (`mode=ro`) and never initialise a schema. Previously
+  `maestro workstreams --db ~/.maestro/maestro.db` — the natural way to look at
+  the pre-split evidence — ran `initialize_schema()` and turned a 1-table,
+  12 288-byte file into 21 tables and 200 704 bytes. `--db` now also reports
+  what the named file *is*: a database with no `run` row is labelled *legacy*
+  and never backfilled (spec §E). The cost of the honesty: a pre-split file has
+  no `workstreams`/`service_ticks` table, so those views now refuse with "no
+  such table" instead of silently creating one. `check-scope` reports an
+  unreadable database as exit 2 (invalid input), never 1 (its "escapes found").
+- **BREAKING (service): reinstall any service unit installed before this
+  release.** The pre-change `maestro service install` baked
+  `--db ~/.maestro/maestro.db` into the generated unit. `service run` is a
+  mutating command, so a machine with an existing unit keeps opening — and
+  rewriting the schema of — the legacy file on **every tick**, and nothing
+  announces it. `maestro service uninstall <config>` then `maestro service
+  install <config> …` replaces the pinned path with per-tick resolution.
 - `maestro service install` no longer bakes a database path into the generated
   unit. A unit outlives every run it starts, so a pinned path would make a
   03:00 tick act on a run that has since ended; each tick now resolves the

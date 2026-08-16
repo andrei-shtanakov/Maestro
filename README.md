@@ -204,10 +204,23 @@ rows predate any project key, and for the July demo tasks the honest owner is
 "none") and no default path writes to it any more. It is still readable, and
 `maestro state-usage` names it. Two caveats worth knowing:
 
-- *Frozen means "never the default", not "immutable".* An explicit
-  `--db ~/.maestro/maestro.db` opens it like any other database, which runs
-  schema initialisation and therefore writes. If you want to inspect it without
-  changing it, copy it first.
+- *Frozen means "never the default", not "immutable" — for the commands that
+  change things.* An explicit `--db ~/.maestro/maestro.db` at a **mutating**
+  command (`retry`, `approve`, `workstream-*`, `orchestrate`, `run`) opens it
+  like any other database, which runs schema initialisation and therefore
+  writes. If you want it untouched under one of those, copy it first. The
+  **view-only** commands — `status`, `workstreams`, `check-scope`,
+  `service status`, `costs` — open `--db` read-only and never initialise a
+  schema, so listing this file no longer rewrites it. The cost of that
+  honesty is that a pre-split file has no `workstreams` table to list, and
+  those commands say so instead of creating one.
+- *If you installed a service unit before this change, reinstall it.* The old
+  `maestro service install` baked `--db ~/.maestro/maestro.db` into the
+  generated unit. `service run` is a mutating command, so an existing unit
+  keeps opening — and rewriting — the legacy file on **every tick**, and
+  nothing on the machine will tell you. Run `maestro service uninstall
+  project.yaml` and `maestro service install project.yaml …` again so the
+  tick resolves the current run instead.
 - *Reading a WAL-mode database read-only legitimately creates `-wal` and `-shm`
   beside it.* The real `~/.maestro/maestro.db` is WAL-mode, so merely
   describing it drops two sidecars next to it. The database itself is

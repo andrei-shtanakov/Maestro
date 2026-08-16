@@ -14,6 +14,7 @@ import fcntl
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -54,7 +55,11 @@ from maestro.config import load_orchestrator_config
 from maestro.coordination.arbiter_client import ArbiterClient, ArbiterClientConfig
 from maestro.coordination.routing import RoutingStrategy, make_routing_strategy
 from maestro.dag import DAG
-from maestro.database import verifier_requeue_block_reason
+from maestro.database import (
+    DatabaseError,
+    create_database_readonly,
+    verifier_requeue_block_reason,
+)
 from maestro.decomposer import ProjectDecomposer, resolve_spec_gen_settings
 from maestro.event_log import create_event_logger
 from maestro.git import GitManager
@@ -104,6 +109,7 @@ from maestro.run_registry import (
     AllRunsTerminal,
     AmbiguousRun,
     NoResumableRun,
+    describe_database,
     home_usage,
     resolve_runs,
     select_run_for_command,
@@ -134,6 +140,8 @@ from maestro.workspace import WorkspaceManager
 
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from maestro.cost_tracker import CostReport
     from maestro.gates import ApprovalMarker
     from maestro.run_registry import RunInfo
@@ -824,18 +832,74 @@ async def _run_scheduler(
             _release_pid_lock(lock_fd)
 
 
-async def _show_status(db_path: Path) -> None:
-    """Show status of all tasks in the database."""
-    # Path.exists() is fast sync I/O, acceptable in async context
-    if not db_path.exists():  # noqa: ASYNC240
-        err_console.print(f"[red]Database not found:[/red] {db_path}")
-        err_console.print("Run 'maestro run <config>' first to create tasks.")
-        raise typer.Exit(1)
+#: The commands whose whole act is *look at the evidence*, and which must
+#: therefore never rewrite it. `costs` reached this rule first, through
+#: `read_all_costs_readonly`; the rest arrive here.
+#:
+#: The line is drawn at the operator's intent, not at convenience. For a
+#: mutating command aimed at a file — `workstream-approve`, `retry`,
+#: `orchestrate --db` — "frozen means never the default, not immutable"
+#: holds: schema init is a precondition of the write they asked for. For a
+#: view it does not: `maestro workstreams --db ~/.maestro/maestro.db` grew a
+#: 1-table, 12 288-byte file into 21 tables and 200 704 bytes, which is the
+#: act of looking destroying what was looked at.
+READONLY_COMMANDS: tuple[str, ...] = (
+    "status",
+    "workstreams",
+    "check-scope",
+    "service status",
+    "costs",
+)
 
-    db = Database(db_path)
-    await db.connect()
 
+@contextlib.asynccontextmanager
+async def _open_readonly(
+    db_path: Path, *, hint: str | None = None, exit_code: int = 1
+) -> "AsyncIterator[Database]":
+    """Open `db_path` for a view-only command, and close it on every path.
+
+    Two failures are translated into operator sentences rather than
+    tracebacks: a path that is not a readable database, and a database whose
+    schema cannot answer the question. The second is the honest outcome for a
+    pre-split file (spec §E) — a read-only view will not upgrade it, and
+    upgrading it silently is the defect this replaces.
+
+    `exit_code` exists because not every view spends exit 1 on "cannot
+    read": `check-scope` documents 1 as *escapes found*, so reporting an
+    unreadable database with it would report a scope escape that was never
+    measured. It passes 2, its own "invalid input".
+    """
     try:
+        db = await create_database_readonly(db_path)
+    except DatabaseError as exc:
+        # The missing-file case keeps its own words: an operator who mistyped
+        # a path is looking for "not found", not for a read-mode diagnosis.
+        if not db_path.exists():  # noqa: ASYNC240 — one stat on the error path
+            err_console.print(f"[red]Database not found:[/red] {escape(str(db_path))}")
+        else:
+            err_console.print(f"[red]Cannot read database:[/red] {escape(str(exc))}")
+        if hint is not None:
+            err_console.print(hint)
+        raise typer.Exit(exit_code) from exc
+    try:
+        yield db
+    except sqlite3.DatabaseError as exc:
+        err_console.print(
+            f"[red]This database cannot answer that:[/red] {escape(str(exc))}\n"
+            "A database written before the state-layout change carries a "
+            "different schema, and a read-only view does not upgrade it "
+            "(spec §E). Copy it first if you want it migrated."
+        )
+        raise typer.Exit(exit_code) from exc
+    finally:
+        await db.close()
+
+
+async def _show_status(db_path: Path) -> None:
+    """Show status of all tasks in the database — read-only."""
+    async with _open_readonly(
+        db_path, hint="Run 'maestro run <config>' first to create tasks."
+    ) as db:
         tasks = await db.get_all_tasks()
         _display_tasks_table(tasks, "Task Status")
         _display_summary(tasks)
@@ -846,9 +910,6 @@ async def _show_status(db_path: Path) -> None:
             console.print(f"\n[cyan]Scheduler running (PID: {pid})[/cyan]")
         else:
             console.print("\n[dim]Scheduler not running[/dim]")
-
-    finally:
-        await db.close()
 
 
 async def _retry_task(db_path: Path, task_id: str) -> None:
@@ -1800,19 +1861,10 @@ async def _run_orchestrator(
 
 
 async def _show_workstreams_status(db_path: Path) -> None:
-    """Show status of all workstreams."""
-    if not db_path.exists():  # noqa: ASYNC240
-        err_console.print(f"[red]Database not found:[/red] {db_path}")
-        raise typer.Exit(1)
-
-    db = Database(db_path)
-    await db.connect()
-
-    try:
+    """Show status of all workstreams — read-only."""
+    async with _open_readonly(db_path) as db:
         workstreams = await db.get_all_workstreams()
         _display_workstreams_table(workstreams, "Workstreams Status")
-    finally:
-        await db.close()
 
 
 @app.command("orchestrate")
@@ -1970,6 +2022,43 @@ def _config_identity(path: Path) -> RepoKey:
             raise IdentityError(msg) from as_tasks
 
 
+def _announce_db_target(db: Path) -> None:
+    """Say what the `--db` file *is*, without changing a byte of it (spec §E).
+
+    `--db` skips the resolver entirely, identity included, so there is no
+    stage lock to read and liveness is genuinely unobserved — which is
+    exactly the case `describe_database(key=None)` documents. It opens the
+    file read-only through a percent-encoded URI and never initialises a
+    schema, so asking what a pre-split database is does not upgrade it. Such
+    a file is reported *legacy* rather than silently rendered *interrupted*,
+    and is never written a `run` row.
+
+    Silent on a path that does not exist yet — `orchestrate --db new.db`
+    legitimately creates one — and silent on a file this cannot read, because
+    the command's own open reports that failure with the right words.
+    """
+    if not db.exists():
+        return
+    try:
+        info = asyncio.run(describe_database(db, key=None))
+    except (OSError, sqlite3.DatabaseError):
+        return
+    if info.row is None:
+        console.print(
+            "[yellow]This database has no run row: it predates the per-run "
+            "layout (spec §E). It is read as a single anonymous run and is "
+            "never backfilled.[/yellow]",
+            soft_wrap=True,
+        )
+        return
+    # `interrupted` here means "not known to be live" rather than "died":
+    # with no identity there is no lock to observe.
+    console.print(
+        f"[dim]run {escape(str(info.run_id))}, {escape(info.status)}[/dim]",
+        soft_wrap=True,
+    )
+
+
 def _resolved_db_path(
     db: Path | None,
     run: str | None,
@@ -2035,6 +2124,7 @@ def _resolved_db_path(
         console.print(
             f"[dim]acting on database {escape(str(db))}[/dim]", soft_wrap=True
         )
+        _announce_db_target(db)
         return db
 
     config_path = config_flag if config_flag is not None else config_arg
@@ -2945,15 +3035,18 @@ def check_scope_command(
         maestro check-scope my-ws --base main --db run/maestro.db
     """
     from maestro.changed_paths import changed_paths_since
-    from maestro.database import Database, WorkstreamNotFoundError
+    from maestro.database import WorkstreamNotFoundError
     from maestro.scope_gate import find_escapes, normalize
 
     db_path = _resolved_db_path(db, run, config_flag=config)
 
     async def _run() -> int:
-        database = Database(db_path)
-        await database.connect()
-        try:
+        # Read-only: this reports the containment fact and records nothing —
+        # not even the approval note, which it only reads back. Exit 2 on an
+        # unreadable database: 1 is this command's "escapes found", and
+        # spending it on a database it never opened would announce an escape
+        # nothing measured.
+        async with _open_readonly(db_path, exit_code=2) as database:
             try:
                 ws = await database.get_workstream(workstream_id)
             except WorkstreamNotFoundError:
@@ -2993,8 +3086,6 @@ def check_scope_command(
                     console.print(f"[dim]note: approved (ex_post, {sha[:12]})[/dim]")
                     break
             return 1
-        finally:
-            await database.close()
 
     raise typer.Exit(asyncio.run(_run()))
 
@@ -3337,12 +3428,8 @@ async def _service_status(
     *, config_path: Path, stage: str | None, limit: int, db_path: Path
 ) -> None:
     project = load_orchestrator_config(config_path)
-    db = Database(db_path)
-    await db.connect()
-    try:
+    async with _open_readonly(db_path) as db:
         rows = await db.list_service_ticks(project.project, stage=stage, limit=limit)
-    finally:
-        await db.close()
     if not rows:
         console.print("[dim]No ticks recorded yet.[/dim]")
         return

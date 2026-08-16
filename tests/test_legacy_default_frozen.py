@@ -273,28 +273,58 @@ def test_mode1_identity_is_the_repo_checkouts_origin(tmp_path: Path) -> None:
     assert key == RepoKey(host="github.com", owner="acme", repo="app")
 
 
-def test_db_still_reaches_the_legacy_database_and_is_not_read_only(
+def test_a_listing_command_does_not_rewrite_what_it_lists(
     legacy_guard: _LegacyGuard,
 ) -> None:
-    """`--db` is the escape hatch of spec §E and is *not* what was frozen.
+    """`maestro workstreams --db <legacy>` must leave the file as it found it.
 
-    Frozen means "never resolved to by default", not "immutable". `--db`
-    "survives unchanged" (§E), and *unchanged* includes the part an operator
-    can be surprised by: a workstream command opens the named database through
-    `Database.connect()`, which runs `initialize_schema()`. Pointing `--db` at
-    the legacy file therefore **does** write to it — new tables, different
-    bytes.
+    This test asserted the opposite until the whole-branch review: `--db` went
+    through `Database.connect()`, which runs `initialize_schema()`, so the
+    natural way to *look at* the evidence spec §1 is about grew a 1-table,
+    12 288-byte file into 21 tables and 200 704 bytes. "Frozen means never the
+    default, not immutable" is a defensible answer for a command the operator
+    aimed at a file **to change it**; it is not an answer for a view, where
+    the act is looking and the effect was destroying.
 
-    Asserted rather than merely noted, because it qualifies spec §G's "not
-    opened for writing by any code path": that sentence is true of every
-    *default* path and false of an explicit `--db`. Only the run registry's
-    `describe_database` opens a named database `mode=ro`.
+    The main file is compared byte for byte. SQLite may still drop a `-shm`
+    beside a WAL database on a read-only connection, which is why the guard's
+    stricter `assert_untouched` (no sidecars, never opened) is not the
+    assertion here — this command *does* open the file, deliberately, just
+    without writing to it.
     """
     before = legacy_guard.digest
 
     result = runner.invoke(app, ["workstreams", "--db", str(legacy_guard.path)])
 
     assert str(legacy_guard.path) in result.stdout
+    assert legacy_guard.path in legacy_guard.opened
+    after = hashlib.sha256(legacy_guard.path.read_bytes()).hexdigest()
+    assert after == before, "a listing command rewrote the database it listed"
+
+
+def test_db_at_a_mutating_command_still_initialises_the_schema(
+    legacy_guard: _LegacyGuard,
+) -> None:
+    """`--db` is the escape hatch of spec §E and is *not* what was frozen.
+
+    The read-only rule above is about views. For a command the operator
+    explicitly aimed at a file in order to change it, schema initialisation is
+    a precondition of the write they asked for, and `--db` "survives
+    unchanged" (§E) — including the part an operator can be surprised by.
+    `maestro retry` is such a command: it opens through `Database.connect()`
+    and writes, even when the task it was given turns out not to exist.
+
+    Asserted rather than merely noted, because it qualifies spec §G's "not
+    opened for writing by any code path": that sentence is true of every
+    *default* path and false of an explicit `--db` at a mutating command.
+    """
+    before = legacy_guard.digest
+
+    result = runner.invoke(
+        app, ["retry", "no-such-task", "--db", str(legacy_guard.path)]
+    )
+
+    assert result.exit_code == 1
     assert legacy_guard.path in legacy_guard.opened
     after = hashlib.sha256(legacy_guard.path.read_bytes()).hexdigest()
     assert after != before, "an explicit --db initialises the schema; docs say so"
