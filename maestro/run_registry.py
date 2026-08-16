@@ -77,6 +77,39 @@ async def resolve_runs(
     return infos
 
 
+async def describe_database(
+    db_path: Path,
+    *,
+    key: RepoKey | None = None,
+    stage: str = "orchestrate",
+    lock_root: Path | None = None,
+) -> RunInfo:
+    """Classify a database reached directly by `--db` (spec §E).
+
+    A database with no `run` row is *legacy*, not *interrupted*, and is never
+    backfilled: inventing `started_at` and `repo_key` would manufacture the
+    provenance that is precisely in question.
+    """
+    db = await create_database(db_path)
+    try:
+        mapping = await db.get_run_row()
+    finally:
+        await db.close()
+    row = run_row_from_mapping(mapping) if mapping is not None else None
+    holder = (
+        read_holder_run_id(key, stage, root=lock_root)  # type: ignore[arg-type]
+        if key is not None
+        else None
+    )
+    return RunInfo(
+        run_id=row.run_id if row else db_path.stem,
+        row=row,
+        status=classify_run(row, lock_holder_run_id=holder),
+        started_at=row.started_at if row else None,
+        db_path=db_path,
+    )
+
+
 def live_run(runs: list[RunInfo]) -> RunInfo | None:
     for info in runs:
         if info.status == "running":
