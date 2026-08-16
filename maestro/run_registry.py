@@ -96,7 +96,15 @@ def _read_run_row_readonly(db_path: Path) -> Mapping[str, object] | None:
     if not db_path.exists():
         msg = f"no such database: {db_path}"
         raise FileNotFoundError(msg)
-    with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+    # `as_uri()` percent-encodes `?`, `#`, and `%`, which a bare f-string does
+    # not: any of those in `db_path` would otherwise truncate the URI's
+    # filename and, for `?`/`#`, swallow `mode=ro` along with it — turning a
+    # read-only open into a read-write one. `resolve()` first because
+    # `as_uri()` rejects a relative path (an ordinary `--db ./state.db`), and
+    # the resolution happens only for the URI: the message above still names
+    # the path as the operator typed it.
+    uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as conn:
         conn.row_factory = sqlite3.Row
         with closing(conn.cursor()) as cursor:
             cursor.execute(
