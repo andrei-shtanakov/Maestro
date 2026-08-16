@@ -912,3 +912,37 @@ def test_cli_state_usage_surfaces_what_it_could_not_read(
     assert "could not be read" in result.stdout
     assert "NOT in the totals" in result.stdout
     assert str(walled) in result.stdout
+
+
+def test_cli_state_usage_survives_an_unreadable_home_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`~/.maestro` losing its own `+x` bit must not raise `PermissionError`.
+
+    `_legacy_db` already tolerates this (it `stat`s `home / "maestro.db"` and
+    catches `OSError`); `_project_dirs` stats `home / "projects"` one call
+    later and, on this Python, `Path.is_dir()` does not swallow `EACCES` the
+    way it swallows "not found" — the outer level has to be exactly as
+    tolerant as the inner one, or the command trades a traceback for the
+    unreadable-paths report it exists to give instead.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root reads a 0o000 directory anyway")
+    home = tmp_path / "home"
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    asyncio.run(
+        create_run(
+            KEY, "RUN-A", repo_key_text="k", started_at="2026-08-15T09:00:00+00:00"
+        )
+    )
+    home.chmod(0o000)
+    try:
+        result = runner.invoke(app, ["state-usage"])
+    finally:
+        home.chmod(0o700)
+
+    assert result.exit_code == 0, result.stderr
+    assert result.exception is None
+    assert "could not be read" in result.stdout
+    assert "NOT in the totals" in result.stdout
+    assert str(home / "projects") in result.stdout

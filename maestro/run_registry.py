@@ -266,8 +266,19 @@ def _project_dirs(base: Path, skipped: list[Path]) -> list[tuple[Path, RepoKey]]
     `projects/_local/<name>/` — so it is walked at exactly those depths. A
     recursive glob would also descend into a run's own contents and mistake
     something there for a project.
+
+    `base.is_dir()` itself can raise: it stats `base`, and stat-ing a path
+    requires traversing every ancestor, so a `~/.maestro` that lost its own
+    `+x` bit turns this into an `EACCES` on `is_dir()` rather than on
+    anything inside `projects/` — the same failure `_legacy_db` already
+    tolerates one call earlier, just one path segment higher up.
     """
-    if not base.is_dir():
+    try:
+        is_projects_dir = base.is_dir()
+    except OSError:
+        skipped.append(base)
+        return []
+    if not is_projects_dir:
         return []
     found: list[tuple[Path, RepoKey]] = []
     for host_dir in _subdirs(base, skipped):
