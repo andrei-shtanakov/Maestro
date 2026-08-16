@@ -1714,31 +1714,66 @@ def _workstream_db_path(db: Path | None, run: str | None) -> Path:
 
     Every refusal is an operator-facing message plus exit 1, never a
     traceback (the pattern of `_run_orchestrator` and `_service_run`).
+
+    **What was resolved is always said out loud.** Resolving silently relocates
+    the accident §C.3 exists to remove rather than removing it: an operator
+    whose shell sits in one checkout while the run they mean belongs to another
+    repository gets the wrong database, and — workstream ids in this ecosystem
+    being short and repeated — quite possibly a workstream of the same name in
+    it, with a success message on top.
     """
     if db is not None:
+        if run is not None:
+            # `--db` selects a database directly and the resolver is not
+            # consulted at all (spec §E), so `--run` has nothing to steer.
+            # Acting on `--db` while quietly dropping `--run` would be the
+            # same wrong-database success this function exists to prevent.
+            err_console.print(
+                "[red]--db and --run cannot be combined:[/red] --db names a "
+                "database directly (spec §E), so the resolver --run steers is "
+                "never consulted. Drop one."
+            )
+            raise typer.Exit(1)
+        console.print(f"[dim]acting on database {db}[/dim]", soft_wrap=True)
         return db
+
+    cwd = Path.cwd()
     try:
-        key = identity_from_checkout(Path.cwd())
-        info = asyncio.run(resolve_run_for_command(key, run_id=run))
+        key = identity_from_checkout(cwd)
     except IdentityError as e:
         err_console.print(
             f"[red]Cannot resolve repository identity:[/red] {e}\n"
             "Run this from the repository's checkout, or pass --db <path>."
         )
         raise typer.Exit(1) from e
+
+    repo = "/".join(key.as_path_parts())
+    # The key and where it came from are named on every refusal. `bootstrap_run`
+    # derives identity from `config.repo_url` while these eight derive it from
+    # the checkout, and the two diverge for a fork or for
+    # `maestro orchestrate ../b/project.yaml`. Advising `orchestrate` here would
+    # mint a *second* project tree under the wrong key; showing the key makes
+    # the mismatch visible while it is still one command's worth of damage.
+    # (Unifying the identity source is Task 13's, which owns the remaining
+    # `DEFAULT_DB_PATH` call sites.)
+    origin = f"Resolved {repo} from the checkout at {cwd}."
+    try:
+        info = asyncio.run(resolve_run_for_command(key, run_id=run))
     except NoResumableRun as e:
+        err_console.print(f"[red]No resumable run:[/red] {e}", soft_wrap=True)
+        err_console.print(origin, soft_wrap=True)
         err_console.print(
-            f"[red]No resumable run:[/red] {e}\n"
-            "Run 'maestro orchestrate <config>' once to establish a run, "
-            "or pass --db <path> to point at an existing database directly."
+            "If that is not the repository you meant, run this from that "
+            "repository's checkout, or pass --db <path> to name the database "
+            "directly."
         )
         raise typer.Exit(1) from e
     except AmbiguousRun as e:
-        err_console.print(
-            f"[red]Several runs could be resumed:[/red] {e}\n"
-            "Pass --run <run-id>, or --db <path> to pick one directly."
-        )
+        err_console.print(f"[red]Several runs could be resumed:[/red] {e}")
+        err_console.print(origin, soft_wrap=True)
+        err_console.print("Pass --run <run-id>, or --db <path> to pick one directly.")
         raise typer.Exit(1) from e
+    console.print(f"[dim]acting on {repo}, run {info.run_id}[/dim]", soft_wrap=True)
     return info.db_path
 
 
@@ -3155,6 +3190,10 @@ def _runs(count: int) -> str:
     return f"{count} run" if count == 1 else f"{count} runs"
 
 
+def _repositories(count: int) -> str:
+    return f"{count} repository" if count == 1 else f"{count} repositories"
+
+
 def _format_bytes(size: int) -> str:
     """A size an operator can read at a glance, in powers of 1024."""
     value = float(size)
@@ -3174,24 +3213,52 @@ def state_usage_command() -> None:
     the whole project directory, `locks/` and any leftover `.staging/`
     included, not just `runs/`.
 
+    On a machine that predates the split there is no `projects/` at all and
+    the legacy `maestro.db` of spec §E is the whole of `~/.maestro` — it is
+    named here rather than reported as an empty home. It is sized by `stat`
+    and never opened.
+
     Examples:
         maestro state-usage
     """
     usage = home_usage()
-    if not usage:
-        console.print(f"No project state under {maestro_home()}.")
-        return
-    total = 0
-    for key, run_count, size in usage:
-        total += size
+    if usage.repositories:
+        total = 0
+        for repo in usage.repositories:
+            total += repo.size
+            unread = f"  ({len(repo.unreadable)} unreadable)" if repo.unreadable else ""
+            console.print(
+                f"{'/'.join(repo.key.as_path_parts())}  {_runs(repo.run_count)}  "
+                f"{_format_bytes(repo.size)}{unread}",
+                soft_wrap=True,
+            )
         console.print(
-            f"{'/'.join(key.as_path_parts())}  {_runs(run_count)}  "
-            f"{_format_bytes(size)}"
+            f"TOTAL  {_repositories(len(usage.repositories))}  "
+            f"{_runs(sum(r.run_count for r in usage.repositories))}  "
+            f"{_format_bytes(total)}"
         )
-    console.print(
-        f"TOTAL  {len(usage)} repositories  "
-        f"{_runs(sum(r for _, r, _ in usage))}  {_format_bytes(total)}"
-    )
+    else:
+        console.print(f"No project state under {maestro_home()}.")
+
+    if usage.legacy_db is not None:
+        console.print(
+            f"Legacy database (spec §E, not counted above): {usage.legacy_db}  "
+            f"{_format_bytes(usage.legacy_db_size)}",
+            soft_wrap=True,
+        )
+
+    skipped = [p for repo in usage.repositories for p in repo.unreadable]
+    skipped.extend(usage.unreadable)
+    if skipped:
+        # A skipped subtree that just vanishes from the byte total is an
+        # unknown rendered as clean. Say what was missed, and say the totals
+        # are short because of it.
+        console.print(
+            f"[yellow]{len(skipped)} path(s) could not be read; their bytes are "
+            f"NOT in the totals above:[/yellow]"
+        )
+        for path in skipped:
+            console.print(f"  {path}", soft_wrap=True)
 
 
 @app.command("costs")
