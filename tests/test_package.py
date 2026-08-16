@@ -196,4 +196,9 @@ class TestEnvironmentCleanup:
 
         maestro_vars = [k for k in os.environ if k.startswith("MAESTRO_")]
         assert maestro_vars == ["MAESTRO_HOME"]
-        assert Path(os.environ["MAESTRO_HOME"]) != Path.home() / ".maestro"
+        # The invariant is not "not this one default path" — it's that the
+        # fence sits somewhere outside the real home entirely. `!= ~/.maestro`
+        # alone would still pass for `~/.maestro-old` or any other sibling
+        # under the developer's actual home.
+        home_dir = Path(os.environ["MAESTRO_HOME"])
+        assert not home_dir.is_relative_to(Path.home())

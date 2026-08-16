@@ -1672,7 +1672,7 @@ git commit -m "feat(state): report a row-less database as legacy, never backfill
 
 **Interfaces:**
 - Consumes: `resolve_runs`, `select_resumable`, `AmbiguousRun` (Task 8); `RepoKey` (Task 1).
-- Produces: `resolve_run_for_command(key, *, run_id=None, home=None, lock_root=None) -> RunInfo`, `home_usage(*, home=None) -> list[tuple[RepoKey, int, int]]` returning `(key, run_count, bytes)`.
+- Produces: `resolve_run_for_command(key, *, run_id=None, home=None, lock_root=None) -> RunInfo`, `home_usage(*, home=None) -> HomeUsage` (a dataclass of `repositories: tuple[RepoUsage, ...]`, `unreadable`, `legacy_db`, `legacy_db_size`; each `RepoUsage` carries `key`, `run_count`, `size`, `unreadable`).
 
 **Why (spec §C.3):** most workstream commands take only a workstream id. Once state is per-run, the same workstream id exists in many databases, so a command that does not resolve `(repository, run)` first would pick a database by accident — the original defect in a new place.
 
