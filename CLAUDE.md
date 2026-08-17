@@ -2,14 +2,14 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## `../_cowork_output/` is dev-only — never a code/runtime resource
+## `../_cowork_output/` — dev-only
 
-`../_cowork_output/` (the polyrepo **sibling** workspace — not to be confused with this repo's own local `./_cowork_output/` scratch directory) is the development-time coordination area (cross-team ADRs, status notes, contract drafts, PM/dev tooling). Users and teams installing or cloning this project do NOT have it. Rules:
-
-- Shipped/runtime code must never read, import, or resolve paths under `../_cowork_output/`.
-- Canonical shippable facts live inside the owning repo: the ecosystem agents-catalog SSOT is `atp-platform/method/agents-catalog.toml` (ADR-ECO-003, canon confirmed 2026-07-03); Maestro's spawner model defaults are (to be) generated from that catalog (ADR-ECO-003 action #4), never resolved from `../_cowork_output/` at runtime.
-- Vendoring a pinned copy INTO a repo is the correct pattern; referencing OUT to `../_cowork_output/` from shipped code is the antipattern.
-- Only workspace-local dev tooling (e.g. the conformance check in `../_cowork_output/devtools/`) and documentation may reference it.
+Координационный dev-scratch воркспейса; у пользователей и клонов проекта его НЕТ.
+Shipped/runtime-код никогда не читает и не резолвит пути под ним; кросс-репные
+контракты вендорятся пиненой копией внутрь, не ссылкой наружу. Ссылаться на него
+могут только dev-тулинг самого воркспейса и документация. Канонические факты живут
+в репо-владельце (пример: SSOT agents-catalog — `atp-platform/method/agents-catalog.toml`,
+ADR-ECO-003). Полное правило (SSOT): `../prograph-vault/authored/rules/cowork-output.md`.
 
 ## Project Overview
 
@@ -356,10 +356,11 @@ An ex-post gate block that the operator approved resumes at the ex-post edge (H-
 
 ## Repo scope & boundaries
 
-- **Этот репо:** `maestro` — рабочая директория `all_ai_orchestrators/Maestro/` (имя папки в
-  верхнем регистре — историческое; канон после переименования 2026-07-16 — lowercase `maestro`),
-  remote `git@github.com:andrei-shtanakov/maestro.git`.
-- **Соседи (READ-ONLY reference):** `../arbiter/`, `../atp-platform/`, `../deployer/`, `../dispatcher/`, `../libretto/`, `../proctor/`, `../prograph/`, `../prograph-vault/`, `../robin-runtime/`, `../robin-toolkit/`, `../spec-runner/`, `../spec-runner-vscode/`, `../steward/` — их код не редактировать.
+- **Этот репо:** `maestro` — git-корень `all_ai_orchestrators/maestro/`, remote `git@github.com:andrei-shtanakov/maestro.git`.
+- **Соседи (READ-ONLY reference):** все остальные подпроекты воркспейса — их код не
+  редактировать. Состав флота — `ai-orchestrators-workspace/workspace-manifest.toml`
+  (SSOT); рукописные списки соседей в CLAUDE.md не ведём — они дрейфуют.
+- **Канон имени репо = имя каталога после обычного `git clone`** (`maestro`, `libretto`).
 - Нужна правка у соседа → **стоп**: запиши handoff в `../prograph-vault/authored/notes/`
   (кросс-проектное) или `../_cowork_output/` (черновик), не трогай его файлы.
 - Кросс-репные контракты — **вендорить пиненой копией внутрь**, не ссылаться наружу.
@@ -367,13 +368,18 @@ An ex-post gate block that the operator approved resumes at the ex-post edge (H-
 
 ## Git workflow (у репо есть remote)
 
-- Ветка `<type>/<slug>` → push → `gh pr create`. **Прямые коммиты в `master` запрещены.**
+- Ветка `<type>/<slug>` → push → `gh pr create`. **Прямые коммиты в `master`
+  запрещены**, как и локальный мерж ветки в `master` в обход PR.
 - После открытия PR — прочитать ревью **GitHub Copilot**: валидные замечания исправлять
   новыми коммитами в ту же ветку; невалидные — ответить с обоснованием, **не применять
-  вслепую**; итерировать, пока не останется открытых замечаний.
+  вслепую**; итерировать, пока не останется открытых замечаний. Ревью не всегда
+  запрашивается само — если его нет, запросить явно:
+  `gh api -X POST repos/<owner>/<repo>/pulls/<n>/requested_reviewers -f 'reviewers[]=copilot-pull-request-reviewer[bot]'`.
 - **Не мержить.** Мерж делает пользователь.
 - После мержа пользователем: `git switch master && git pull --ff-only`, затем удалить
-  влитую ветку (`git branch -d <branch>`) и `git fetch --prune`; убрать прочие влитые ветки.
+  влитую ветку в **обеих половинах**: локально `git branch -d` (после squash-мержа `-d`
+  откажется — сверить, что `git diff master <ветка>` пуст, и удалить `-D`) и на origin
+  `git push origin --delete <ветка>`, если GitHub не удалил сам; затем `git fetch --prune`.
 - Никогда не делать force-push в общие ветки; не трогать другие репо (см. scope выше).
 - Полное правило (SSOT): `../prograph-vault/authored/rules/git-workflow.md`.
 
@@ -388,3 +394,9 @@ Issue с лейблом `inbox` — запрос от соседнего реп�
 (`slug:` + `from:` + проза). Правило: ADR-ECO-006 — канон в `ecosystem-kb`
 (каталог `prograph-vault/` в корне воркспейса),
 `authored/decisions/2026-07-28-adr-eco-006-cross-repo-issue-inbox.md`.
+
+Исходящее ожидание — вторая половина того же ритуала: «ждём соседа» существует
+**только** как чекбокс `TODO.md` с `@blocked_by:todo://<repo>/<id>` (переходно —
+`<repo>#<номер>`); память сессий, заметки и handoff-доки — лишь зеркало. Находка
+PF-BLOCKER-STALE по этому репо = «ожидание доставлено — действуй или переставь тег».
+Правило (SSOT): `../prograph-vault/authored/rules/cross-repo-waits.md`.
