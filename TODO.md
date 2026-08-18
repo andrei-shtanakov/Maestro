@@ -718,7 +718,7 @@
       `[models]`, поэтому каркасный хедер незачем писать). Регресс-тест сделал
       своё дело — упал на бампе пина, а не позволил дивергенции осесть.
 
-- [ ] **catalog-conformance-pin-bump-v1-gaps** — бамп пина набора на @owner:github:andrei-shtanakov @id:catalog-conformance-pin-bump-v1-gaps
+- [x] **catalog-conformance-pin-bump-v1-gaps** — бамп пина набора на @owner:github:andrei-shtanakov @id:catalog-conformance-pin-bump-v1-gaps
       `devtools@2533ff7` (два новых кейса v1: `v1-empty-harnesses`,
       `v7-unknown-kind`). Принят из devtools#47, issue #192.
       Оба кейса чинятся, не записываются в дивергенцию: арминг V1/V5 переезжает
@@ -726,6 +726,8 @@
       `harnesses.*.kind` даёт warning (класс `flag` — reject был бы неверен,
       Maestro не запускает harness'ы из Плоскости 2). Словарь kind заводится
       интеримом со ссылкой на `@id:catalog-enum-vocabulary-machine-readable`.
+      Закрыт PR #193 (merge `0285bcd`). Реальный SSOT-каталог под новыми
+      правилами чист (9 harness'ов / 15 агентов, ноль предупреждений).
 
 ---
 
