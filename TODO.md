@@ -695,7 +695,7 @@
 > test-wiring нельзя: это ровно та тихая подмена, против которой стоит вся
 > governance-линия.
 
-- [ ] **catalog-conformance-wiring** — вендорить SSOT-набор conformance-фикстур @owner:github:andrei-shtanakov @id:catalog-conformance-wiring
+- [x] **catalog-conformance-wiring** — вендорить SSOT-набор conformance-фикстур @owner:github:andrei-shtanakov @id:catalog-conformance-wiring
       каталога (`devtools@2a5c154 contracts/catalog-conformance-fixtures/v1`)
       пиненой копией в `tests/fixtures/catalog-conformance/v1/` + PIN, и
       подключить его к сьюту: тест на каждый `[[case]]` и `[[pathres]]`,
@@ -706,6 +706,12 @@
       частичное принятие дало бы маршрутизацию по молча урезанному набору),
       V6 → warning на загрузке. Откладывается: `missing-file` (см.
       `@id:catalog-missing-file-fail-loud`).
+      Закрыт PR #189 (merge `0025657`). По ревью дополнительно зафиксировано
+      решением, а не умолчанием: пустая плоскость `[harnesses]` читается как
+      schema scaffolding (не «ноль объявленных harness'ов») — иначе набранный
+      заголовок секции отвергал бы весь каталог; закреплено регрессионным
+      тестом. Обе дырки покрытия v1 (пустая плоскость; V7 только по `status`,
+      не по `kind`) отправлены владельцу набора в devtools#43.
 
 ---
 
