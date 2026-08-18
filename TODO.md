@@ -128,8 +128,8 @@
 
 - [x] **M3-obs / arbiter trace** (2026-07-19): W3C `traceparent` инжектится в `params._meta` каждого `tools/call` (`arbiter_client._call_tool_once`); пропуск при нулевом trace-id; e2e-тест подтверждает, что пинованный arbiter игнорирует `_meta`. Arbiter-side чтение `_meta.traceparent` — handoff в `prograph-vault/authored/notes/2026-07-19-arbiter-meta-traceparent-handoff.md`.
 - [ ] **R-06b M4b**: revisit `max_per_task=200` sampling for swe-bench-full (>1000 tasks). Trigger: first PROD swe-bench-full run. @owner:github:andrei-shtanakov @trigger:"первый PROD-прогон swe-bench-full" @id:r-06b-m4b
-- [ ] **R-07 prereq (GIN index)**: GIN index on `benchmark_runs.per_task` jsonb. Trigger: when R-07 starts writing SQL filters on per_task. @owner:repo:arbiter @blocked_by:arbiter#R-07 @trigger:"R-07 начинает писать SQL-фильтры по per_task" @id:r-07-prereq-gin-index
-- [ ] **R-07 prereq (normalize)**: normalize `benchmark_task_results` table (migration from jsonb blob). Trigger: same as GIN — formal query demand. @owner:repo:arbiter @blocked_by:arbiter#R-07 @trigger:"тот же формальный запрос, что у GIN" @id:r-07-prereq-normalize
+- [ ] **R-07 prereq (GIN index)**: GIN index on `benchmark_runs.per_task` jsonb. Trigger: when R-07 starts writing SQL filters on per_task. @owner:repo:arbiter @trigger:"R-07 начинает писать SQL-фильтры по per_task" @id:r-07-prereq-gin-index
+- [ ] **R-07 prereq (normalize)**: normalize `benchmark_task_results` table (migration from jsonb blob). Trigger: same as GIN — formal query demand. @owner:repo:arbiter @trigger:"тот же формальный запрос, что у GIN" @id:r-07-prereq-normalize
 - [ ] **R-07 prereq (retention)**: TTL / archive policy for `benchmark_runs`. Trigger: table > 10k rows OR > 1 GB total JSON blobs. @owner:repo:arbiter @trigger:"benchmark_runs > 10k строк ИЛИ > 1 GB JSON" @id:r-07-prereq-retention
 - [ ] **R-14**: vendored `arbiter_client.py` → standalone PyPI `arbiter-py` package. M4 enlarged vendor surface. @owner:repo:arbiter @trigger:"arbiter публикует standalone arbiter-py package" @id:r-14
 - [ ] **Unscheduled — outbox**: persistent outbox + background retry for benchmark report. Trigger: if fire-and-forget shows real CI churn. @owner:github:andrei-shtanakov @trigger:"fire-and-forget даёт реальный CI-churn" @id:outbox-persistent-retry
@@ -728,6 +728,28 @@
       интеримом со ссылкой на `@id:catalog-enum-vocabulary-machine-readable`.
       Закрыт PR #193 (merge `0285bcd`). Реальный SSOT-каталог под новыми
       правилами чист (9 harness'ов / 15 агентов, ноль предупреждений).
+
+---
+
+## Входящие 2026-08, волна 6 (inbox #196, принят 2026-08-18)
+
+- [x] **stale-arbiter-r07-waits** — снять `@blocked_by:arbiter#R-07` с обоих @owner:github:andrei-shtanakov @id:stale-arbiter-r07-waits
+      пунктов R-07 prereq (closed by chore/drop-phantom-r07-blockers). Принят из
+      devtools#legacy-blocker-stale-silent, issue #196.
+      Разбор: `arbiter#R-07` не является `@id` ни у одного пункта arbiter — R-07
+      это имя трека; существующие иды — `r-07-link-strength-decision` (открыт) и
+      `r-07-second-task-type-data` (закрыт, чужой, `@owner:repo:atp-platform`).
+      Детектор зацепился за второй. То есть **ожидания в этой форме никогда не
+      было**, а не «ожидание доставлено». Реальное условие уже стояло рядом
+      точнее — `@trigger:` про SQL-фильтры по `per_task`, и он НЕ сработал:
+      механизм R-07 сдан и сужен до тайбрейкера, открытый хвост — только
+      `r-07-link-strength-decision`. Перевешивать реф на него было бы неверно:
+      тот пункт про силу связи ранжирования, а не про запросы к `per_task`.
+      Третий пункт тройки (`@id:r-07-prereq-retention`) уже живёт в этой форме —
+      owner + trigger без блокера.
+      Побочно (в этот PR не входит): `arbiter/TODO.md` считает эти пункты
+      «Maestro-side», хотя таблицы `benchmark_runs` у нас нет вовсе — вопрос
+      владения вынесен в arbiter отдельным issue.
 
 ---
 
