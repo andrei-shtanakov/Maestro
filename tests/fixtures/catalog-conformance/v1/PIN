@@ -1,0 +1,12 @@
+source: devtools@2a5c1543643ac11da20f911c14c35b049e48eae8 contracts/catalog-conformance-fixtures/v1
+vendored: 2026-08-18
+accepted-as: maestro#188 (slug catalog-conformance-wiring), from devtools#catalog-conformance-single-owner
+
+Pinned copy of the SSOT catalog conformance fixture set (ADR-ECO-003 /
+ADR-ECO-003b, owner: devtools). Do NOT edit any file under v1/ by hand: this
+is a vendored contract, not Maestro's fixtures. Updating the pin is a
+deliberate PR — re-copy the whole directory from the new devtools commit,
+bump the `source:` line above, and let tests/test_catalog_conformance.py
+verify the copy against manifest.json.
+
+Integrity surface: every file in v1/ except manifest.json and this PIN file.

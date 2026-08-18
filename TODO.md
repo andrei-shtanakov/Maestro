@@ -685,6 +685,30 @@
 
 ---
 
+## Входящие 2026-08, волна 5 (inbox #188, принят 2026-08-18)
+
+> Решение владельца при принятии: набор фикстур принимается как **вендоренный
+> контракт**, а не как «ещё одни тесты». Три известные дивергенции разведены по
+> цене исправления: V1–V6 чинятся здесь же (аддитивно, реальный SSOT-каталог
+> проходит), `missing-file` — breaking change против записанного решения
+> 2026-07-02 и получает свой PR. Протаскивать его побочным эффектом PR про
+> test-wiring нельзя: это ровно та тихая подмена, против которой стоит вся
+> governance-линия.
+
+- [ ] **catalog-conformance-wiring** — вендорить SSOT-набор conformance-фикстур @owner:github:andrei-shtanakov @id:catalog-conformance-wiring
+      каталога (`devtools@2a5c154 contracts/catalog-conformance-fixtures/v1`)
+      пиненой копией в `tests/fixtures/catalog-conformance/v1/` + PIN, и
+      подключить его к сьюту: тест на каждый `[[case]]` и `[[pathres]]`,
+      проверка целостности против `manifest.json` (пофайлово + `tree_sha256`)
+      ДО параметризации и независимо от неё. Принят из devtools#43
+      (`catalog-conformance-single-owner`), issue #188.
+      Чинится в этом же PR: V1–V5 → `CatalogMalformed` (глобальный halt —
+      частичное принятие дало бы маршрутизацию по молча урезанному набору),
+      V6 → warning на загрузке. Откладывается: `missing-file` (см.
+      `@id:catalog-missing-file-fail-loud`).
+
+---
+
 ## Бэклог идей из research-дайджеста (2026-07-22)
 
 > Источник: `../prograph-vault/authored/notes/2026-07-22-ideas-from-ai-repos-research.md`
@@ -756,6 +780,23 @@ ls .github/workflows/
 - [ ] `default = true` field in the catalog `[[agents]]` schema to disambiguate the @owner:repo:atp-platform @trigger:"atp-platform catalog schema добавляет default=true" @id:agents-catalog-default-flag
       A/B window (cross-repo, PM-owned) — removes the `HarnessModelUnresolved`
       ambiguity raise.
+- [ ] `$ATP_CATALOG` указывает на отсутствующий файл → сейчас молчаливый `None` + @owner:github:andrei-shtanakov @id:catalog-missing-file-fail-loud
+      info-лог; контракт (ADR-ECO-003b D2, зеркалит arbiter) требует громкой
+      ошибки. Ожидание **признано верным, а не оспорено** — Maestro здесь
+      единственный расходящийся потребитель ратифицированного контракта.
+      Отложено, а не забыто: это breaking change против записанного решения
+      2026-07-02, ему нужен свой PR + CHANGELOG + разбор, кто полагается на
+      мягкое поведение. Растяжка стоит: `xfail(strict=True)` в
+      `tests/test_catalog_conformance.py` — починить молча невозможно.
+      Блокера нет намеренно (ждать нечего, работа своя).
+- [ ] `maestro models init`: шаблон не эмитит плоскость `[harnesses.*]`, поэтому @owner:github:andrei-shtanakov @id:models-init-harnesses-plane
+      на каталогах, созданных этой командой, референсные проверки V1/V5
+      **не вооружены вовсе** (`check_catalog_references` армирует их только при
+      наличии плоскости — как велит фикстура). Отсутствие плоскости — это
+      «непроверяемо», а не «валидно»; загрузчик сообщает об этом событием
+      `catalog.reference_checks_not_armed`, но настоящее закрытие дыры —
+      эмиссия плоскости из шаблона. Требует решения, какие harness'ы шаблон
+      объявляет по умолчанию (registry Maestro ≠ SSOT ATP).
 - [ ] Extract the loader to a shared PyPI lib with a cross-reader behavioral @owner:github:andrei-shtanakov @id:catalog-loader-shared-lib
       conformance test (precedence + alias resolution across Maestro / ATP / arbiter).
 - [ ] `maestro models`: detect the same observed model id under TWO vendors in @owner:github:andrei-shtanakov @id:models-duplicate-vendor-detection
