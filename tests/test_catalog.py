@@ -7,10 +7,14 @@ from structlog.testing import capture_logs
 
 from maestro.catalog import (
     Catalog,
+    CatalogAgent,
     CatalogError,
+    CatalogHarness,
     CatalogMalformed,
+    CatalogModel,
     CatalogNotConfigured,
     HarnessModelUnresolved,
+    check_catalog_references,
     load_catalog,
     resolve_catalog_path,
     resolve_model,
@@ -204,3 +208,69 @@ def test_warn_active_silent_and_no_catalog_noop(
     with capture_logs() as logs:
         warn_on_model_status("anything", "routed", None)  # no catalog → no-op
     assert not [e for e in logs if e["event"].startswith("agent.model_")]
+
+
+# --- Referential checks V1..V6 (shared conformance vocabulary) -------------
+
+
+def _agent(harness: str, model: str, routable: bool = False) -> CatalogAgent:
+    return CatalogAgent(harness=harness, model=model, tested=True, routable=routable)
+
+
+def test_reference_checks_resolve_aliases_before_declaring_v2() -> None:
+    """An alias is a declared model id — V2 must not fire on it."""
+    cat = Catalog(
+        models={"alpha-1": CatalogModel(vendor="acme", aliases=["alpha-latest"])},
+        agents=[_agent("alpha_cli", "alpha-latest")],
+    )
+    errors, warnings = check_catalog_references(cat)
+    assert errors == []
+    assert warnings == []
+
+
+def test_reference_checks_flag_deprecated_but_reject_retired() -> None:
+    cat = Catalog(
+        models={
+            "old-1": CatalogModel(vendor="acme", status="deprecated"),
+            "dead-1": CatalogModel(vendor="acme", status="retired"),
+        },
+        agents=[_agent("alpha_cli", "old-1"), _agent("alpha_cli", "dead-1")],
+    )
+    errors, warnings = check_catalog_references(cat)
+    assert [e for e in errors if e.startswith("V3")]
+    assert not [e for e in errors if e.startswith("V6")]
+    assert [w for w in warnings if w.startswith("V6")]
+
+
+def test_v1_and_v5_are_not_armed_without_the_harness_plane() -> None:
+    """No [harnesses.*] means unverifiable, not valid — and it is announced."""
+    cat = Catalog(
+        models={"alpha-1": CatalogModel(vendor="acme")},
+        agents=[_agent("ghost_cli", "alpha-1", routable=True)],
+    )
+    assert check_catalog_references(cat) == ([], [])
+
+
+def test_v1_and_v5_fire_once_the_harness_plane_is_present() -> None:
+    cat = Catalog(
+        models={"alpha-1": CatalogModel(vendor="acme")},
+        harnesses={"alpha_cli": CatalogHarness(kind="cli", routable=False)},
+        agents=[
+            _agent("ghost_cli", "alpha-1"),
+            _agent("alpha_cli", "alpha-1", routable=True),
+        ],
+    )
+    errors, _ = check_catalog_references(cat)
+    assert [e for e in errors if e.startswith("V1")]
+    assert [e for e in errors if e.startswith("V5")]
+
+
+def test_unarmed_reference_checks_are_announced_on_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_catalog(monkeypatch, "agents-catalog.toml")  # no [harnesses.*] plane
+    with capture_logs() as logs:
+        assert load_catalog() is not None
+    events = [e for e in logs if e["event"] == "catalog.reference_checks_not_armed"]
+    assert len(events) == 1
+    assert events[0]["unarmed"] == ["V1", "V5"]

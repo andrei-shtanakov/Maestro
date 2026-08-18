@@ -66,10 +66,24 @@ class CatalogAgent(BaseModel):
     routable: bool = False
 
 
+class CatalogHarness(BaseModel):
+    """Plane 2 harness entry. Read for reference checks only — Maestro launches
+    harnesses from its own spawner registry, never from this plane.
+
+    ``kind`` stays a free string on purpose: V7 (unknown enum value) is already
+    covered by CatalogModel.status's Literal, and hard-failing on an unknown
+    harness kind would reject catalogs Maestro can otherwise use in full.
+    """
+
+    kind: str = ""
+    routable: bool = False
+
+
 class Catalog(BaseModel):
-    """Parsed catalog. Plane 2 (harnesses) is ignored — Maestro does not need it."""
+    """Parsed catalog. Plane 2 (harnesses) is read for V1/V5 only."""
 
     models: dict[str, CatalogModel]
+    harnesses: dict[str, CatalogHarness] = {}
     agents: list[CatalogAgent] = []
 
     def default_model_for_harness(self, harness: str) -> str:
@@ -107,6 +121,55 @@ class Catalog(BaseModel):
         return difflib.get_close_matches(model, list(self.models), n=n, cutoff=0.3)
 
 
+def check_catalog_references(catalog: Catalog) -> tuple[list[str], list[str]]:
+    """Referential checks V1..V6 over a parsed catalog (rule vocabulary: the
+    shared conformance set, ``tests/fixtures/catalog-conformance/v1/README.md``).
+
+    Returns ``(errors, warnings)``. Errors mean the catalog contradicts itself
+    and nobody can use it — the caller raises CatalogMalformed, which halts the
+    run. Partial acceptance is deliberately not an option: routing over a
+    silently-pruned agent set is the failure this check exists to prevent.
+
+    **V1 and V5 are armed only when Plane 2 is present.** That is a hole, not a
+    decision: catalogs scaffolded by ``maestro models init`` carry no
+    ``[harnesses]`` table at all, so on most real catalogs "harness reference
+    is checked" is simply untrue. An absent plane means *unverifiable*, never
+    *valid* — the caller says so out loud, and emitting the plane from the
+    scaffold template is the actual fix.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    armed = bool(catalog.harnesses)
+    seen: set[tuple[str, str]] = set()
+
+    for agent in catalog.agents:
+        agent_id = f"{agent.harness}@{agent.model}"
+
+        if armed and agent.harness not in catalog.harnesses:
+            errors.append(f"V1: {agent_id} — harness not declared in [harnesses.*]")
+
+        status = catalog.status_of(agent.model)
+        if status is None:
+            errors.append(f"V2: {agent_id} — model not declared in [models.*]")
+        elif status == "retired":
+            errors.append(f"V3: {agent_id} — references a retired model")
+        elif status == "deprecated":
+            warnings.append(f"V6: {agent_id} — references a deprecated model")
+
+        pair = (agent.harness, agent.model)
+        if pair in seen:
+            errors.append(f"V4: {agent_id} — duplicate enrollment")
+        seen.add(pair)
+
+        harness = catalog.harnesses.get(agent.harness)
+        if armed and harness is not None and agent.routable and not harness.routable:
+            errors.append(
+                f"V5: {agent_id} — routable enrollment on a non-routable harness"
+            )
+
+    return errors, warnings
+
+
 def resolve_catalog_path() -> Path | None:
     """Resolve the catalog file path. $ATP_CATALOG only for now.
 
@@ -122,7 +185,14 @@ def load_catalog() -> Catalog | None:
 
     Returns None for both "no catalog" cases: $ATP_CATALOG unset, or set but the
     file is absent (a path typo must not crash a routed run). Raises
-    CatalogMalformed when the file is present but corrupt / schema-invalid.
+    CatalogMalformed when the file is present but corrupt / schema-invalid, or
+    when it contradicts itself referentially (V1..V5).
+
+    Note: "set but absent -> None" diverges from ADR-ECO-003b D2, which requires
+    a loud missing-file error. The expectation is accepted, not disputed; the
+    fix is a breaking change against Maestro's 2026-07-02 decision and is
+    tracked separately. tests/test_catalog_conformance.py holds the xfail that
+    makes fixing it silently impossible.
     """
     path = resolve_catalog_path()
     if path is None:
@@ -132,9 +202,25 @@ def load_catalog() -> Catalog | None:
         return None
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
-        return Catalog.model_validate(data)
+        catalog = Catalog.model_validate(data)
     except (tomllib.TOMLDecodeError, ValidationError, OSError) as exc:
         raise CatalogMalformed(f"catalog is corrupt ({path}): {exc}") from exc
+
+    errors, warnings = check_catalog_references(catalog)
+    for warning in warnings:
+        _obs_log.warning("catalog.reference_warning", path=str(path), finding=warning)
+    if not catalog.harnesses and catalog.agents:
+        _obs_log.info(
+            "catalog.reference_checks_not_armed",
+            path=str(path),
+            unarmed=["V1", "V5"],
+            reason="no [harnesses.*] plane — harness references are unverifiable",
+        )
+    if errors:
+        raise CatalogMalformed(
+            f"catalog is inconsistent ({path}): " + "; ".join(errors)
+        )
+    return catalog
 
 
 def resolve_model(

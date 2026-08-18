@@ -137,6 +137,42 @@
   fabricated pin and a stale pin are different defects.
 
 ### Added
+- **The catalog loader now checks the catalog against itself, and the shared
+  conformance set is wired into the suite (#188).** Until now `load_catalog()`
+  parsed Plane 1 and Plane 3 and validated neither against the other: an
+  `[[agents]]` row could name a model no `[models.*]` table declares, name it
+  twice, or name one marked `retired`, and the catalog loaded clean. The five
+  referential rules of the shared vocabulary (V1 unknown harness, V2 unknown
+  model, V3 retired reference, V4 duplicate enrollment, V5 routable enrollment
+  on a non-routable harness) now raise `CatalogMalformed`, which halts the run.
+  Rejecting the whole catalog is deliberate: accepting it partially would route
+  work over a silently pruned agent set, which is the failure the checks exist
+  to prevent. V6 (a reference to a `deprecated` model) warns at load, in
+  addition to the existing spawn-time warning. Aliases resolve before V2 fires,
+  so an `[[agents]]` row naming an alias is not a dangling reference.
+  **V1 and V5 are armed only when the catalog carries a `[harnesses.*]`
+  plane** — and that is a hole, not a decision. Catalogs scaffolded by
+  `maestro models init` carry no such plane at all, so on most real catalogs
+  "the harness reference is checked" is simply untrue. An absent plane means
+  *unverifiable*, never *valid*, and the loader now says so with a
+  `catalog.reference_checks_not_armed` event; teaching the scaffold template to
+  emit the plane is the actual fix and is tracked separately
+  (`@id:models-init-harnesses-plane`).
+  The fixtures behind all of this are a **pinned vendored copy** of a contract
+  owned by devtools (`devtools@2a5c154
+  contracts/catalog-conformance-fixtures/v1`), verified per-file and by
+  `tree_sha256` against its own manifest **before** the parametrized cases run,
+  so a truncated copy fails loudly instead of quietly shrinking into a smaller
+  green suite.
+  One expectation is knowingly **not** met: `$ATP_CATALOG` pointing at a
+  missing file still returns "no catalog" plus an info log rather than an
+  error. The contract (ADR-ECO-003b D2, already implemented by arbiter) is
+  accepted as correct — Maestro is the diverging consumer, not the dissenting
+  one — but reversing it is a breaking change against a recorded 2026-07-02
+  decision and gets its own PR rather than riding along inside a test-wiring
+  change. A strict `xfail` holds the position, so fixing it silently is
+  impossible: the day the loader complies, that test fails as XPASS.
+
 - **Per-workstream quarantine (#166 half A).**
   `maestro workstream-quarantine <id> --reason "<why>"` forbids one
   workstream's result from progressing, and **does not kill anything**: a
