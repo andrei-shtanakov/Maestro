@@ -830,7 +830,15 @@ ls .github/workflows/
       загрузчик и сьют самодостаточны, работа появляется только если фикстуры
       выйдут. Проставить сюда блокер значило бы завести фантомное ожидание.
       Сработал 2026-08-18: фикстуры вышли (`devtools@2533ff7`), пришли как
-      inbox #192 → см. `@id:catalog-conformance-pin-bump-v1-gaps`.
+      inbox #192 → см. `@id:catalog-conformance-pin-bump-v1-gaps`. Исход обоих
+      предсказаний выше (текст оставлен как есть — это прогноз, каким он был,
+      а не описание итога): (1) `v7-unknown-kind` действительно была красной,
+      но решено **чинить**, а не фиксировать дивергенцию — `kind` теперь
+      проверяется против интерим-словаря `HARNESS_KINDS` с warning'ом
+      (см. `@id:catalog-enum-vocabulary-machine-readable`); (2) канонизировали
+      **противоположное** нашему чтение пустой плоскости, названный здесь тест
+      упал на бампе пина ровно как задумано и переписан в
+      `test_empty_harness_plane_declares_zero_harnesses`.
 - [ ] Заменить рукописные `MODEL_STATUSES`/`HARNESS_KINDS` в `maestro/catalog.py` @owner:github:andrei-shtanakov @blocked_by:devtools#catalog-enum-vocabulary-machine-readable @id:catalog-enum-vocabulary-machine-readable
       чтением машиночитаемого словаря из вендоренного набора. Обе константы —
       интерим-копии enum'ов ADR-ECO-003, который публикует их только прозой

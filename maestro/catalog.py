@@ -173,8 +173,13 @@ def _reference_checks_armed(catalog: Catalog) -> bool:
 
 
 def check_catalog_references(catalog: Catalog) -> tuple[list[str], list[str]]:
-    """Referential checks V1..V6 over a parsed catalog (rule vocabulary: the
-    shared conformance set, ``tests/fixtures/catalog-conformance/v1/README.md``).
+    """Rule checks V1..V7 over a parsed catalog (rule vocabulary: the shared
+    conformance set, ``tests/fixtures/catalog-conformance/v1/README.md``).
+
+    V1..V6 are referential — Plane 3 against Planes 1 and 2. V7 is not: it
+    checks a single field against a vocabulary, and only for
+    ``harnesses.*.kind``, an unknown model ``status`` having already failed
+    CatalogModel's schema before this function is reached.
 
     Returns ``(errors, warnings)``. Errors mean the catalog contradicts itself
     and nobody can use it — the caller raises CatalogMalformed, which halts the
@@ -183,8 +188,7 @@ def check_catalog_references(catalog: Catalog) -> tuple[list[str], list[str]]:
 
     V1/V5 arming is delegated to _reference_checks_armed — an ABSENT Plane 2
     leaves them unevaluated, which is a hole and is announced as one by the
-    caller. V7 is checked here for ``kind`` only; an unknown model ``status``
-    never reaches this function, having already failed CatalogModel's schema.
+    caller.
     """
     errors: list[str] = []
     warnings: list[str] = []
