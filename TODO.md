@@ -803,6 +803,18 @@ ls .github/workflows/
       `catalog.reference_checks_not_armed`, но настоящее закрытие дыры —
       эмиссия плоскости из шаблона. Требует решения, какие harness'ы шаблон
       объявляет по умолчанию (registry Maestro ≠ SSOT ATP).
+- [ ] Обновить пин conformance-набора, когда devtools#47 закроет две развилки @owner:github:andrei-shtanakov @trigger:"devtools публикует в v1 фикстуры на пустую плоскость [harnesses] и на V7 только по kind" @id:catalog-conformance-v1-gaps-pin-bump
+      v1 (`catalog-conformance-v1-gaps`). Заявлено заранее: фикстура «V7 только
+      по `kind`» будет у нас **красной** — `kind` не валидируется намеренно
+      (словарь `cli | api-baseline | local` принадлежит ADR-ECO-003, а
+      переобъявлять чужой контракт у потребителя — тихий дрейф), и это
+      потребует решения, а не быстрого патча. Фикстура на пустую плоскость
+      должна пройти: наше чтение (schema scaffolding) закреплено тестом
+      `test_empty_harness_plane_reads_as_scaffolding_not_as_zero_harnesses`;
+      если канонизируют противоположное — упадёт именно он.
+      Это `@trigger`, а НЕ `@blocked_by`: ничего у нас не ждёт devtools —
+      загрузчик и сьют самодостаточны, работа появляется только если фикстуры
+      выйдут. Проставить сюда блокер значило бы завести фантомное ожидание.
 - [ ] Extract the loader to a shared PyPI lib with a cross-reader behavioral @owner:github:andrei-shtanakov @id:catalog-loader-shared-lib
       conformance test (precedence + alias resolution across Maestro / ATP / arbiter).
 - [ ] `maestro models`: detect the same observed model id under TWO vendors in @owner:github:andrei-shtanakov @id:models-duplicate-vendor-detection
