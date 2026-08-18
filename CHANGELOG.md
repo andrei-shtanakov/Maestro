@@ -137,6 +137,35 @@
   fabricated pin and a stale pin are different defects.
 
 ### Added
+- **Conformance pin bumped to `devtools@2533ff7`; the two forks Maestro flagged
+  came back decided, and one went against us (#192).** Wiring the shared set in
+  #188 surfaced two places where it declined to rule, so each consumer was
+  deciding privately — the drift the set exists to prevent, one storey up. Both
+  are now canon, with fixtures.
+  **An empty `[harnesses]` plane declares zero harnesses.** A bare header with
+  `[[agents]]` rows present is V1 for every row, fail-closed. Maestro read it as
+  schema scaffolding, arguing that the shipped template teaches an empty
+  `[models]` header; the ruling points out that `[models]` is *required* and
+  `[harnesses]` is not, and nobody writes a scaffolding header for an optional
+  table — which is the better argument. Arming moved from "the mapping is
+  non-empty" to "the key was declared" (`model_fields_set`). An empty plane with
+  no agents stays valid: only "nothing to resolve with, and something to
+  resolve" is rejected. Catalogs from `maestro models init` are untouched, since
+  that template emits no Plane 2 at all — and *that* absence remains an unarmed
+  hole, announced rather than assumed healthy.
+  **An unknown `harnesses.*.kind` now warns (V7).** Never rejects: Maestro does
+  not launch from Plane 2, so an unfamiliar kind is information, not an
+  obstruction. The warning names the vocabulary's owner and the repair, because
+  a false positive is possible by construction — `HARNESS_KINDS` is a hand-made
+  copy of a vocabulary ADR-ECO-003 publishes only as prose. It sits beside the
+  model-status Literal so the pair cannot drift apart, is marked INTERIM, and a
+  test pins both against the vendored set's valid fixtures. The structural fix —
+  a machine-readable vocabulary inside the pinned surface — is requested as
+  devtools#51; these constants are meant to be deleted, not maintained.
+  The regression test that pinned Maestro's losing reading is what forced this
+  change: it failed on the pin bump instead of letting the divergence sit, which
+  is the entire reason positions get pinned to tests rather than to prose.
+
 - **The catalog loader now checks the catalog against itself, and the shared
   conformance set is wired into the suite (#188).** Until now `load_catalog()`
   parsed Plane 1 and Plane 3 and validated neither against the other: an

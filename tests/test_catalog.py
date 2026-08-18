@@ -1,11 +1,14 @@
 """Tests for the model catalog loader (ADR-ECO-003b)."""
 
+import tomllib
 from pathlib import Path
 
 import pytest
 from structlog.testing import capture_logs
 
 from maestro.catalog import (
+    HARNESS_KINDS,
+    MODEL_STATUSES,
     Catalog,
     CatalogAgent,
     CatalogError,
@@ -265,31 +268,89 @@ def test_v1_and_v5_fire_once_the_harness_plane_is_present() -> None:
     assert [e for e in errors if e.startswith("V5")]
 
 
-def test_empty_harness_plane_reads_as_scaffolding_not_as_zero_harnesses(
+def test_empty_harness_plane_declares_zero_harnesses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A bare `[harnesses]` header must not reject the whole catalog.
+    """A bare `[harnesses]` header arms V1 and rejects every enrollment.
 
-    Pydantic CAN tell "header present but empty" from "header absent"
-    (model_fields_set), so treating them alike is a decision: the shipped
-    template teaches users to keep an empty table header as schema scaffolding,
-    and reading that header as "zero harnesses exist" would turn every
-    [[agents]] row into a V1 violation. Recorded here so the reading cannot be
-    flipped by accident.
+    This test used to assert the opposite ("bare header = schema scaffolding"),
+    which is why it exists: the reading was pinned rather than left to an
+    unexamined bool(), so when devtools#47 canonised the fail-closed reading the
+    test failed and forced the change instead of letting the divergence sit.
     """
     catalog_file = tmp_path / "agents-catalog.toml"
     catalog_file.write_text(
         '[models."alpha-1"]\nvendor = "acme"\n\n'
         "[harnesses]\n\n"
-        '[[agents]]\nharness = "alpha_cli"\nmodel = "alpha-1"\nroutable = true\n',
+        '[[agents]]\nharness = "alpha_cli"\nmodel = "alpha-1"\n',
         encoding="utf-8",
     )
     monkeypatch.setenv("ATP_CATALOG", str(catalog_file))
-    with capture_logs() as logs:
-        catalog = load_catalog()
-    assert catalog is not None
-    assert catalog.harnesses == {}
-    assert [e for e in logs if e["event"] == "catalog.reference_checks_not_armed"]
+    with pytest.raises(CatalogMalformed, match="V1"):
+        load_catalog()
+
+
+def test_empty_harness_plane_without_agents_stays_valid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only "nothing to resolve with + something to resolve" is rejected."""
+    catalog_file = tmp_path / "agents-catalog.toml"
+    catalog_file.write_text(
+        '[models."alpha-1"]\nvendor = "acme"\n\n[harnesses]\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("ATP_CATALOG", str(catalog_file))
+    assert load_catalog() is not None
+
+
+def test_unknown_harness_kind_warns_and_names_the_owner_and_the_fix() -> None:
+    """V7 by `kind`: a warning that teaches the repair, never a rejection.
+
+    A false positive is possible by construction — HARNESS_KINDS is a hand-made
+    copy of a vocabulary published only as prose — so the message has to carry
+    both who owns the vocabulary and what to do about it. A self-explaining
+    false warning costs a minute; silence cost a session.
+    """
+    cat = Catalog(
+        models={"alpha-1": CatalogModel(vendor="acme")},
+        harnesses={"gamma_box": CatalogHarness(kind="container")},
+        agents=[],
+    )
+    errors, warnings = check_catalog_references(cat)
+    assert errors == []
+    assert len(warnings) == 1
+    assert "V7" in warnings[0] and "container" in warnings[0]
+    assert "ADR-ECO-003" in warnings[0]
+    assert "HARNESS_KINDS" in warnings[0]
+
+
+def test_vendored_vocabularies_cover_the_conformance_sets_valid_fixtures() -> None:
+    """Tripwire on the INTERIM copies of the ADR-ECO-003 enums.
+
+    Both vocabularies are hand-copied prose. If the vendored set's valid
+    fixtures ever use a value our copies lack, the copies have drifted from the
+    contract — and the set's own `valid` class (loads with zero warnings) would
+    start failing for a reason that looks like a loader bug.
+    """
+    valid_dir = (
+        Path(__file__).parent
+        / "fixtures"
+        / "catalog-conformance"
+        / "v1"
+        / "fixtures"
+        / "valid"
+    )
+    fixtures = sorted(valid_dir.glob("*.toml"))
+    assert fixtures, "vendored valid fixtures missing — copy truncated?"
+    for fixture in fixtures:
+        data = tomllib.loads(fixture.read_text(encoding="utf-8"))
+        for name, model in data.get("models", {}).items():
+            assert model.get("status", "active") in MODEL_STATUSES, (
+                f"{fixture.name}: models.{name}.status outside MODEL_STATUSES"
+            )
+        for name, harness in data.get("harnesses", {}).items():
+            assert harness.get("kind", "") in HARNESS_KINDS, (
+                f"{fixture.name}: harnesses.{name}.kind outside HARNESS_KINDS"
+            )
 
 
 def test_unarmed_reference_checks_are_announced_on_load(

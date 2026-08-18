@@ -712,6 +712,20 @@
       заголовок секции отвергал бы весь каталог; закреплено регрессионным
       тестом. Обе дырки покрытия v1 (пустая плоскость; V7 только по `status`,
       не по `kind`) отправлены владельцу набора в devtools#43.
+      **Постскриптум 2026-08-18:** обе дырки заведены как devtools#47 и
+      канонизированы — пустую плоскость владелец решил ПРОТИВ нашего чтения
+      (V1 fail-closed: `harnesses` опционален, в отличие от обязательного
+      `[models]`, поэтому каркасный хедер незачем писать). Регресс-тест сделал
+      своё дело — упал на бампе пина, а не позволил дивергенции осесть.
+
+- [ ] **catalog-conformance-pin-bump-v1-gaps** — бамп пина набора на @owner:github:andrei-shtanakov @id:catalog-conformance-pin-bump-v1-gaps
+      `devtools@2533ff7` (два новых кейса v1: `v1-empty-harnesses`,
+      `v7-unknown-kind`). Принят из devtools#47, issue #192.
+      Оба кейса чинятся, не записываются в дивергенцию: арминг V1/V5 переезжает
+      на «плоскость ОБЪЯВЛЕНА» (`model_fields_set`), незнакомый
+      `harnesses.*.kind` даёт warning (класс `flag` — reject был бы неверен,
+      Maestro не запускает harness'ы из Плоскости 2). Словарь kind заводится
+      интеримом со ссылкой на `@id:catalog-enum-vocabulary-machine-readable`.
 
 ---
 
@@ -803,7 +817,7 @@ ls .github/workflows/
       `catalog.reference_checks_not_armed`, но настоящее закрытие дыры —
       эмиссия плоскости из шаблона. Требует решения, какие harness'ы шаблон
       объявляет по умолчанию (registry Maestro ≠ SSOT ATP).
-- [ ] Обновить пин conformance-набора, когда devtools#47 закроет две развилки @owner:github:andrei-shtanakov @trigger:"devtools публикует в v1 фикстуры на пустую плоскость [harnesses] и на V7 только по kind" @id:catalog-conformance-v1-gaps-pin-bump
+- [x] Обновить пин conformance-набора, когда devtools#47 закроет две развилки @owner:github:andrei-shtanakov @trigger:"devtools публикует в v1 фикстуры на пустую плоскость [harnesses] и на V7 только по kind" @id:catalog-conformance-v1-gaps-pin-bump
       v1 (`catalog-conformance-v1-gaps`). Заявлено заранее: фикстура «V7 только
       по `kind`» будет у нас **красной** — `kind` не валидируется намеренно
       (словарь `cli | api-baseline | local` принадлежит ADR-ECO-003, а
@@ -815,6 +829,18 @@ ls .github/workflows/
       Это `@trigger`, а НЕ `@blocked_by`: ничего у нас не ждёт devtools —
       загрузчик и сьют самодостаточны, работа появляется только если фикстуры
       выйдут. Проставить сюда блокер значило бы завести фантомное ожидание.
+      Сработал 2026-08-18: фикстуры вышли (`devtools@2533ff7`), пришли как
+      inbox #192 → см. `@id:catalog-conformance-pin-bump-v1-gaps`.
+- [ ] Заменить рукописные `MODEL_STATUSES`/`HARNESS_KINDS` в `maestro/catalog.py` @owner:github:andrei-shtanakov @blocked_by:devtools#catalog-enum-vocabulary-machine-readable @id:catalog-enum-vocabulary-machine-readable
+      чтением машиночитаемого словаря из вендоренного набора. Обе константы —
+      интерим-копии enum'ов ADR-ECO-003, который публикует их только прозой
+      (инлайн-комментарий в примере TOML + README набора), поэтому три
+      загрузчика копируют словарь руками и могут разойтись уже на нём — риск №1
+      ADR-ECO-003b этажом выше проверок. Набор такое расхождение сейчас НЕ
+      видит: `v7-unknown-kind` проверяет, что незнакомый kind помечается, но не
+      что три загрузчика считают знакомым одно множество. Запрошено
+      devtools#51; блокер настоящий (пока словаря нет, заменять нечем).
+      Признак: константы удалены, а не поддерживаются.
 - [ ] Extract the loader to a shared PyPI lib with a cross-reader behavioral @owner:github:andrei-shtanakov @id:catalog-loader-shared-lib
       conformance test (precedence + alias resolution across Maestro / ATP / arbiter).
 - [ ] `maestro models`: detect the same observed model id under TWO vendors in @owner:github:andrei-shtanakov @id:models-duplicate-vendor-detection

@@ -19,7 +19,7 @@ import difflib
 import os
 import tomllib
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 from pydantic import BaseModel, ValidationError
 
@@ -49,11 +49,37 @@ class HarnessModelUnresolved(RuntimeError):
     """No routable model, or >1, for this harness. Per-task; NOT a CatalogError."""
 
 
+# --- ADR-ECO-003 enum vocabularies (INTERIM vendored copies) ---------------
+#
+# Both live here, together, on purpose: they belong to the SAME upstream
+# document and neither is Maestro's to define. ADR-ECO-003 publishes them only
+# as prose — an inline comment in its example TOML, mirrored in the conformance
+# set's README — so every consumer hand-copies them and consumers can now drift
+# on the vocabulary itself, one storey above the drift the conformance set was
+# built to catch. A machine-readable vocabulary derived from the ADR is
+# requested from the set's owner; these constants are the INTERIM stand-in and
+# should be deleted when it lands — devtools#51,
+# @id:catalog-enum-vocabulary-machine-readable.
+#
+# Kept adjacent so the pair cannot drift apart: a status vocabulary in a
+# pydantic Literal and a kind vocabulary in a loose constant, declared in two
+# different places, is the setup for the next invisible divergence.
+# tests/test_catalog.py pins both against the vendored set's valid fixtures.
+#
+# The asymmetry in enforcement is deliberate, not an oversight: an unknown
+# status is a hard schema reject (it decides whether an enrollment is legal),
+# an unknown kind is a warning (V7 class "flag" — Maestro never launches from
+# Plane 2, so an unfamiliar kind costs nothing until someone routes to it).
+ModelStatus = Literal["active", "deprecated", "retired"]
+MODEL_STATUSES: frozenset[str] = frozenset(get_args(ModelStatus))
+HARNESS_KINDS: frozenset[str] = frozenset({"cli", "api-baseline", "local"})
+
+
 class CatalogModel(BaseModel):
     """Plane 1 model entry."""
 
     vendor: str
-    status: Literal["active", "deprecated", "retired"] = "active"
+    status: ModelStatus = "active"
     aliases: list[str] = []
 
 
@@ -70,15 +96,13 @@ class CatalogHarness(BaseModel):
     """Plane 2 harness entry. Read for reference checks only — Maestro launches
     harnesses from its own spawner registry, never from this plane.
 
-    ``kind`` is deliberately unvalidated, and that is narrower than it looks.
-    V7 (unknown enum value) spans two fields: an unknown model ``status`` IS
-    rejected, by CatalogModel.status's Literal — an unknown harness ``kind`` is
-    NOT, and nothing else here checks it. The current V7 fixture varies both, so
-    the Literal alone carries it; a future fixture varying only ``kind`` would
-    be red and would need a decision, not a quick patch. The reason to leave it
-    open is ownership: the kind vocabulary (``cli | api-baseline | local``)
-    belongs to ADR-ECO-003, and re-declaring a contract Maestro does not own is
-    how a consumer drifts from it silently.
+    ``kind`` stays a free string at the schema level and is checked at load
+    time instead, as a V7 warning against HARNESS_KINDS. The split is the point:
+    an unknown ``kind`` must be *flagged*, not rejected, because Maestro never
+    launches from Plane 2 — an unfamiliar kind is information, not an
+    obstruction. Upstream shipped ``warn/v7-unknown-kind.toml`` (devtools#47) to
+    make exactly this observable, which is the decision the previous revision of
+    this docstring said such a fixture would force.
     """
 
     kind: str = ""
@@ -127,6 +151,27 @@ class Catalog(BaseModel):
         return difflib.get_close_matches(model, list(self.models), n=n, cutoff=0.3)
 
 
+def _reference_checks_armed(catalog: Catalog) -> bool:
+    """Whether V1/V5 can be evaluated: Plane 2 DECLARED, entries or not.
+
+    Presence of the key, never truthiness of the mapping. A ``[harnesses]``
+    header with no entries declares zero harnesses, so every enrollment
+    references an undeclared harness and V1 fires for each — canon from
+    devtools#47, ``fixtures/invalid/v1-empty-harnesses.toml``. Maestro read a
+    bare header as schema scaffolding before that ruling; the argument was that
+    the shipped catalog template teaches an empty ``[models]`` header, and it
+    does not carry, because ``[models]`` is REQUIRED and ``[harnesses]`` is not
+    — nobody writes a scaffolding header for an optional table.
+
+    An ABSENT plane is still unarmed, and that remains a hole rather than a
+    decision: ``maestro models init`` emits no Plane 2 at all, so on catalogs it
+    scaffolds the harness reference is unverified. load_catalog() announces that
+    case; closing it means teaching the template to emit the plane
+    (@id:models-init-harnesses-plane).
+    """
+    return "harnesses" in catalog.model_fields_set
+
+
 def check_catalog_references(catalog: Catalog) -> tuple[list[str], list[str]]:
     """Referential checks V1..V6 over a parsed catalog (rule vocabulary: the
     shared conformance set, ``tests/fixtures/catalog-conformance/v1/README.md``).
@@ -136,27 +181,14 @@ def check_catalog_references(catalog: Catalog) -> tuple[list[str], list[str]]:
     run. Partial acceptance is deliberately not an option: routing over a
     silently-pruned agent set is the failure this check exists to prevent.
 
-    **V1 and V5 are armed only when Plane 2 carries at least one harness.** That
-    is a hole, not a decision: catalogs scaffolded by ``maestro models init``
-    carry no ``[harnesses]`` table at all, so on most real catalogs "harness
-    reference is checked" is simply untrue. An absent plane means
-    *unverifiable*, never *valid* — the caller says so out loud, and emitting
-    the plane from the scaffold template is the actual fix.
-
-    A ``[harnesses]`` header present but EMPTY counts as unarmed too, and that
-    part IS a decision. Pydantic can tell the two apart (``model_fields_set``),
-    so the conflation is a choice, not an oversight: the shipped catalog
-    template instructs users to "keep this table header even when empty" for
-    ``[models]``, so a bare header is this ecosystem's idiom for schema
-    scaffolding, not an assertion that zero harnesses exist. Reading it as the
-    latter would make every ``[[agents]]`` row a V1 violation and reject the
-    whole catalog because someone typed a section header. The shared fixture
-    set has no case for it (v1 carries no empty-plane fixture), so this is
-    Maestro's reading until the contract owner canonises one.
+    V1/V5 arming is delegated to _reference_checks_armed — an ABSENT Plane 2
+    leaves them unevaluated, which is a hole and is announced as one by the
+    caller. V7 is checked here for ``kind`` only; an unknown model ``status``
+    never reaches this function, having already failed CatalogModel's schema.
     """
     errors: list[str] = []
     warnings: list[str] = []
-    armed = bool(catalog.harnesses)
+    armed = _reference_checks_armed(catalog)
     seen: set[tuple[str, str]] = set()
 
     for agent in catalog.agents:
@@ -182,6 +214,15 @@ def check_catalog_references(catalog: Catalog) -> tuple[list[str], list[str]]:
         if armed and harness is not None and agent.routable and not harness.routable:
             errors.append(
                 f"V5: {agent_id} — routable enrollment on a non-routable harness"
+            )
+
+    for name, harness in catalog.harnesses.items():
+        if harness.kind and harness.kind not in HARNESS_KINDS:
+            warnings.append(
+                f"V7: harnesses.{name}.kind = '{harness.kind}' is outside the "
+                f"ADR-ECO-003 vocabulary "
+                f"({', '.join(sorted(HARNESS_KINDS))}) — if the ADR added the "
+                f"value, refresh HARNESS_KINDS in maestro/catalog.py"
             )
 
     return errors, warnings
@@ -226,12 +267,12 @@ def load_catalog() -> Catalog | None:
     errors, warnings = check_catalog_references(catalog)
     for warning in warnings:
         _obs_log.warning("catalog.reference_warning", path=str(path), finding=warning)
-    if not catalog.harnesses and catalog.agents:
+    if not _reference_checks_armed(catalog) and catalog.agents:
         _obs_log.info(
             "catalog.reference_checks_not_armed",
             path=str(path),
             unarmed=["V1", "V5"],
-            reason="no [harnesses.*] plane — harness references are unverifiable",
+            reason="no [harnesses] plane declared — harness references are unverifiable",
         )
     if errors:
         raise CatalogMalformed(
