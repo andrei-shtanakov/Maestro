@@ -70,9 +70,15 @@ class CatalogHarness(BaseModel):
     """Plane 2 harness entry. Read for reference checks only — Maestro launches
     harnesses from its own spawner registry, never from this plane.
 
-    ``kind`` stays a free string on purpose: V7 (unknown enum value) is already
-    covered by CatalogModel.status's Literal, and hard-failing on an unknown
-    harness kind would reject catalogs Maestro can otherwise use in full.
+    ``kind`` is deliberately unvalidated, and that is narrower than it looks.
+    V7 (unknown enum value) spans two fields: an unknown model ``status`` IS
+    rejected, by CatalogModel.status's Literal — an unknown harness ``kind`` is
+    NOT, and nothing else here checks it. The current V7 fixture varies both, so
+    the Literal alone carries it; a future fixture varying only ``kind`` would
+    be red and would need a decision, not a quick patch. The reason to leave it
+    open is ownership: the kind vocabulary (``cli | api-baseline | local``)
+    belongs to ADR-ECO-003, and re-declaring a contract Maestro does not own is
+    how a consumer drifts from it silently.
     """
 
     kind: str = ""
@@ -130,12 +136,23 @@ def check_catalog_references(catalog: Catalog) -> tuple[list[str], list[str]]:
     run. Partial acceptance is deliberately not an option: routing over a
     silently-pruned agent set is the failure this check exists to prevent.
 
-    **V1 and V5 are armed only when Plane 2 is present.** That is a hole, not a
-    decision: catalogs scaffolded by ``maestro models init`` carry no
-    ``[harnesses]`` table at all, so on most real catalogs "harness reference
-    is checked" is simply untrue. An absent plane means *unverifiable*, never
-    *valid* — the caller says so out loud, and emitting the plane from the
-    scaffold template is the actual fix.
+    **V1 and V5 are armed only when Plane 2 carries at least one harness.** That
+    is a hole, not a decision: catalogs scaffolded by ``maestro models init``
+    carry no ``[harnesses]`` table at all, so on most real catalogs "harness
+    reference is checked" is simply untrue. An absent plane means
+    *unverifiable*, never *valid* — the caller says so out loud, and emitting
+    the plane from the scaffold template is the actual fix.
+
+    A ``[harnesses]`` header present but EMPTY counts as unarmed too, and that
+    part IS a decision. Pydantic can tell the two apart (``model_fields_set``),
+    so the conflation is a choice, not an oversight: the shipped catalog
+    template instructs users to "keep this table header even when empty" for
+    ``[models]``, so a bare header is this ecosystem's idiom for schema
+    scaffolding, not an assertion that zero harnesses exist. Reading it as the
+    latter would make every ``[[agents]]`` row a V1 violation and reject the
+    whole catalog because someone typed a section header. The shared fixture
+    set has no case for it (v1 carries no empty-plane fixture), so this is
+    Maestro's reading until the contract owner canonises one.
     """
     errors: list[str] = []
     warnings: list[str] = []

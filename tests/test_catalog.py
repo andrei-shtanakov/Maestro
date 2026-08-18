@@ -265,6 +265,33 @@ def test_v1_and_v5_fire_once_the_harness_plane_is_present() -> None:
     assert [e for e in errors if e.startswith("V5")]
 
 
+def test_empty_harness_plane_reads_as_scaffolding_not_as_zero_harnesses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bare `[harnesses]` header must not reject the whole catalog.
+
+    Pydantic CAN tell "header present but empty" from "header absent"
+    (model_fields_set), so treating them alike is a decision: the shipped
+    template teaches users to keep an empty table header as schema scaffolding,
+    and reading that header as "zero harnesses exist" would turn every
+    [[agents]] row into a V1 violation. Recorded here so the reading cannot be
+    flipped by accident.
+    """
+    catalog_file = tmp_path / "agents-catalog.toml"
+    catalog_file.write_text(
+        '[models."alpha-1"]\nvendor = "acme"\n\n'
+        "[harnesses]\n\n"
+        '[[agents]]\nharness = "alpha_cli"\nmodel = "alpha-1"\nroutable = true\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ATP_CATALOG", str(catalog_file))
+    with capture_logs() as logs:
+        catalog = load_catalog()
+    assert catalog is not None
+    assert catalog.harnesses == {}
+    assert [e for e in logs if e["event"] == "catalog.reference_checks_not_armed"]
+
+
 def test_unarmed_reference_checks_are_announced_on_load(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
