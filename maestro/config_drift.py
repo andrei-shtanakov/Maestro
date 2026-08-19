@@ -111,14 +111,28 @@ def find_config_drift(
     configured: list[WorkstreamConfig],
     persisted: list[Workstream],
     branch_prefix: str,
+    workstreams_declared: bool | None = None,
 ) -> ConfigDrift:
     """Compare the config's workstreams against the run's persisted copy.
 
-    An empty ``configured`` returns no drift: a run created by
-    auto-decomposition has no declared workstreams to disagree with, and
-    reporting the whole run as "removed" would be nonsense.
+    ``workstreams_declared`` says how this run's workstreams were created, and
+    exists only to disambiguate an EMPTY ``configured``. The two causes are
+    indistinguishable from the persisted rows alone:
+
+    * ``False`` — auto-decomposed. Nothing was declared, so nothing can
+      disagree; reporting the whole run as "removed" would be nonsense.
+    * ``True`` — declared, and the section is now gone. That is the same
+      silence this module exists to end, just a different edit shape, so it
+      reports every workstream as removed.
+    * ``None`` — a run predating migration 28. **Fails open**: treated as
+      auto-decomposed. Halting every legacy auto-decomposed run on resume
+      would be a worse defect than the hole left unclosed, and per-run state
+      directories are short-lived enough that the unknown window closes on its
+      own.
     """
     if not configured:
+        if workstreams_declared and persisted:
+            return ConfigDrift(removed_ids=tuple(sorted(w.id for w in persisted)))
         return ConfigDrift()
 
     by_id = {w.id: w for w in persisted}

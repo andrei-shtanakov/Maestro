@@ -164,6 +164,15 @@
   starting a new run. A bypass flag was considered and rejected: it would turn
   a fail-closed signal into a permanent detour, which is how the silence would
   come back.
+  An empty `workstreams:` section is the one shape the persisted rows cannot
+  disambiguate on their own — an auto-decomposed run and a run whose section
+  the operator deleted look identical — so migration 28 records how a run's
+  workstreams were created (`run.workstreams_declared`, nullable). Declared and
+  now absent reports every workstream as removed; auto-decomposed stays silent.
+  Runs created before the migration answer NULL and **fail open**: halting
+  every legacy auto-decomposed run on resume would be a worse defect than the
+  hole, and per-run state directories are short-lived enough that the unknown
+  window closes on its own.
   The halt runs **after** crash recovery, not before. Drift forbids new
   dispatch, decomposition and delivery — never the liveness and reconciliation
   pass over handles that already exist. Raising earlier would have traded one

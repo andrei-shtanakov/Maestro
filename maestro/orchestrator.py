@@ -1406,10 +1406,13 @@ class Orchestrator:
             # are both in hand — but do NOT raise here: `run` still owes this
             # run its recovery pass, and a halt before that would leave a
             # crash-stranded execution unobserved because someone fixed a typo.
+            run_row = await self._db.get_run_row()
+            declared = run_row.get("workstreams_declared") if run_row else None
             self._config_drift = find_config_drift(
                 self._config.workstreams,
                 existing,
                 branch_prefix=self._config.branch_prefix,
+                workstreams_declared=None if declared is None else bool(declared),
             )
             if self._config_drift:
                 self._logger.warning(
@@ -1427,7 +1430,9 @@ class Orchestrator:
                 "Creating %d workstreams from config",
                 len(self._config.workstreams),
             )
-            await self._create_workstreams_from_configs(self._config.workstreams)
+            await self._create_workstreams_from_configs(
+                self._config.workstreams, declared=True
+            )
             return
 
         # Auto-decompose
@@ -1437,12 +1442,17 @@ class Orchestrator:
 
         self._logger.info("Auto-decomposing project")
         configs = self._decomposer.decompose(self._config.description)
-        await self._create_workstreams_from_configs(configs)
+        await self._create_workstreams_from_configs(configs, declared=False)
 
     async def _create_workstreams_from_configs(
-        self, configs: list[WorkstreamConfig]
+        self, configs: list[WorkstreamConfig], *, declared: bool
     ) -> None:
-        """Create Workstream records in DB from configs."""
+        """Create Workstream records in DB from configs.
+
+        ``declared`` distinguishes the two callers — an explicit
+        ``workstreams:`` block versus auto-decomposition — and is persisted for
+        the resume-time drift check (#198).
+        """
         for config in configs:
             workstream = Workstream.from_config(
                 config,
@@ -1452,6 +1462,10 @@ class Orchestrator:
 
         self._stats.total_workstreams = len(configs)
         self._logger.info("Created %d workstreams in database", len(configs))
+        # #198: record HOW they were created. Without it, a resume cannot tell
+        # an auto-decomposed run from one whose `workstreams:` section the
+        # operator deleted — the persisted rows are identical.
+        await self._db.set_run_workstreams_declared(declared=declared)
 
     async def _main_loop(self) -> None:
         """Main orchestration loop."""

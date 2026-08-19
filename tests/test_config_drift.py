@@ -300,3 +300,83 @@ async def test_unchanged_config_leaves_the_real_path_silent(tmp_path: Path) -> N
         assert not orch._config_drift
     finally:
         await db.close()
+
+
+# --- Empty `workstreams:` — the hole Copilot found on #199 ----------------
+
+
+def test_deleted_workstreams_section_is_drift_when_the_run_declared_them() -> None:
+    """The same silence, a different edit shape: the section removed entirely.
+
+    Without provenance this is indistinguishable from an auto-decomposed run,
+    so `find_config_drift` would have returned "no drift" and the resume would
+    have continued quietly — exactly what #198 is about.
+    """
+    persisted = [_persisted(_config("a1")), _persisted(_config("a2"))]
+    drift = find_config_drift([], persisted, PREFIX, workstreams_declared=True)
+    assert drift
+    assert drift.removed_ids == ("a1", "a2")
+    assert not drift.all_refreshable
+
+
+def test_auto_decomposed_run_is_silent_even_with_an_empty_config() -> None:
+    persisted = [_persisted(_config("a1"))]
+    assert not find_config_drift([], persisted, PREFIX, workstreams_declared=False)
+
+
+def test_unknown_provenance_fails_open() -> None:
+    """Runs predating migration 28 answer NULL — treated as auto-decomposed.
+
+    Fail-open is the deliberate choice: halting every legacy auto-decomposed
+    run on resume would be a worse defect than the hole left open for the
+    short life of a per-run state directory.
+    """
+    persisted = [_persisted(_config("a1"))]
+    assert not find_config_drift([], persisted, PREFIX, workstreams_declared=None)
+
+
+@pytest.mark.anyio
+async def test_provenance_is_recorded_and_read_back_through_the_real_path(
+    tmp_path: Path,
+) -> None:
+    """Creation records it; a later resume reads it and reports the removal."""
+    from unittest.mock import MagicMock
+
+    from maestro.database import Database
+    from maestro.models import OrchestratorConfig
+    from maestro.orchestrator import Orchestrator
+
+    def _orch(db: Database, workstreams: list[WorkstreamConfig]) -> Orchestrator:
+        return Orchestrator(
+            db=db,
+            workspace_mgr=MagicMock(),
+            decomposer=MagicMock(),
+            pr_manager=MagicMock(),
+            config=OrchestratorConfig(
+                project="p",
+                repo_url="https://github.com/t/r",
+                repo_path=str(tmp_path / "repo"),
+                workspace_base=str(tmp_path / "ws"),
+                workstreams=workstreams,
+            ),
+        )
+
+    db = Database(tmp_path / "orch.db")
+    await db.connect()
+    try:
+        await db.create_run_row(
+            run_id="01RUN", repo_key="github.com/t/r", started_at="2026-08-19T00:00:00Z"
+        )
+
+        # First orchestrate: workstreams declared in the config.
+        await _orch(db, [_config("a1")])._ensure_workstreams()
+        row = await db.get_run_row()
+        assert row is not None
+        assert row["workstreams_declared"] == 1
+
+        # Resume after the operator deleted the `workstreams:` section.
+        resumed = _orch(db, [])
+        await resumed._ensure_workstreams()
+        assert resumed._config_drift.removed_ids == ("a1",)
+    finally:
+        await db.close()
