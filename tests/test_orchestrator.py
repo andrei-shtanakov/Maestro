@@ -205,6 +205,12 @@ def mock_db() -> MagicMock:
     type(db).is_connected = PropertyMock(return_value=True)
     db.get_all_workstreams = AsyncMock(return_value=[])
     db.get_workstreams_by_status = AsyncMock(return_value=[])
+    # #198 resume-time drift check: provenance read on every resume,
+    # written whenever workstreams are created. `None` here is the
+    # fail-open (pre-migration-28) answer, so these tests keep their
+    # pre-#198 behaviour unless they say otherwise.
+    db.get_run_row = AsyncMock(return_value=None)
+    db.set_run_workstreams_declared = AsyncMock(return_value=None)
     db.create_workstream = AsyncMock()
     db.get_workstream = AsyncMock()
 

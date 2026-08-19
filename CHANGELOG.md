@@ -136,6 +136,50 @@
   sibling, skipped where absent) are separate tests, because a local edit, a
   fabricated pin and a stale pin are different defects.
 
+### Fixed
+- **`--resume` no longer continues silently against an edited config (#198).**
+  A run persists its workstream configuration when it is created and every
+  later tick works from that copy, which is correct — a run must not change
+  the rules under itself mid-flight. What was wrong was the silence: editing
+  `workstreams[].scope` and resuming was indistinguishable from "the edit
+  applied and did not help", and a green `maestro validate` on the edited file
+  actively encouraged that reading. The reported case spent a full
+  fix → resume → identical-refusal cycle before anyone opened `state.db` and
+  saw seven scope entries where the file had eleven.
+  On resume, the persisted workstreams are now compared against the config:
+  every field `Workstream.from_config` sets (`title`, `description`, `scope`,
+  `depends_on`, `priority`, `backend`), the derived `branch` — because editing
+  `branch_prefix` was silently ignored the same way — and the set of ids, since
+  a workstream added to the YAML was also being dropped without a word.
+  Reordering `scope` or `depends_on` is not drift: order means nothing to a
+  glob match or a dependency set, and flagging it would train operators to
+  ignore the check. A run created by auto-decomposition has nothing to compare
+  and is unaffected.
+  Drift is **fail-closed with no override flag**: nothing is dispatched,
+  decomposed or delivered, and the message names the diverged fields, states
+  that the persisted version stays in force, and splits the remedy —
+  `description`/`scope` can be adopted with `maestro workstream-rework
+  --refresh-from` (a rework, so it re-decomposes and respawns the author; it is
+  not a free config update), while everything else means reverting the edit or
+  starting a new run. A bypass flag was considered and rejected: it would turn
+  a fail-closed signal into a permanent detour, which is how the silence would
+  come back.
+  An empty `workstreams:` section is the one shape the persisted rows cannot
+  disambiguate on their own — an auto-decomposed run and a run whose section
+  the operator deleted look identical — so migration 28 records how a run's
+  workstreams were created (`run.workstreams_declared`, nullable). Declared and
+  now absent reports every workstream as removed; auto-decomposed stays silent.
+  Runs created before the migration answer NULL and **fail open**: halting
+  every legacy auto-decomposed run on resume would be a worse defect than the
+  hole, and per-run state directories are short-lived enough that the unknown
+  window closes on its own.
+  The halt runs **after** crash recovery, not before. Drift forbids new
+  dispatch, decomposition and delivery — never the liveness and reconciliation
+  pass over handles that already exist. Raising earlier would have traded one
+  silent failure for another: a typo in `title` would leave a crash-stranded
+  execution unobserved. The run records **no** outcome and stays open, so
+  fixing the config and resuming continues the same run.
+
 ### Added
 - **Conformance pin bumped to `devtools@2533ff7`; the two forks Maestro flagged
   came back decided, and one went against us (#192).** Wiring the shared set in

@@ -656,6 +656,11 @@ class Database:
                 self._migrate_workstream_continuation,
             ),
             (27, "run_table", self._migrate_run_table),
+            (
+                28,
+                "run_workstreams_declared",
+                self._migrate_run_workstreams_declared,
+            ),
         ]
 
         for version, name, fn in ordered:
@@ -1367,6 +1372,27 @@ class Database:
             )
             """
         )
+
+    async def _migrate_run_workstreams_declared(self) -> None:
+        """Migration 28: how this run's workstreams were created (#198).
+
+        One additive, NULLABLE column. Nullable is the whole design: the
+        resume-time drift check must tell "the config declares no workstreams
+        because this run was auto-decomposed" from "the operator deleted the
+        `workstreams:` section", and the persisted rows are identical in both
+        cases. Runs created before this migration cannot answer, and NULL says
+        exactly that rather than guessing — the check then fails OPEN for them,
+        because halting every legacy auto-decomposed run on resume would be a
+        worse defect than the hole it closes. Per-run state directories are
+        short-lived, so the unknown window closes on its own.
+        """
+        assert self._connection is not None
+        cursor = await self._connection.execute("PRAGMA table_info(run)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "workstreams_declared" not in columns:
+            await self._connection.execute(
+                "ALTER TABLE run ADD COLUMN workstreams_declared INTEGER"
+            )
 
     async def _migrate_workstream_rework(self) -> None:
         """Migration 18: operator rework columns + audit tables (#124).
@@ -4704,6 +4730,20 @@ class Database:
         await self._connection.execute(
             "INSERT INTO run (run_id, repo_key, started_at) VALUES (?, ?, ?)",
             (run_id, repo_key, started_at),
+        )
+        await self._connection.commit()
+
+    async def set_run_workstreams_declared(self, *, declared: bool) -> None:
+        """Record whether this run's workstreams came from the config (#198).
+
+        Written once, when the workstreams are created. A no-op when the run
+        row does not exist yet (Mode-2 runs started before the run row was
+        introduced): the drift check reads NULL and fails open, which is the
+        same answer it would reach anyway.
+        """
+        assert self._connection is not None
+        await self._connection.execute(
+            "UPDATE run SET workstreams_declared = ?", (1 if declared else 0,)
         )
         await self._connection.commit()
 
