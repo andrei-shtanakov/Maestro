@@ -863,6 +863,9 @@ ls .github/workflows/
       **противоположное** нашему чтение пустой плоскости, названный здесь тест
       упал на бампе пина ровно как задумано и переписан в
       `test_empty_harness_plane_declares_zero_harnesses`.
+      Постскриптум к (1): интерим снят в PR #200 — `HARNESS_KINDS` удалён,
+      V7 проверяет `kind` против вендоренного `vocabulary.toml`. Текст выше —
+      запись о том, что было сделано тогда, и намеренно не переписан.
 - [x] Заменить рукописные `MODEL_STATUSES`/`HARNESS_KINDS` в `maestro/catalog.py` @owner:github:andrei-shtanakov @blocked_by:todo://devtools/catalog-enum-vocabulary-machine-readable @id:catalog-enum-vocabulary-machine-readable
       чтением машиночитаемого словаря из вендоренного набора. Обе константы —
       интерим-копии enum'ов ADR-ECO-003, который публикует их только прозой

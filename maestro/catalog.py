@@ -82,6 +82,14 @@ class CatalogVocabularyUnavailable(CatalogError):
     """
 
 
+def _enum_values(data: dict[str, object], key: str) -> frozenset[str]:
+    """One enum from the vocabulary document, or TypeError if it is not one."""
+    value = data[key]
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise TypeError(f"{key} must be a list of strings, got {value!r}")
+    return frozenset(value)
+
+
 @lru_cache(maxsize=1)
 def _vocabulary() -> tuple[frozenset[str], frozenset[str]]:
     """(model statuses, harness kinds) from the vendored `vocabulary.toml`."""
@@ -92,9 +100,19 @@ def _vocabulary() -> tuple[frozenset[str], frozenset[str]]:
             .read_text(encoding="utf-8")
         )
         data = tomllib.loads(raw)
-        statuses = frozenset(data["model_status"])
-        kinds = frozenset(data["harness_kind"])
-    except (OSError, ModuleNotFoundError, tomllib.TOMLDecodeError, KeyError) as exc:
+        # Explicit list-of-str check: `model_status = "active"` is valid TOML,
+        # and frozenset() would turn it into a set of CHARACTERS — a corrupt
+        # vocabulary that passes every emptiness check and then rejects every
+        # catalog for reasons no message explains.
+        statuses = _enum_values(data, "model_status")
+        kinds = _enum_values(data, "harness_kind")
+    except (
+        OSError,
+        ModuleNotFoundError,
+        tomllib.TOMLDecodeError,
+        KeyError,
+        TypeError,
+    ) as exc:
         raise CatalogVocabularyUnavailable(
             f"vendored ADR-ECO-003 vocabulary is unreadable: {exc}"
         ) from exc
@@ -279,12 +297,13 @@ def check_catalog_references(catalog: Catalog) -> tuple[list[str], list[str]]:
                 f"V5: {agent_id} — routable enrollment on a non-routable harness"
             )
 
+    known_kinds = harness_kinds()
     for name, harness in catalog.harnesses.items():
-        if harness.kind and harness.kind not in harness_kinds():
+        if harness.kind and harness.kind not in known_kinds:
             warnings.append(
                 f"V7: harnesses.{name}.kind = '{harness.kind}' is outside the "
                 f"ADR-ECO-003 vocabulary "
-                f"({', '.join(sorted(harness_kinds()))}) — if the ADR "
+                f"({', '.join(sorted(known_kinds))}) — if the ADR "
                 f"added the value, re-vendor the conformance set "
                 f"(tests/fixtures/catalog-conformance + "
                 f"maestro/resources/catalog_conformance); do not edit Python"

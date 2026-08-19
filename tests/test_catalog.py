@@ -492,3 +492,35 @@ def test_roundtrip_fixture_exercises_every_vocabulary_value() -> None:
     used_kinds = {h.get("kind", "") for h in data["harnesses"].values()}
     assert used_statuses == set(model_statuses())
     assert used_kinds == set(harness_kinds())
+
+
+def test_scalar_enum_in_the_vocabulary_fails_loud_not_as_characters(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`model_status = "active"` is valid TOML and a corrupt vocabulary.
+
+    frozenset() over a string yields a set of CHARACTERS — non-empty, so it
+    survives every emptiness check, and then rejects every catalog for a reason
+    no message explains. Corruption has to fail as corruption.
+    """
+    from importlib import resources
+
+    broken = tmp_path / "vocabulary.toml"
+    broken.write_text(
+        'version = 1\nmodel_status = "active"\nharness_kind = ["cli"]\n',
+        encoding="utf-8",
+    )
+
+    class _Files:
+        def joinpath(self, _name: str) -> Path:
+            return broken
+
+    monkeypatch.setattr(resources, "files", lambda _pkg: _Files())
+    maestro.catalog._vocabulary.cache_clear()
+    try:
+        with pytest.raises(
+            maestro.catalog.CatalogVocabularyUnavailable, match="list of strings"
+        ):
+            model_statuses()
+    finally:
+        maestro.catalog._vocabulary.cache_clear()
