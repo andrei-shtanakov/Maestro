@@ -136,6 +136,39 @@
   sibling, skipped where absent) are separate tests, because a local edit, a
   fabricated pin and a stale pin are different defects.
 
+### Changed
+- **The ADR-ECO-003 enum vocabularies are now vendored, not declared
+  (devtools#51).** `models.*.status` and `harnesses.*.kind` belong to
+  ADR-ECO-003, which published them only as prose — an inline comment in an
+  example TOML — so all three catalog loaders hand-copied them and could
+  diverge on the vocabulary itself, one storey above the drift the conformance
+  set exists to catch. No fixture would have seen it: `v7-unknown-kind` checks
+  that an unknown kind is flagged, not that three loaders call the same set
+  known. Maestro carried two such copies, and asymmetrically — the status copy
+  hard-rejected an unknown value while the missing kind copy stayed silent.
+  Upstream now ships `vocabulary.toml` inside the pinned conformance set, so
+  both copies are **deleted**: `MODEL_STATUSES`, `HARNESS_KINDS` and the
+  `ModelStatus` Literal are gone, and `model_statuses()`/`harness_kinds()` read
+  the vendored file. An additive upstream bump is adopted by re-vendoring
+  alone — no Python edit names any value any more, which is what makes this a
+  vendored contract rather than a maintained constant.
+  `CatalogModel.status` is consequently a plain `str` with a field validator
+  instead of a `Literal`. Rejection of an unknown status stays where it was, at
+  validation time, and stays an error; what is lost is the static type and the
+  enum in the generated JSON Schema, which is the price of not re-declaring
+  someone else's contract. An unreadable vocabulary is **fail-loud**
+  (`CatalogVocabularyUnavailable`), never a silent empty set — empty would
+  reject every catalog on `status` and, worse, stop flagging every `kind`.
+  The file is shipped **inside the package**
+  (`maestro/resources/catalog_conformance/`) and read through
+  `importlib.resources`: the conformance set lives under `tests/`, which is not
+  in the wheel, so a checkout-relative path would have worked for developers
+  only. A test asserts the shipped copy and the set's copy are byte-identical,
+  so one pin still covers both, and the conformance pin moves to
+  `devtools@070acdc` with the new `vocabulary-roundtrip.toml` case — a valid
+  fixture using every vocabulary value, which goes red for any loader whose
+  known set quietly lost one.
+
 ### Fixed
 - **`--resume` no longer continues silently against an edited config (#198).**
   A run persists its workstream configuration when it is created and every

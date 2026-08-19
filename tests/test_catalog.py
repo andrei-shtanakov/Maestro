@@ -4,11 +4,11 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from structlog.testing import capture_logs
 
+import maestro.catalog
 from maestro.catalog import (
-    HARNESS_KINDS,
-    MODEL_STATUSES,
     Catalog,
     CatalogAgent,
     CatalogError,
@@ -18,7 +18,9 @@ from maestro.catalog import (
     CatalogNotConfigured,
     HarnessModelUnresolved,
     check_catalog_references,
+    harness_kinds,
     load_catalog,
+    model_statuses,
     resolve_catalog_path,
     resolve_model,
     warn_on_model_status,
@@ -320,16 +322,15 @@ def test_unknown_harness_kind_warns_and_names_the_owner_and_the_fix() -> None:
     assert len(warnings) == 1
     assert "V7" in warnings[0] and "container" in warnings[0]
     assert "ADR-ECO-003" in warnings[0]
-    assert "HARNESS_KINDS" in warnings[0]
+    assert "re-vendor" in warnings[0]
 
 
 def test_vendored_vocabularies_cover_the_conformance_sets_valid_fixtures() -> None:
-    """Tripwire on the INTERIM copies of the ADR-ECO-003 enums.
+    """Every value the set's valid fixtures use is in the vendored vocabulary.
 
-    Both vocabularies are hand-copied prose. If the vendored set's valid
-    fixtures ever use a value our copies lack, the copies have drifted from the
-    contract — and the set's own `valid` class (loads with zero warnings) would
-    start failing for a reason that looks like a loader bug.
+    Holds by construction now that both come from the same pinned file — which
+    is the point of the test: it fails if the shipped copy and the conformance
+    set ever stop being the same contract.
     """
     valid_dir = (
         Path(__file__).parent
@@ -344,12 +345,12 @@ def test_vendored_vocabularies_cover_the_conformance_sets_valid_fixtures() -> No
     for fixture in fixtures:
         data = tomllib.loads(fixture.read_text(encoding="utf-8"))
         for name, model in data.get("models", {}).items():
-            assert model.get("status", "active") in MODEL_STATUSES, (
-                f"{fixture.name}: models.{name}.status outside MODEL_STATUSES"
+            assert model.get("status", "active") in model_statuses(), (
+                f"{fixture.name}: models.{name}.status outside the vocabulary"
             )
         for name, harness in data.get("harnesses", {}).items():
-            assert harness.get("kind", "") in HARNESS_KINDS, (
-                f"{fixture.name}: harnesses.{name}.kind outside HARNESS_KINDS"
+            assert harness.get("kind", "") in harness_kinds(), (
+                f"{fixture.name}: harnesses.{name}.kind outside the vocabulary"
             )
 
 
@@ -362,3 +363,132 @@ def test_unarmed_reference_checks_are_announced_on_load(
     events = [e for e in logs if e["event"] == "catalog.reference_checks_not_armed"]
     assert len(events) == 1
     assert events[0]["unarmed"] == ["V1", "V5"]
+
+
+# --- The vocabulary is vendored, not declared (devtools#51) ---------------
+
+
+def test_no_hand_written_vocabulary_remains_in_the_module() -> None:
+    """The point of the change is DELETION, not a pinned constant.
+
+    A copy that survives is a copy someone edits by hand on the next additive
+    bump, which is exactly the maintenance this contract removes.
+    """
+    import maestro.catalog as catalog_module
+
+    for name in ("MODEL_STATUSES", "HARNESS_KINDS", "ModelStatus"):
+        assert not hasattr(catalog_module, name), (
+            f"{name} is back — the vocabulary must come from the vendored file"
+        )
+    source = Path(catalog_module.__file__).read_text(encoding="utf-8")
+    for value in ("api-baseline",):
+        assert value not in source, f"vocabulary value {value!r} hard-coded again"
+
+
+def test_shipped_vocabulary_matches_the_conformance_sets_copy() -> None:
+    """Runtime reads the package copy; the pin covers the conformance set.
+
+    Byte-identity is what makes one pin cover both — `tests/fixtures/` is not
+    in the wheel, so runtime cannot read the set itself.
+    """
+    shipped = (
+        Path(maestro.catalog.__file__).parent
+        / "resources"
+        / "catalog_conformance"
+        / "vocabulary.toml"
+    )
+    vendored = (
+        Path(__file__).parent
+        / "fixtures"
+        / "catalog-conformance"
+        / "v1"
+        / "vocabulary.toml"
+    )
+    assert shipped.read_bytes() == vendored.read_bytes()
+
+
+def test_vocabulary_is_read_from_package_data_not_a_checkout_path() -> None:
+    """importlib.resources, so an installed wheel resolves it too."""
+    from importlib import resources
+
+    handle = resources.files("maestro.resources.catalog_conformance").joinpath(
+        "vocabulary.toml"
+    )
+    assert handle.is_file()
+    assert "harness_kind" in handle.read_text(encoding="utf-8")
+
+
+def test_an_additive_bump_needs_no_python_edit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A value added upstream is accepted by re-vendoring alone.
+
+    This is the property that makes the vocabulary a vendored contract rather
+    than a maintained constant: no `if` in Python names any value.
+    """
+    from importlib import resources
+
+    newer = tmp_path / "vocabulary.toml"
+    newer.write_text(
+        "version = 1\n"
+        'model_status = ["active", "deprecated", "retired", "preview"]\n'
+        'harness_kind = ["cli", "api-baseline", "local", "container"]\n',
+        encoding="utf-8",
+    )
+
+    class _Files:
+        def joinpath(self, _name: str) -> Path:
+            return newer
+
+    monkeypatch.setattr(resources, "files", lambda _pkg: _Files())
+    maestro.catalog._vocabulary.cache_clear()
+    try:
+        assert "preview" in model_statuses()
+        assert "container" in harness_kinds()
+        # And the loader honours it: a status that was invalid a moment ago now
+        # validates, with no code change of any kind.
+        assert CatalogModel(vendor="acme", status="preview").status == "preview"
+    finally:
+        maestro.catalog._vocabulary.cache_clear()
+
+
+def test_unreadable_vocabulary_fails_loud_not_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty set would reject every catalog AND stop flagging every kind."""
+    from importlib import resources
+
+    def _boom(_pkg: str) -> object:
+        raise ModuleNotFoundError("package data missing")
+
+    monkeypatch.setattr(resources, "files", _boom)
+    maestro.catalog._vocabulary.cache_clear()
+    try:
+        with pytest.raises(maestro.catalog.CatalogVocabularyUnavailable):
+            model_statuses()
+    finally:
+        maestro.catalog._vocabulary.cache_clear()
+
+
+def test_unknown_status_is_still_rejected_at_validation_time() -> None:
+    """Dropping the Literal moved the source of truth, not the strictness."""
+    with pytest.raises(ValidationError, match="unknown model status"):
+        CatalogModel(vendor="acme", status="preview")
+
+
+def test_roundtrip_fixture_exercises_every_vocabulary_value() -> None:
+    """The set's own guard against a loader whose known-set lost a value."""
+    fixture = (
+        Path(__file__).parent
+        / "fixtures"
+        / "catalog-conformance"
+        / "v1"
+        / "fixtures"
+        / "valid"
+        / "vocabulary-roundtrip.toml"
+    )
+    data = tomllib.loads(fixture.read_text(encoding="utf-8"))
+    used_statuses = {m.get("status", "active") for m in data["models"].values()}
+    used_kinds = {h.get("kind", "") for h in data["harnesses"].values()}
+    assert used_statuses == set(model_statuses())
+    assert used_kinds == set(harness_kinds())

@@ -18,10 +18,11 @@ from __future__ import annotations
 import difflib
 import os
 import tomllib
+from functools import lru_cache
+from importlib import resources
 from pathlib import Path
-from typing import Literal, get_args
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, field_validator
 
 from maestro._vendor import obs
 
@@ -49,38 +50,95 @@ class HarnessModelUnresolved(RuntimeError):
     """No routable model, or >1, for this harness. Per-task; NOT a CatalogError."""
 
 
-# --- ADR-ECO-003 enum vocabularies (INTERIM vendored copies) ---------------
+# --- ADR-ECO-003 enum vocabularies, read from the vendored contract --------
 #
-# Both live here, together, on purpose: they belong to the SAME upstream
-# document and neither is Maestro's to define. ADR-ECO-003 publishes them only
-# as prose — an inline comment in its example TOML, mirrored in the conformance
-# set's README — so every consumer hand-copies them and consumers can now drift
-# on the vocabulary itself, one storey above the drift the conformance set was
-# built to catch. A machine-readable vocabulary derived from the ADR is
-# requested from the set's owner; these constants are the INTERIM stand-in and
-# should be deleted when it lands — devtools#51,
-# @id:catalog-enum-vocabulary-machine-readable.
+# Not declared here. ADR-ECO-003 owns `models.*.status` and `harnesses.*.kind`,
+# and until devtools#51 shipped `vocabulary.toml` the only published form was
+# prose — an inline comment in the ADR's example TOML — so all three loaders
+# hand-copied it and could diverge on the vocabulary itself, one storey above
+# the drift the conformance set exists to catch. Maestro carried two such
+# copies, asymmetrically: the status copy hard-rejected an unknown value while
+# the absent kind copy stayed silent.
 #
-# Kept adjacent so the pair cannot drift apart: a status vocabulary in a
-# pydantic Literal and a kind vocabulary in a loose constant, declared in two
-# different places, is the setup for the next invisible divergence.
-# tests/test_catalog.py pins both against the vendored set's valid fixtures.
+# The file is read from inside the package, not from the conformance set under
+# tests/: that directory is absent from the wheel, so a checkout-relative path
+# would work for developers only. The two copies are asserted byte-identical
+# (tests/test_catalog_conformance.py), which keeps one pin covering both.
 #
-# The asymmetry in enforcement is deliberate, not an oversight: an unknown
-# status is a hard schema reject (it decides whether an enrollment is legal),
-# an unknown kind is a warning (V7 class "flag" — Maestro never launches from
-# Plane 2, so an unfamiliar kind costs nothing until someone routes to it).
-ModelStatus = Literal["active", "deprecated", "retired"]
-MODEL_STATUSES: frozenset[str] = frozenset(get_args(ModelStatus))
-HARNESS_KINDS: frozenset[str] = frozenset({"cli", "api-baseline", "local"})
+# An additive upstream bump is therefore adopted by re-vendoring alone — no
+# Python edit, which is the property that makes this a vendored contract rather
+# than a maintained constant.
+
+_VOCABULARY_RESOURCE = "vocabulary.toml"
+
+
+class CatalogVocabularyUnavailable(CatalogError):
+    """The shipped vocabulary is missing or unreadable.
+
+    Fail-loud rather than degrading to an empty set: an empty vocabulary would
+    reject every catalog on `status`, and — worse — silently stop flagging any
+    `kind` at all, which is the exact silence this vocabulary was shipped to
+    end.
+    """
+
+
+@lru_cache(maxsize=1)
+def _vocabulary() -> tuple[frozenset[str], frozenset[str]]:
+    """(model statuses, harness kinds) from the vendored `vocabulary.toml`."""
+    try:
+        raw = (
+            resources.files("maestro.resources.catalog_conformance")
+            .joinpath(_VOCABULARY_RESOURCE)
+            .read_text(encoding="utf-8")
+        )
+        data = tomllib.loads(raw)
+        statuses = frozenset(data["model_status"])
+        kinds = frozenset(data["harness_kind"])
+    except (OSError, ModuleNotFoundError, tomllib.TOMLDecodeError, KeyError) as exc:
+        raise CatalogVocabularyUnavailable(
+            f"vendored ADR-ECO-003 vocabulary is unreadable: {exc}"
+        ) from exc
+    if not statuses or not kinds:
+        raise CatalogVocabularyUnavailable(
+            "vendored ADR-ECO-003 vocabulary declares an empty enum"
+        )
+    return statuses, kinds
+
+
+def model_statuses() -> frozenset[str]:
+    """Legal `models.*.status` values, per the vendored contract."""
+    return _vocabulary()[0]
+
+
+def harness_kinds() -> frozenset[str]:
+    """Legal `harnesses.*.kind` values, per the vendored contract."""
+    return _vocabulary()[1]
 
 
 class CatalogModel(BaseModel):
-    """Plane 1 model entry."""
+    """Plane 1 model entry.
+
+    `status` is a plain string validated against the vendored vocabulary rather
+    than a Literal: the values are ADR-ECO-003's, so hard-coding them here is
+    the hand-copy this module stopped keeping. Rejection stays at validation
+    time and stays an error — only the source of truth moved.
+    """
 
     vendor: str
-    status: ModelStatus = "active"
+    status: str = "active"
     aliases: list[str] = []
+
+    @field_validator("status")
+    @classmethod
+    def _known_status(cls, v: str) -> str:
+        known = model_statuses()
+        if v not in known:
+            raise ValueError(
+                f"unknown model status {v!r}; ADR-ECO-003 declares "
+                f"{', '.join(sorted(known))}. If the ADR added the value, "
+                "re-vendor the conformance set — do not edit Python."
+            )
+        return v
 
 
 class CatalogAgent(BaseModel):
@@ -97,7 +155,8 @@ class CatalogHarness(BaseModel):
     harnesses from its own spawner registry, never from this plane.
 
     ``kind`` stays a free string at the schema level and is checked at load
-    time instead, as a V7 warning against HARNESS_KINDS. The split is the point:
+    time instead, as a V7 warning against the vendored `harness_kind` set.
+    The split is the point:
     an unknown ``kind`` must be *flagged*, not rejected, because Maestro never
     launches from Plane 2 — an unfamiliar kind is information, not an
     obstruction. Upstream shipped ``warn/v7-unknown-kind.toml`` (devtools#47) to
@@ -221,12 +280,14 @@ def check_catalog_references(catalog: Catalog) -> tuple[list[str], list[str]]:
             )
 
     for name, harness in catalog.harnesses.items():
-        if harness.kind and harness.kind not in HARNESS_KINDS:
+        if harness.kind and harness.kind not in harness_kinds():
             warnings.append(
                 f"V7: harnesses.{name}.kind = '{harness.kind}' is outside the "
                 f"ADR-ECO-003 vocabulary "
-                f"({', '.join(sorted(HARNESS_KINDS))}) — if the ADR added the "
-                f"value, refresh HARNESS_KINDS in maestro/catalog.py"
+                f"({', '.join(sorted(harness_kinds()))}) — if the ADR "
+                f"added the value, re-vendor the conformance set "
+                f"(tests/fixtures/catalog-conformance + "
+                f"maestro/resources/catalog_conformance); do not edit Python"
             )
 
     return errors, warnings

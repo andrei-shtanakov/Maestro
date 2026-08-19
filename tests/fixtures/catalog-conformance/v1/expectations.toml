@@ -20,6 +20,10 @@ file   = "fixtures/valid/retired-unreferenced.toml"
 expect = "valid"
 
 [[case]]
+file   = "fixtures/valid/vocabulary-roundtrip.toml"
+expect = "valid"
+
+[[case]]
 file   = "fixtures/invalid/broken.toml"
 expect = "parse-error"
 

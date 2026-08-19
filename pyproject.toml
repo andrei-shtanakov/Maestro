@@ -75,6 +75,10 @@ include = ["maestro*"]
 # catalog from inside the package — the sibling checkout it came from does not
 # exist for anyone who installed Maestro.
 "maestro.resources.gate_catalog" = ["upstream/**/*.yaml", "upstream/**/*.md"]
+# Vendored ADR-ECO-003 enum vocabulary (devtools#51): shipped for the same
+# reason — the conformance set it is copied from lives under tests/ and is
+# not in the wheel, so runtime could not read it.
+"maestro.resources.catalog_conformance" = ["*.toml"]
 "maestro.execution.resources" = ["*.py"]
 
 [tool.pyrefly]
