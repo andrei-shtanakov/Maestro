@@ -116,7 +116,7 @@ def test_vendored_copy_matches_upstream_manifest() -> None:
 
 def test_pin_file_records_the_vendored_source() -> None:
     pin = (CONTRACT_DIR / "PIN").read_text(encoding="utf-8")
-    assert "devtools@2533ff7b8c3afd74110b3838325bf76ba46ba186" in pin
+    assert "devtools@070acdc775ca0cb504766de9329d342649fcb26f" in pin
     assert "contracts/catalog-conformance-fixtures/v1" in pin
 
 

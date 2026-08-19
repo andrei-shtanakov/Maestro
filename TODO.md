@@ -863,7 +863,10 @@ ls .github/workflows/
       **противоположное** нашему чтение пустой плоскости, названный здесь тест
       упал на бампе пина ровно как задумано и переписан в
       `test_empty_harness_plane_declares_zero_harnesses`.
-- [ ] Заменить рукописные `MODEL_STATUSES`/`HARNESS_KINDS` в `maestro/catalog.py` @owner:github:andrei-shtanakov @blocked_by:todo://devtools/catalog-enum-vocabulary-machine-readable @id:catalog-enum-vocabulary-machine-readable
+      Постскриптум к (1): интерим снят в PR #200 — `HARNESS_KINDS` удалён,
+      V7 проверяет `kind` против вендоренного `vocabulary.toml`. Текст выше —
+      запись о том, что было сделано тогда, и намеренно не переписан.
+- [x] Заменить рукописные `MODEL_STATUSES`/`HARNESS_KINDS` в `maestro/catalog.py` @owner:github:andrei-shtanakov @blocked_by:todo://devtools/catalog-enum-vocabulary-machine-readable @id:catalog-enum-vocabulary-machine-readable
       чтением машиночитаемого словаря из вендоренного набора. Обе константы —
       интерим-копии enum'ов ADR-ECO-003, который публикует их только прозой
       (инлайн-комментарий в примере TOML + README набора), поэтому три
@@ -873,6 +876,14 @@ ls .github/workflows/
       что три загрузчика считают знакомым одно множество. Запрошено
       devtools#51; блокер настоящий (пока словаря нет, заменять нечем).
       Признак: константы удалены, а не поддерживаются.
+      Закрыт (closed by feat/catalog-vocabulary-vendored): devtools выпустили
+      `vocabulary.toml` (PR #54), пин набора поднят на `070acdc`. Обе копии
+      УДАЛЕНЫ, включая `Literal` в `CatalogModel.status` — иначе рукописный
+      список остался бы один и его правили бы руками на аддитивном бампе.
+      Словарь шипается в пакете (`maestro/resources/catalog_conformance/`,
+      проверено сборкой wheel), потому что набор лежит под `tests/`, которых в
+      wheel нет; байт-идентичность двух копий проверяется тестом, так что пин
+      по-прежнему один.
 - [ ] Extract the loader to a shared PyPI lib with a cross-reader behavioral @owner:github:andrei-shtanakov @id:catalog-loader-shared-lib
       conformance test (precedence + alias resolution across Maestro / ATP / arbiter).
 - [ ] `maestro models`: detect the same observed model id under TWO vendors in @owner:github:andrei-shtanakov @id:models-duplicate-vendor-detection

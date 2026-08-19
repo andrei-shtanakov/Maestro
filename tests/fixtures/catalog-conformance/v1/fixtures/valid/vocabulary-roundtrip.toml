@@ -1,0 +1,40 @@
+# Valid: uses EVERY vocabulary.toml value — all three model statuses and
+# all three harness kinds — and must load warning-free. A loader whose
+# known-set silently LOST a value (e.g. dropped "api-baseline") flags it
+# here and goes red on a "valid" case; a loader that accepts EXTRA values
+# is caught by the v7-* cases instead. Together they make the vocabulary
+# observable as an exact set (devtools#51). The deprecated and retired
+# models stay unreferenced so no V3/V6 fires.
+
+[models."alpha-1"]
+vendor = "acme"
+status = "active"
+
+[models."alpha-0"]
+vendor = "acme"
+status = "retired"
+
+[models."beta-0"]
+vendor = "bmesh"
+status = "deprecated"
+
+[harnesses.alpha_cli]
+kind      = "cli"
+model_env = "ALPHA_MODEL"
+routable  = true
+
+[harnesses.beta_api]
+kind      = "api-baseline"
+model_env = "BETA_MODEL"
+routable  = false
+
+[harnesses.gamma_local]
+kind      = "local"
+model_env = "GAMMA_MODEL"
+routable  = false
+
+[[agents]]
+harness  = "alpha_cli"
+model    = "alpha-1"
+tested   = true
+routable = true

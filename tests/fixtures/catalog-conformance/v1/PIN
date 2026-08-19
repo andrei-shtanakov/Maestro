@@ -1,7 +1,7 @@
-source: devtools@2533ff7b8c3afd74110b3838325bf76ba46ba186 contracts/catalog-conformance-fixtures/v1
+source: devtools@070acdc775ca0cb504766de9329d342649fcb26f contracts/catalog-conformance-fixtures/v1
 vendored: 2026-08-18
-accepted-as: maestro#192 (slug catalog-conformance-pin-bump-v1-gaps), from devtools#catalog-conformance-v1-gaps
-previous-pin: devtools@2a5c1543643ac11da20f911c14c35b049e48eae8 (maestro#188 / PR #189)
+accepted-as: maestro @id:catalog-enum-vocabulary-machine-readable (from devtools#51)
+previous-pin: devtools@2533ff7b8c3afd74110b3838325bf76ba46ba186 (maestro#192 / PR #193)
 
 Pinned copy of the SSOT catalog conformance fixture set (ADR-ECO-003 /
 ADR-ECO-003b, owner: devtools). Do NOT edit any file under v1/ by hand: this
@@ -11,3 +11,7 @@ bump the `source:` line above, and let tests/test_catalog_conformance.py
 verify the copy against manifest.json.
 
 Integrity surface: every file in v1/ except manifest.json and this PIN file.
+
+`vocabulary.toml` has a SECOND home: maestro/resources/catalog_conformance/.
+Runtime reads that one, because this directory is not in the wheel. Re-vendor
+BOTH — a test asserts they are byte-identical, so one pin covers both.
