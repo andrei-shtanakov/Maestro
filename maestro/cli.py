@@ -52,6 +52,7 @@ from maestro.benchmark import (
 from maestro.benchmark.models import BenchmarkResult
 from maestro.catalog_cli import models_app
 from maestro.config import load_orchestrator_config
+from maestro.config_drift import render_config_drift
 from maestro.coordination.arbiter_client import ArbiterClient, ArbiterClientConfig
 from maestro.coordination.routing import RoutingStrategy, make_routing_strategy
 from maestro.dag import DAG
@@ -65,7 +66,7 @@ from maestro.event_log import create_event_logger
 from maestro.git import GitManager
 from maestro.logging_bridge import setup_logging
 from maestro.models import ArbiterMode, OrchestratorConfig, TaskStatus, WorkstreamStatus
-from maestro.orchestrator import Orchestrator
+from maestro.orchestrator import ConfigDriftDetected, Orchestrator
 from maestro.pr_manager import PRManager
 from maestro.preflight import (
     ValidationIssue,
@@ -1855,6 +1856,19 @@ async def _run_orchestrator(
         if stats.failed > 0:
             raise typer.Exit(1)
 
+    except ConfigDriftDetected as exc:
+        # #198: a refusal to proceed, not a run failure. Deliberately records
+        # NO outcome — the run stays open and resumable, which is the whole
+        # point: reconcile the config and resume the same run.
+        console.print()
+        console.print(
+            Panel(
+                escape(render_config_drift(exc.drift, str(config_path))),
+                title="[red]Config drift — run not advanced[/red]",
+                border_style="red",
+            )
+        )
+        raise typer.Exit(1) from exc
     except (KeyboardInterrupt, asyncio.CancelledError):
         # Operator cancellation is a run outcome, not an interruption: the
         # person who stopped it knows it is over, and `cancelled` is what
