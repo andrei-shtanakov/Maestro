@@ -56,6 +56,7 @@ COMPARED_FIELDS = (
     "priority",
     "backend",
     "branch",
+    "max_retries",
 )
 
 #: Order carries no meaning for either: scope globs are asked "does any match"

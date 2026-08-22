@@ -1150,6 +1150,17 @@ class WorkstreamConfig(BaseModel):
         default=None,
         description=("Execution backend name (local|docker); None -> default_backend"),
     )
+    max_retries: int = Field(
+        default=2,
+        ge=0,
+        le=10,
+        description=(
+            "Automatic workstream retries (0 disables them). Distinct from "
+            "`spec_runner.max_retries`, which retries a task INSIDE one "
+            "spec-runner run; each retry here pays a full re-decomposition "
+            "and regenerates the spec."
+        ),
+    )
 
     @field_validator("id")
     @classmethod
@@ -1354,6 +1365,7 @@ class Workstream(BaseModel):
             depends_on=config.depends_on,
             priority=config.priority,
             backend=config.backend,
+            max_retries=config.max_retries,
         )
 
 

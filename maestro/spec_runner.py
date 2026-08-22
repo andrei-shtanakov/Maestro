@@ -149,6 +149,28 @@ def read_executor_state(spec_dir: Path, prefix: str = "") -> ExecutorState | Non
     return None
 
 
+def read_executor_state_db(path: Path) -> ExecutorState | None:
+    """Read one SQLite executor-state file by path, or None if unreadable.
+
+    `read_executor_state` locates the file inside a live worktree's `spec/`.
+    The post-mortem archive holds the same database under a different name
+    (`postmortem.STATE_FILENAME`), so the archive reader needs the path form —
+    and needs it *here*, because the point of this module is that spec-runner's
+    on-disk format is known in exactly one place.
+
+    None on any read failure, which callers must not confuse with "the file
+    said nothing": `classify_blocked` takes that distinction as an argument.
+    """
+    if not path.is_file():
+        logger.warning("no executor state db at %s", path)
+        return None
+    try:
+        return _read_state_from_sqlite(path)
+    except (sqlite3.DatabaseError, sqlite3.OperationalError, OSError) as exc:
+        logger.warning("failed to read executor state %s: %s", path, exc)
+        return None
+
+
 def _read_state_from_json(path: Path) -> ExecutorState:
     """Parse the legacy JSON executor state file into an `ExecutorState`."""
     raw = json.loads(path.read_text(encoding="utf-8"))

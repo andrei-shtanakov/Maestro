@@ -8,10 +8,16 @@ The classification keys off spec-runner's typed `stop_reason` and nothing
 else: never `stop_detail` substrings, never how fast the run failed. A fast
 failure is just as likely to be an infrastructure hiccup, and turning that
 into NEEDS_REVIEW would trade one bad behaviour for another.
+
+The second axis (#209) reads the same run's persisted `TASK_BLOCKED` error
+code, and is three-valued on purpose — see `TestBlockedVerdictFailsClosed`.
 """
 
+from maestro.models import ExecutorState
 from maestro.retry_policy import (
     NON_RETRYABLE_STOP_REASONS,
+    BlockedVerdict,
+    classify_blocked,
     describe_retry_decision,
     retry_is_unproductive,
 )
@@ -106,3 +112,35 @@ class TestDescription:
         message = describe_retry_decision(None)
 
         assert "none recorded" in message
+
+
+class TestBlockedVerdictFailsClosed:
+    """The three-valued answer, and which two of the three stop a retry.
+
+    A tripwire on the decision itself: collapsing `unreadable` into
+    `not_blocked` would leave a check that is green exactly when it read
+    nothing, which is the defect #209 was reported against in another guise.
+    """
+
+    def test_blocked_stops_the_retry(self) -> None:
+        assert BlockedVerdict("blocked", "d").retry_is_unproductive is True
+
+    def test_unreadable_stops_the_retry(self) -> None:
+        assert BlockedVerdict("unreadable", "d").retry_is_unproductive is True
+
+    def test_not_blocked_keeps_the_retry(self) -> None:
+        assert BlockedVerdict("not_blocked", "d").retry_is_unproductive is False
+
+    def test_missing_state_db_is_a_fact_not_a_silence(self) -> None:
+        """#164 keeps this case retryable on purpose, and the inference is
+        sound: attempts are written to that database."""
+        verdict = classify_blocked(None, state_missing=True)
+        assert verdict.reason == "not_blocked"
+
+    def test_unparseable_state_is_a_silence(self) -> None:
+        assert classify_blocked(None, state_missing=False).reason == "unreadable"
+
+    def test_a_run_with_no_tasks_read_something(self) -> None:
+        """No task ran, so no agent refused — an inference, not a silence."""
+        verdict = classify_blocked(ExecutorState(tasks={}), state_missing=False)
+        assert verdict.reason == "not_blocked"
