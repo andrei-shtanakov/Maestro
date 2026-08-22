@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Added
+- **Weekly upstream-drift watch over ATP's score contract**
+  (`.github/workflows/atp-score-contract-drift.yml`). A vendored contract needs
+  two guarantees, and only one of them was real here: copy-integrity (our bytes
+  match our `PIN`) is a unit test, but upstream-drift was checked by comparing
+  against the **pinned commit** in a sibling checkout — so the producer could
+  move arbitrarily far and the test stayed green, and with no sibling checkout it
+  skipped entirely. ATP now publishes a digest sidecar for exactly this, so the
+  check is "download one file and compare". Weekly rather than per-PR: our pull
+  requests cannot move their contract, so per-PR frequency would only buy a red
+  build whenever GitHub is briefly unreachable. A sidecar that cannot be read
+  fails the run (exit 2) rather than passing — an unreachable producer is an
+  unknown, not agreement. Exit 2 also covers a sidecar that arrives but cannot
+  be interpreted (wrong document, schema change, a digest that is not a digest):
+  both outcomes are red, but drift asks you to re-vendor the current bytes while
+  this one means nothing was compared, and conflating them sends an operator to
+  re-vendor bytes nobody looked at.
+
 ### Changed
 - **BREAKING (wire): `report_benchmark` now sends `score` as a FRACTION in
   [0,1], not a percent.** ATP reports the benchmark-plane score as a percent
