@@ -273,7 +273,6 @@ def test_mixed_task_scores_caveat_is_carried() -> None:
     assert any(c.startswith("mixed_task_scores") for c in finalized.semantics.caveats)
 
 
-
 # ---------------------------------------------------------------------------
 # Numeric narrowing at the arbiter edge
 # ---------------------------------------------------------------------------
@@ -335,8 +334,6 @@ def _result_from(finalized: Any, **overrides: Any) -> BenchmarkResult:
         duration_seconds=1.0,
         **overrides,
     )
-
-
 
 
 def test_legacy_unknown_is_withheld() -> None:
