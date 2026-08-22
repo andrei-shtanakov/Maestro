@@ -136,7 +136,7 @@
 
 ### Score contract v1 (ATP → maestro), закрыт 2026-08-22
 
-- [x] **score-breakdown-consumer-contract**: потребительская сторона ATP score contract v1 @owner:github:andrei-shtanakov @id:score-breakdown-consumer-contract
+- [x] **score-breakdown-consumer-contract**: потребительская сторона ATP score contract v1 (PR #202, merge `46de3f5`) @owner:github:andrei-shtanakov @id:score-breakdown-consumer-contract
   - `finalize()` возвращает `FinalizedScore` (score + components + semantics), а не кортеж;
     `BenchmarkResult.semantics` **обязателен**, с сентинелом `unknown` для продюсеров
     до контракта. Malformed-блок — contract error, не legacy: иначе испорченный новый
