@@ -149,16 +149,16 @@
   - Copy-integrity держится тестом; это вторая гарантия — «апстрим уехал». Тест
     сверяется с соседним чекаутом, когда он есть, и **скипается**, когда его нет,
     поэтому у установленного пользователя гарантию несёт этот пункт.
-  - Прецедент: handoff-дока ATP разъехалась с собственными фикстурами за один коммит,
+  - Прецедент (заведено atp-platform#298): handoff-дока ATP разъехалась с собственными фикстурами за один коммит,
     и 2 пина из 3 в ней были неверны — прозаический пин не гарантия.
 - [ ] **benchmark-score-semantics-on-the-wire**: провести `score_semantics` до arbiter @owner:github:andrei-shtanakov @blocked_by:todo://arbiter/benchmark-score-semantics @id:benchmark-score-semantics-on-the-wire
-  - Пока семантики нет на проводе, любой не-качественный прогон приходится **удерживать**,
+  - Заведено: arbiter#82. Пока семантики нет на проводе, любой не-качественный прогон приходится **удерживать**,
     а не помечать. Схема `report_benchmark-v1` уже допускает лишний ключ верхнего уровня
     (`Request.additionalProperties: true`) — держат наш `extra="forbid"` и то, что arbiter
     поле не читает. Как только он его читает и учитывает — гейт можно смягчить с
     «не отправлять» до «отправлять с меткой».
 - [ ] **benchmark-score-unit-mismatch**: у `score` в `report_benchmark-v1` два продюсера с разными единицами @owner:github:andrei-shtanakov @blocked_by:todo://arbiter/benchmark-score-unit-mismatch @id:benchmark-score-unit-mismatch
-  - atp-platform кладёт долю `[0..1]` (`benchmark_reporter.py`, `pass_rate`), maestro —
+  - Заведено: arbiter#81. atp-platform кладёт долю `[0..1]` (`benchmark_reporter.py`, `pass_rate`), maestro —
     процент `[0..100]` (ATP `total_score`, `unit: percent`). Потребитель делает
     `.clamp(0.0, 1.0)` (`arbiter-mcp/src/db.rs`), поэтому наш прогон с >1% завершённых
     задач приезжает в ре-ранк ровно как `1.0`. Схема этого не ловит: `{"type": "number"}`
