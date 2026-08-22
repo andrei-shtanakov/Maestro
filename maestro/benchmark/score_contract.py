@@ -203,7 +203,11 @@ def publication_decision(result: BenchmarkResult) -> PublicationDecision:
     """
     semantics = result.semantics
 
-    if semantics.kind == UNKNOWN_KIND:
+    # One predicate for "there is no block to send", not two. `kind` and an
+    # empty `raw` say the same thing, and letting them disagree would turn a
+    # decision the gate should make into a `_build_wire_payload` exception —
+    # i.e. a run that ought to be `withheld` reported as `failed`.
+    if semantics.kind == UNKNOWN_KIND or not semantics.raw:
         return PublicationDecision(allowed=False, reason="semantics_unknown")
 
     if not result.score_finalized:

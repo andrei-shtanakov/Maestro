@@ -679,3 +679,23 @@ def test_wire_payload_refuses_to_ship_without_a_semantics_block() -> None:
 
     with pytest.raises(ValueError, match="semantics"):
         _build_wire_payload(blind, max_per_task=200)
+
+
+def test_gate_and_wire_guard_agree_on_having_no_block() -> None:
+    """The gate decides; the guard must never be the thing that decides.
+
+    A hand-built `ScoreSemantics` with a named kind but an empty `raw` is
+    unreachable from `parse_finalized_score` — but if the two predicates
+    disagreed, such a result would pass the gate and then raise inside
+    `_build_wire_payload`, surfacing as `report_status="failed"` instead of an
+    honest `withheld`. (Found by review on PR #205.)
+    """
+    blind = ScoreSemantics(kind="completion_rate", quality_signal=False, raw={})
+    result = _result_from(
+        parse_finalized_score(_load("run_status_evaluated.json"))
+    ).model_copy(update={"semantics": blind})
+
+    decision = publication_decision(result)
+
+    assert decision.allowed is False
+    assert decision.reason == "semantics_unknown"
