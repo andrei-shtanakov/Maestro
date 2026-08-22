@@ -153,11 +153,14 @@ class ReportBenchmarkPayload(BaseModel):
     drifting apart silently.
 
     Declaring a field is not the same as bumping ``payload_version``, and the
-    two must not be conflated. An **additive optional** field (``score_semantics``
-    is the worked example) keeps the version: the schema already allows unknown
-    top-level keys (``Request.additionalProperties: true``), and arbiter
-    *rejects* an unrecognised ``payload_version``, so a bump would force both
-    sides to move in lockstep and break every unmatched pair in the meantime.
+    two must not be conflated. A field that is **optional in the shared
+    contract** keeps the version, even when this producer always sends it:
+    ``score_semantics`` is optional for arbiter (an absent block means a legacy
+    producer) and required here, because a maestro report with no block is one
+    the gate should have withheld. The schema already allows unknown top-level
+    keys (``Request.additionalProperties: true``), and arbiter *rejects* an
+    unrecognised ``payload_version``, so a bump would force both sides to move
+    in lockstep and break every unmatched pair in the meantime.
     A **breaking** change — a removed field, a narrowed type, a changed unit —
     is what requires the bump plus a contract-test update on both sides.
     """
