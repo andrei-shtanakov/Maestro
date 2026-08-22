@@ -83,8 +83,16 @@ def parse_finalized_score(status: Mapping[str, Any]) -> FinalizedScore:
     An absent block is legacy, not an error.
     """
     total = status.get("total_score")
-    finalized = total is not None
-    score = float(total) if finalized else 0.0
+    if total is None:
+        # `null_until_finalized`, stated on the wire as a caveat.
+        finalized, score = False, 0.0
+    elif isinstance(total, bool) or not isinstance(total, (int, float)):
+        # A non-numeric score is a broken producer, not an unfinalized run:
+        # coercing it would invent a number, and letting `float()` raise would
+        # surface as a bare ValueError that no caller is watching for.
+        raise ScoreContractError(f"total_score must be a number or null, got {total!r}")
+    else:
+        finalized, score = True, float(total)
 
     raw_semantics = status.get("score_semantics")
     if raw_semantics is None:

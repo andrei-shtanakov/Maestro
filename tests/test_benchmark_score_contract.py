@@ -551,3 +551,15 @@ def test_human_summary_stays_quiet_on_a_real_quality_score() -> None:
 
     assert "not quality" not in out
     assert "not reported to arbiter" not in out
+
+
+@pytest.mark.parametrize(
+    "total", [pytest.param("66.7", id="string"), pytest.param(True, id="bool")]
+)
+def test_non_numeric_total_score_is_a_contract_error(total: Any) -> None:
+    """A broken producer is not an unfinalized run, and must not become one."""
+    payload = _load("run_status_evaluated.json")
+    payload["total_score"] = total
+
+    with pytest.raises(ScoreContractError):
+        parse_finalized_score(payload)
