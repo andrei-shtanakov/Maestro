@@ -115,7 +115,7 @@ def _build_result(run_id: str, per_task_n: int = 2) -> BenchmarkResult:
         run_id=run_id,
         benchmark_id="e2e-bench",
         agent_id="claude_code",
-        score=0.75,
+        score=75.0,  # ATP percent; the wire projection divides by 100
         score_components={"accuracy": 0.75},
         semantics=evaluated_semantics(),
         per_task=tasks,
@@ -168,6 +168,7 @@ async def test_report_benchmark_created_end_to_end(
     benchmark_id, agent_id, score, per_task_total_count, per_task_truncated = row
     assert benchmark_id == "e2e-bench"
     assert agent_id == "claude_code"
+    # 75.0 percent in the domain -> 0.75 fraction on the wire and in their row.
     assert abs(score - 0.75) < 1e-6, f"expected score≈0.75, got {score}"
     assert per_task_total_count == 2
     assert per_task_truncated == 0  # 2 tasks well below cap

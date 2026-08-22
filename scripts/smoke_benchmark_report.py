@@ -75,7 +75,7 @@ async def _run() -> int:
                 run_id=run_id,
                 benchmark_id="smoke-bench",
                 agent_id="claude_code",
-                score=0.99,
+                score=99.0,  # ATP percent; wire projection sends 0.99
                 score_components={"smoke": 1.0},
                 semantics=ScoreSemantics(
                     kind="aggregated_evaluation",

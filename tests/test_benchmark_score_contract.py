@@ -273,17 +273,6 @@ def test_mixed_task_scores_caveat_is_carried() -> None:
     assert any(c.startswith("mixed_task_scores") for c in finalized.semantics.caveats)
 
 
-def test_unsupported_schema_version_is_not_publishable() -> None:
-    payload = _load("run_status_evaluated.json")
-    payload["score_semantics"]["schema_version"] = 2
-
-    finalized = parse_finalized_score(payload)
-    decision = publication_decision(_result_from(finalized))
-
-    assert decision.allowed is False
-    assert decision.reason == "unsupported_schema_version"
-
-
 # ---------------------------------------------------------------------------
 # Numeric narrowing at the arbiter edge
 # ---------------------------------------------------------------------------
@@ -347,25 +336,6 @@ def _result_from(finalized: Any, **overrides: Any) -> BenchmarkResult:
     )
 
 
-def test_quality_signal_true_is_publishable() -> None:
-    finalized = parse_finalized_score(_load("run_status_evaluated.json"))
-
-    decision = publication_decision(_result_from(finalized))
-
-    assert decision.allowed is True
-    assert decision.reason == "ok"
-
-
-def test_completion_rate_is_withheld_from_the_tiebreaker() -> None:
-    """Today's real payload. Not quality — so it must not reach the re-ranker."""
-    finalized = parse_finalized_score(_load("run_status_completion_only.json"))
-
-    decision = publication_decision(_result_from(finalized))
-
-    assert decision.allowed is False
-    assert decision.reason == "quality_signal_false"
-
-
 def test_legacy_unknown_is_withheld() -> None:
     payload = _load("run_status_evaluated.json")
     del payload["score_semantics"]
@@ -426,12 +396,6 @@ class _RecordingClient:
     ("fixture", "mutation", "reason"),
     [
         pytest.param(
-            "run_status_completion_only.json",
-            {},
-            "quality_signal_false",
-            id="completion-rate",
-        ),
-        pytest.param(
             "run_status_evaluated.json",
             {"total_score": None},
             "score_not_finalized",
@@ -448,9 +412,11 @@ class _RecordingClient:
 async def test_non_quality_never_reaches_the_arbiter_tiebreaker(
     fixture: str, mutation: dict[str, Any], reason: str
 ) -> None:
-    """arbiter falls back to the scalar score, so withholding must be real.
+    """What stays withheld after the softening, and the RPC must not happen.
 
-    Not merely "reported as withheld" — the RPC must not happen at all.
+    Not merely "reported as withheld": for a legacy run, sending would mean
+    sending no `score_semantics` block, and an absent block is read as
+    ELIGIBLE for routing on the arbiter side.
     """
     from maestro.benchmark.arbiter_report import report_benchmark_to_arbiter
 
@@ -563,3 +529,173 @@ def test_non_numeric_total_score_is_a_contract_error(total: Any) -> None:
 
     with pytest.raises(ScoreContractError):
         parse_finalized_score(payload)
+
+
+# ---------------------------------------------------------------------------
+# Round 2 — arbiter reads `score_semantics` (arbiter#82) and the canonical
+# wire unit is a fraction (arbiter#81). The gate softens, but not everywhere.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("fixture", "mutation", "allowed", "reason"),
+    [
+        pytest.param(
+            "run_status_evaluated.json",
+            {},
+            True,
+            "quality_signal",
+            id="evaluated-routes",
+        ),
+        pytest.param(
+            "run_status_completion_only.json",
+            {},
+            True,
+            "stored_not_routed",
+            id="completion-stored-not-routed",
+        ),
+        pytest.param(
+            "run_status_evaluated.json",
+            {"schema_version": 2},
+            True,
+            "stored_not_routed",
+            id="future-version-stored-not-routed",
+        ),
+        pytest.param(
+            "run_status_evaluated.json",
+            {"drop_semantics": True},
+            False,
+            "semantics_unknown",
+            id="legacy-still-withheld",
+        ),
+        pytest.param(
+            "run_status_evaluated.json",
+            {"null_score": True},
+            False,
+            "score_not_finalized",
+            id="unfinalized-still-withheld",
+        ),
+    ],
+)
+def test_publication_matrix(
+    fixture: str, mutation: dict[str, Any], allowed: bool, reason: str
+) -> None:
+    """The two withheld rows are withheld *because* arbiter is permissive.
+
+    `semantics_permit_routing` returns **true** for an absent block — a
+    deliberate deviation on their side, so their 21 legacy rows keep feeding
+    R-07. It means we must never send a run whose semantics we could not read:
+    absence there is not "unknown", it is "eligible".
+    """
+    payload = _load(fixture)
+    if mutation.pop("drop_semantics", False):
+        del payload["score_semantics"]
+    if mutation.pop("null_score", False):
+        payload["total_score"] = None
+    payload.get("score_semantics", {}).update(mutation)
+
+    decision = publication_decision(_result_from(parse_finalized_score(payload)))
+
+    assert decision.allowed is allowed
+    assert decision.reason == reason
+
+
+async def test_completion_rate_now_reaches_arbiter_carrying_its_block() -> None:
+    """Softened: stored and inspectable, excluded from the tiebreaker by them."""
+    from maestro.benchmark.arbiter_report import report_benchmark_to_arbiter
+
+    result = _result_from(
+        parse_finalized_score(_load("run_status_completion_only.json"))
+    )
+    client = _RecordingClient()
+
+    returned = await report_benchmark_to_arbiter(result, client)
+
+    assert returned.report_status == "ok"
+    sent = client.payloads[0]
+    assert sent["score_semantics"]["quality_signal"] is False
+    assert sent["score_semantics"]["schema_version"] == 1
+
+
+async def test_legacy_run_is_still_withheld_because_absence_means_eligible() -> None:
+    from maestro.benchmark.arbiter_report import report_benchmark_to_arbiter
+
+    payload = _load("run_status_evaluated.json")
+    del payload["score_semantics"]
+    result = _result_from(parse_finalized_score(payload))
+    client = _RecordingClient()
+
+    returned = await report_benchmark_to_arbiter(result, client)
+
+    assert client.payloads == []
+    assert returned.report_status == "withheld"
+    assert returned.report_error == "withheld: semantics_unknown"
+
+
+async def test_wire_score_is_a_fraction_not_a_percent() -> None:
+    """ATP reports a percent; the wire's canonical unit is a fraction [0,1].
+
+    Sending the percent is what made every run above 1% arrive as a perfect
+    `1.0` after arbiter's clamp; arbiter now rejects out-of-range with -32602.
+    """
+    from maestro.benchmark.arbiter_report import report_benchmark_to_arbiter
+
+    result = _result_from(parse_finalized_score(_load("run_status_evaluated.json")))
+    assert result.score == 50.0  # domain value stays ATP's percent
+    client = _RecordingClient()
+
+    await report_benchmark_to_arbiter(result, client)
+
+    assert client.payloads[0]["score"] == pytest.approx(0.5)
+
+
+async def test_semantics_travels_verbatim_not_normalized() -> None:
+    """Send ATP's claim, not our reading of it.
+
+    Verbatim keeps the block *theirs*; the cases where our reading disagrees
+    (an unfinalized run whose producer claimed quality) never ship at all.
+    """
+    from maestro.benchmark.arbiter_report import report_benchmark_to_arbiter
+
+    result = _result_from(
+        parse_finalized_score(_load("run_status_forward_compat.json"))
+    )
+    client = _RecordingClient()
+
+    await report_benchmark_to_arbiter(result, client)
+
+    sent = client.payloads[0]["score_semantics"]
+    assert sent["some_future_key"] == "consumers must ignore this"
+    assert sent["kind"] == "weighted_quality"
+
+
+def test_wire_payload_refuses_to_ship_without_a_semantics_block() -> None:
+    """Defence in depth behind the gate: a block-less payload is routable
+    on their side, so building one must be impossible, not merely unreached."""
+    from maestro.benchmark.arbiter_report import _build_wire_payload
+
+    result = _result_from(parse_finalized_score(_load("run_status_evaluated.json")))
+    blind = result.model_copy(update={"semantics": ScoreSemantics.unknown()})
+
+    with pytest.raises(ValueError, match="semantics"):
+        _build_wire_payload(blind, max_per_task=200)
+
+
+def test_gate_and_wire_guard_agree_on_having_no_block() -> None:
+    """The gate decides; the guard must never be the thing that decides.
+
+    A hand-built `ScoreSemantics` with a named kind but an empty `raw` is
+    unreachable from `parse_finalized_score` — but if the two predicates
+    disagreed, such a result would pass the gate and then raise inside
+    `_build_wire_payload`, surfacing as `report_status="failed"` instead of an
+    honest `withheld`. (Found by review on PR #205.)
+    """
+    blind = ScoreSemantics(kind="completion_rate", quality_signal=False, raw={})
+    result = _result_from(
+        parse_finalized_score(_load("run_status_evaluated.json"))
+    ).model_copy(update={"semantics": blind})
+
+    decision = publication_decision(result)
+
+    assert decision.allowed is False
+    assert decision.reason == "semantics_unknown"

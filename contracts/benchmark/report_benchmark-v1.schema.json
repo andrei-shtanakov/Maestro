@@ -35,10 +35,27 @@
         "benchmark_id": {"type": "string", "minLength": 1},
         "agent_id": {"type": "string", "minLength": 1},
         "ts": {"type": "string", "format": "date-time"},
-        "score": {"type": "number"},
+        "score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Canonical unit: a FRACTION in [0,1] (e.g. a critical pass rate), never a percent in [0,100]. The consumer (get_benchmark_score) feeds this straight into the routing tiebreaker, whose arithmetic assumes [0,1]; a percent used to be silently clamped to a perfect 1.0. A percent producer must divide by 100 before sending."
+        },
         "score_components": {
           "type": "object",
           "additionalProperties": {"type": "number"}
+        },
+        "score_semantics": {
+          "type": ["object", "null"],
+          "additionalProperties": true,
+          "description": "ATP benchmark score contract v1: what the number MEANS. Optional; an absent block is a legacy producer of unknown semantics. Unknown keys must be ignored (that is what keeps additions additive). arbiter branches on quality_signal alone: a present block that is not schema_version 1 with quality_signal true is stored but withheld from the routing tiebreaker.",
+          "properties": {
+            "schema_version": {"type": "integer"},
+            "kind": {"type": "string"},
+            "quality_signal": {"type": "boolean"},
+            "coverage": {"type": ["object", "null"]},
+            "caveats": {"type": "array", "items": {"type": "string"}}
+          }
         },
         "total_tokens": {"type": ["integer", "null"], "minimum": 0},
         "total_cost_usd": {"type": ["number", "null"], "minimum": 0},

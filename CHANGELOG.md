@@ -3,22 +3,48 @@
 ## Unreleased
 
 ### Changed
-- **BREAKING (arbiter reporting): a benchmark result is no longer reported to
-  arbiter unless it is an evaluated, finalized, interpretable quality score.**
-  ATP's benchmark plane scores a task 100 when the agent returned a *completed*
-  response, whatever it contained, and says so on the wire via `score_semantics`
-  (contract v1). arbiter's routing tiebreaker reads
-  `score_components.rank_score` and **falls back to the scalar `score`** when it
-  is absent (`arbiter-mcp/src/db.rs::get_benchmark_score`), so a completion rate
-  reported as a bare number silently becomes a routing input. Reports are now
-  withheld fail-closed with a named reason — `quality_signal_false`,
-  `semantics_unknown`, `score_not_finalized`, `unsupported_schema_version` —
-  carried as the new `report_status: "withheld"` and a
-  `benchmark.report.withheld` obs event. Since ATP wires no evaluators into this
-  plane today, in practice **every current run is withheld**; that is the point,
-  not a regression, and the numbers it stops sending were already being clamped
-  to `1.0` on arrival (see the unit mismatch filed as arbiter#…). Nothing about
-  local results changes: `maestro benchmark` still runs, prints and returns them.
+- **BREAKING (wire): `report_benchmark` now sends `score` as a FRACTION in
+  [0,1], not a percent.** ATP reports the benchmark-plane score as a percent
+  (`unit: percent`, `range {0,100}`); arbiter's canonical wire unit is a
+  fraction, and its consumer feeds the number straight into a tiebreaker whose
+  arithmetic assumes [0,1]. Every run above 1% used to arrive clamped to a
+  perfect, indistinguishable `1.0` (arbiter#81). The conversion lives only at
+  the wire boundary (`_score_as_fraction`): `BenchmarkResult.score` stays the
+  percent ATP reported, which is what `maestro benchmark` shows a human and what
+  `--json` emits. The shared schema now declares `minimum: 0` / `maximum: 1`, so
+  an out-of-range score is rejected on ingest with `-32602` — a contract break
+  the producer fixes, already classified here as such rather than as a transient.
+- **The arbiter publication gate softened — but not everywhere.** arbiter now
+  accepts `score_semantics` as an optional payload field, stores it verbatim and
+  branches on `quality_signal` itself (arbiter#82). So a non-quality run is no
+  longer silenced: it is sent with its block, stored, stays inspectable, and
+  their reader keeps it out of the routing tiebreaker (`stored_not_routed`).
+  Two cases stay withheld, and the reason is the shape of *their* rule: their
+  `semantics_permit_routing` returns **true** for an absent block — a deliberate
+  deviation so their existing legacy rows keep feeding R-07 — so a run whose
+  semantics we could not read must never be sent, because on that wire an absent
+  block does not mean "unknown", it means "eligible". An unfinalized run stays
+  withheld too: its `0.0` is a placeholder, not a measurement.
+  `_build_wire_payload` now refuses outright to build a block-less payload.
+- **`payload_version` deliberately stays `1.0.0`.** arbiter rejects an unknown
+  version, so bumping it for the additive `score_semantics` field would have
+  been breaking rather than cosmetic — both sides would have had to move in
+  lockstep. The schema already tolerated the extra key
+  (`Request.additionalProperties: true`).
+
+- **BREAKING (arbiter reporting): a benchmark result is reported only when its
+  meaning has been read.** ATP's benchmark plane scores a task 100 when the
+  agent returned a *completed* response, whatever it contained, and says so on
+  the wire via `score_semantics` (contract v1). arbiter's routing tiebreaker
+  reads `score_components.rank_score` and **falls back to the scalar `score`**
+  when it is absent (`arbiter-mcp/src/db.rs::get_benchmark_score`), so a bare
+  number is never inert — it becomes a routing input. Maestro therefore reads
+  the semantics block and gates on it, with the new
+  `report_status: "withheld"` and a `benchmark.report.withheld` obs event
+  carrying a named reason. The two reasons that withhold are
+  `semantics_unknown` and `score_not_finalized` — see the entry above for why
+  those two and not the rest. Nothing about local results changes:
+  `maestro benchmark` still runs, prints and returns them.
 - **(CLI) `maestro benchmark --json` gained `semantics` and `score_finalized`.**
   Additive, but the shape of a documented output changed: `semantics` carries
   `kind`, `quality_signal` and `caveats`. The verbatim upstream block is

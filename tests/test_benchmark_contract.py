@@ -185,3 +185,57 @@ def test_unknown_response_fields_dont_crash_helper() -> None:
     )
     returned = asyncio.run(report_benchmark_to_arbiter(result, mock_client))
     assert returned.report_status == "ok"
+
+
+def test_schema_rejects_a_percent_shaped_score(
+    request_validator: Draft202012Validator,
+) -> None:
+    """The defect behind arbiter#81 must now be a contract failure.
+
+    A percent used to pass this schema (`{"type": "number"}`, no range) and was
+    then clamped to a perfect `1.0` by the consumer. The canonical unit is a
+    fraction, and the schema says so.
+    """
+    payload = _build_wire_payload(
+        BenchmarkResult(
+            run_id="r1",
+            benchmark_id="b",
+            agent_id="a",
+            score=85.0,
+            semantics=evaluated_semantics(),
+            per_task=[],
+            duration_seconds=1.0,
+        ),
+        max_per_task=200,
+    ).model_dump(mode="json")
+
+    assert request_validator.is_valid(payload), "0.85 fraction must validate"
+
+    payload["score"] = 85.0  # what we used to send
+    errors = list(request_validator.iter_errors(payload))
+    assert errors, "a percent must not validate against the fraction contract"
+    assert any("maximum" in e.validator for e in errors)
+
+
+def test_schema_copy_matches_the_arbiter_side() -> None:
+    """This file is the SSOT, but the last change to it was made downstream.
+
+    arbiter keeps its own copy at `arbiter-mcp/tests/contract/` and validates
+    against it; the two silently diverged when arbiter#81/#82 landed there
+    first. Formatting may differ — the schema must not.
+    """
+    sibling = (
+        SCHEMA_PATH.parents[2].parent
+        / "arbiter"
+        / "arbiter-mcp"
+        / "tests"
+        / "contract"
+        / "report_benchmark-v1.schema.json"
+    )
+    if not sibling.exists():
+        pytest.skip("no sibling arbiter checkout")
+
+    with SCHEMA_PATH.open() as ours, sibling.open() as theirs:
+        assert json.load(ours) == json.load(theirs), (
+            "report_benchmark-v1 schema differs from the arbiter copy"
+        )
