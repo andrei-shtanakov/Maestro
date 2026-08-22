@@ -181,7 +181,7 @@ def test_empty_sidecar_is_never_agreement(field: str) -> None:
 
 def test_non_string_digest_is_a_finding_not_a_crash() -> None:
     """Трейсбек вышел бы тем же кодом, что и дрейф — оператор пошёл бы
-    перевендоривать байты, с которыми всё в порядке."""
+    перевендоривать байты, которые в полном порядке."""
     sidecar = _sidecar()
     sidecar["files"][f"{FIXTURE_DIR}/run_status_evaluated.json"] = 12345
 
