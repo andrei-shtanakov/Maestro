@@ -148,8 +148,18 @@ REPORT_MAX_PER_TASK: int = _parse_max_per_task_env(_DEFAULT_MAX_PER_TASK)
 class ReportBenchmarkPayload(BaseModel):
     """Wire payload for the arbiter ``report_benchmark`` MCP tool (v1.0.0).
 
-    Frozen and ``extra="forbid"`` — any drift requires a
-    ``payload_version`` bump + contract test update on both sides.
+    Frozen and ``extra="forbid"``, so a new field must be declared here before
+    it can be sent — that is what keeps the payload and the shared schema from
+    drifting apart silently.
+
+    Declaring a field is not the same as bumping ``payload_version``, and the
+    two must not be conflated. An **additive optional** field (``score_semantics``
+    is the worked example) keeps the version: the schema already allows unknown
+    top-level keys (``Request.additionalProperties: true``), and arbiter
+    *rejects* an unrecognised ``payload_version``, so a bump would force both
+    sides to move in lockstep and break every unmatched pair in the meantime.
+    A **breaking** change — a removed field, a narrowed type, a changed unit —
+    is what requires the bump plus a contract-test update on both sides.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
