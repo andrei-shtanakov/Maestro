@@ -199,7 +199,11 @@ def main(argv: list[str] | None = None) -> int:
             if args.sidecar_file
             else fetch(args.url)
         )
-    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+    # `ValueError` covers both failures that reading can produce: `JSONDecodeError`
+    # (not JSON) and `UnicodeDecodeError` (not even text). Both are subclasses of
+    # it, and both used to escape as a traceback — which exits the same way drift
+    # does, contradicting this script's own contract.
+    except (urllib.error.URLError, OSError, ValueError) as exc:
         print(f"could not read the score-contract sidecar: {exc}", file=sys.stderr)
         print("unknown is not agreement — this run is inconclusive", file=sys.stderr)
         return 2

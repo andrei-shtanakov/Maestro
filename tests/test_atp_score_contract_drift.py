@@ -286,3 +286,15 @@ def test_uppercase_or_truncated_digest_is_unusable() -> None:
         sidecar["files"][MODULE_PATH] = bad
         with pytest.raises(WATCH.SidecarMalformed):
             WATCH.compare(sidecar, PINS)
+
+
+def test_non_utf8_sidecar_is_inconclusive_not_a_traceback(tmp_path: Path) -> None:
+    """Bytes that are not text at all — a truncated download, a binary error page.
+
+    `UnicodeDecodeError` is neither `OSError` nor `JSONDecodeError`, so it used
+    to escape as a traceback and exit the way drift does.
+    """
+    path = tmp_path / "DIGESTS.json"
+    path.write_bytes(b"\xff\xfe not utf-8 at all")
+
+    assert WATCH.main(["--sidecar-file", str(path)]) == 2
