@@ -173,6 +173,19 @@ def main(argv: list[str] | None = None) -> int:
         print("unknown is not agreement — this run is inconclusive", file=sys.stderr)
         return 2
 
+    if not isinstance(sidecar, dict):
+        # Valid JSON, but not a sidecar — an error page, a redirect body, the
+        # wrong URL. That is "could not read it" (2), not "upstream drifted"
+        # (1): reporting drift would send the operator to re-vendor bytes that
+        # were never compared.
+        print(
+            f"the sidecar is a {type(sidecar).__name__}, not an object — "
+            f"this is not the score-contract sidecar",
+            file=sys.stderr,
+        )
+        print("unknown is not agreement — this run is inconclusive", file=sys.stderr)
+        return 2
+
     findings = compare(sidecar, read_pin())
     if not findings:
         print("ATP score contract: pin still describes upstream")

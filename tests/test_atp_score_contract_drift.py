@@ -220,3 +220,18 @@ def test_ambiguous_name_is_reported_once_and_not_compared() -> None:
     naming_the_file = [f for f in findings if "score_contract.py" in f]
     assert len(naming_the_file) == 1
     assert "ambiguous" in naming_the_file[0]
+
+
+@pytest.mark.parametrize(
+    "root", [pytest.param([], id="list"), pytest.param("text", id="string")]
+)
+def test_non_object_root_is_inconclusive_not_drift(tmp_path: Path, root: Any) -> None:
+    """Валидный JSON, но не сайдкар: страница ошибки, редирект, не тот URL.
+
+    Это «не смогли прочитать» (2), но не «апстрим уехал» (1): код 1 отправил бы
+    оператора перевендоривать байты, которые никто не сравнивал.
+    """
+    path = tmp_path / "DIGESTS.json"
+    path.write_text(json.dumps(root), encoding="utf-8")
+
+    assert WATCH.main(["--sidecar-file", str(path)]) == 2
