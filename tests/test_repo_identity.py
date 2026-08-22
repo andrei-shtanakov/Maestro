@@ -63,3 +63,24 @@ def test_path_parts_are_filesystem_safe():
     assert all(
         "/" not in part and part not in ("", ".", "..") for part in key.as_path_parts()
     )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        # owner == ".." — the segment check was applied to `repo` only, so
+        # this parsed into ("github.com", "..", "etc") and walked the run
+        # tree one level above `projects/` (inbox #210).
+        "git@github.com:owner/../etc.git",
+        "git@github.com:../repo.git",
+        "https://github.com/../repo",
+        "git@github.com:owner/.",
+        # host is a path segment too, and was not checked at all.
+        "git@..:owner/repo.git",
+        "https://../owner/repo.git",
+        "ssh://git@../owner/repo.git",
+    ],
+)
+def test_traversal_segments_refuse(bad):
+    with pytest.raises(IdentityError):
+        parse_remote_url(bad)

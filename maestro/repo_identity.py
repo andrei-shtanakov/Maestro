@@ -48,6 +48,18 @@ def _fold(host: str, owner: str, repo: str) -> tuple[str, str, str]:
     return host, owner, repo
 
 
+def _segment_is_safe(segment: str) -> bool:
+    """True when `segment` is usable as one path component under `projects/`.
+
+    Every part of a `RepoKey` — host included — becomes a directory name in
+    `state_paths`, so all three are held to the same rule. `_UNSAFE` alone is
+    not that rule: `.` is a legal character in a hostname (`github.com`) and in
+    a repository name, so `..` passes the character class untouched and walks
+    the run tree out of the directory the state layer owns (inbox #210).
+    """
+    return bool(segment) and not _UNSAFE.search(segment) and segment not in {".", ".."}
+
+
 def parse_remote_url(url: str) -> RepoKey:
     """Parse a git remote into a `RepoKey`, or raise `IdentityError`."""
     text = (url or "").strip()
@@ -72,7 +84,7 @@ def parse_remote_url(url: str) -> RepoKey:
         raise IdentityError(f"remote URL has no owner/repo: {url!r}")
 
     owner, repo = parts[-2], parts[-1]
-    if _UNSAFE.search(owner) or _UNSAFE.search(repo) or repo in {".", ".."}:
+    if not all(_segment_is_safe(part) for part in (host, owner, repo)):
         raise IdentityError(f"remote URL yields unsafe path segments: {url!r}")
 
     host, owner, repo = _fold(host, owner, repo)
