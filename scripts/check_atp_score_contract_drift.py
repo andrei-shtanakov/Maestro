@@ -23,9 +23,12 @@ fine":
 
 * ``0`` — the sidecar agrees with our pin.
 * ``1`` — drift: something upstream differs from what we vendored.
-* ``2`` — the sidecar could not be read. **Not** treated as agreement: an
-  unreachable producer is an unknown, and an unknown that renders as green is
-  the failure this whole contract keeps re-teaching.
+* ``2`` — the sidecar could not be read **or could not be interpreted**, so
+  nothing was compared. Kept apart from ``1`` deliberately: both are red, but
+  drift asks you to re-vendor the current bytes, while this one means we never
+  got a usable answer, and conflating them sends you to re-vendor bytes nobody
+  looked at. Never treated as agreement either — an unknown that renders as
+  green is the failure this whole contract keeps re-teaching.
 """
 
 from __future__ import annotations
@@ -73,8 +76,21 @@ def read_pin(path: Path = PIN_PATH) -> dict[str, str]:
     return pins
 
 
+class SidecarMalformed(Exception):
+    """The sidecar could not be interpreted, so nothing was compared.
+
+    Kept distinct from a drift finding on purpose. Both make the run red, but
+    they ask for different things: drift says "re-vendor the current bytes",
+    while this says "we never got a usable answer". Reporting the second as the
+    first would send an operator to re-vendor bytes nobody looked at.
+    """
+
+
 def compare(sidecar: dict[str, Any], pins: dict[str, str]) -> list[str]:
     """Findings, in reading order. Empty means the pin still describes upstream.
+
+    Raises `SidecarMalformed` when the document cannot be interpreted at all —
+    see that class for why the two outcomes are not merged.
 
     Upstream keys are repo-relative paths; our `PIN` is keyed by file name, so
     the join is on the basename. That is unambiguous for this contract — and
@@ -84,8 +100,20 @@ def compare(sidecar: dict[str, Any], pins: dict[str, str]) -> list[str]:
     """
     findings: list[str] = []
 
-    version = sidecar.get("contract_version")
+    if not isinstance(sidecar, dict):
+        raise SidecarMalformed(
+            f"the sidecar is a {type(sidecar).__name__}, not an object"
+        )
+
+    if "contract_version" not in sidecar:
+        # A required field of their schema. Absent, we cannot say which
+        # contract these digests describe — that is uninterpretable, not drift.
+        raise SidecarMalformed("sidecar declares no `contract_version`")
+
+    version = sidecar["contract_version"]
     if version != SUPPORTED_CONTRACT_VERSION:
+        # Present but different: a real event on their side, and re-vendoring
+        # (after reading the handoff) is the right response. This one is drift.
         findings.append(
             f"contract_version is {version!r}, we implement "
             f"{SUPPORTED_CONTRACT_VERSION} — read the handoff before re-vendoring"
@@ -93,8 +121,7 @@ def compare(sidecar: dict[str, Any], pins: dict[str, str]) -> list[str]:
 
     files = sidecar.get("files")
     if not isinstance(files, dict) or not files:
-        findings.append("sidecar carries no `files` map — cannot compare anything")
-        return findings
+        raise SidecarMalformed("sidecar carries no usable `files` map")
 
     by_name: dict[str, list[str]] = {}
     for key in files:
@@ -115,13 +142,10 @@ def compare(sidecar: dict[str, Any], pins: dict[str, str]) -> list[str]:
             continue
         upstream = files[keys[0]]
         if not isinstance(upstream, str) or not upstream:
-            # A malformed sidecar must read as a finding, not a traceback: an
-            # exception here exits the same way drift does, so the operator
-            # would go re-vendor bytes that are fine.
-            findings.append(
-                f"{name}: digest is {upstream!r}, not a string — sidecar is malformed"
-            )
-            continue
+            # One bad entry makes the whole document untrustworthy: it comes
+            # out of a single generator, so a digest that is not a digest means
+            # the file is not what it claims to be.
+            raise SidecarMalformed(f"{name}: digest is {upstream!r}, not a string")
         ours = pins.get(name)
         if ours is None:
             # The case a hardcoded list of known paths cannot catch: a fixture
@@ -173,20 +197,15 @@ def main(argv: list[str] | None = None) -> int:
         print("unknown is not agreement — this run is inconclusive", file=sys.stderr)
         return 2
 
-    if not isinstance(sidecar, dict):
-        # Valid JSON, but not a sidecar — an error page, a redirect body, the
-        # wrong URL. That is "could not read it" (2), not "upstream drifted"
-        # (1): reporting drift would send the operator to re-vendor bytes that
-        # were never compared.
-        print(
-            f"the sidecar is a {type(sidecar).__name__}, not an object — "
-            f"this is not the score-contract sidecar",
-            file=sys.stderr,
-        )
-        print("unknown is not agreement — this run is inconclusive", file=sys.stderr)
+    try:
+        findings = compare(sidecar, read_pin())
+    except SidecarMalformed as exc:
+        # Valid JSON that is not a usable sidecar — an error page, a redirect
+        # body, the wrong URL, a schema change on their side. Nothing was
+        # compared, so this is inconclusive (2) rather than drift (1).
+        print(f"the score-contract sidecar is unusable: {exc}", file=sys.stderr)
+        print("nothing was compared — this run is inconclusive", file=sys.stderr)
         return 2
-
-    findings = compare(sidecar, read_pin())
     if not findings:
         print("ATP score contract: pin still describes upstream")
         return 0

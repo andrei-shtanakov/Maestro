@@ -14,7 +14,11 @@
   requests cannot move their contract, so per-PR frequency would only buy a red
   build whenever GitHub is briefly unreachable. A sidecar that cannot be read
   fails the run (exit 2) rather than passing — an unreachable producer is an
-  unknown, not agreement.
+  unknown, not agreement. Exit 2 also covers a sidecar that arrives but cannot
+  be interpreted (wrong document, schema change, a digest that is not a digest):
+  both outcomes are red, but drift asks you to re-vendor the current bytes while
+  this one means nothing was compared, and conflating them sends an operator to
+  re-vendor bytes nobody looked at.
 
 ### Changed
 - **BREAKING (wire): `report_benchmark` now sends `score` as a FRACTION in

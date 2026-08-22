@@ -122,10 +122,10 @@ def test_basename_collision_is_its_own_finding() -> None:
     assert any("ambiguous" in f for f in findings)
 
 
-def test_missing_files_map_does_not_pass_as_agreement() -> None:
-    findings = WATCH.compare({"contract_version": 1}, PINS)
-
-    assert findings and "cannot compare anything" in findings[0]
+def test_missing_files_map_is_unusable_not_drift() -> None:
+    """Nothing was compared, so this is "unusable", not "disagreed"."""
+    with pytest.raises(WATCH.SidecarMalformed, match="files"):
+        WATCH.compare({"contract_version": 1}, PINS)
 
 
 def test_unreadable_sidecar_exits_two_not_zero(tmp_path: Path) -> None:
@@ -169,49 +169,52 @@ def test_pin_parser_agrees_with_the_vendored_pin() -> None:
 
 
 @pytest.mark.parametrize("field", ["contract_version", "files"])
-def test_empty_sidecar_is_never_agreement(field: str) -> None:
+def test_missing_required_field_is_never_agreement(field: str) -> None:
+    """A required field of their schema: without it, we cannot say what we read."""
     sidecar = _sidecar()
     del sidecar[field]
 
-    assert WATCH.compare(sidecar, PINS) != []
+    with pytest.raises(WATCH.SidecarMalformed):
+        WATCH.compare(sidecar, PINS)
 
 
 # --- ревью PR #208: сломанный сайдкар не должен ронять скрипт ---------------
 
 
-def test_non_string_digest_is_a_finding_not_a_crash() -> None:
-    """Трейсбек вышел бы тем же кодом, что и дрейф — оператор пошёл бы
-    перевендоривать байты, которые в полном порядке."""
+def test_non_string_digest_is_unusable_not_drift() -> None:
+    """One bad entry makes the whole document untrustworthy.
+
+    The sidecar comes out of a single generator, so a digest that is not a
+    digest means the file is not what it claims to be. A traceback here would
+    exit the same way drift does and send the operator re-vendoring for nothing.
+    """
     sidecar = _sidecar()
     sidecar["files"][f"{FIXTURE_DIR}/run_status_evaluated.json"] = 12345
 
-    findings = WATCH.compare(sidecar, PINS)
-
-    assert len(findings) == 1
-    assert "not a string" in findings[0]
-    assert "run_status_evaluated.json" in findings[0]
+    with pytest.raises(WATCH.SidecarMalformed, match=r"run_status_evaluated\.json"):
+        WATCH.compare(sidecar, PINS)
 
 
-def test_null_digest_is_a_finding_too() -> None:
+def test_null_digest_is_unusable_too() -> None:
     sidecar = _sidecar()
     sidecar["files"][MODULE_PATH] = None
 
-    findings = WATCH.compare(sidecar, PINS)
+    with pytest.raises(WATCH.SidecarMalformed):
+        WATCH.compare(sidecar, PINS)
 
-    assert any("not a string" in f for f in findings)
 
-
-def test_malformed_digest_still_exits_one(tmp_path: Path) -> None:
+def test_malformed_digest_exits_two(tmp_path: Path) -> None:
+    """Red either way, but they ask for different things: re-vendor, or look."""
     sidecar = _sidecar()
     sidecar["files"][MODULE_PATH] = []
     path = tmp_path / "DIGESTS.json"
     path.write_text(json.dumps(sidecar), encoding="utf-8")
 
-    assert WATCH.main(["--sidecar-file", str(path)]) == 1
+    assert WATCH.main(["--sidecar-file", str(path)]) == 2
 
 
 def test_ambiguous_name_is_reported_once_and_not_compared() -> None:
-    """Сравнение по произвольно выбранному ключу зависело бы от порядка словаря."""
+    """Comparing an arbitrarily chosen key would depend on dict order."""
     sidecar = _sidecar()
     sidecar["files"]["packages/elsewhere/score_contract.py"] = "ffff"
 
@@ -226,12 +229,23 @@ def test_ambiguous_name_is_reported_once_and_not_compared() -> None:
     "root", [pytest.param([], id="list"), pytest.param("text", id="string")]
 )
 def test_non_object_root_is_inconclusive_not_drift(tmp_path: Path, root: Any) -> None:
-    """Валидный JSON, но не сайдкар: страница ошибки, редирект, не тот URL.
+    """Valid JSON, but not the sidecar: an error page, a redirect, a wrong URL.
 
-    Это «не смогли прочитать» (2), но не «апстрим уехал» (1): код 1 отправил бы
-    оператора перевендоривать байты, которые никто не сравнивал.
+    That is "could not read it" (2), never "upstream drifted" (1): exit 1 would
+    send the operator to re-vendor bytes that were never compared.
     """
     path = tmp_path / "DIGESTS.json"
     path.write_text(json.dumps(root), encoding="utf-8")
 
     assert WATCH.main(["--sidecar-file", str(path)]) == 2
+
+
+def test_version_bump_is_drift_not_malformed() -> None:
+    """A version that is present but not ours is their event, not a broken file.
+
+    The distinction is not pedantry: re-vendoring (after reading the handoff) is
+    the right response here, so it is a finding (1), not unusable (2).
+    """
+    findings = WATCH.compare(_sidecar(contract_version=2), PINS)
+
+    assert any("contract_version" in f for f in findings)
