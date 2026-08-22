@@ -100,15 +100,28 @@ def compare(sidecar: dict[str, Any], pins: dict[str, str]) -> list[str]:
     for key in files:
         by_name.setdefault(Path(key).name, []).append(key)
 
-    for name, keys in sorted(by_name.items()):
-        if len(keys) > 1:
-            findings.append(
-                f"upstream publishes {len(keys)} files named {name!r} "
-                f"({', '.join(sorted(keys))}) — the name-based join is ambiguous"
-            )
+    ambiguous = {name for name, keys in by_name.items() if len(keys) > 1}
+    for name in sorted(ambiguous):
+        findings.append(
+            f"upstream publishes {len(by_name[name])} files named {name!r} "
+            f"({', '.join(sorted(by_name[name]))}) — the name-based join is ambiguous"
+        )
 
     for name, keys in sorted(by_name.items()):
+        if name in ambiguous:
+            # Already reported. Comparing one arbitrarily chosen key would add
+            # a second finding whose truth depends on dict order — noise on top
+            # of a defect, and the kind that sends a reader after the wrong file.
+            continue
         upstream = files[keys[0]]
+        if not isinstance(upstream, str) or not upstream:
+            # A malformed sidecar must read as a finding, not a traceback: an
+            # exception here exits the same way drift does, so the operator
+            # would go re-vendor bytes that are fine.
+            findings.append(
+                f"{name}: digest is {upstream!r}, not a string — sidecar is malformed"
+            )
+            continue
         ours = pins.get(name)
         if ours is None:
             # The case a hardcoded list of known paths cannot catch: a fixture

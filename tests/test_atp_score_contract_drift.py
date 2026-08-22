@@ -174,3 +174,49 @@ def test_empty_sidecar_is_never_agreement(field: str) -> None:
     del sidecar[field]
 
     assert WATCH.compare(sidecar, PINS) != []
+
+
+# --- ревью PR #208: сломанный сайдкар не должен ронять скрипт ---------------
+
+
+def test_non_string_digest_is_a_finding_not_a_crash() -> None:
+    """Трейсбек вышел бы тем же кодом, что и дрейф — оператор пошёл бы
+    перевендоривать байты, с которыми всё в порядке."""
+    sidecar = _sidecar()
+    sidecar["files"][f"{FIXTURE_DIR}/run_status_evaluated.json"] = 12345
+
+    findings = WATCH.compare(sidecar, PINS)
+
+    assert len(findings) == 1
+    assert "not a string" in findings[0]
+    assert "run_status_evaluated.json" in findings[0]
+
+
+def test_null_digest_is_a_finding_too() -> None:
+    sidecar = _sidecar()
+    sidecar["files"][MODULE_PATH] = None
+
+    findings = WATCH.compare(sidecar, PINS)
+
+    assert any("not a string" in f for f in findings)
+
+
+def test_malformed_digest_still_exits_one(tmp_path: Path) -> None:
+    sidecar = _sidecar()
+    sidecar["files"][MODULE_PATH] = []
+    path = tmp_path / "DIGESTS.json"
+    path.write_text(json.dumps(sidecar), encoding="utf-8")
+
+    assert WATCH.main(["--sidecar-file", str(path)]) == 1
+
+
+def test_ambiguous_name_is_reported_once_and_not_compared() -> None:
+    """Сравнение по произвольно выбранному ключу зависело бы от порядка словаря."""
+    sidecar = _sidecar()
+    sidecar["files"]["packages/elsewhere/score_contract.py"] = "ffff"
+
+    findings = WATCH.compare(sidecar, PINS)
+
+    naming_the_file = [f for f in findings if "score_contract.py" in f]
+    assert len(naming_the_file) == 1
+    assert "ambiguous" in naming_the_file[0]
