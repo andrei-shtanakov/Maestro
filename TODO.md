@@ -850,6 +850,28 @@
 
 ---
 
+## Входящие 2026-08, волна 8 (inbox #209, принят 2026-08-22)
+
+- [x] **workstream-retry-wipes-tdd-state** — автоповтор workstream'а стирает @owner:github:andrei-shtanakov @id:workstream-retry-wipes-tdd-state
+      TDD-состояние, операторские remedy недостижимы. Принят из disputatio,
+      issue #209. (closed by feat/blocked-task-no-retry)
+      Взяты варианты 1+2, вариант 3 отклонён: держать executor state поверх
+      заново сгенерированного спека — это `state_spec_mismatch`, оформленный
+      как фича.
+      Вариант 1 реализован НЕ через `stop_reason` (под `on_task_failure=stop`
+      он равен `task_failed_stop`, а тот намеренно ретраится — упавшая задача
+      может быть флейком), а через персистентный per-attempt `error_code =
+      TASK_BLOCKED`. Ключ — попытка, не статус задачи: `TASK_BLOCKED` фатален
+      у spec-runner, поэтому задача до `failed` не доходит.
+      Вердикт трёхзначный; `unreadable` фейлится закрыто. Исключение —
+      `state_missing: true`: это записанный факт, а не молчание (attempts
+      пишутся в ту же БД), и ретрай там сохранён — тот самый, который #164
+      сберёг намеренно.
+      Реф на нашей стороне канонический; disputatio держал
+      `@blocked_by:todo://maestro/209` — переставить на этот `@id` им самим.
+
+---
+
 ## Бэклог идей из research-дайджеста (2026-07-22)
 
 > Источник: `../prograph-vault/authored/notes/2026-07-22-ideas-from-ai-repos-research.md`

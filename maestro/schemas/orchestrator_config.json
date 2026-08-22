@@ -1059,6 +1059,14 @@
           "default": null,
           "description": "Execution backend name (local|docker); None -> default_backend",
           "title": "Backend"
+        },
+        "max_retries": {
+          "default": 2,
+          "description": "Automatic workstream retries (0 disables them). Distinct from `spec_runner.max_retries`, which retries a task INSIDE one spec-runner run; each retry here pays a full re-decomposition and regenerates the spec.",
+          "maximum": 10,
+          "minimum": 0,
+          "title": "Max Retries",
+          "type": "integer"
         }
       },
       "required": [

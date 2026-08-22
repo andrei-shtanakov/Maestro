@@ -103,6 +103,13 @@ workstreams:
     depends_on: []
     priority: 10           # Higher priority = runs first
 
+    # Automatic retries of the WHOLE workstream (default 2, 0 disables).
+    # Not the same knob as `spec_runner.max_retries` above, which retries a
+    # subtask inside one run: each retry here pays a full re-decomposition and
+    # regenerates the spec — which also recreates spec-runner's executor state.
+    # Set 0 on a stand where you want to inspect that state after a failure.
+    max_retries: 2
+
   - id: user-management
     title: "User Management"
     description: |

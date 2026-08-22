@@ -277,6 +277,21 @@ goes straight to NEEDS_REVIEW instead of spending another re-decomposition.
 Unknown, dynamic `error_*`, empty and absent reasons keep the existing retry
 policy — unclassified is not unfit.
 
+A **second retry-fitness axis** (#209) reads the archived per-attempt
+`error_code` for spec-runner's `TASK_BLOCKED` — an agent's deliberate refusal,
+which spec-runner itself treats as fatal. A retry cannot lift a refusal, and
+worse, it regenerates the spec and destroys the executor state the operator's
+remedy (`spec-runner tdd repair`) works against; NEEDS_REVIEW keeps the
+worktree and that state alive. Keyed off the **attempt**, never the task
+status: `TASK_BLOCKED` is fatal, so the task never reaches `failed`. The
+verdict is three-valued — `blocked` / `not_blocked` / `unreadable` — and
+`unreadable` fails closed, because on this path `_handle_completion` is
+unreachable without a committed archive, so an unreadable one contradicts a
+guarantee. The exception that only looks like silence: the archive's own
+`state_missing: true` keeps its retry (no database means no attempt was ever
+recorded, so no refusal existed), which is the retry #164 deliberately
+preserved.
+
 **Three recovery paths out of NEEDS_REVIEW, and they must not be confused:**
 
 | Verb | `resume_reason` | What runs |

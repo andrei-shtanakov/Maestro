@@ -110,6 +110,7 @@ from maestro.models import (
 )
 from maestro.notifications.manager import NotificationManager
 from maestro.postmortem import (
+    STATE_FILENAME,
     PostmortemCaptureError,
     archive_is_committed,
     build_recapture_marker,
@@ -119,10 +120,20 @@ from maestro.postmortem import (
     read_manifest,
 )
 from maestro.pr_manager import PRManager, PRManagerError
-from maestro.retry_policy import describe_retry_decision, retry_is_unproductive
+from maestro.retry_policy import (
+    BlockedVerdict,
+    classify_blocked,
+    describe_blocked_decision,
+    describe_retry_decision,
+    retry_is_unproductive,
+)
 from maestro.rework import build_operator_rework_addendum
 from maestro.scope_gate import build_scope_escape_reason, find_escapes, normalize
-from maestro.spec_runner import read_executor_state, read_planned_total
+from maestro.spec_runner import (
+    read_executor_state,
+    read_executor_state_db,
+    read_planned_total,
+)
 from maestro.tasks_spec import (
     SELF_CONTAINED_DEPENDENCIES_INSTRUCTION,
     DanglingDependency,
@@ -2595,6 +2606,37 @@ class Orchestrator:
         reason = manifest.get("last_run_stop_reason")
         return str(reason) if reason else None
 
+    async def _last_blocked_verdict(self, workstream_id: str) -> BlockedVerdict:
+        """Did the run that just finished contain a deliberate refusal? (#209)
+
+        Read from the post-mortem archive's state snapshot — the same evidence
+        disputatio had to reconstruct the block from by hand, because the retry
+        had already destroyed the live database. This is consulted ONLY on the
+        RUNNING-failure path, where `_handle_completion` is unreachable until a
+        capture has been committed (`fin.archive_error is None`), so a missing
+        or unparseable archive here contradicts a guarantee rather than
+        describing an ordinary run.
+
+        A spec-generation failure never gets here: it produced no executor
+        state, and its caller keeps passing the default.
+        """
+        row = await self._newest_archive(workstream_id)
+        if row is None:
+            return BlockedVerdict(
+                "unreadable", "no committed post-mortem archive for this run"
+            )
+        loop = asyncio.get_running_loop()
+        manifest = await loop.run_in_executor(None, read_manifest, row["path"])
+        if manifest is None:
+            return BlockedVerdict("unreadable", f"unreadable manifest in {row['path']}")
+        state = None
+        state_missing = bool(manifest.get("state_missing"))
+        if not state_missing:
+            state = await loop.run_in_executor(
+                None, read_executor_state_db, Path(row["path"]) / STATE_FILENAME
+            )
+        return classify_blocked(state, state_missing=state_missing)
+
     async def _newest_archive(self, workstream_id: str) -> dict[str, Any] | None:
         """This run's archive — the newest row, and only if it is committed.
 
@@ -3883,6 +3925,7 @@ class Orchestrator:
                 workstream_id,
                 f"spec-runner exited with code {return_code}",
                 stop_reason=await self._last_stop_reason(workstream_id),
+                blocked=await self._last_blocked_verdict(workstream_id),
             )
 
     async def _handle_success(
@@ -4458,6 +4501,7 @@ class Orchestrator:
         error_message: str,
         *,
         stop_reason: str | None = None,
+        blocked: BlockedVerdict | None = None,
     ) -> None:
         """Handle workstream failure with retry logic.
 
@@ -4465,6 +4509,11 @@ class Orchestrator:
         supplied by callers that have it. Callers that cannot — a
         spec-generation failure never produced executor state — pass None,
         which keeps the existing retry policy: unclassified is not unfit.
+
+        `blocked` is the same idea on the second axis (#209): the archived
+        evidence for a deliberate `TASK_BLOCKED` refusal. None means the caller
+        had no executor state to judge — again the spec-generation path — and
+        leaves the policy untouched.
         """
         workstream = await self._db.get_workstream(workstream_id)
 
@@ -4478,20 +4527,33 @@ class Orchestrator:
         # re-decomposition. The pilot burned three on one validation error.
         # Classified ONLY from the typed stop_reason — never from stop_detail
         # prose, never from how fast the run failed.
-        if retry_is_unproductive(stop_reason):
+        # #209: the blocked axis is checked first — when both fire it is the
+        # more actionable of the two, because it names a remedy and the state
+        # that remedy needs. Routing here (rather than into a retry) is what
+        # keeps the worktree, and with it the live executor database, alive
+        # long enough for `spec-runner tdd repair` to reach it.
+        verdict = None
+        if blocked is not None and blocked.retry_is_unproductive:
+            verdict = describe_blocked_decision(blocked)
+            self._logger.warning(
+                "workstream.retry.skipped workstream=%s blocked=%s",
+                workstream_id,
+                blocked.reason,
+            )
+        elif retry_is_unproductive(stop_reason):
             verdict = describe_retry_decision(stop_reason)
             self._logger.warning(
                 "workstream.retry.skipped workstream=%s stop_reason=%s",
                 workstream_id,
                 stop_reason,
             )
-            blocked = f"{preserved} — {verdict}"
+        if verdict is not None:
             await self._transition(
                 workstream_id,
                 WorkstreamStatus.NEEDS_REVIEW,
                 expected_status=workstream.status,
                 message=verdict,
-                error_message=blocked,
+                error_message=f"{preserved} — {verdict}",
                 process_pid=None,
                 generation_pid=None,
             )

@@ -3,6 +3,31 @@
 ## Unreleased
 
 ### Added
+- **A deliberate `TASK_BLOCKED` refusal no longer earns an automatic retry**
+  (#209). Under `execution_mode: tdd` a task can be blocked *correctly* — the
+  frozen RED test asserts the wrong thing, and the agent rightly refuses to
+  edit it, pointing at `spec-runner tdd repair`. Maestro then retried the
+  workstream two seconds later, which regenerates the spec and recreates the
+  executor state; by the time an operator arrived, the remedy had nothing to
+  work against (the checkpoint the repair CAS needs was gone, and only the
+  post-mortem archive still knew it had existed). The point of routing this to
+  NEEDS_REVIEW is not to save a retry — a retry cannot lift a refusal — it is
+  that NEEDS_REVIEW keeps the worktree, and with it the live database the
+  remedy needs. Read from the archived state snapshot's persisted per-attempt
+  `error_code`, never from prose. The answer is three-valued: "the attempts
+  contain no refusal" and "the attempts could not be read" are different, and
+  the second fails closed, because a check that is green exactly when it read
+  nothing is not a check. The one case that looks like silence and is not —
+  the archive's own record that spec-runner never created a state database —
+  keeps its retry, since attempts are written to that database and with no
+  database no attempt, and no refusal, ever existed (#164 preserved that retry
+  on purpose).
+- **`workstreams[].max_retries` in `project.yaml`** (#209). The automatic
+  workstream retry was declared only on the runtime model, so a stand could
+  not switch it off deliberately; `spec_runner.max_retries` is a different
+  level (task retries inside one run). Default unchanged at 2; `0` disables.
+  Included in the resume-time config-drift comparison (#198) like every other
+  configured field.
 - **Weekly upstream-drift watch over ATP's score contract**
   (`.github/workflows/atp-score-contract-drift.yml`). A vendored contract needs
   two guarantees, and only one of them was real here: copy-integrity (our bytes
