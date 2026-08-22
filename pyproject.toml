@@ -180,6 +180,12 @@ exclude = [
     ".git",
     "build",
     "dist",
+    # Vendored upstream bytes: `fix = true` above means a plain `ruff check`
+    # rewrites files, and rewriting one character destroys the very thing
+    # copy-integrity proves. This is not a style opinion about the neighbour's
+    # code — it is the pin staying true. (Caught in practice: ruff added a
+    # blank line to the vendored score_contract.py and the PIN test failed.)
+    "tests/fixtures/atp-score-contract",
 ]
 
 [tool.ruff.lint]

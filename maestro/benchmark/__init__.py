@@ -15,6 +15,8 @@ from maestro.benchmark.models import (
     AgentResponse,
     BenchmarkResult,
     BenchmarkTaskResult,
+    FinalizedScore,
+    ScoreSemantics,
 )
 from maestro.benchmark.runner import (
     AgentResponder,
@@ -22,6 +24,12 @@ from maestro.benchmark.runner import (
     BenchmarkRun,
     BenchmarkRunner,
     BenchmarkTask,
+)
+from maestro.benchmark.score_contract import (
+    PublicationDecision,
+    ScoreContractError,
+    parse_finalized_score,
+    publication_decision,
 )
 from maestro.benchmark.spawner_responder import SpawnerResponder
 
@@ -35,9 +43,15 @@ __all__ = [
     "BenchmarkRunner",
     "BenchmarkTask",
     "BenchmarkTaskResult",
+    "FinalizedScore",
     "MaestroATPAdapter",
+    "PublicationDecision",
     "ReportBenchmarkPayload",
+    "ScoreContractError",
+    "ScoreSemantics",
     "SpawnerResponder",
     "WireTaskResult",
+    "parse_finalized_score",
+    "publication_decision",
     "report_benchmark_to_arbiter",
 ]

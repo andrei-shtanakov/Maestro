@@ -15,7 +15,9 @@ from maestro.benchmark import (
     AgentResponse,
     BenchmarkResult,
     BenchmarkRunner,
+    FinalizedScore,
 )
+from tests.fakes.benchmark_score import finalized_score
 
 
 if TYPE_CHECKING:
@@ -50,9 +52,9 @@ class MockRun:
     async def submit(self, task_index: int, response: str) -> None:
         self.submitted.append((task_index, response))
 
-    async def finalize(self) -> tuple[float, dict[str, float]]:
+    async def finalize(self) -> FinalizedScore:
         self.finalized = True
-        return self._score, self._components
+        return finalized_score(self._score, self._components)
 
 
 class MockATPClient:
@@ -219,9 +221,9 @@ async def test_runner_propagates_task_type_when_present() -> None:
         async def submit(self, task_index: int, response: str) -> None:
             self.submitted.append((task_index, response))
 
-        async def finalize(self) -> tuple[float, dict[str, float]]:
+        async def finalize(self) -> FinalizedScore:
             self.finalized = True
-            return 0.5, {}
+            return finalized_score(0.5, {})
 
     class ClientWithTypedTasks:
         async def start_run(

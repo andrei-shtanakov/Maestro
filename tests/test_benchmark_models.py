@@ -1,6 +1,7 @@
 """Tests for R-06b M4 additive benchmark model fields."""
 
 from maestro.benchmark.models import BenchmarkResult, BenchmarkTaskResult
+from tests.fakes.benchmark_score import evaluated_semantics
 
 
 def test_benchmark_result_has_default_report_status_skipped():
@@ -9,6 +10,7 @@ def test_benchmark_result_has_default_report_status_skipped():
         benchmark_id="b",
         agent_id="a",
         score=0.5,
+        semantics=evaluated_semantics(),
         per_task=[],
         duration_seconds=1.0,
     )
@@ -23,6 +25,7 @@ def test_benchmark_result_report_status_accepts_ok_failed_skipped():
             benchmark_id="b",
             agent_id="a",
             score=0.5,
+            semantics=evaluated_semantics(),
             per_task=[],
             duration_seconds=1.0,
             report_status=status,

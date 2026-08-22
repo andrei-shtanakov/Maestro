@@ -20,6 +20,7 @@ from maestro.benchmark.models import (
     AgentResponse,
     BenchmarkResult,
     BenchmarkTaskResult,
+    FinalizedScore,
 )
 
 
@@ -51,8 +52,13 @@ class BenchmarkRun(Protocol):
 
     async def submit(self, task_index: int, response: str) -> None: ...
 
-    async def finalize(self) -> tuple[float, dict[str, float]]:
-        """Close the run and return ``(score, score_components)``."""
+    async def finalize(self) -> FinalizedScore:
+        """Close the run and return the score together with its meaning.
+
+        A named result, not a tuple: ATP's contract is designed to grow, and a
+        positional return turns every addition into a breaking arity change or
+        a second channel that callers forget to read.
+        """
 
 
 @runtime_checkable
@@ -136,7 +142,7 @@ class BenchmarkRunner:
                 )
             )
 
-        score, components = await run.finalize()
+        finalized = await run.finalize()
         total_duration = time.monotonic() - started_at
 
         total_tokens = _sum_or_none(t.tokens_used for t in per_task)
@@ -147,8 +153,10 @@ class BenchmarkRunner:
             run_id=effective_run_id,
             benchmark_id=benchmark_id,
             agent_id=self._agent.agent_id,
-            score=score,
-            score_components=components,
+            score=finalized.score,
+            score_components=finalized.score_components,
+            semantics=finalized.semantics,
+            score_finalized=finalized.finalized,
             per_task=per_task,
             total_tokens=int(total_tokens) if total_tokens is not None else None,
             total_cost_usd=float(total_cost) if total_cost is not None else None,

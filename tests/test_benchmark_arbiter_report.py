@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from maestro.benchmark.arbiter_report import WireTaskResult
 from maestro.benchmark.models import BenchmarkResult, BenchmarkTaskResult
+from tests.fakes.benchmark_score import evaluated_semantics
 
 
 def _domain_task(**kwargs):
@@ -90,12 +91,18 @@ from maestro.benchmark.arbiter_report import (  # noqa: E402
 )
 
 
-def _result(run_id: str = "r", per_task: list | None = None, score: float = 0.5):
+def _result(
+    run_id: str = "r",
+    per_task: list | None = None,
+    score: float = 0.5,
+    semantics=None,
+):
     return BenchmarkResult(
         run_id=run_id,
         benchmark_id="b",
         agent_id="a",
         score=score,
+        semantics=semantics or evaluated_semantics(),
         per_task=per_task or [],
         duration_seconds=1.0,
     )

@@ -9,10 +9,11 @@ import pytest
 from typer.testing import CliRunner
 
 import maestro.cli as cli_mod
-from maestro.benchmark.models import BenchmarkResult
+from maestro.benchmark.models import BenchmarkResult, FinalizedScore
 from maestro.cli import app
 from maestro.execution.models import CollectPolicy, ExecutionRequest
 from maestro.spawners.base import AgentSpawner
+from tests.fakes.benchmark_score import finalized_score
 
 
 runner = CliRunner()
@@ -38,8 +39,8 @@ class FakeRun:
     async def submit(self, task_index: int, response: str) -> None:
         self.submitted.append((task_index, response))
 
-    async def finalize(self) -> tuple[float, dict[str, float]]:
-        return 0.75, {"accuracy": 0.75}
+    async def finalize(self) -> FinalizedScore:
+        return finalized_score(0.75, {"accuracy": 0.75})
 
 
 class FakeAdapter:

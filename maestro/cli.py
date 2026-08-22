@@ -1343,14 +1343,31 @@ def _print_benchmark_summary(result: BenchmarkResult, wd: Path, notes: Console) 
         f"benchmark [bold]{escape(result.benchmark_id)}[/bold] | agent "
         f"{escape(result.agent_id)} | run {escape(result.run_id)}"
     )
+    # ATP's contract asks consumers to branch on `quality_signal` before showing
+    # the number to a human: on the benchmark plane a task scores 100 when the
+    # agent returned a *completed* response, whatever it contained.
+    if result.semantics.quality_signal:
+        caveat = ""
+    elif result.semantics.kind == "unknown":
+        caveat = " [yellow](semantics unknown — not a quality score)[/yellow]"
+    else:
+        caveat = (
+            f" [yellow](kind={escape(result.semantics.kind)}: completion, "
+            "not quality)[/yellow]"
+        )
     notes.print(
-        f"score: [bold]{result.score}[/bold]"
+        f"score: [bold]{result.score}[/bold]{caveat}"
         + (
             f" | components: {result.score_components}"
             if result.score_components
             else ""
         )
     )
+    if result.report_status == "withheld":
+        notes.print(
+            f"[yellow]not reported to arbiter:[/yellow] {escape(result.report_error or '')}"
+            " — a non-quality score would become a routing tiebreaker"
+        )
     table = Table(title="Tasks")
     table.add_column("#")
     table.add_column("duration s")

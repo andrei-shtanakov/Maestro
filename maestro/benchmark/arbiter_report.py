@@ -22,6 +22,10 @@ from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 from pydantic import BaseModel, ConfigDict
 
 from maestro._vendor import obs
+from maestro.benchmark.score_contract import (
+    publication_decision,
+    split_numeric_components,
+)
 from maestro.coordination.arbiter_errors import (
     ArbiterContractError,
     ArbiterUnavailable,
@@ -187,10 +191,17 @@ def _build_wire_payload(
     result: BenchmarkResult,
     max_per_task: int,
 ) -> ReportBenchmarkPayload:
-    """Project a domain ``BenchmarkResult`` into a wire ``ReportBenchmarkPayload``."""
+    """Project a domain ``BenchmarkResult`` into a wire ``ReportBenchmarkPayload``.
+
+    Score components are narrowed to numbers here because that is what our own
+    ``report_benchmark-v1`` schema promises. Which names that drops is reported
+    separately by the caller (``split_numeric_components``), since one of them —
+    ``rank_score`` — is the only component arbiter's tiebreaker reads.
+    """
     per_task_wire, truncated = _sample_per_task(
         result.per_task, max_per_task, result.run_id
     )
+    numeric_components, _ = split_numeric_components(result.score_components)
     ts_str = result.ts.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     return ReportBenchmarkPayload(
         payload_version="1.0.0",
@@ -199,7 +210,7 @@ def _build_wire_payload(
         agent_id=result.agent_id,
         ts=ts_str,
         score=result.score,
-        score_components=dict(result.score_components),
+        score_components=numeric_components,
         total_tokens=result.total_tokens,
         total_cost_usd=result.total_cost_usd,
         duration_seconds=result.duration_seconds,
@@ -263,8 +274,12 @@ async def report_benchmark_to_arbiter(
     ``KeyboardInterrupt``, ``SystemExit``) propagate naturally because
     the internal ``except Exception`` clause does not cover them.
 
-    Emits 5 distinct obs events (one per outcome class):
+    Emits distinct obs events (one per outcome class):
     - ``benchmark.report.skipped`` (info) — client=None
+    - ``benchmark.report.withheld`` (warning) — fail-closed publication gate:
+      the score is not an evaluated, finalized, interpretable quality signal
+    - ``benchmark.report.components_dropped`` (warning) — non-numeric score
+      components narrowed away, listed by name
     - ``benchmark.report.succeeded`` (info) — RPC ok, new row created
     - ``benchmark.report.duplicate`` (info) — RPC ok, idempotency
     - ``benchmark.report.failed`` (warning|error) — transient or unexpected failure
@@ -284,9 +299,39 @@ async def report_benchmark_to_arbiter(
             update={"report_status": "skipped", "report_error": None}
         )
 
+    # Fail-closed: arbiter's tiebreaker falls back to this scalar when no
+    # `rank_score` is present, so an un-evaluated, unfinalized or
+    # uninterpretable number would silently become a routing input.
+    decision = publication_decision(result)
+    if not decision.allowed:
+        _obs_log.warning(
+            "benchmark.report.withheld",
+            reason=decision.reason,
+            semantics_kind=result.semantics.kind,
+            quality_signal=result.semantics.quality_signal,
+            score=result.score,
+            **event_attrs,
+        )
+        return result.model_copy(
+            update={
+                "report_status": "withheld",
+                "report_error": f"withheld: {decision.reason}",
+            }
+        )
+
     with obs.span("benchmark.report", **event_attrs):
         try:
             payload = _build_wire_payload(result, max_per_task)
+            _, dropped_components = split_numeric_components(result.score_components)
+            if dropped_components:
+                # By name, never as a count: `rank_score` is the one key whose
+                # loss changes arbiter's routing, and it must be greppable.
+                _obs_log.warning(
+                    "benchmark.report.components_dropped",
+                    dropped=list(dropped_components),
+                    rank_score_dropped="rank_score" in dropped_components,
+                    **event_attrs,
+                )
             response = await asyncio.wait_for(
                 client.report_benchmark_raw(payload.model_dump(mode="json")),
                 timeout=REPORT_TIMEOUT_S,
