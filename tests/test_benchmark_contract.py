@@ -68,12 +68,17 @@ def test_schema_is_valid_jsonschema(schema: dict) -> None:
 def test_pydantic_payload_validates_against_schema(
     request_validator: Draft202012Validator,
 ) -> None:
-    """Canonical Pydantic-serialized payload must satisfy the Request sub-schema."""
+    """Canonical Pydantic-serialized payload must satisfy the Request sub-schema.
+
+    The domain score is a percent on purpose: `0.85` would validate whether or
+    not the wire projection converts, so it would keep passing with the
+    conversion removed. `85.0` validates only once converted.
+    """
     result = BenchmarkResult(
         run_id="r1",
         benchmark_id="b",
         agent_id="claude_code",
-        score=0.85,
+        score=85.0,
         score_components={"accuracy": 0.85},
         semantics=evaluated_semantics(),
         per_task=[
