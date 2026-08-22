@@ -15,6 +15,7 @@ from jsonschema import Draft202012Validator, RefResolver
 
 from maestro.benchmark.arbiter_report import _build_wire_payload
 from maestro.benchmark.models import BenchmarkResult, BenchmarkTaskResult
+from tests.fakes.benchmark_score import evaluated_semantics
 
 
 SCHEMA_PATH = (
@@ -74,6 +75,7 @@ def test_pydantic_payload_validates_against_schema(
         agent_id="claude_code",
         score=0.85,
         score_components={"accuracy": 0.85},
+        semantics=evaluated_semantics(),
         per_task=[
             BenchmarkTaskResult(
                 task_index=0,
@@ -177,6 +179,7 @@ def test_unknown_response_fields_dont_crash_helper() -> None:
         benchmark_id="b",
         agent_id="a",
         score=0.5,
+        semantics=evaluated_semantics(),
         per_task=[],
         duration_seconds=1.0,
     )

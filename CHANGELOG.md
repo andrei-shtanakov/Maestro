@@ -3,6 +3,38 @@
 ## Unreleased
 
 ### Changed
+- **BREAKING (arbiter reporting): a benchmark result is no longer reported to
+  arbiter unless it is an evaluated, finalized, interpretable quality score.**
+  ATP's benchmark plane scores a task 100 when the agent returned a *completed*
+  response, whatever it contained, and says so on the wire via `score_semantics`
+  (contract v1). arbiter's routing tiebreaker reads
+  `score_components.rank_score` and **falls back to the scalar `score`** when it
+  is absent (`arbiter-mcp/src/db.rs::get_benchmark_score`), so a completion rate
+  reported as a bare number silently becomes a routing input. Reports are now
+  withheld fail-closed with a named reason — `quality_signal_false`,
+  `semantics_unknown`, `score_not_finalized`, `unsupported_schema_version` —
+  carried as the new `report_status: "withheld"` and a
+  `benchmark.report.withheld` obs event. Since ATP wires no evaluators into this
+  plane today, in practice **every current run is withheld**; that is the point,
+  not a regression, and the numbers it stops sending were already being clamped
+  to `1.0` on arrival (see the unit mismatch filed as arbiter#…). Nothing about
+  local results changes: `maestro benchmark` still runs, prints and returns them.
+- **(CLI) `maestro benchmark --json` gained `semantics` and `score_finalized`.**
+  Additive, but the shape of a documented output changed: `semantics` carries
+  `kind`, `quality_signal` and `caveats`. The verbatim upstream block is
+  deliberately **not** serialized — it is an unbounded blob whose shape upstream
+  controls — and stays in-process as `ScoreSemantics.raw`. The human summary now
+  marks a non-quality score rather than printing the bare number.
+- **(Contract) score components are no longer typed `dict[str, float]`.**
+  ATP's forward-compat fixture proves a component value may be an object, and
+  the previous type would have raised on the very payload the contract exists to
+  tolerate. `BenchmarkResult.score_components` is now `dict[str, Any]`; the
+  narrowing to numbers happens only at the arbiter wire boundary, where our own
+  `report_benchmark-v1` schema promises `additionalProperties: {"type":
+  "number"}`. Dropped component names are logged **by name**
+  (`benchmark.report.components_dropped`), because one of them — `rank_score` —
+  is the only component arbiter's tiebreaker reads.
+
 - **BREAKING (state layout): orchestration state moved to
   `~/.maestro/projects/<host>/<owner>/<repo>/runs/<run-id>/`.** One database
   held everything before, with no project key anywhere in the path, and on

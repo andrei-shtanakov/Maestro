@@ -16,10 +16,11 @@ token refresh delegate to ``AsyncATPClient`` (token resolution order:
 explicit ``token`` arg → ``ATP_TOKEN`` env → ``~/.atp/config.json``), so
 M3 itself owns no auth UX.
 
-ATP scoring note: today the server scores each submit binary
-(``status == "completed"`` → 100, else 0) and reports the mean as
-``total_score``. ``score_components`` stays empty until ATP exposes a
-per-metric breakdown.
+ATP scoring note: the server reports the mean of per-submit scores as
+``total_score``, and says what that mean *means* in ``score_semantics``
+(contract v1). Whether a component breakdown arrives, and whether the number
+is a quality signal at all, is read off the payload rather than assumed —
+see ``maestro.benchmark.score_contract``.
 """
 
 from __future__ import annotations
@@ -29,12 +30,16 @@ from typing import TYPE_CHECKING, Any
 
 from atp_sdk.client import AsyncATPClient
 
+from maestro.benchmark.score_contract import parse_finalized_score
+
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from types import TracebackType
 
     from atp_sdk.benchmark import BenchmarkRun as SDKBenchmarkRun
+
+    from maestro.benchmark.models import FinalizedScore
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,11 +132,9 @@ class _RunAdapter:
             ]
         await self._sdk_run.submit(atp_response, task_index)
 
-    async def finalize(self) -> tuple[float, dict[str, float]]:
+    async def finalize(self) -> FinalizedScore:
         status = await self._sdk_run.status()
-        total = status.get("total_score")
-        score = float(total) if total is not None else 0.0
-        return score, {}
+        return parse_finalized_score(status)
 
 
 class MaestroATPAdapter:

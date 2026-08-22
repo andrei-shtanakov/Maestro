@@ -18,6 +18,7 @@ from pathlib import Path
 from maestro.benchmark import (
     BenchmarkResult,
     BenchmarkTaskResult,
+    ScoreSemantics,
     report_benchmark_to_arbiter,
 )
 from maestro.coordination.arbiter_client import ArbiterClient, ArbiterClientConfig
@@ -76,6 +77,11 @@ async def _run() -> int:
                 agent_id="claude_code",
                 score=0.99,
                 score_components={"smoke": 1.0},
+                semantics=ScoreSemantics(
+                    kind="aggregated_evaluation",
+                    quality_signal=True,
+                    raw={"schema_version": 1},
+                ),
                 per_task=[
                     BenchmarkTaskResult(
                         task_index=0,

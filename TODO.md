@@ -133,6 +133,37 @@
 - [ ] **R-07 prereq (retention)**: TTL / archive policy for `benchmark_runs`. Trigger: table > 10k rows OR > 1 GB total JSON blobs. @owner:repo:arbiter @trigger:"benchmark_runs > 10k строк ИЛИ > 1 GB JSON" @id:r-07-prereq-retention
 - [ ] **R-14**: vendored `arbiter_client.py` → standalone PyPI `arbiter-py` package. M4 enlarged vendor surface. @owner:repo:arbiter @trigger:"arbiter публикует standalone arbiter-py package" @id:r-14
 - [ ] **Unscheduled — outbox**: persistent outbox + background retry for benchmark report. Trigger: if fire-and-forget shows real CI churn. @owner:github:andrei-shtanakov @trigger:"fire-and-forget даёт реальный CI-churn" @id:outbox-persistent-retry
+
+### Score contract v1 (ATP → maestro), закрыт 2026-08-22
+
+- [x] **score-breakdown-consumer-contract**: потребительская сторона ATP score contract v1 @owner:github:andrei-shtanakov @id:score-breakdown-consumer-contract
+  - `finalize()` возвращает `FinalizedScore` (score + components + semantics), а не кортеж;
+    `BenchmarkResult.semantics` **обязателен**, с сентинелом `unknown` для продюсеров
+    до контракта. Malformed-блок — contract error, не legacy: иначе испорченный новый
+    продюсер выглядит старым.
+  - Публикация в arbiter fail-closed: не-качество / unknown / нефинализированный
+    прогон не отправляется (`report_status: "withheld"`).
+  - Фикстуры и `score_contract.py` завендорены с пином по фактическим байтам
+    (`tests/fixtures/atp-score-contract/v1/`, atp-platform `05bd939`).
+- [ ] **atp-score-contract-upstream-drift**: перевендорить, когда ATP тронет контракт @owner:github:andrei-shtanakov @trigger:"atp-platform меняет packages/atp-dashboard/atp/dashboard/benchmark/score_contract.py или tests/fixtures/benchmark_score_contract/ выше 05bd939" @id:atp-score-contract-upstream-drift
+  - Copy-integrity держится тестом; это вторая гарантия — «апстрим уехал». Тест
+    сверяется с соседним чекаутом, когда он есть, и **скипается**, когда его нет,
+    поэтому у установленного пользователя гарантию несёт этот пункт.
+  - Прецедент (заведено atp-platform#298): handoff-дока ATP разъехалась с собственными фикстурами за один коммит,
+    и 2 пина из 3 в ней были неверны — прозаический пин не гарантия.
+- [ ] **benchmark-score-semantics-on-the-wire**: провести `score_semantics` до arbiter @owner:github:andrei-shtanakov @blocked_by:todo://arbiter/benchmark-score-semantics @id:benchmark-score-semantics-on-the-wire
+  - Заведено: arbiter#82. Пока семантики нет на проводе, любой не-качественный прогон приходится **удерживать**,
+    а не помечать. Схема `report_benchmark-v1` уже допускает лишний ключ верхнего уровня
+    (`Request.additionalProperties: true`) — держат наш `extra="forbid"` и то, что arbiter
+    поле не читает. Как только он его читает и учитывает — гейт можно смягчить с
+    «не отправлять» до «отправлять с меткой».
+- [ ] **benchmark-score-unit-mismatch**: у `score` в `report_benchmark-v1` два продюсера с разными единицами @owner:github:andrei-shtanakov @blocked_by:todo://arbiter/benchmark-score-unit-mismatch @id:benchmark-score-unit-mismatch
+  - Заведено: arbiter#81. atp-platform кладёт долю `[0..1]` (`benchmark_reporter.py`, `pass_rate`), maestro —
+    процент `[0..100]` (ATP `total_score`, `unit: percent`). Потребитель делает
+    `.clamp(0.0, 1.0)` (`arbiter-mcp/src/db.rs`), поэтому наш прогон с >1% завершённых
+    задач приезжает в ре-ранк ровно как `1.0`. Схема этого не ловит: `{"type": "number"}`
+    без единиц и диапазона. Пока fail-closed гейт выше держит наши прогоны, дефект не
+    проявляется — но он не исправлен, а замаскирован.
 - [ ] **Unscheduled — arbiter-initiated benchmark**: outgoing benchmark trigger from arbiter ("router uncertain → run benchmark"). From design open question #2. @owner:repo:arbiter @id:arbiter-initiated-benchmark
 - [ ] **M5 / multi-tenant auth**: service-account ATP token for CI; multi-tenant arbiter auth as separate ticket if arbiter ever leaves subprocess trust model. @owner:repo:atp-platform @trigger:"arbiter выходит за subprocess-trust-модель" @id:m5-multi-tenant-auth
 

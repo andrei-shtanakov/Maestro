@@ -1,0 +1,37 @@
+# Vendored: ATP benchmark score contract v1
+#
+# Upstream repo:   git@github.com:andrei-shtanakov/atp-platform.git
+# Content commit:  05bd939   (feat(benchmark): honest score_semantics on the
+#                             benchmark plane (#272) — the last upstream commit
+#                             that changed any byte below)
+# Copied at HEAD:  f5a28e5   (bytes identical to 05bd939, verified at copy time)
+# Copied on:       2026-08-22
+#
+# Why a copy and not a path to ../atp-platform: cross-repo contracts are
+# vendored as a pinned copy inside the consumer (repo-boundaries rule). The
+# sibling checkout does not exist for installed users.
+#
+# WARNING — do not take pins from upstream prose. atp-platform's own
+# docs/maestro-score-contract-handoff.md pins two of these files, and both of
+# those pins were stale by the time this copy was taken: `05bd939` added the
+# `coverage` block, the `aggregated_evaluation` kind and a third fixture, and
+# the doc was not updated. The hashes below were recomputed from the bytes on
+# disk. Handed back to the owner as an inbox issue.
+#
+# The two guarantees are separate and BOTH are needed:
+#   1. copy-integrity — these hashes still describe the files in this directory.
+#      Enforced by tests/test_benchmark_score_contract.py, before the fixtures
+#      are parametrized, so a truncated copy cannot shrink into a smaller green
+#      suite.
+#   2. upstream-drift — upstream has not moved past `05bd939`. Enforced by the
+#      same file when a sibling atp-platform checkout is present, and by a
+#      TODO.md checkbox when it is not. Copy-integrity alone reads an upstream
+#      change as health, which is exactly how the handoff doc above went stale.
+#
+# Re-vendoring: copy the four files again, recompute the hashes here from disk,
+# and update both commit lines. Never hand-edit a vendored byte.
+
+cd5e79e92e46d9ef81be60dd577663eed294057dc9e8935a849846a962dcfca1  run_status_completion_only.json
+0e2169cb04550be8d6b4cccd396ac4ee8ad68b03bae78e706e6913adaf68fa4a  run_status_evaluated.json
+09f85de6e767ab635ec10755657372877211555aec168689a2afb24e895c3a3b  run_status_forward_compat.json
+fb543c00189b67748828f9249511b1468b69945136f3ce00c7abb9ed5d77bf1c  score_contract.py

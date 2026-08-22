@@ -23,6 +23,7 @@ from maestro.benchmark import (
 )
 from maestro.coordination.arbiter_client import ArbiterClient, ArbiterClientConfig
 from maestro.coordination.arbiter_errors import ArbiterContractError
+from tests.fakes.benchmark_score import evaluated_semantics
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +117,7 @@ def _build_result(run_id: str, per_task_n: int = 2) -> BenchmarkResult:
         agent_id="claude_code",
         score=0.75,
         score_components={"accuracy": 0.75},
+        semantics=evaluated_semantics(),
         per_task=tasks,
         duration_seconds=10.0,
     )
