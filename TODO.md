@@ -146,15 +146,19 @@
   - Фикстуры и `score_contract.py` завендорены с пином по фактическим байтам
     (`tests/fixtures/atp-score-contract/v1/`, atp-platform `05bd939`).
 - [ ] **atp-score-contract-upstream-drift**: перевендорить, когда ATP тронет контракт @owner:github:andrei-shtanakov @trigger:"atp-platform меняет packages/atp-dashboard/atp/dashboard/benchmark/score_contract.py или tests/fixtures/benchmark_score_contract/ выше 05bd939" @id:atp-score-contract-upstream-drift
-  - Copy-integrity держится тестом; это вторая гарантия — «апстрим уехал». Её сегодня
-    **не несёт ничто, кроме этого пункта**: `test_upstream_has_not_drifted_past_the_pin`
-    сверяется с соседним чекаутом по `git show 05bd939:<path>`, то есть с **пиненым
-    коммитом**, а не с их HEAD — апстрим может уехать сколь угодно далеко, тест
-    останется зелёным. Скип без чекаута — не главная дыра, а частный случай. См.
-    `atp-score-contract-provenance-test-misnamed`.
+  - Copy-integrity держится тестом; это вторая гарантия — «апстрим уехал».
+    **Больше не держится на одном этом пункте:** `atp-score-contract-digest-sidecar`
+    закрыт — еженедельный workflow сверяет опубликованные ATP дайджесты с нашим `PIN`,
+    то есть смотрит на их **текущее** состояние, а не на пиненый коммит. Пункт остаётся
+    как обязательство *перевендорить*, когда сверка покраснеет.
+    Прежняя формулировка проблемы верна и стоит того, чтобы остаться:
+    `test_upstream_has_not_drifted_past_the_pin` сверяется по `git show 05bd939:<path>`,
+    то есть с **пиненым коммитом**, а не с их HEAD — апстрим мог уехать сколь угодно
+    далеко, а тест оставался зелёным. Скип без чекаута был частным случаем, не главной
+    дырой. См. `atp-score-contract-provenance-test-misnamed`.
   - Прецедент (заведено atp-platform#298): handoff-дока ATP разъехалась с собственными фикстурами за один коммит,
     и 2 пина из 3 в ней были неверны — прозаический пин не гарантия.
-- [ ] **atp-score-contract-digest-sidecar**: потребить `DIGESTS.json` от ATP как машинный детект дрейфа @owner:github:andrei-shtanakov @blocked_by:todo://atp-platform/score-contract-digest-sidecar @id:atp-score-contract-digest-sidecar
+- [x] **atp-score-contract-digest-sidecar**: потребить `DIGESTS.json` от ATP как машинный детект дрейфа @owner:github:andrei-shtanakov @id:atp-score-contract-digest-sidecar
   - Принят inbox-запрос maestro#204: ATP публикует `tests/fixtures/benchmark_score_contract/DIGESTS.json`
     (дайджесты + `contract_version`), генерируемый и сверяемый их же
     `TestHandoffPinsAreRecomputed` — значит по построению не разъезжается с байтами.
@@ -167,6 +171,15 @@
     вверху — то, что перечислением известных путей не ловится), и на `contract_version != 1`.
   - Форма — **еженедельный cron-workflow**, не блокирующий PR-джоб: наши PR их контракт
     не двигают, так что per-PR частота покупает только флейк на недоступности GitHub.
+  - **Сделано:** `scripts/check_atp_score_contract_drift.py` + workflow
+    `.github/workflows/atp-score-contract-drift.yml` (понедельник 07:00 UTC — на час позже
+    arbiter-сверки в `ci.yml`, чтобы не толкаться за раннер). Логика сравнения чистая и
+    покрыта 13 тестами, сеть — в двухстрочной обёртке. Коды: 0 — сходится, 1 — дрейф,
+    **2 — сайдкар не прочитан** (недоступный продюсер это неизвестность, а не согласие).
+    Ловится и то, чего перечислением известных путей не поймать: ключ, которого нет в
+    нашем `PIN` — фикстура, опубликованная уже после вендоринга.
+  - **Порядок мержа:** сначала atp-platform#301, потом наш PR. Сайдкар тянется из их
+    `main`, и до мержа #301 первый прогон честно упадёт с кодом 2.
 - [ ] **atp-score-contract-provenance-test-misnamed**: `test_upstream_has_not_drifted_past_the_pin` проверяет провенанс, а не дрейф @owner:github:andrei-shtanakov @id:atp-score-contract-provenance-test-misnamed
   - Тест сверяет наши байты с `git show 05bd939:<path>` — это «мы скопировали то, что
     действительно лежало в пиненом коммите, а не из чужого дерева». Гарантия настоящая

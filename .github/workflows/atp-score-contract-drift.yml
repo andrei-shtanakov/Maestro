@@ -1,0 +1,33 @@
+name: ATP score-contract drift
+
+# The second of the two guarantees a vendored contract needs. Copy-integrity —
+# our bytes still match our own PIN — is a unit test in the ordinary suite.
+# This one asks the other question: has the producer published something new?
+#
+# It is deliberately NOT a pull-request job. Our PRs cannot move ATP's contract,
+# so running it per-PR would buy nothing except a red build whenever GitHub is
+# briefly unreachable — and a check that cries wolf gets ignored, which is worse
+# than not having it.
+#
+# A red run here means "act": re-vendor from the current bytes and update
+# tests/fixtures/atp-score-contract/v1/PIN. Exit 2 means the sidecar could not
+# be read at all; that is reported as a failure on purpose, because an
+# unreachable producer is an unknown, and an unknown rendered as green is the
+# exact defect this contract keeps re-teaching.
+
+on:
+  schedule:
+    # Monday 07:00 UTC — an hour after the arbiter drift check in ci.yml, so the
+    # two never contend for the same runner minute.
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv sync
+      - name: Compare ATP's published digests against our PIN
+        run: uv run python scripts/check_atp_score_contract_drift.py
