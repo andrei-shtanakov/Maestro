@@ -146,11 +146,35 @@
   - Фикстуры и `score_contract.py` завендорены с пином по фактическим байтам
     (`tests/fixtures/atp-score-contract/v1/`, atp-platform `05bd939`).
 - [ ] **atp-score-contract-upstream-drift**: перевендорить, когда ATP тронет контракт @owner:github:andrei-shtanakov @trigger:"atp-platform меняет packages/atp-dashboard/atp/dashboard/benchmark/score_contract.py или tests/fixtures/benchmark_score_contract/ выше 05bd939" @id:atp-score-contract-upstream-drift
-  - Copy-integrity держится тестом; это вторая гарантия — «апстрим уехал». Тест
-    сверяется с соседним чекаутом, когда он есть, и **скипается**, когда его нет,
-    поэтому у установленного пользователя гарантию несёт этот пункт.
+  - Copy-integrity держится тестом; это вторая гарантия — «апстрим уехал». Её сегодня
+    **не несёт ничто, кроме этого пункта**: `test_upstream_has_not_drifted_past_the_pin`
+    сверяется с соседним чекаутом по `git show 05bd939:<path>`, то есть с **пиненым
+    коммитом**, а не с их HEAD — апстрим может уехать сколь угодно далеко, тест
+    останется зелёным. Скип без чекаута — не главная дыра, а частный случай. См.
+    `atp-score-contract-provenance-test-misnamed`.
   - Прецедент (заведено atp-platform#298): handoff-дока ATP разъехалась с собственными фикстурами за один коммит,
     и 2 пина из 3 в ней были неверны — прозаический пин не гарантия.
+- [ ] **atp-score-contract-digest-sidecar**: потребить `DIGESTS.json` от ATP как машинный детект дрейфа @owner:github:andrei-shtanakov @blocked_by:todo://atp-platform/score-contract-digest-sidecar @id:atp-score-contract-digest-sidecar
+  - Принят inbox-запрос maestro#204: ATP публикует `tests/fixtures/benchmark_score_contract/DIGESTS.json`
+    (дайджесты + `contract_version`), генерируемый и сверяемый их же
+    `TestHandoffPinsAreRecomputed` — значит по построению не разъезжается с байтами.
+  - Наша поправка к формату, отправлена в #204: `score_contract.py` должен быть в той же
+    карте. Фикстура, разъехавшаяся с парсером, проявляется у нас отказом на живом
+    прогоне, а не красным тестом. SHA коммита в сайдкаре, наоборот, не просим — на
+    момент прогона их теста этого коммита ещё нет, поле было бы незаполнимым.
+  - Сайдкар **не вендорим**: `PIN` уже держит те же дайджесты. Проверка = скачать файл,
+    сверить карту с `PIN`, поднять флаг на ключ, которого в `PIN` нет (новая фикстура
+    вверху — то, что перечислением известных путей не ловится), и на `contract_version != 1`.
+  - Форма — **еженедельный cron-workflow**, не блокирующий PR-джоб: наши PR их контракт
+    не двигают, так что per-PR частота покупает только флейк на недоступности GitHub.
+- [ ] **atp-score-contract-provenance-test-misnamed**: `test_upstream_has_not_drifted_past_the_pin` проверяет провенанс, а не дрейф @owner:github:andrei-shtanakov @id:atp-score-contract-provenance-test-misnamed
+  - Тест сверяет наши байты с `git show 05bd939:<path>` — это «мы скопировали то, что
+    действительно лежало в пиненом коммите, а не из чужого дерева». Гарантия настоящая
+    (copy-integrity сверяет байты с хешами, посчитанными с нашего же диска, и ложный пин
+    не ловит), но имя и докстринг обещают дрейф, которого тест не делает; `PIN` повторяет
+    то же обещание в блоке «две гарантии».
+  - Переименовать в провенанс, переписать докстринг и блок в `PIN`; дрейф уходит в
+    `atp-score-contract-digest-sidecar`. Правка чисто вербальная — байты не трогаем.
 - [x] **benchmark-score-semantics-on-the-wire**: провести `score_semantics` до arbiter @owner:github:andrei-shtanakov @id:benchmark-score-semantics-on-the-wire
   - Блокер снят: arbiter#82 закрыт (их PR #83, `238fc8c`) — блок принимается, хранится
     дословно и читается по `quality_signal`. Гейт смягчён: не-качественный прогон и прогон
