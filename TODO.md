@@ -835,6 +835,21 @@
 
 ---
 
+## Входящие 2026-08, волна 7 (inbox #210, принят 2026-08-22)
+
+- [x] **repo-identity-owner-traversal** — `parse_remote_url` пропускает `..` @owner:github:andrei-shtanakov @id:repo-identity-owner-traversal
+      в сегменте пути. Принят из dispatcher, issue #210.
+      Проверка `repo in {".", ".."}` стояла только на `repo`; `_UNSAFE`
+      разрешает точку, поэтому `git@github.com:owner/../etc.git` давал
+      `("github.com", "..", "etc")` — дерево прогонов уходит на уровень выше
+      `projects/`. Шире заявленного: `host` не проверялся вовсе (ни `_UNSAFE`,
+      ни на `..`), так что `git@..:owner/repo.git` уводил ровно так же.
+      Правило одно на все три сегмента (`_segment_is_safe`) — чинить только
+      `owner` значило бы оставить зеркало dispatcher'а по-прежнему неверным.
+      (closed by fix/repo-identity-segment-traversal)
+
+---
+
 ## Бэклог идей из research-дайджеста (2026-07-22)
 
 > Источник: `../prograph-vault/authored/notes/2026-07-22-ideas-from-ai-repos-research.md`
