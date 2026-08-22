@@ -17,7 +17,7 @@ import logging
 import os
 import random
 from datetime import UTC
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
@@ -161,12 +161,31 @@ class ReportBenchmarkPayload(BaseModel):
     ts: str  # RFC3339 UTC
     score: float
     score_components: dict[str, float]
+    score_semantics: dict[str, Any]
     total_tokens: int | None
     total_cost_usd: float | None
     duration_seconds: float
     per_task: list[WireTaskResult]
     per_task_total_count: int
     per_task_truncated: bool
+
+
+#: ATP reports the benchmark-plane score as a percent (`unit: percent`,
+#: `range {0, 100}`); the wire's canonical unit is a fraction in [0,1].
+_PERCENT_PER_UNIT = 100.0
+
+
+def _score_as_fraction(percent: float) -> float:
+    """Convert ATP's percent to the wire's canonical fraction.
+
+    The conversion lives here, at the boundary, and nowhere else: the domain
+    `BenchmarkResult.score` stays the percent ATP reported, which is what the
+    CLI shows a human. Sending the percent was the defect behind arbiter#81 —
+    the consumer clamps to [0,1], so every run above 1% arrived as a perfect
+    `1.0`. arbiter now rejects an out-of-range score with -32602 instead, which
+    this repo already classifies as a contract break rather than a transient.
+    """
+    return percent / _PERCENT_PER_UNIT
 
 
 def _sample_per_task(
@@ -202,6 +221,15 @@ def _build_wire_payload(
         result.per_task, max_per_task, result.run_id
     )
     numeric_components, _ = split_numeric_components(result.score_components)
+    if not result.semantics.raw:
+        # Defence in depth behind `publication_decision`. On arbiter's wire an
+        # absent `score_semantics` is read as a legacy producer and stays
+        # ELIGIBLE for the routing tiebreaker, so a block-less payload is not a
+        # cautious payload — it is a silently routable one. Refuse to build it.
+        raise ValueError(
+            "refusing to build a payload with no score_semantics block: "
+            "an absent block is read as routable on the arbiter side"
+        )
     ts_str = result.ts.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     return ReportBenchmarkPayload(
         payload_version="1.0.0",
@@ -209,8 +237,12 @@ def _build_wire_payload(
         benchmark_id=result.benchmark_id,
         agent_id=result.agent_id,
         ts=ts_str,
-        score=result.score,
+        score=_score_as_fraction(result.score),
         score_components=numeric_components,
+        # Verbatim, so the claim stays ATP's rather than our reading of it.
+        # Where our reading disagrees (an unfinalized run whose producer
+        # claimed quality) the gate withholds the run entirely.
+        score_semantics=dict(result.semantics.raw),
         total_tokens=result.total_tokens,
         total_cost_usd=result.total_cost_usd,
         duration_seconds=result.duration_seconds,

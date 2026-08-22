@@ -123,11 +123,13 @@ def test_payload_version_pinned_to_1_0_0():
 
 
 def test_payload_maps_all_aggregate_fields():
-    result = _result(run_id="x", per_task=_tasks(3), score=0.85)
+    result = _result(run_id="x", per_task=_tasks(3), score=85.0)
     p = _build_wire_payload(result, max_per_task=200)
     assert p.run_id == "x"
     assert p.benchmark_id == "b"
     assert p.agent_id == "a"
+    # Domain carries ATP's percent; the wire carries the canonical fraction
+    # (arbiter#81 — sending the percent was clamped to a perfect 1.0).
     assert p.score == 0.85
     assert p.per_task_total_count == 3
     assert p.per_task_truncated is False

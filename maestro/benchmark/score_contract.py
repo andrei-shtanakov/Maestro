@@ -49,12 +49,13 @@ __all__ = [
 #: The only `score_semantics.schema_version` this consumer can interpret.
 SUPPORTED_SCHEMA_VERSION = 1
 
-WithholdReason = Literal[
-    "ok",
+PublicationReason = Literal[
+    # allowed
+    "quality_signal",
+    "stored_not_routed",
+    # withheld
     "semantics_unknown",
-    "unsupported_schema_version",
     "score_not_finalized",
-    "quality_signal_false",
 ]
 
 
@@ -73,7 +74,7 @@ class PublicationDecision(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     allowed: bool
-    reason: WithholdReason
+    reason: PublicationReason
 
 
 def parse_finalized_score(status: Mapping[str, Any]) -> FinalizedScore:
@@ -181,25 +182,38 @@ def split_numeric_components(
 
 
 def publication_decision(result: BenchmarkResult) -> PublicationDecision:
-    """Fail-closed gate on reporting this result to arbiter.
+    """Gate on reporting this result to arbiter (arbiter#81/#82).
 
-    Only an evaluated, finalized, interpretable run is publishable. Everything
-    else is withheld with a named reason rather than sent as a bare number that
-    the re-ranker cannot tell apart from a quality score.
+    arbiter now stores `score_semantics` verbatim and branches on
+    `quality_signal` itself, so a non-quality run no longer has to be silenced —
+    it is stored, stays inspectable, and their reader keeps it out of the
+    routing tiebreaker. That is `stored_not_routed`.
+
+    Two cases stay withheld, and the reason is the shape of *their* rule rather
+    than ours. `semantics_permit_routing` returns **true** for an absent block —
+    a deliberate deviation so their existing legacy rows keep feeding R-07. So
+    on that wire an absent block does not mean "unknown", it means "eligible".
+    A run whose semantics we could not read therefore must not be sent at all:
+    there is no way to say "I did not read this" in a field whose absence is
+    read as consent.
+
+    An unfinalized run is withheld for a different reason: its `0.0` is a
+    placeholder, not a measurement, and storing it would put a fabricated
+    number in a table people read.
     """
     semantics = result.semantics
 
     if semantics.kind == UNKNOWN_KIND:
         return PublicationDecision(allowed=False, reason="semantics_unknown")
 
-    version = semantics.raw.get("schema_version", SUPPORTED_SCHEMA_VERSION)
-    if version != SUPPORTED_SCHEMA_VERSION:
-        return PublicationDecision(allowed=False, reason="unsupported_schema_version")
-
     if not result.score_finalized:
         return PublicationDecision(allowed=False, reason="score_not_finalized")
 
-    if not semantics.quality_signal:
-        return PublicationDecision(allowed=False, reason="quality_signal_false")
+    version = semantics.raw.get("schema_version", SUPPORTED_SCHEMA_VERSION)
+    if semantics.quality_signal and version == SUPPORTED_SCHEMA_VERSION:
+        return PublicationDecision(allowed=True, reason="quality_signal")
 
-    return PublicationDecision(allowed=True, reason="ok")
+    # Present block, but not one arbiter will route on: an unsupported
+    # schema_version we cannot interpret, or an honest `quality_signal: false`.
+    # We ship the block verbatim and let their reader apply its own rule.
+    return PublicationDecision(allowed=True, reason="stored_not_routed")

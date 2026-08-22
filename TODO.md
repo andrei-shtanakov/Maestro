@@ -151,19 +151,33 @@
     поэтому у установленного пользователя гарантию несёт этот пункт.
   - Прецедент (заведено atp-platform#298): handoff-дока ATP разъехалась с собственными фикстурами за один коммит,
     и 2 пина из 3 в ней были неверны — прозаический пин не гарантия.
-- [ ] **benchmark-score-semantics-on-the-wire**: провести `score_semantics` до arbiter @owner:github:andrei-shtanakov @blocked_by:todo://arbiter/benchmark-score-semantics @id:benchmark-score-semantics-on-the-wire
-  - Заведено: arbiter#82. Пока семантики нет на проводе, любой не-качественный прогон приходится **удерживать**,
-    а не помечать. Схема `report_benchmark-v1` уже допускает лишний ключ верхнего уровня
-    (`Request.additionalProperties: true`) — держат наш `extra="forbid"` и то, что arbiter
-    поле не читает. Как только он его читает и учитывает — гейт можно смягчить с
-    «не отправлять» до «отправлять с меткой».
-- [ ] **benchmark-score-unit-mismatch**: у `score` в `report_benchmark-v1` два продюсера с разными единицами @owner:github:andrei-shtanakov @blocked_by:todo://arbiter/benchmark-score-unit-mismatch @id:benchmark-score-unit-mismatch
-  - Заведено: arbiter#81. atp-platform кладёт долю `[0..1]` (`benchmark_reporter.py`, `pass_rate`), maestro —
-    процент `[0..100]` (ATP `total_score`, `unit: percent`). Потребитель делает
-    `.clamp(0.0, 1.0)` (`arbiter-mcp/src/db.rs`), поэтому наш прогон с >1% завершённых
-    задач приезжает в ре-ранк ровно как `1.0`. Схема этого не ловит: `{"type": "number"}`
-    без единиц и диапазона. Пока fail-closed гейт выше держит наши прогоны, дефект не
-    проявляется — но он не исправлен, а замаскирован.
+- [x] **benchmark-score-semantics-on-the-wire**: провести `score_semantics` до arbiter @owner:github:andrei-shtanakov @id:benchmark-score-semantics-on-the-wire
+  - Блокер снят: arbiter#82 закрыт (их PR #83, `238fc8c`) — блок принимается, хранится
+    дословно и читается по `quality_signal`. Гейт смягчён: не-качественный прогон и прогон
+    с неизвестной нам `schema_version` теперь **отправляются с блоком** (`stored_not_routed`),
+    arbiter хранит их и не пускает в тайбрейкер.
+  - **Смягчено не везде, и это не осторожность, а их правило.** `semantics_permit_routing`
+    возвращает `true` на **отсутствующий** блок (сознательное послабление ради их 21 legacy-строки).
+    Значит прогон с непрочитанной семантикой отправлять нельзя: на том проводе отсутствие
+    блока — не «неизвестно», а «пригоден». Удерживаются два случая: `semantics_unknown`
+    и `score_not_finalized` (0.0 — заглушка, не измерение).
+  - `payload_version` остаётся `1.0.0`: arbiter отвергает незнакомую версию, так что бамп
+    был бы ломающим, а не косметическим.
+- [x] **benchmark-score-unit-mismatch**: у `score` в `report_benchmark-v1` два продюсера с разными единицами @owner:github:andrei-shtanakov @id:benchmark-score-unit-mismatch
+  - Канон назначен владельцем arbiter (#81, их PR #83): **доля `[0..1]`**, потому что 21
+    существующая строка — доли, `rank_score <= pass_rate <= 1.0` по построению, а арифметика
+    ре-ранка `(score - 0.5) * weight` предполагает `[0,1]`.
+  - Наша половина: делим на 100 **на проводе** (`_score_as_fraction`), доменный
+    `BenchmarkResult.score` остаётся процентом, каким его отдал ATP (`unit: percent`) — таким
+    его и видит человек в CLI. Одна конвертация в одном месте, с тестом.
+  - Схема получила `minimum: 0` / `maximum: 1`; выход за диапазон теперь `-32602` на ингесте,
+    что у нас уже классифицируется как contract_break, а не транзиент для ретрая.
+- [ ] **report-benchmark-schema-ownership**: SSOT схемы у нас, но правку внесли у потребителя @owner:github:andrei-shtanakov @trigger:"следующая правка report_benchmark-v1 с любой стороны" @id:report-benchmark-schema-ownership
+  - `contracts/benchmark/report_benchmark-v1.schema.json` объявлен единственным источником
+    истины (так написано в `tests/test_benchmark_contract.py`), но `minimum/maximum` и
+    `score_semantics` появились сначала в копии arbiter, и копии молча разъехались на 1224 байта.
+    Тест `test_schema_copy_matches_the_arbiter_side` теперь ловит расхождение при наличии
+    соседнего чекаута — но вопрос «кто редактирует SSOT» остаётся открытым и решается не тестом.
 - [ ] **Unscheduled — arbiter-initiated benchmark**: outgoing benchmark trigger from arbiter ("router uncertain → run benchmark"). From design open question #2. @owner:repo:arbiter @id:arbiter-initiated-benchmark
 - [ ] **M5 / multi-tenant auth**: service-account ATP token for CI; multi-tenant arbiter auth as separate ticket if arbiter ever leaves subprocess trust model. @owner:repo:atp-platform @trigger:"arbiter выходит за subprocess-trust-модель" @id:m5-multi-tenant-auth
 
