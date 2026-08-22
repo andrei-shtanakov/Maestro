@@ -40,9 +40,9 @@ def _load() -> Any:
 WATCH = _load()
 
 PINS = {
-    "run_status_completion_only.json": "aaaa",
-    "run_status_evaluated.json": "bbbb",
-    "score_contract.py": "cccc",
+    "run_status_completion_only.json": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "run_status_evaluated.json": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "score_contract.py": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 }
 
 FIXTURE_DIR = "tests/fixtures/benchmark_score_contract"
@@ -53,9 +53,9 @@ def _sidecar(**overrides: Any) -> dict[str, Any]:
     base: dict[str, Any] = {
         "contract_version": 1,
         "files": {
-            f"{FIXTURE_DIR}/run_status_completion_only.json": "aaaa",
-            f"{FIXTURE_DIR}/run_status_evaluated.json": "bbbb",
-            MODULE_PATH: "cccc",
+            f"{FIXTURE_DIR}/run_status_completion_only.json": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            f"{FIXTURE_DIR}/run_status_evaluated.json": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            MODULE_PATH: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         },
     }
     base.update(overrides)
@@ -68,7 +68,9 @@ def test_agreement_is_silent() -> None:
 
 def test_changed_digest_is_reported_by_name() -> None:
     sidecar = _sidecar()
-    sidecar["files"][f"{FIXTURE_DIR}/run_status_evaluated.json"] = "dddd"
+    sidecar["files"][f"{FIXTURE_DIR}/run_status_evaluated.json"] = (
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    )
 
     findings = WATCH.compare(sidecar, PINS)
 
@@ -85,7 +87,9 @@ def test_new_upstream_fixture_is_reported() -> None:
     shipped undeclared in ATP's own handoff document (their #298).
     """
     sidecar = _sidecar()
-    sidecar["files"][f"{FIXTURE_DIR}/run_status_future.json"] = "eeee"
+    sidecar["files"][f"{FIXTURE_DIR}/run_status_future.json"] = (
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    )
 
     findings = WATCH.compare(sidecar, PINS)
 
@@ -115,7 +119,9 @@ def test_contract_version_bump_is_reported() -> None:
 def test_basename_collision_is_its_own_finding() -> None:
     """The join is on basename; ambiguity must be loud, not last-write-wins."""
     sidecar = _sidecar()
-    sidecar["files"]["packages/elsewhere/score_contract.py"] = "ffff"
+    sidecar["files"]["packages/elsewhere/score_contract.py"] = (
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    )
 
     findings = WATCH.compare(sidecar, PINS)
 
@@ -216,7 +222,9 @@ def test_malformed_digest_exits_two(tmp_path: Path) -> None:
 def test_ambiguous_name_is_reported_once_and_not_compared() -> None:
     """Comparing an arbitrarily chosen key would depend on dict order."""
     sidecar = _sidecar()
-    sidecar["files"]["packages/elsewhere/score_contract.py"] = "ffff"
+    sidecar["files"]["packages/elsewhere/score_contract.py"] = (
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    )
 
     findings = WATCH.compare(sidecar, PINS)
 
@@ -249,3 +257,32 @@ def test_version_bump_is_drift_not_malformed() -> None:
     findings = WATCH.compare(_sidecar(contract_version=2), PINS)
 
     assert any("contract_version" in f for f in findings)
+
+
+def test_string_that_is_not_a_sha256_is_unusable(tmp_path: Path) -> None:
+    """The case the type check alone misses.
+
+    `"hello"` is a string, so a type check waves it through — and then it is
+    compared, disagrees with our pin, and gets reported as drift. The operator
+    is told to re-vendor, when the actual defect is upstream publishing
+    something that is not a digest at all.
+    """
+    sidecar = _sidecar()
+    sidecar["files"][f"{FIXTURE_DIR}/run_status_evaluated.json"] = "hello"
+
+    with pytest.raises(WATCH.SidecarMalformed, match="sha256"):
+        WATCH.compare(sidecar, PINS)
+
+    path = tmp_path / "DIGESTS.json"
+    path.write_text(json.dumps(sidecar), encoding="utf-8")
+    assert WATCH.main(["--sidecar-file", str(path)]) == 2
+
+
+def test_uppercase_or_truncated_digest_is_unusable() -> None:
+    """Shape, not merely presence: a 63-char or upper-case digest is neither
+    what the generator emits nor something our pin can be compared against."""
+    for bad in ("A" * 64, "a" * 63, "a" * 65):
+        sidecar = _sidecar()
+        sidecar["files"][MODULE_PATH] = bad
+        with pytest.raises(WATCH.SidecarMalformed):
+            WATCH.compare(sidecar, PINS)

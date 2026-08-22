@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -62,6 +63,11 @@ PIN_PATH = (
 SUPPORTED_CONTRACT_VERSION = 1
 
 FETCH_TIMEOUT_S = 30
+
+#: A sha256, lowercase hex. Checked rather than assumed: a string that is not a
+#: digest cannot disagree with our pin in any meaningful way, so treating it as
+#: drift would name the wrong defect and prescribe the wrong fix.
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 
 def read_pin(path: Path = PIN_PATH) -> dict[str, str]:
@@ -141,11 +147,12 @@ def compare(sidecar: dict[str, Any], pins: dict[str, str]) -> list[str]:
             # of a defect, and the kind that sends a reader after the wrong file.
             continue
         upstream = files[keys[0]]
-        if not isinstance(upstream, str) or not upstream:
+        if not isinstance(upstream, str) or not _DIGEST.match(upstream):
             # One bad entry makes the whole document untrustworthy: it comes
             # out of a single generator, so a digest that is not a digest means
-            # the file is not what it claims to be.
-            raise SidecarMalformed(f"{name}: digest is {upstream!r}, not a string")
+            # the file is not what it claims to be. Shape is checked, not just
+            # type — "hello" would otherwise be compared and reported as drift.
+            raise SidecarMalformed(f"{name}: {upstream!r} is not a sha256 digest")
         ours = pins.get(name)
         if ours is None:
             # The case a hardcoded list of known paths cannot catch: a fixture
