@@ -1,8 +1,20 @@
 # Mode-1 run-level branch isolation (`git.run_branch`) — design
 
-**Status:** revision 5 — codex-review round 3 incorporated; awaiting
+**Status:** revision 6 — codex-review round 4 incorporated; awaiting
 owner approval
 **Date:** 2026-08-24
+**Revision 6 (codex-review round 4: one major, one medium):** (1) §6 —
+the supersession check is re-founded on *state* instead of proxies:
+the run row records `run_branch_head` (tip sha, kept current by the
+run), and continuation refuses when the branch tip moved
+(`resume_stale_checkout`) — round 4 rightly showed the round-2
+name-counting rule false-blocks, but its DAG-keying remedy is refused
+with rationale (a different DAG that advanced the shared branch still
+moved the state; the invariant is "the state did not move", not "no
+newer run exists"); the crash window refuses over the run's own commit
+and the escape is an explicit audited `--accept-branch-tip`, not
+silent adoption. (2) §6 — plain `--db` naming a branch-bound database
+is a continuation and walks the same verification, `--resume` or not.
 **Revision 5 (codex-review round 3, three majors, each confirmed):**
 (1) §7 — the completion-path tripwire fires before any terminal
 transition, and the success tail reorders to tripwire → auto-commit →
@@ -244,9 +256,15 @@ happened to resume from. A schema migration adds both columns to
 existing databases; the number is claimed at implementation time
 (parallel actors also claim migrations).
 
-On continuation of an existing run — `--resume`, `--run <id>`, or both
-(§2; the flagless definition is deliberate so no selector of an
-existing run bypasses this section) — (consumer point 4):
+On continuation of an existing run — `--resume`, `--run <id>`, or both,
+**and plain `--db <path>` naming a database whose run row is
+branch-bound** (`declared=1`): that invocation already continues prior
+task state today (`--db` skips the resolver, opens the named database,
+and the scheduler preserves its existing tasks), so it walks the same
+verification whether or not `--resume` was typed (codex-review round 4,
+medium — the selector list alone left it undefined). The flagless
+definition is deliberate so no selector of an existing run bypasses
+this section (consumer point 4):
 
 - The branch is **read from the run row and verified against the
   checkout** — never re-derived from the config. The config may have
@@ -260,20 +278,38 @@ existing run bypasses this section) — (consumer point 4):
   remove. Acting nowhere beats acting in the wrong place.
 - No cleanliness check on resume: a crashed run legitimately leaves
   uncommitted task work in the tree.
-- **A superseded run refuses to resume** (codex-review round 2,
-  major 1). The branch is per-DAG, so a *newer* run of the same DAG
-  legitimately advances the same branch (that is the consumer's
-  iteration pattern — fresh attempts, old runs abandoned). What must
-  not happen is the older run then resuming on top of the newer run's
-  state while the name-only check smiles: name equality is not state
-  identity. On resume, the runs registry (already enumerated by
-  `resolve_runs`) is checked for any **newer** run whose record binds
-  the same branch; if one exists, resume refuses
-  (`resume_superseded`), naming the newer run id. Runs without a
-  branch record (`declared=0`/pre-migration) do not participate. No
-  override flag in this slice — the operator's remedy is resuming the
-  newest run, which is the one whose state the checkout actually
-  carries.
+- **A run whose branch moved underneath it refuses to resume** —
+  checked against *state*, not proxies (revised twice: round 2 major 1
+  established the hazard — an older run resuming on top of a newer
+  run's commits while a name-only check smiles; round 4 major 1 showed
+  the round-2 remedy, "any newer run recording the same branch name",
+  is itself a proxy with false positives — a newer run that bound the
+  branch but never advanced it would block a perfectly resumable run.
+  Keying supersession to DAG identity, as round 4 suggested, would be
+  the wrong fix: a different DAG that *did* advance the shared branch
+  still moved the state under this run, and DAG-keying would wave that
+  resume through on top of foreign commits. The invariant was never
+  "no newer run exists"; it is "the state did not move"). So the run
+  row records **`run_branch_head`** — the branch tip sha — written at
+  publication, updated after each auto-commit the run itself makes,
+  and refreshed on graceful suspension/stop. On continuation: tip of
+  the recorded branch equals the recorded head → proceed; anything
+  else → refuse (`resume_stale_checkout`), naming both shas — this
+  catches a newer run of the same DAG, a run of a different DAG, and a
+  human commit alike, and never blocks when nothing actually moved.
+  Runs without a branch record (`declared=0`/pre-migration) do not
+  participate.
+  **The crash window is stated, not hidden:** a crash between a task's
+  git commit and the bookkeeping update leaves the tip one commit
+  ahead of the record, so the next resume refuses over the run's *own*
+  work. The escape is explicit and audited, not automatic:
+  `--accept-branch-tip` re-records the observed tip as a deliberate
+  operator statement ("I inspected the delta and it is this run's
+  own"), emitting a structured event — the same
+  verify-then-state-it-explicitly shape as
+  `workstream-resolve-ambiguity`. Without the flag the refusal stands;
+  silent adoption here would reopen the hole the check exists to
+  close.
 - The record is read as a three-state matrix on the two columns:
   - `declared=1` → `run_branch` is set; verify as above.
   - `declared=0` → the run opted out at creation; the gate does
@@ -381,7 +417,7 @@ first instant.
 
 - One typed error family (`RunBranchGateError` with a machine-readable
   `reason`: `branch_equals_base`, `dirty_tree`, `wrong_start_point`,
-  `resume_branch_mismatch`, `resume_superseded`, `record_missing`).
+  `resume_branch_mismatch`, `resume_stale_checkout`, `record_missing`).
   The one fail-open case (§6: a true pre-migration record) is a
   warning, not a member of this family.
 - Rendered as plain text on **stderr** (`err_console`, matching every
@@ -406,10 +442,18 @@ first instant.
   adopted record; `--db` + configured `run_branch` + no run row
   refuses (`record_missing`), never proceeds off the config-derived
   name.
-- Superseded-resume test (round 2, major 1): run A suspended on `B`,
-  fresh run B' records the same branch → `--resume --run <A>` refuses
-  (`resume_superseded`) even though the branch name matches; resuming
-  B' succeeds.
+- Stale-checkout tests (round 2 major 1 + round 4 major 1): run A
+  suspended on `B`, a fresh run advances `B` → `--resume --run <A>`
+  refuses (`resume_stale_checkout`) with both shas; a newer run that
+  recorded `B` but never committed → resume of A **proceeds** (the
+  round-4 false positive); a human commit on `B` between suspension
+  and resume → refuses; `--accept-branch-tip` re-records the tip with
+  an audited event and the next resume proceeds; crash between a
+  task's commit and the head-record update → refusal over the run's
+  own commit, then the flag path.
+- Plain `--db` continuation test (round 4, medium): `--db` naming a
+  database whose run row is branch-bound, no `--resume`, wrong
+  checkout branch → same refusal as the `--resume` form.
 - Lock-ordering test (round 1, major 1): with the PID lock already
   held, a second `maestro run` with `run_branch` configured refuses
   **without touching the checkout** — current branch asserted
