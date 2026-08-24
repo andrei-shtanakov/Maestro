@@ -1214,6 +1214,61 @@ class TestRunBranchGateContinuation:
 
         assert excinfo.value.exit_code == 1
 
+    async def test_gated_fresh_db_run_publishes_its_binding(
+        self, temp_dir: Path
+    ) -> None:
+        """The `--db` fresh gate writes a run row carrying the binding: the
+        path skips `bootstrap_run`, so nothing else would (ruling R12)."""
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        db_path = temp_dir / "test.db"
+
+        await self._run(config_path, db_path=db_path)
+
+        row = await _read_run_row(db_path)
+        assert (row["run_branch"], row["run_branch_declared"]) == ("pilot/x", 1)
+        assert row["run_branch_head"] == _git(
+            repo_dir, "rev-parse", "refs/heads/pilot/x"
+        )
+
+    async def test_gated_fresh_db_run_is_resumable(self, temp_dir: Path) -> None:
+        """The trap ruling R12 closes: without a row of its own, the SECOND
+        `--db` invocation is a continuation that finds no run row and refuses
+        `record_missing` — so opting into `run_branch` would make the
+        documented `--db` workflow single-shot."""
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        db_path = temp_dir / "test.db"
+
+        await self._run(config_path, db_path=db_path)
+        mock_create = await self._run(config_path, db_path=db_path, resume=True)
+
+        # It got past the gate by verifying against its own recorded binding,
+        # and continues to maintain it.
+        assert mock_create.call_args.kwargs["on_auto_commit"] is not None
+        assert (await _read_run_row(db_path))["run_branch"] == "pilot/x"
+
+    async def test_ungated_fresh_db_run_writes_no_row(self, temp_dir: Path) -> None:
+        """No `run_branch` configured: byte-identical to before the gate —
+        the row exists only to carry a binding, so with none there is none."""
+        config_path = _write_scheduler_config(temp_dir)
+        _init_git_repo(temp_dir / "sched-repo")
+        db_path = temp_dir / "test.db"
+
+        await self._run(config_path, db_path=db_path)
+
+        db = await create_database(db_path)
+        try:
+            assert await db.get_run_row() is None
+        finally:
+            await db.close()
+
     async def test_plain_db_on_existing_state_is_a_continuation(
         self, temp_dir: Path
     ) -> None:
@@ -1308,18 +1363,18 @@ class TestRunBranchGateContinuation:
         (repo_dir / "b.txt").write_text("b")
         _git(repo_dir, "add", "b.txt")
         _git(repo_dir, "commit", "-m", "foreign")
+        moved = _git(repo_dir, "rev-parse", "refs/heads/pilot/x")
         db_path = temp_dir / "test.db"
         await _seed_run_row(db_path, branch="pilot/x", declared=1, head=recorded)
 
         await self._run(config_path, db_path=db_path, clean=True)
 
-        # The named database was discarded, so the binding it carried — and
-        # the stale tip that would have refused a continuation — is gone.
-        db = await create_database(db_path)
-        try:
-            assert await db.get_run_row() is None
-        finally:
-            await db.close()
+        # The named database was discarded with the binding it carried, and
+        # the start gate published a fresh one: the recorded head is the tip
+        # as it is NOW, not the stale one that would have refused a
+        # continuation.
+        row = await _read_run_row(db_path)
+        assert row["run_branch_head"] == moved != recorded
         assert _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD") == "pilot/x"
 
     async def test_dirty_continuation_warns_and_proceeds(

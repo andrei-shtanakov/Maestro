@@ -91,6 +91,18 @@ class TestApplyStartGate:
         assert exc.value.reason == "dirty_tree"
         assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "master"
 
+    def test_non_git_directory_says_so(self, tmp_path: Path) -> None:
+        """A `repo:` that is not a checkout at all used to read as an empty
+        `git status` — a clean tree with no branch — and be refused as a
+        detached HEAD, telling the operator to check out a branch somewhere
+        with no branches to check out."""
+        not_a_repo = tmp_path / "plain-dir"
+        not_a_repo.mkdir()
+        with pytest.raises(RunBranchGateError) as exc:
+            apply_start_gate(not_a_repo, run_branch="pilot/x", base_branch="master")
+        assert exc.value.reason == "wrong_start_point"
+        assert "not a usable git checkout" in str(exc.value)
+
 
 class TestVerifyContinuation:
     def test_matching_branch_and_tip(self, repo: Path) -> None:

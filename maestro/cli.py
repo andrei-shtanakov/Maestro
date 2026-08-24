@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import typer
+import ulid
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
@@ -717,12 +718,14 @@ async def _run_scheduler(
         git_cfg = config.git
         gate_on = git_cfg is not None and git_cfg.run_branch is not None
         # The branch `_record_head` (below) keeps `run_branch_head` current
-        # against — set only where a run row actually carries the binding
-        # (spec §6): the bootstrap fresh-start path and a continuation whose
-        # row has `run_branch_declared == 1`. The explicit `--db` fresh-gated
-        # path deliberately leaves this None: no run row exists there, so
-        # there is nothing to persist the tip against.
+        # against — set wherever a run row actually carries the binding
+        # (spec §6): the bootstrap fresh-start path, a continuation whose row
+        # has `run_branch_declared == 1`, and — since ruling R12 gave that
+        # path a row of its own — the explicit `--db` fresh-gated start.
         bound_branch: str | None = None
+        # The tip the `--db` fresh gate observed; also the signal that this
+        # invocation must publish its own run row (see below).
+        db_fresh_binding_head: str | None = None
 
         async def _branch_pre_publish(_run_id: str) -> dict[str, object]:
             assert git_cfg is not None and git_cfg.run_branch is not None
@@ -805,11 +808,11 @@ async def _run_scheduler(
             # Explicit `--db`: `bootstrap_run` (and its `pre_publish` seam)
             # is skipped entirely, so the gate runs at the equivalent point
             # here instead — before the database is opened, and equally
-            # after the PID lock (spec §5). No run row exists on this path,
-            # so nothing is recorded (spec §6 `--db` limitation).
+            # after the PID lock (spec §5). The tip it returns is carried to
+            # the row this path writes once the database is open (below).
             try:
                 assert git_cfg is not None and git_cfg.run_branch is not None
-                apply_start_gate(
+                db_fresh_binding_head = apply_start_gate(
                     workdir,
                     run_branch=git_cfg.run_branch,
                     base_branch=git_cfg.base_branch,
@@ -842,6 +845,32 @@ async def _run_scheduler(
 
         # Create or connect to database
         db = await create_database(resolved_db_path)
+
+        if db_fresh_binding_head is not None:
+            assert git_cfg is not None and git_cfg.run_branch is not None
+            # A gated `--db` run publishes its own run row, or it could never
+            # be resumed: the next `--db` invocation is a continuation, finds
+            # no row and refuses `record_missing` — so opting into
+            # `run_branch` would trap the documented `--db` workflow (ruling
+            # R12). `repo_key` is a deliberate sentinel: this path skips the
+            # resolver, nothing reads the key here, and the row exists solely
+            # to carry the binding. Reached only on a fresh start, where the
+            # file either did not exist or `--clean` just removed it, so
+            # there is no row to collide with.
+            await db.create_run_row(
+                run_id=str(ulid.new()),
+                repo_key=f"_db_explicit/{config.project}",
+                started_at=datetime.now(UTC).isoformat(),
+                run_branch=git_cfg.run_branch,
+                run_branch_declared=1,
+                run_branch_head=db_fresh_binding_head,
+            )
+            # And the row must be maintained by the run that wrote it: left
+            # unbound, the tip would stay at the start sha while auto-commits
+            # advance the branch, and the next continuation would refuse
+            # `resume_stale_checkout` over this run's own work — the same trap
+            # one step later.
+            bound_branch = git_cfg.run_branch
 
         # Verification precedes recovery, deliberately (spec §6): Mode-1
         # recovery is not checkout-neutral — finalizing open handles collects

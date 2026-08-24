@@ -94,6 +94,15 @@ def read_snapshot(workdir: Path, run_branch: str) -> CheckoutSnapshot:
         == 0
     )
     status = _run_git(workdir, "status", "--porcelain")
+    if status.returncode != 0:
+        # Without this, a missing directory or a non-repository reads as
+        # "no output, so a clean tree" and the run is refused for a detached
+        # HEAD — telling the operator to check out a branch somewhere that
+        # has no branches to check out.
+        raise RunBranchGateError(
+            "wrong_start_point",
+            f"not a usable git checkout: {status.stderr.strip()}",
+        )
     dirty = [line[3:] for line in status.stdout.splitlines() if line.strip()]
     return CheckoutSnapshot(
         current_branch=current, target_exists=exists, dirty_paths=dirty

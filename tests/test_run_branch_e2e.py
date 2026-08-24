@@ -9,11 +9,44 @@ scheduler main loop — end to end.
 """
 
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
+import pytest
+import structlog
 import yaml
 
 from maestro.cli import _run_scheduler
+
+
+@pytest.fixture(autouse=True)
+def _no_structlog_logger_caching() -> Iterator[None]:
+    """Keep these tests from poisoning `structlog`-based tests that follow.
+
+    `obs.init_logging` (reached here through `setup_logging`, which earlier
+    CLI tests trigger) configures structlog with
+    `cache_logger_on_first_use=True`. A module-level lazy proxy —
+    `scheduler.py`'s `_obs_log` — then *caches* whatever pipeline is
+    configured on its first emission, for the rest of the process. This file
+    is the first test to emit through that proxy under a real run, so the
+    JSONL pipeline got baked in and a later `structlog.testing.capture_logs()`
+    in `tests/test_scheduler.py` saw nothing (green alone, red in the full
+    suite). Emitting with caching off leaves the proxy re-reading the config
+    every time, which is what `capture_logs` needs.
+    """
+    was_configured = structlog.is_configured()
+    saved: dict[str, Any] = dict(structlog.get_config())
+    uncached: dict[str, Any] = dict(saved)
+    uncached["cache_logger_on_first_use"] = False
+    structlog.configure(**uncached)
+    try:
+        yield
+    finally:
+        if was_configured:
+            structlog.configure(**saved)
+        else:
+            structlog.reset_defaults()
 
 
 def _git(repo: Path, *args: str) -> str:
