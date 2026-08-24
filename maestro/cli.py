@@ -1079,7 +1079,7 @@ def run_command(
             "--log-dir",
             "-l",
             help=(
-                "Directory for task log files "
+                "Directory for per-task logs and the structured event log "
                 "(default: logs/ beside the state database)"
             ),
             file_okay=False,

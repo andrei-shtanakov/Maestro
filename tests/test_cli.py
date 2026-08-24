@@ -557,8 +557,11 @@ class TestMode1DefaultLogDir:
 
         (resolved,) = mock_create_logger.call_args.args
         assert resolved == db_path.parent / "logs"
+        # Pinning the exact location is what keeps it out of the workdir;
+        # a filesystem check would be dead weight here (the logger is mocked,
+        # so no directory is created under either implementation).
         workdir = temp_dir / "sched-repo"
-        assert not (workdir / "logs").exists()
+        assert workdir not in resolved.parents
 
     async def test_explicit_log_dir_wins(self, temp_dir: Path) -> None:
         config_path = _write_scheduler_config(temp_dir)
