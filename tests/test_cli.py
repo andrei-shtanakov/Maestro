@@ -573,6 +573,51 @@ class TestMode1DefaultLogDir:
         (resolved,) = mock_create_logger.call_args.args
         assert resolved == custom
 
+    async def test_bootstrap_path_defaults_into_run_directory(
+        self, temp_dir: Path
+    ) -> None:
+        """The common path (no --db): the default must land in the run
+        directory `bootstrap_run` resolved — `runs/<id>/logs/`."""
+        config_path = _write_scheduler_config(temp_dir)
+        run_dir = temp_dir / "runs" / "01TESTRUN"
+        run_dir.mkdir(parents=True)
+        bootstrap = SimpleNamespace(
+            key=SimpleNamespace(as_path_parts=lambda: ("host", "owner", "repo")),
+            run_id="01TESTRUN",
+            db_path=run_dir / "state.db",
+            fresh=True,
+        )
+
+        scheduler_instance = MagicMock()
+        scheduler_instance.run = AsyncMock(return_value=None)
+
+        with (
+            patch(
+                "maestro.cli.bootstrap_run",
+                new_callable=AsyncMock,
+                return_value=bootstrap,
+            ),
+            patch("maestro.cli.create_event_logger") as mock_create_logger,
+            patch("maestro.cli.make_routing_strategy", new_callable=AsyncMock),
+            patch(
+                "maestro.cli.create_scheduler_from_config",
+                new_callable=AsyncMock,
+                return_value=scheduler_instance,
+            ),
+            patch("maestro.cli._acquire_pid_lock", return_value=99),
+            patch("maestro.cli._release_pid_lock"),
+        ):
+            await _run_scheduler(
+                config_path=config_path,
+                db_path=None,
+                resume=False,
+                log_dir=None,
+                clean=False,
+            )
+
+        (resolved,) = mock_create_logger.call_args.args
+        assert resolved == run_dir / "logs"
+
 
 # =============================================================================
 # Test: Run Command
