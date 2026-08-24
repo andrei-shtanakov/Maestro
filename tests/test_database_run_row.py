@@ -69,3 +69,59 @@ async def test_only_one_run_row_per_database(db: Database) -> None:
     await db.create_run_row(run_id="01ABC", repo_key="k", started_at=STARTED)
     with pytest.raises(sqlite3.IntegrityError):
         await db.create_run_row(run_id="01XYZ", repo_key="k", started_at=STARTED)
+
+
+async def test_run_row_branch_binding_roundtrip(db: Database) -> None:
+    await db.create_run_row(
+        run_id="01TEST",
+        repo_key="host/o/r",
+        started_at="2026-08-24T00:00:00+00:00",
+        run_branch="pilot/x",
+        run_branch_declared=1,
+        run_branch_head="a" * 40,
+    )
+    row = await db.get_run_row()
+    assert row is not None
+    assert row["run_branch"] == "pilot/x"
+    assert row["run_branch_declared"] == 1
+    assert row["run_branch_head"] == "a" * 40
+
+
+async def test_run_row_binding_defaults_null(db: Database) -> None:
+    await db.create_run_row(
+        run_id="01TEST", repo_key="host/o/r", started_at="2026-08-24T00:00:00+00:00"
+    )
+    row = await db.get_run_row()
+    assert row is not None
+    assert row["run_branch"] is None
+    assert row["run_branch_declared"] is None
+
+
+async def test_set_run_branch_binding_and_head_update(db: Database) -> None:
+    await db.create_run_row(
+        run_id="01TEST", repo_key="host/o/r", started_at="2026-08-24T00:00:00+00:00"
+    )
+    await db.set_run_branch_binding(branch="pilot/x", declared=1, head="a" * 40)
+    await db.update_run_branch_head("b" * 40)
+    row = await db.get_run_row()
+    assert row is not None
+    assert row["run_branch"] == "pilot/x"
+    assert row["run_branch_head"] == "b" * 40
+
+
+async def test_set_run_branch_declared_leaves_branch_and_head_untouched(
+    db: Database,
+) -> None:
+    await db.create_run_row(
+        run_id="01TEST",
+        repo_key="host/o/r",
+        started_at="2026-08-24T00:00:00+00:00",
+        run_branch="pilot/x",
+        run_branch_head="a" * 40,
+    )
+    await db.set_run_branch_declared(0)
+    row = await db.get_run_row()
+    assert row is not None
+    assert row["run_branch_declared"] == 0
+    assert row["run_branch"] == "pilot/x"
+    assert row["run_branch_head"] == "a" * 40

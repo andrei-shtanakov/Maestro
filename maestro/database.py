@@ -661,6 +661,11 @@ class Database:
                 "run_workstreams_declared",
                 self._migrate_run_workstreams_declared,
             ),
+            (
+                29,
+                "run_branch_binding",
+                self._migrate_run_branch_binding,
+            ),
         ]
 
         for version, name, fn in ordered:
@@ -1368,6 +1373,9 @@ class Database:
                 reason         TEXT,
                 suspended_at   TEXT,
                 suspend_reason TEXT,
+                run_branch          TEXT,
+                run_branch_declared INTEGER,
+                run_branch_head     TEXT,
                 singleton      INTEGER NOT NULL DEFAULT 1 UNIQUE CHECK (singleton = 1)
             )
             """
@@ -1393,6 +1401,30 @@ class Database:
             await self._connection.execute(
                 "ALTER TABLE run ADD COLUMN workstreams_declared INTEGER"
             )
+
+    async def _migrate_run_branch_binding(self) -> None:
+        """Migration 29: Mode-1 run-branch binding (issue #216 part 2).
+
+        Three additive nullable columns on `run`. Two are NOT one (#198's
+        lesson, spec §6): `run_branch_declared` NULL means a pre-migration
+        row (the continuation gate fails OPEN with adoption), 0 means the
+        run opted out at creation (genuinely byte-identical resume), 1 means
+        bound. `run_branch_head` is the branch tip the stale-check compares
+        against — state, not a name proxy.
+        """
+        assert self._connection is not None
+        cursor = await self._connection.execute("PRAGMA table_info(run)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        for name, ddl in (
+            ("run_branch", "ALTER TABLE run ADD COLUMN run_branch TEXT"),
+            (
+                "run_branch_declared",
+                "ALTER TABLE run ADD COLUMN run_branch_declared INTEGER",
+            ),
+            ("run_branch_head", "ALTER TABLE run ADD COLUMN run_branch_head TEXT"),
+        ):
+            if name not in columns:
+                await self._connection.execute(ddl)
 
     async def _migrate_workstream_rework(self) -> None:
         """Migration 18: operator rework columns + audit tables (#124).
@@ -4723,14 +4755,60 @@ class Database:
                 raise ValueError(msg)
 
     async def create_run_row(
-        self, *, run_id: str, repo_key: str, started_at: str
+        self,
+        *,
+        run_id: str,
+        repo_key: str,
+        started_at: str,
+        run_branch: str | None = None,
+        run_branch_declared: int | None = None,
+        run_branch_head: str | None = None,
     ) -> None:
         """Write the run's own row. Exactly once per database."""
         assert self._connection is not None
         await self._connection.execute(
-            "INSERT INTO run (run_id, repo_key, started_at) VALUES (?, ?, ?)",
-            (run_id, repo_key, started_at),
+            "INSERT INTO run (run_id, repo_key, started_at, run_branch, "
+            "run_branch_declared, run_branch_head) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                repo_key,
+                started_at,
+                run_branch,
+                run_branch_declared,
+                run_branch_head,
+            ),
         )
+        await self._connection.commit()
+
+    async def set_run_branch_binding(
+        self, *, branch: str, declared: int, head: str | None
+    ) -> None:
+        """One UPDATE binding the run to a branch (legacy adoption, spec §6)."""
+        assert self._connection is not None
+        await self._connection.execute(
+            "UPDATE run SET run_branch = ?, run_branch_declared = ?, "
+            "run_branch_head = ?",
+            (branch, declared, head),
+        )
+        await self._connection.commit()
+
+    async def set_run_branch_declared(self, declared: int) -> None:
+        """Record only whether the run's branch binding is declared.
+
+        Leaves `run_branch`/`run_branch_head` untouched (controller ruling
+        R2) — this setter exists for callers that need to flip the
+        declared-flag independently of the branch/head values themselves.
+        """
+        assert self._connection is not None
+        await self._connection.execute(
+            "UPDATE run SET run_branch_declared = ?", (declared,)
+        )
+        await self._connection.commit()
+
+    async def update_run_branch_head(self, head: str) -> None:
+        """Record the branch tip after the run itself moved it (spec §6)."""
+        assert self._connection is not None
+        await self._connection.execute("UPDATE run SET run_branch_head = ?", (head,))
         await self._connection.commit()
 
     async def set_run_workstreams_declared(self, *, declared: bool) -> None:
