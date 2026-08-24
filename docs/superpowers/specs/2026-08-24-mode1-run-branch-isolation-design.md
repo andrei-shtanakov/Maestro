@@ -1,8 +1,23 @@
 # Mode-1 run-level branch isolation (`git.run_branch`) — design
 
-**Status:** revision 7 — codex-review round 5 incorporated; awaiting
-owner approval
+**Status:** revision 8 — codex-review round 6 incorporated under an
+owner-set cap: one more paid round; an empty verdict merges, a further
+"hole in the remedy" finding merges over red with recorded reasoning
+(precedents #313, #214) — no round 8 of revisions
 **Date:** 2026-08-24
+**Revision 8 (codex-review round 6: two high, one medium; owner
+decision on the process):** (1) §6 — continuation deliberately does
+not require a clean tree: both alternatives (fail-closed; acceptance
+flag) are weighed and refused *in the file*, the accepted consequence
+is stated, and the gate owes visibility — a structured warning naming
+the dirty paths — not a block. (2) §6 — `--db --clean` is a fresh
+start, not a continuation: it discards the state there is to continue,
+so the §4 start gate applies and the documented escape hatch survives.
+(3) §6 — legacy adoption also persists `run_branch_head`, so the
+adopted row can pass its next stale-check. Core observation for the
+record: the spec's base (key, start gate, lock order, durable record,
+verification-before-recovery) is unchanged since revision 3 — rounds
+4–6 found issues only in the remedies of earlier rounds.
 **Revision 7 (codex-review round 5, three majors, each confirmed):**
 (1) §6 — continuation selectors also take the recovery path: phase A
 re-keys the Mode-1 recovery guard from the `--resume` flag to "an
@@ -273,7 +288,13 @@ branch-bound** (`declared=1`): that invocation already continues prior
 task state today (`--db` skips the resolver, opens the named database,
 and the scheduler preserves its existing tasks), so it walks the same
 verification whether or not `--resume` was typed (codex-review round 4,
-medium — the selector list alone left it undefined). The flagless
+medium — the selector list alone left it undefined). The one exception
+is `--db ... --clean` (round 6, major 2): `--clean` discards the named
+database's state, so there is nothing left to continue — that
+invocation is a **fresh start** and takes the §4 start gate instead.
+Routing it through continuation verification would refuse
+(`resume_stale_checkout`) an invocation whose entire point is
+abandoning that state, breaking a documented escape hatch. The flagless
 definition is deliberate so no selector of an existing run bypasses
 this section (consumer point 4).
 
@@ -299,8 +320,23 @@ The verification rules:
   (`maestro service`), and a checkout silently moved under a human at
   the terminal is the same class of surprise this issue exists to
   remove. Acting nowhere beats acting in the wrong place.
-- No cleanliness check on resume: a crashed run legitimately leaves
-  uncommitted task work in the tree.
+- **Continuation does not require a clean tree — a priced hole, not an
+  oversight** (round 6, major 1; owner decision). Both alternatives
+  were weighed and refused, and the argument is recorded here so the
+  next reader — human or gate — does not re-litigate it from scratch:
+  *fail-closed on any dirt* refuses exactly the resume the feature
+  exists to serve, because a crashed run legitimately leaves
+  uncommitted task work in the tree and no cheap check can attribute
+  dirt to the run versus to a foreign edit made after the crash; *an
+  explicit acceptance flag* puts every crash-resume behind a flag,
+  which operators learn to type reflexively — the same hole with extra
+  ceremony. Accepted consequence: a foreign uncommitted edit made
+  between crash and resume is indistinguishable from the run's own
+  residue, and the next auto-commit may sweep it. What the gate owes
+  the operator here is **visibility, not a block**: continuation emits
+  a structured warning naming the dirty paths (bounded list), so what
+  will ride along is seen before it does. Same shape as §7's TOCTOU
+  window — stated, priced, bounded.
 - **A run whose branch moved underneath it refuses to resume** —
   checked against *state*, not proxies (revised twice: round 2 major 1
   established the hazard — an older run resuming on top of a newer
@@ -347,7 +383,10 @@ The verification rules:
     and **adoption verifies against it first** (round 5, major 3):
     observed branch == configured `run_branch` → warn (legacy binding,
     #198's fail-open precedent) and adopt, one UPDATE setting both
-    columns, announced by a structured event — the hole closes on
+    columns **plus `run_branch_head` = the observed tip** (round 6,
+    medium — without the head, the next continuation's stale-check
+    would have nothing to compare against and would falsely refuse),
+    announced by a structured event — the hole closes on
     first use, not by legacy runs dying out. Observed branch !=
     configured → **refuse** (`resume_branch_mismatch`, verified
     against the config-declared name since no record exists). The
@@ -500,6 +539,13 @@ first instant.
 - Live same-branch movement test (round 5, major 2): foreign commit on
   the run branch while a task runs → next tripwire seam refuses, no
   auto-commit on top of the moved state, run suspended.
+- Dirty-continuation visibility test (round 6, major 1): continuation
+  with uncommitted paths in the tree → proceeds, structured warning
+  names the dirty paths.
+- `--clean` fresh-start test (round 6, major 2): `--db state.db
+  --clean` on a branch-bound database with a moved tip → no
+  continuation refusal; the §4 start gate applies and the state is
+  discarded as documented.
 - Lock-ordering test (round 1, major 1): with the PID lock already
   held, a second `maestro run` with `run_branch` configured refuses
   **without touching the checkout** — current branch asserted
