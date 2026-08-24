@@ -876,6 +876,50 @@ class TestOnAutoCommitWiring:
 
         assert mock_create.call_args.kwargs["on_auto_commit"] is None
 
+    async def test_gated_continuation_passes_non_none_callback(
+        self, temp_dir: Path
+    ) -> None:
+        """A continuation whose run row carries `run_branch_declared == 1`
+        is the other binding path (besides the fresh bootstrap gate) — the
+        explicit `--db` fresh-gated path is the only one that stays None.
+        Arrange copied from `TestRunBranchGateContinuation`'s
+        `test_dirty_continuation_warns_and_proceeds` (matching checkout +
+        recorded tip -> the continuation succeeds with no tasks to recover).
+        """
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        _git(repo_dir, "switch", "-c", "pilot/x")
+        tip = _git(repo_dir, "rev-parse", "refs/heads/pilot/x")
+        db_path = temp_dir / "test.db"
+        await _seed_run_row(db_path, branch="pilot/x", declared=1, head=tip)
+
+        scheduler_instance = MagicMock()
+        scheduler_instance.run = AsyncMock(return_value=None)
+
+        with (
+            patch("maestro.cli.create_event_logger"),
+            patch("maestro.cli.make_routing_strategy", new_callable=AsyncMock),
+            patch(
+                "maestro.cli.create_scheduler_from_config",
+                new_callable=AsyncMock,
+                return_value=scheduler_instance,
+            ) as mock_create,
+            patch("maestro.cli._acquire_pid_lock", return_value=99),
+            patch("maestro.cli._release_pid_lock"),
+        ):
+            await _run_scheduler(
+                config_path=config_path,
+                db_path=db_path,
+                resume=True,
+                log_dir=None,
+                clean=False,
+            )
+
+        assert mock_create.call_args.kwargs["on_auto_commit"] is not None
+
 
 class TestRunBranchGateContinuation:
     """Task 7: continuation of an existing run verifies the recorded binding
