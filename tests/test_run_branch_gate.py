@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from structlog.testing import capture_logs
 
 from maestro.run_branch_gate import (
     CheckoutSnapshot,
@@ -147,3 +148,53 @@ class TestVerifyContinuation:
         verify_continuation(
             repo, RunBranchRecord(branch="pilot/x", head=None), accept_tip=False
         )
+
+
+class TestGateEvents:
+    """Spec §8: run_branch_gate.{created,verified,refused} as STRUCTURED obs
+    events — `Attributes.event` carries the name and branch/reason/tip ride
+    as attributes (codex round on PR #223: stdlib-bridge records all land as
+    `log.stdlib`, so message-text logging was not queryable by event name).
+    Best-effort telemetry; the stderr text remains the contract — but the
+    pilot's acceptance built on these traces (issue #216)."""
+
+    def test_create_emits_created(self, repo: Path) -> None:
+        with capture_logs() as logs:
+            apply_start_gate(repo, run_branch="pilot/x", base_branch="master")
+        created = [e for e in logs if e["event"] == "run_branch_gate.created"]
+        assert created and created[0]["branch"] == "pilot/x"
+        assert created[0]["tip"]
+
+    def test_proceed_emits_verified(self, repo: Path) -> None:
+        apply_start_gate(repo, run_branch="pilot/x", base_branch="master")
+        with capture_logs() as logs:
+            apply_start_gate(repo, run_branch="pilot/x", base_branch="master")
+        events = [e["event"] for e in logs]
+        assert "run_branch_gate.verified" in events
+        assert "run_branch_gate.created" not in events
+
+    def test_start_refusal_emits_refused_with_reason(self, repo: Path) -> None:
+        (repo / "a.txt").write_text("edited")
+        with capture_logs() as logs, pytest.raises(RunBranchGateError):
+            apply_start_gate(repo, run_branch="pilot/x", base_branch="master")
+        refused = [e for e in logs if e["event"] == "run_branch_gate.refused"]
+        assert refused and refused[0]["reason"] == "dirty_tree"
+
+    def test_continuation_success_emits_verified(self, repo: Path) -> None:
+        tip = apply_start_gate(repo, run_branch="pilot/x", base_branch="master")
+        with capture_logs() as logs:
+            verify_continuation(
+                repo, RunBranchRecord(branch="pilot/x", head=tip), accept_tip=False
+            )
+        verified = [e for e in logs if e["event"] == "run_branch_gate.verified"]
+        assert verified and verified[0]["branch"] == "pilot/x"
+
+    def test_continuation_refusal_emits_refused(self, repo: Path) -> None:
+        tip = apply_start_gate(repo, run_branch="pilot/x", base_branch="master")
+        _git(repo, "switch", "master")
+        with capture_logs() as logs, pytest.raises(RunBranchGateError):
+            verify_continuation(
+                repo, RunBranchRecord(branch="pilot/x", head=tip), accept_tip=False
+            )
+        refused = [e for e in logs if e["event"] == "run_branch_gate.refused"]
+        assert refused and refused[0]["reason"] == "resume_branch_mismatch"
