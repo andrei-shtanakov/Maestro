@@ -236,11 +236,15 @@ maestro state-usage    # runs and bytes per repository, plus the legacy file
 
 There is deliberately no retention policy yet.
 
-A run directory holds `state.db` and an empty `logs/`. **Logs do not live there
-yet** — they are still written next to the working directory (`logs/<run-id>/`)
-and, for the service, under `~/.maestro/service-logs/`. So a run directory is
-not yet removable as a unit, and `maestro state-usage` does not see the logs.
-Moving them is follow-up work, not part of this change.
+A run directory holds `state.db` and `logs/`. Mode 1 (`maestro run`) defaults
+its structured event log and per-task logs there — beside the state database,
+never inside the target repo's working tree (#217); an explicit `--log-dir`
+overrides. **Not every log has moved:** the obs OTel JSONL stream is still
+written under `logs/<run-id>/` relative to the current directory (or
+`$ORCHESTRA_LOG_DIR`), Mode 2 still defaults to `<repo_path>/logs`, and the
+service writes under `~/.maestro/service-logs/`. So a run directory is still
+not removable as a unit, and `maestro state-usage` does not see the logs
+outside it.
 
 **Ending a run.** A run records its own ending: `completed` when everything is
 terminal, `failed` only when it cannot advance, `cancelled` on Ctrl-C. A
