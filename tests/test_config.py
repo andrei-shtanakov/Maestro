@@ -569,6 +569,65 @@ class TestValidationErrors:
         assert "timeout" in str(exc_info.value).lower()
 
 
+class TestMode1BranchPrefixRejected:
+    """Mode-1 configs must reject git.branch_prefix loudly, not ignore it.
+
+    Regression for issue #216: a Mode-1 run with `branch_prefix: "pilot/"`
+    silently committed straight to the checked-out branch (master) — the key's
+    only consumer is the Mode-2 path, so accepting it promises isolation the
+    run cannot provide.
+    """
+
+    def test_branch_prefix_is_rejected(self) -> None:
+        """The pilot's exact shape: git.branch_prefix set in a Mode-1 config."""
+        content = """
+project: pilot
+repo: /tmp/pilot-repo
+git:
+  auto_commit: true
+  branch_prefix: "pilot/"
+tasks:
+  - id: task-1
+    title: Test
+    prompt: Do it
+"""
+        with pytest.raises(ConfigError) as exc_info:
+            load_config_from_string(content)
+
+        message = str(exc_info.value)
+        assert "branch_prefix" in message
+        assert "Mode 1" in message
+        # The refusal must name the replacement, not just say no.
+        assert "#216" in message
+
+    def test_branch_prefix_rejected_even_at_default_value(self) -> None:
+        """Explicitly writing the default is still naming the impossible."""
+        content = """
+project: pilot
+repo: /tmp/pilot-repo
+git:
+  branch_prefix: "agent/"
+tasks: []
+"""
+        with pytest.raises(ConfigError, match="branch_prefix"):
+            load_config_from_string(content)
+
+    def test_git_block_without_branch_prefix_still_loads(self) -> None:
+        """The rest of the git block is untouched by the rejection."""
+        content = """
+project: pilot
+repo: /tmp/pilot-repo
+git:
+  base_branch: develop
+  auto_commit: true
+  auto_push: false
+tasks: []
+"""
+        config = load_config_from_string(content)
+        assert config.git is not None
+        assert config.git.auto_commit is True
+
+
 class TestConfigErrorFormatting:
     """Tests for ConfigError formatting."""
 
@@ -633,7 +692,6 @@ defaults:
 git:
   base_branch: develop
   auto_push: true
-  branch_prefix: feature/
 
 notifications:
   desktop: true
@@ -679,7 +737,6 @@ tasks:
         assert config.git is not None
         assert config.git.base_branch == "develop"
         assert config.git.auto_push is True
-        assert config.git.branch_prefix == "feature/"
 
         # Check notifications with env vars resolved
         assert config.notifications is not None

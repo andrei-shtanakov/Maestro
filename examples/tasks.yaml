@@ -26,7 +26,6 @@ defaults:
 git:
   base_branch: main
   auto_push: true
-  branch_prefix: "agent/"
 
 # Desktop notifications on task completion/failure
 notifications:

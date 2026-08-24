@@ -400,7 +400,7 @@
       "type": "object"
     },
     "GitConfig": {
-      "description": "Git configuration for project.",
+      "description": "Git configuration for a Mode-1 (`maestro run`) project.\n\n`branch_prefix` is rejected when explicitly set: per-task branches are\nsemantically impossible in Mode 1 (one shared checkout, concurrent\ntasks), and silently accepting the key made a run with\n`auto_commit: true` write to whatever branch was checked out while the\nauthor believed isolation was configured (issue #216). The field is kept\n(rather than dropped) so the key cannot regress to being silently\nignored as an unknown extra.",
       "properties": {
         "base_branch": {
           "default": "main",
@@ -422,7 +422,7 @@
         },
         "branch_prefix": {
           "default": "agent/",
-          "description": "Prefix for task branches",
+          "description": "Rejected if set: Mode 1 runs on one shared checkout and cannot branch per task (issue #216)",
           "title": "Branch Prefix",
           "type": "string"
         }

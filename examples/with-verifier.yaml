@@ -55,7 +55,6 @@ defaults:
 git:
   base_branch: main
   auto_push: true
-  branch_prefix: "agent/"
 
 # Opt-in adversarial verifier gate. `runner: claude` is the only supported
 # runner this slice; `model` can also be left unset here and supplied via

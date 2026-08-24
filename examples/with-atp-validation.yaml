@@ -35,7 +35,6 @@ defaults:
 git:
   base_branch: main
   auto_push: true
-  branch_prefix: "agent/"
 
 tasks:
   # -------------------------------------------------------------------------

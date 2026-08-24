@@ -21,7 +21,6 @@ defaults:
 git:
   base_branch: main
   auto_push: true
-  branch_prefix: "refactor/"
 
 tasks:
   # --- Layer 1: independent extractions (run in parallel) ---
