@@ -798,6 +798,85 @@ class TestRunBranchGateStart:
         assert not db_path.exists()
 
 
+class TestOnAutoCommitWiring:
+    """Task 8: `on_auto_commit` reaches `create_scheduler_from_config` only
+    where the run-branch gate is bound to a branch — a fresh gated run
+    through the bootstrap resolver (which records the binding on the run
+    row) — and stays `None` for an ungated run, which has nothing to bind."""
+
+    async def test_gated_fresh_run_passes_non_none_callback(
+        self, temp_dir: Path
+    ) -> None:
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        run_dir = temp_dir / "runs" / "01TESTRUN"
+        run_dir.mkdir(parents=True)
+        bootstrap = SimpleNamespace(
+            key=SimpleNamespace(as_path_parts=lambda: ("host", "owner", "repo")),
+            run_id="01TESTRUN",
+            db_path=run_dir / "state.db",
+            fresh=True,
+        )
+
+        scheduler_instance = MagicMock()
+        scheduler_instance.run = AsyncMock(return_value=None)
+
+        with (
+            patch(
+                "maestro.cli.bootstrap_run",
+                new_callable=AsyncMock,
+                return_value=bootstrap,
+            ),
+            patch("maestro.cli.create_event_logger"),
+            patch("maestro.cli.make_routing_strategy", new_callable=AsyncMock),
+            patch(
+                "maestro.cli.create_scheduler_from_config",
+                new_callable=AsyncMock,
+                return_value=scheduler_instance,
+            ) as mock_create,
+            patch("maestro.cli._acquire_pid_lock", return_value=99),
+            patch("maestro.cli._release_pid_lock"),
+        ):
+            await _run_scheduler(
+                config_path=config_path,
+                db_path=None,
+                resume=False,
+                log_dir=None,
+                clean=False,
+            )
+
+        assert mock_create.call_args.kwargs["on_auto_commit"] is not None
+
+    async def test_ungated_run_passes_none_callback(self, temp_dir: Path) -> None:
+        config_path = _write_scheduler_config(temp_dir)  # no git block
+        db_path = temp_dir / "test.db"
+
+        scheduler_instance = MagicMock()
+        scheduler_instance.run = AsyncMock(return_value=None)
+
+        with (
+            patch("maestro.cli.create_event_logger"),
+            patch("maestro.cli.make_routing_strategy", new_callable=AsyncMock),
+            patch(
+                "maestro.cli.create_scheduler_from_config",
+                new_callable=AsyncMock,
+                return_value=scheduler_instance,
+            ) as mock_create,
+            patch("maestro.cli._acquire_pid_lock", return_value=99),
+            patch("maestro.cli._release_pid_lock"),
+        ):
+            await _run_scheduler(
+                config_path=config_path,
+                db_path=db_path,
+                resume=False,
+                log_dir=None,
+                clean=False,
+            )
+
+        assert mock_create.call_args.kwargs["on_auto_commit"] is None
+
+
 class TestRunBranchGateContinuation:
     """Task 7: continuation of an existing run verifies the recorded binding
     against the checkout BEFORE recovery (spec §6). "Continuation" is defined

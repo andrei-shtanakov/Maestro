@@ -1799,6 +1799,104 @@ class TestAutoCommit:
         config = SchedulerConfig()
         assert config.auto_commit is False
 
+    def test_scheduler_config_default_no_on_auto_commit(self) -> None:
+        """SchedulerConfig defaults on_auto_commit to None."""
+        config = SchedulerConfig()
+        assert config.on_auto_commit is None
+
+    @pytest.mark.anyio
+    async def test_on_auto_commit_callback_fires_after_commit(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """`on_auto_commit` fires right after a completed task's auto-commit."""
+        calls: list[int] = []
+
+        async def on_commit() -> None:
+            calls.append(1)
+
+        task_config = TaskConfig(id="t", title="T", prompt="do it")
+
+        db = await create_database(temp_db_path)
+        try:
+            task = Task.from_config(task_config, str(temp_dir))
+            await db.create_task(task)
+
+            mock_spawner = MockSpawner()
+            dag = DAG([task_config])
+            scheduler_config = SchedulerConfig(
+                max_concurrent=1,
+                poll_interval=0.05,
+                workdir=temp_dir,
+                log_dir=temp_dir / "logs",
+                auto_commit=True,
+                on_auto_commit=on_commit,
+            )
+            scheduler = Scheduler(
+                db=db,
+                dag=dag,
+                spawners={"claude_code": mock_spawner},
+                config=scheduler_config,
+            )
+
+            async def run_with_timeout() -> None:
+                try:
+                    await asyncio.wait_for(scheduler.run(), timeout=5.0)
+                except TimeoutError:
+                    await scheduler.shutdown()
+
+            await run_with_timeout()
+
+            assert calls == [1]
+            all_tasks = await db.get_all_tasks()
+            assert all_tasks[0].status == TaskStatus.DONE
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_on_auto_commit_absent_does_not_crash(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """No `on_auto_commit` configured -> auto-commit still completes."""
+        task_config = TaskConfig(id="t", title="T", prompt="do it")
+
+        db = await create_database(temp_db_path)
+        try:
+            task = Task.from_config(task_config, str(temp_dir))
+            await db.create_task(task)
+
+            mock_spawner = MockSpawner()
+            dag = DAG([task_config])
+            scheduler_config = SchedulerConfig(
+                max_concurrent=1,
+                poll_interval=0.05,
+                workdir=temp_dir,
+                log_dir=temp_dir / "logs",
+                auto_commit=True,
+            )
+            scheduler = Scheduler(
+                db=db,
+                dag=dag,
+                spawners={"claude_code": mock_spawner},
+                config=scheduler_config,
+            )
+
+            async def run_with_timeout() -> None:
+                try:
+                    await asyncio.wait_for(scheduler.run(), timeout=5.0)
+                except TimeoutError:
+                    await scheduler.shutdown()
+
+            await run_with_timeout()
+
+            all_tasks = await db.get_all_tasks()
+            assert all_tasks[0].status == TaskStatus.DONE
+        finally:
+            await db.close()
+
 
 class TestSchedulerRoutingInjection:
     """Scheduler must accept an optional RoutingStrategy + arbiter_mode."""

@@ -101,6 +101,7 @@ from maestro.run_branch_gate import (
     RunBranchGateError,
     RunBranchRecord,
     apply_start_gate,
+    branch_tip,
     verify_continuation,
 )
 from maestro.run_lifecycle import (
@@ -701,6 +702,13 @@ async def _run_scheduler(
     try:
         git_cfg = config.git
         gate_on = git_cfg is not None and git_cfg.run_branch is not None
+        # The branch `_record_head` (below) keeps `run_branch_head` current
+        # against — set only where a run row actually carries the binding
+        # (spec §6): the bootstrap fresh-start path and a continuation whose
+        # row has `run_branch_declared == 1`. The explicit `--db` fresh-gated
+        # path deliberately leaves this None: no run row exists there, so
+        # there is nothing to persist the tip against.
+        bound_branch: str | None = None
 
         async def _branch_pre_publish(_run_id: str) -> dict[str, object]:
             assert git_cfg is not None and git_cfg.run_branch is not None
@@ -771,6 +779,9 @@ async def _run_scheduler(
                 )
                 raise typer.Exit(1) from e
             resolved_db_path = bootstrap.db_path
+            if gate_on and fresh_start:
+                assert git_cfg is not None and git_cfg.run_branch is not None
+                bound_branch = git_cfg.run_branch
             console.print(
                 f"[dim]acting on {escape('/'.join(bootstrap.key.as_path_parts()))}, "
                 f"run {escape(bootstrap.run_id)}[/dim]",
@@ -843,6 +854,23 @@ async def _run_scheduler(
                 )
                 raise typer.Exit(1) from e
             raise
+
+        if run_row is not None and run_row.get("run_branch_declared") == 1:
+            bound_branch = str(run_row["run_branch"])
+
+        async def _record_head() -> None:
+            """Refresh `run_branch_head` to the checkout's current tip.
+
+            Best-effort bookkeeping (spec §6): a failure here must never
+            fail the task it rides in on, so every error is swallowed after
+            a warning. A no-op when the gate isn't bound to a branch.
+            """
+            if bound_branch is None:
+                return
+            try:
+                await db.update_run_branch_head(branch_tip(workdir, bound_branch))
+            except Exception:
+                logger.warning("run_branch.head_record_failed", exc_info=True)
 
         notifications: NotificationManager | None = None
 
@@ -983,6 +1011,7 @@ async def _run_scheduler(
                 notification_manager=notifications,
                 on_status_change=_on_status_change,
                 auto_commit=(config.git.auto_commit if config.git else False),
+                on_auto_commit=_record_head if bound_branch is not None else None,
                 routing=routing,
                 arbiter_mode=arbiter_mode,
                 arbiter_enabled=arbiter_cfg is not None and arbiter_cfg.enabled,
@@ -1011,6 +1040,7 @@ async def _run_scheduler(
 
             # Run scheduler
             await scheduler.run()
+            await _record_head()
 
             # Show what agents changed
             _display_git_summary(workdir)
@@ -1043,6 +1073,7 @@ async def _run_scheduler(
 
         except (KeyboardInterrupt, asyncio.CancelledError):
             await record_cancelled(db, "interrupted by the operator")
+            await _record_head()
             raise
         finally:
             if routing is not None:

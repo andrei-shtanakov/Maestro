@@ -18,7 +18,7 @@ import subprocess
 import tempfile
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -232,6 +232,11 @@ class SchedulerConfig:
         poll_interval: Seconds between scheduler loop iterations.
         workdir: Base working directory for tasks.
         log_dir: Directory for task log files.
+        on_auto_commit: Optional callback awaited right after a successful
+            `_auto_commit_task` call. The scheduler itself stays
+            git/DB-agnostic about run bookkeeping — the callback owner (the
+            run-branch gate, when active) reads the checkout's current tip
+            and persists it.
     """
 
     max_concurrent: int = 3
@@ -240,6 +245,7 @@ class SchedulerConfig:
     log_dir: Path = field(default_factory=lambda: Path.cwd() / "logs")
     shutdown_grace_seconds: float = 5.0
     auto_commit: bool = False
+    on_auto_commit: Callable[[], Awaitable[None]] | None = None
 
 
 class SchedulerError(Exception):
@@ -1902,6 +1908,8 @@ class Scheduler:
                             result_summary="Task completed successfully",
                         )
                         self._auto_commit_task(task)
+                        if self._config.on_auto_commit is not None:
+                            await self._config.on_auto_commit()
                         outcome = await self._build_outcome(done_task, exit_code=0)
                         await self._try_report_outcome(done_task, outcome)
                         _obs_log.info(
@@ -1926,6 +1934,8 @@ class Scheduler:
                     result_summary="Task completed successfully",
                 )
                 self._auto_commit_task(task)
+                if self._config.on_auto_commit is not None:
+                    await self._config.on_auto_commit()
                 outcome = await self._build_outcome(done_task, exit_code=0)
                 await self._try_report_outcome(done_task, outcome)
                 _obs_log.info(
@@ -2283,6 +2293,8 @@ class Scheduler:
                 result_summary="Task completed successfully (verifier PASS)",
             )
             self._auto_commit_task(task)
+            if self._config.on_auto_commit is not None:
+                await self._config.on_auto_commit()
             outcome = await self._build_outcome(done_task, exit_code=0, attempt=attempt)
             await self._try_report_outcome(done_task, outcome)
             self._emit_event(
@@ -2720,6 +2732,7 @@ async def create_scheduler_from_config(
     notification_manager: NotificationManager | None = None,
     on_status_change: StatusChangeCallback | None = None,
     auto_commit: bool = False,
+    on_auto_commit: Callable[[], Awaitable[None]] | None = None,
     routing: RoutingStrategy | None = None,
     arbiter_mode: ArbiterMode = ArbiterMode.ADVISORY,
     arbiter_enabled: bool = False,
@@ -2743,6 +2756,8 @@ async def create_scheduler_from_config(
         notification_manager: Optional notification manager.
         on_status_change: Optional callback for task status changes.
         auto_commit: Whether to auto-commit after task completion.
+        on_auto_commit: Optional callback awaited right after a successful
+            auto-commit; forwarded to `SchedulerConfig`.
         routing: Routing strategy (defaults to StaticRouting).
         arbiter_mode: Arbiter authority mode (ADVISORY by default).
         arbiter_enabled: Whether arbiter integration is enabled.
@@ -2765,6 +2780,7 @@ async def create_scheduler_from_config(
         workdir=workdir or Path.cwd(),
         log_dir=log_dir or Path.cwd() / "logs",
         auto_commit=auto_commit,
+        on_auto_commit=on_auto_commit,
     )
 
     # Create tasks in database if they don't exist
