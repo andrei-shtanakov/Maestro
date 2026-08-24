@@ -913,6 +913,30 @@
 
 ---
 
+## Входящие 2026-08, волна 10 (inbox #217, принят 2026-08-24)
+
+> Запрос от deployer (разбор deployer#34, из того же пилота Dark Factory):
+> в обоих Mode-1 прогонах логи прогона легли в рабочее дерево целевого репо
+> (`deployer/logs/`), а собственный каталог прогона
+> `~/.maestro/projects/.../runs/<id>/logs/` остался пустым. Факт подтверждён
+> в коде: Mode-1 дефолт — `log_dir = workdir / "logs"` (`cli.py:657`), где
+> `workdir` и есть чекаут целевого репо. С `auto_commit: true` auto-commit
+> сметает логи в коммиты задач; deployer защитился `.gitignore` (deployer#35),
+> но это дешёвая половина — правильная в том, чтобы maestro не трогал чужое
+> рабочее дерево вовсе. Смежно с #216, но ортогонально: там изоляция ветки,
+> здесь — куда попадают артефакты самого maestro.
+
+- [ ] **mode1-run-logs-in-worktree**: Mode-1 пишет логи в каталог прогона, а не в рабочее дерево целевого репо @owner:github:andrei-shtanakov @id:mode1-run-logs-in-worktree
+      Дефолт `log_dir` в Mode-1 (`cli.py:657`) перевести с `workdir / "logs"`
+      на каталог прогона (туда, куда его обещает
+      `~/.maestro/projects/.../runs/<id>/logs/`); явный `--log-dir` остаётся
+      как есть. Инвариант: артефакты maestro никогда не появляются в рабочем
+      дереве целевого репозитория — иначе auto-commit уносит их в коммиты
+      задач. Проверить тем же прогоном: после Mode-1 run дерево целевого репо
+      чистое, логи лежат в каталоге прогона.
+
+---
+
 ## Бэклог идей из research-дайджеста (2026-07-22)
 
 > Источник: `../prograph-vault/authored/notes/2026-07-22-ideas-from-ai-repos-research.md`
@@ -938,14 +962,13 @@
 
 ## codex-review: потребитель кита steward (принят 2026-08-24)
 
-- [x] PR-B: caller-workflow гейта codex-review (по образцу пилота spec-runner:
+- [x] PR-B: caller-workflow гейта codex-review (по образцу пилота spec-runner: @owner:github:andrei-shtanakov @id:codex-review-caller
       механика из base, потолки, generated-декларация, экономный триггер по
       драфту/лейблу) + лейбл `codex-review` + секрет `CODEX_REVIEW_API_KEY`
       (кладёт владелец в настройки репо) — после мержа PR-A — влит #214
       (`a2438c4`, 2026-08-24); приёмка одним платным прогоном; major про
       metadata-события отклонён с доводом (влит поверх красного), довод
       дописан у продюсера (steward#112) и приехал сюда синком caller'а
-      @owner:github:andrei-shtanakov @id:codex-review-caller
 
   PR-A (этот): кит завендорен — `scripts/review/` (5 скриптов) +
   `.github/codex/review-schema.json`, PIN @ steward `1634af7`;
