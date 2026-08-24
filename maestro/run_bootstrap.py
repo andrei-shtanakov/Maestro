@@ -26,6 +26,7 @@ from maestro.run_registry import (
 
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
     from pathlib import Path
 
 
@@ -59,6 +60,7 @@ async def bootstrap_run(
     resume: bool,
     run_id_override: str | None,
     home: Path | None = None,
+    pre_publish: Callable[[str], Awaitable[dict[str, object]]] | None = None,
 ) -> BootstrapResult:
     # One identity rule for both modes: `identity_from_config` reads
     # `repo_url` when the config declares one (spec §3.2) and the `repo:`
@@ -101,12 +103,16 @@ async def bootstrap_run(
                 "wait for it, or pass --run <run-id> --resume"
             )
         run_id = str(ulid.new())
+        extra: dict[str, object] = {}
+        if pre_publish is not None:
+            extra = await pre_publish(run_id)
         db_path = await create_run(
             key,
             run_id,
             repo_key_text=repo_key_text,
             started_at=datetime.now(UTC).isoformat(),
             home=home,
+            **extra,  # type: ignore[arg-type]  # keys mirror create_run kwargs
         )
         fresh = True
 

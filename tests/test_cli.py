@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import os
+import subprocess
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import typer
 import yaml
 from typer.testing import CliRunner
 
@@ -74,21 +76,44 @@ def _write_orchestrator_config(base_dir: Path) -> Path:
     return config_path
 
 
-def _write_scheduler_config(base_dir: Path) -> Path:
+def _write_scheduler_config(base_dir: Path, git_block: dict | None = None) -> Path:
     """Create a minimal scheduler (mode-1) config file for testing."""
     repo_dir = base_dir / "sched-repo"
     repo_dir.mkdir(parents=True, exist_ok=True)
-    config = {
+    config: dict[str, object] = {
         "project": "scheduler-test",
         "repo": str(repo_dir),
         "tasks": [
             {"id": "t1", "title": "T1", "prompt": "do work"},
         ],
     }
+    if git_block is not None:
+        config["git"] = git_block
     config_path = base_dir / "tasks.yaml"
     with config_path.open("w") as f:
         yaml.safe_dump(config, f)
     return config_path
+
+
+def _git(repo: Path, *args: str) -> str:
+    """Run a git command in `repo`, mirroring test_run_branch_gate.py's helper."""
+    result = subprocess.run(
+        ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+    )
+    return result.stdout.strip()
+
+
+def _init_git_repo(repo_dir: Path) -> None:
+    """Turn `repo_dir` into a real, clean git repo on `master` with one commit
+    — what the run-branch gate's git plumbing needs (it shells out to real
+    `git`), unlike the bare `.git/` marker directory the orchestrator config
+    fixtures use."""
+    _git(repo_dir, "init", "-b", "master")
+    _git(repo_dir, "config", "user.email", "t@t")
+    _git(repo_dir, "config", "user.name", "t")
+    (repo_dir / "a.txt").write_text("a")
+    _git(repo_dir, "add", "a.txt")
+    _git(repo_dir, "commit", "-m", "init")
 
 
 async def _seed_workstream(db_path: Path, workstream_id: str) -> None:
@@ -620,6 +645,93 @@ class TestMode1DefaultLogDir:
 
         (resolved,) = mock_create_logger.call_args.args
         assert resolved == run_dir / "logs"
+
+
+class TestRunBranchGateStart:
+    """Task 6: PID lock moves ahead of both the bootstrap resolver and the
+    run-branch start gate (design doc §5) — a losing invocation must die on
+    the lock before it can touch the checkout, and a gate refusal must exit
+    before the database is ever created."""
+
+    async def _run_with_mocked_scheduler(
+        self, config_path: Path, db_path: Path, log_dir: Path | None = None
+    ) -> None:
+        """Copied verbatim from `TestMode1DefaultLogDir`'s helper."""
+        scheduler_instance = MagicMock()
+        scheduler_instance.run = AsyncMock(return_value=None)
+
+        with (
+            patch("maestro.cli.create_event_logger"),
+            patch("maestro.cli.make_routing_strategy", new_callable=AsyncMock),
+            patch(
+                "maestro.cli.create_scheduler_from_config",
+                new_callable=AsyncMock,
+                return_value=scheduler_instance,
+            ),
+            patch("maestro.cli._acquire_pid_lock", return_value=99),
+            patch("maestro.cli._release_pid_lock"),
+        ):
+            await _run_scheduler(
+                config_path=config_path,
+                db_path=db_path,
+                resume=False,
+                log_dir=log_dir,
+                clean=False,
+            )
+
+    async def test_lock_held_refuses_before_touching_checkout(
+        self, temp_dir: Path
+    ) -> None:
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+
+        with (
+            patch("maestro.cli._acquire_pid_lock", side_effect=typer.Exit(1)),
+            pytest.raises(typer.Exit),
+        ):
+            await _run_scheduler(
+                config_path=config_path,
+                db_path=temp_dir / "test.db",
+                resume=False,
+                log_dir=None,
+                clean=False,
+            )
+
+        # The lock refusal happened before any gate action could run — the
+        # checkout is still on the branch `_init_git_repo` left it on.
+        assert _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD") == "master"
+
+    async def test_fresh_run_creates_branch_and_records_binding(
+        self, temp_dir: Path
+    ) -> None:
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        db_path = temp_dir / "test.db"
+
+        await self._run_with_mocked_scheduler(config_path, db_path)
+
+        assert _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD") == "pilot/x"
+
+    async def test_gate_refusal_exits_1_before_db(self, temp_dir: Path) -> None:
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        (repo_dir / "a.txt").write_text("edited, uncommitted")
+        db_path = temp_dir / "test.db"
+
+        with pytest.raises(typer.Exit) as excinfo:
+            await self._run_with_mocked_scheduler(config_path, db_path)
+
+        assert excinfo.value.exit_code == 1
+        assert not db_path.exists()
 
 
 # =============================================================================

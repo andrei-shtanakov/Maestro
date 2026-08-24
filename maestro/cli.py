@@ -96,6 +96,7 @@ from maestro.review_workspace import (
     recover_push,
 )
 from maestro.run_bootstrap import RunIsLive, bootstrap_run
+from maestro.run_branch_gate import RunBranchGateError, apply_start_gate
 from maestro.run_lifecycle import (
     OPERATOR_ENDINGS,
     RunConclusion,
@@ -579,267 +580,321 @@ async def _run_scheduler(
         err_console.print(f"[red]DAG error:[/red] {e}")
         raise typer.Exit(1) from e
 
-    # Identity, the run, and `ORCHESTRA_PIPELINE_ID` are resolved before
-    # logging initializes — obs.py mints a fresh ULID otherwise (spec §A.3).
-    # Mode 1's identity comes from the `repo:` checkout's `origin` (spec §3.3),
-    # which `bootstrap_run` reaches through the same `identity_from_config`
-    # rule Mode 2 uses. `--db` is an explicit override that skips the resolver.
-    resolved_db_path = db_path
-    if resolved_db_path is None:
-        try:
-            bootstrap = await bootstrap_run(config, resume=resume, run_id_override=run)
-        except IdentityError as e:
-            err_console.print(f"[red]Cannot resolve repository identity:[/red] {e}")
-            raise typer.Exit(1) from e
-        except RunIsLive as e:
-            err_console.print(f"[red]Refusing to start a second run:[/red] {e}")
-            raise typer.Exit(1) from e
-        except NoResumableRun as e:
-            # `--run <id>` puts an operator-controlled string in this message
-            # (see `run_bootstrap._run_by_id`), and a value like `[bold]` would
-            # otherwise be parsed as Rich markup instead of printed.
-            err_console.print(
-                f"[red]No resumable run:[/red] {escape(str(e))}", soft_wrap=True
-            )
-            raise typer.Exit(1) from e
-        except AmbiguousRun as e:
-            err_console.print(f"[red]Several runs could be resumed:[/red] {e}")
-            raise typer.Exit(1) from e
-        resolved_db_path = bootstrap.db_path
-        console.print(
-            f"[dim]acting on {escape('/'.join(bootstrap.key.as_path_parts()))}, "
-            f"run {escape(bootstrap.run_id)}[/dim]",
-            soft_wrap=True,
-        )
+    # Needed by the run-branch gate below (and, unchanged, by the scheduler
+    # further down) — moved up from its old post-bootstrap site.
+    workdir = Path(config.repo).expanduser()  # noqa: ASYNC240
 
-    # Ensure DB directory exists
-    resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Clean existing state if requested
-    if clean:
-        if db_path is None:
-            # A resolved fresh run is empty by construction and a resumed one
-            # must never be cleared — unlinking it would delete the `run` row
-            # that is the run's identity, which is exactly the evidence spec
-            # §E exists to preserve. `--clean` therefore only means anything
-            # against an explicitly named `--db`.
-            console.print(
-                "[yellow]--clean has no effect without --db: a fresh run gets "
-                "its own empty database, and a resumed one must not be "
-                "cleared.[/yellow]"
-            )
-        elif resolved_db_path.exists():
-            resolved_db_path.unlink()
-            console.print("[yellow]Cleaned database for fresh start[/yellow]")
-
-    # Create or connect to database
-    db = await create_database(resolved_db_path)
-    lock_fd: int | None = None
-    notifications: NotificationManager | None = None
-
-    # R-03: pick routing strategy. StaticRouting if cfg.arbiter is None or
-    # disabled; ArbiterRouting (with its subprocess) when enabled.
-    # Build inside try/finally so db.close() and lock release always run even
-    # if arbiter startup raises (e.g. ArbiterStartupError with optional=false).
-    arbiter_cfg = config.arbiter
-    arbiter_mode = arbiter_cfg.mode if arbiter_cfg is not None else ArbiterMode.ADVISORY
-    routing: RoutingStrategy | None = None
-
+    # The run-branch start gate (design doc §5) may switch/create a branch in
+    # `workdir`, so the checkout must only ever be mutated under the Mode-1
+    # singleton fence: acquire lock -> identity + RunIsLive -> gate ->
+    # publish. PID-lock acquisition therefore moves ahead of both the gate
+    # and the bootstrap resolver (it used to sit deep inside the try block
+    # below, after scheduler construction) — a losing second invocation now
+    # dies on the lock before it can touch the checkout at all. Its scope is
+    # unchanged; only the acquisition point moves earlier.
+    lock_fd = _acquire_pid_lock()
     try:
-        routing = await make_routing_strategy(arbiter_cfg)
+        git_cfg = config.git
+        gate_on = git_cfg is not None and git_cfg.run_branch is not None
 
-        # Determine the log directory and activate the structured event log
-        # BEFORE any resume/recovery work: StateRecovery.recover() emits events
-        # via get_event_logger() (e.g. RECOVERY_ARBITER_DECISIONS_CLOSED), so
-        # activating the logger later would drop recovery events on --resume.
-        workdir = Path(config.repo).expanduser()  # noqa: ASYNC240
-        if log_dir is None:
-            # Beside the state database — `runs/<id>/logs/` on the bootstrap
-            # path — never the target repo's working tree: with
-            # `auto_commit: true` an auto-commit would sweep the logs into
-            # task commits (inbox #217).
-            log_dir = resolved_db_path.parent / "logs"
-        create_event_logger(log_dir)
-
-        # Check if resuming
-        if resume:
-            existing_tasks = await db.get_all_tasks()
-            if existing_tasks:
-                console.print(
-                    f"[cyan]Resuming with {len(existing_tasks)} existing tasks[/cyan]"
-                )
-
-                # Perform state recovery for orphaned tasks
-                recovery = StateRecovery(
-                    db, execution=config.execution, verifier=config.verifier
-                )
-                if await recovery.needs_recovery():
-                    console.print(
-                        "[yellow]Detected orphaned tasks, performing recovery...[/yellow]"
-                    )
-                    stats = await recovery.recover(routing=routing)
-                    console.print(
-                        Panel(
-                            f"[green]Recovery complete[/green]\n"
-                            f"RUNNING → READY: {stats.running_recovered}\n"
-                            f"VALIDATING → READY: {stats.validating_recovered}\n"
-                            f"VERIFYING → NEEDS_REVIEW: "
-                            f"{stats.verifying_recovered}\n"
-                            f"Total recovered: {stats.total_recovered}\n"
-                            f"Already done: {stats.tasks_done}",
-                            title="State Recovery",
-                        )
-                    )
-            else:
-                console.print(
-                    "[yellow]No existing tasks found, starting fresh[/yellow]"
-                )
-
-        # Setup spawners — all five built-ins so YAML configs with
-        # agent_type: codex_cli / aider / announce / opencode work out of
-        # the box, matching what examples/hello.yaml, examples/tasks.yaml,
-        # and the arbiter policy tree's agent set expect.
-        spawners: dict[str, AgentSpawner] = {
-            "claude_code": ClaudeCodeSpawner(),
-            "codex_cli": CodexSpawner(),
-            "aider": AiderSpawner(),
-            "announce": AnnounceSpawner(),
-            "opencode": OpencodeSpawner(),
-        }
-
-        # Setup notifications
-        notifications = create_notification_manager(config.notifications)
-
-        # Setup streaming progress callback
-        _task_start_times: dict[str, datetime] = {}
-
-        def _on_status_change(
-            task_id: str,
-            old_status: str,
-            new_status: str,
-        ) -> None:
-            now = datetime.now(UTC)
-            timestamp = now.strftime("%H:%M:%S")
-            if new_status == "running":
-                _task_start_times[task_id] = now
-                console.print(
-                    f"[dim]{timestamp}[/dim] "
-                    f"[cyan]{task_id}[/cyan]: "
-                    f"[yellow]RUNNING[/yellow]"
-                )
-            elif new_status == "done":
-                elapsed = ""
-                if task_id in _task_start_times:
-                    delta = now - _task_start_times[task_id]
-                    minutes = int(delta.total_seconds() // 60)
-                    seconds = int(delta.total_seconds() % 60)
-                    elapsed = f" [dim]({minutes}m{seconds:02d}s)[/dim]"
-                console.print(
-                    f"[dim]{timestamp}[/dim] "
-                    f"[cyan]{task_id}[/cyan]: "
-                    f"[green]DONE[/green]{elapsed}"
-                )
-            elif new_status == "failed":
-                console.print(
-                    f"[dim]{timestamp}[/dim] [cyan]{task_id}[/cyan]: [red]FAILED[/red]"
-                )
-            elif new_status == "needs_review":
-                console.print(
-                    f"[dim]{timestamp}[/dim] "
-                    f"[cyan]{task_id}[/cyan]: "
-                    f"[red]NEEDS_REVIEW[/red]"
-                )
-            elif new_status == "ready" and old_status == "failed":
-                console.print(
-                    f"[dim]{timestamp}[/dim] "
-                    f"[cyan]{task_id}[/cyan]: "
-                    f"[yellow]RETRYING[/yellow]"
-                )
-
-        # Create scheduler
-        scheduler = await create_scheduler_from_config(
-            db=db,
-            tasks=config.tasks,
-            spawners=spawners,  # type: ignore[arg-type]  # variance of invariant dict
-            max_concurrent=config.max_concurrent,
-            workdir=workdir,
-            log_dir=log_dir,
-            notification_manager=notifications,
-            on_status_change=_on_status_change,
-            auto_commit=(config.git.auto_commit if config.git else False),
-            routing=routing,
-            arbiter_mode=arbiter_mode,
-            arbiter_enabled=arbiter_cfg is not None and arbiter_cfg.enabled,
-            execution=config.execution,
-            verifier=config.verifier,
-        )
-        if arbiter_cfg is not None:
-            scheduler._abandon_outcome_after_s = arbiter_cfg.abandon_outcome_after_s
-
-        # Display initial state
-        all_tasks = await db.get_all_tasks()
-        _display_tasks_table(all_tasks, "Starting Tasks")
-
-        # Acquire PID lock
-        lock_fd = _acquire_pid_lock()
-
-        console.print(
-            Panel(
-                f"[green]Scheduler started[/green]\n"
-                f"Project: {config.project}\n"
-                f"Max concurrent: {config.max_concurrent}\n"
-                f"Tasks: {len(config.tasks)}",
-                title="Maestro",
+        async def _branch_pre_publish(_run_id: str) -> dict[str, object]:
+            assert git_cfg is not None and git_cfg.run_branch is not None
+            head = apply_start_gate(
+                workdir,
+                run_branch=git_cfg.run_branch,
+                base_branch=git_cfg.base_branch,
             )
-        )
+            return {
+                "run_branch": git_cfg.run_branch,
+                "run_branch_declared": 1,
+                "run_branch_head": head,
+            }
 
-        # Record HEAD before run for commit summary
-        head_before = _get_git_head(workdir)
-
-        # Run scheduler
-        await scheduler.run()
-
-        # Show what agents changed
-        _display_git_summary(workdir)
-        _display_auto_commits(workdir, head_before)
-
-        # Display final state
-        all_tasks = await db.get_all_tasks()
-        console.print()
-        _display_tasks_table(all_tasks, "Final Status")
-        _display_summary(all_tasks)
-
-        # Same rule as mode 2 (`orchestrate`): the run records its own ending
-        # before the failure exit, or it is reported `interrupted` forever
-        # (spec §B.1, §B.3).
-        await _announce_conclusion(db, conclusion_for_tasks(all_tasks))
-
-        # Check for failures
-        failed_tasks = [
-            t
-            for t in all_tasks
-            if t.status in (TaskStatus.FAILED, TaskStatus.NEEDS_REVIEW)
-        ]
-        if failed_tasks:
+        # Identity, the run, and `ORCHESTRA_PIPELINE_ID` are resolved before
+        # logging initializes — obs.py mints a fresh ULID otherwise (spec §A.3).
+        # Mode 1's identity comes from the `repo:` checkout's `origin` (spec §3.3),
+        # which `bootstrap_run` reaches through the same `identity_from_config`
+        # rule Mode 2 uses. `--db` is an explicit override that skips the resolver.
+        resolved_db_path = db_path
+        fresh_start = not resume and run is None
+        if resolved_db_path is None:
+            try:
+                bootstrap = await bootstrap_run(
+                    config,
+                    resume=resume,
+                    run_id_override=run,
+                    pre_publish=_branch_pre_publish
+                    if (gate_on and fresh_start)
+                    else None,
+                )
+            except IdentityError as e:
+                err_console.print(f"[red]Cannot resolve repository identity:[/red] {e}")
+                raise typer.Exit(1) from e
+            except RunIsLive as e:
+                err_console.print(f"[red]Refusing to start a second run:[/red] {e}")
+                raise typer.Exit(1) from e
+            except NoResumableRun as e:
+                # `--run <id>` puts an operator-controlled string in this message
+                # (see `run_bootstrap._run_by_id`), and a value like `[bold]` would
+                # otherwise be parsed as Rich markup instead of printed.
+                err_console.print(
+                    f"[red]No resumable run:[/red] {escape(str(e))}", soft_wrap=True
+                )
+                raise typer.Exit(1) from e
+            except AmbiguousRun as e:
+                err_console.print(f"[red]Several runs could be resumed:[/red] {e}")
+                raise typer.Exit(1) from e
+            except RunBranchGateError as e:
+                err_console.print(f"[red]run-branch gate:[/red] {e}")
+                raise typer.Exit(1) from e
+            resolved_db_path = bootstrap.db_path
             console.print(
-                f"\n[red]Warning: {len(failed_tasks)} task(s) failed or need review[/red]"
+                f"[dim]acting on {escape('/'.join(bootstrap.key.as_path_parts()))}, "
+                f"run {escape(bootstrap.run_id)}[/dim]",
+                soft_wrap=True,
             )
-            raise typer.Exit(1)
+        elif gate_on and fresh_start:
+            # Explicit `--db`: `bootstrap_run` (and its `pre_publish` seam)
+            # is skipped entirely, so the gate runs at the equivalent point
+            # here instead — before the database is opened, and equally
+            # after the PID lock (spec §5). No run row exists on this path,
+            # so nothing is recorded (spec §6 `--db` limitation).
+            try:
+                assert git_cfg is not None and git_cfg.run_branch is not None
+                apply_start_gate(
+                    workdir,
+                    run_branch=git_cfg.run_branch,
+                    base_branch=git_cfg.base_branch,
+                )
+            except RunBranchGateError as e:
+                err_console.print(f"[red]run-branch gate:[/red] {e}")
+                raise typer.Exit(1) from e
 
-        console.print("\n[green]All tasks completed successfully![/green]")
+        # Ensure DB directory exists
+        resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        await record_cancelled(db, "interrupted by the operator")
-        raise
+        # Clean existing state if requested
+        if clean:
+            if db_path is None:
+                # A resolved fresh run is empty by construction and a resumed one
+                # must never be cleared — unlinking it would delete the `run` row
+                # that is the run's identity, which is exactly the evidence spec
+                # §E exists to preserve. `--clean` therefore only means anything
+                # against an explicitly named `--db`.
+                console.print(
+                    "[yellow]--clean has no effect without --db: a fresh run gets "
+                    "its own empty database, and a resumed one must not be "
+                    "cleared.[/yellow]"
+                )
+            elif resolved_db_path.exists():
+                resolved_db_path.unlink()
+                console.print("[yellow]Cleaned database for fresh start[/yellow]")
+
+        # Create or connect to database
+        db = await create_database(resolved_db_path)
+        notifications: NotificationManager | None = None
+
+        # R-03: pick routing strategy. StaticRouting if cfg.arbiter is None or
+        # disabled; ArbiterRouting (with its subprocess) when enabled.
+        # Build inside try/finally so db.close() always runs even if arbiter
+        # startup raises (e.g. ArbiterStartupError with optional=false).
+        arbiter_cfg = config.arbiter
+        arbiter_mode = (
+            arbiter_cfg.mode if arbiter_cfg is not None else ArbiterMode.ADVISORY
+        )
+        routing: RoutingStrategy | None = None
+
+        try:
+            routing = await make_routing_strategy(arbiter_cfg)
+
+            # Determine the log directory and activate the structured event log
+            # BEFORE any resume/recovery work: StateRecovery.recover() emits events
+            # via get_event_logger() (e.g. RECOVERY_ARBITER_DECISIONS_CLOSED), so
+            # activating the logger later would drop recovery events on --resume.
+            if log_dir is None:
+                # Beside the state database — `runs/<id>/logs/` on the bootstrap
+                # path — never the target repo's working tree: with
+                # `auto_commit: true` an auto-commit would sweep the logs into
+                # task commits (inbox #217).
+                log_dir = resolved_db_path.parent / "logs"
+            create_event_logger(log_dir)
+
+            # Check if resuming
+            if resume:
+                existing_tasks = await db.get_all_tasks()
+                if existing_tasks:
+                    console.print(
+                        f"[cyan]Resuming with {len(existing_tasks)} existing tasks[/cyan]"
+                    )
+
+                    # Perform state recovery for orphaned tasks
+                    recovery = StateRecovery(
+                        db, execution=config.execution, verifier=config.verifier
+                    )
+                    if await recovery.needs_recovery():
+                        console.print(
+                            "[yellow]Detected orphaned tasks, performing recovery...[/yellow]"
+                        )
+                        stats = await recovery.recover(routing=routing)
+                        console.print(
+                            Panel(
+                                f"[green]Recovery complete[/green]\n"
+                                f"RUNNING → READY: {stats.running_recovered}\n"
+                                f"VALIDATING → READY: {stats.validating_recovered}\n"
+                                f"VERIFYING → NEEDS_REVIEW: "
+                                f"{stats.verifying_recovered}\n"
+                                f"Total recovered: {stats.total_recovered}\n"
+                                f"Already done: {stats.tasks_done}",
+                                title="State Recovery",
+                            )
+                        )
+                else:
+                    console.print(
+                        "[yellow]No existing tasks found, starting fresh[/yellow]"
+                    )
+
+            # Setup spawners — all five built-ins so YAML configs with
+            # agent_type: codex_cli / aider / announce / opencode work out of
+            # the box, matching what examples/hello.yaml, examples/tasks.yaml,
+            # and the arbiter policy tree's agent set expect.
+            spawners: dict[str, AgentSpawner] = {
+                "claude_code": ClaudeCodeSpawner(),
+                "codex_cli": CodexSpawner(),
+                "aider": AiderSpawner(),
+                "announce": AnnounceSpawner(),
+                "opencode": OpencodeSpawner(),
+            }
+
+            # Setup notifications
+            notifications = create_notification_manager(config.notifications)
+
+            # Setup streaming progress callback
+            _task_start_times: dict[str, datetime] = {}
+
+            def _on_status_change(
+                task_id: str,
+                old_status: str,
+                new_status: str,
+            ) -> None:
+                now = datetime.now(UTC)
+                timestamp = now.strftime("%H:%M:%S")
+                if new_status == "running":
+                    _task_start_times[task_id] = now
+                    console.print(
+                        f"[dim]{timestamp}[/dim] "
+                        f"[cyan]{task_id}[/cyan]: "
+                        f"[yellow]RUNNING[/yellow]"
+                    )
+                elif new_status == "done":
+                    elapsed = ""
+                    if task_id in _task_start_times:
+                        delta = now - _task_start_times[task_id]
+                        minutes = int(delta.total_seconds() // 60)
+                        seconds = int(delta.total_seconds() % 60)
+                        elapsed = f" [dim]({minutes}m{seconds:02d}s)[/dim]"
+                    console.print(
+                        f"[dim]{timestamp}[/dim] "
+                        f"[cyan]{task_id}[/cyan]: "
+                        f"[green]DONE[/green]{elapsed}"
+                    )
+                elif new_status == "failed":
+                    console.print(
+                        f"[dim]{timestamp}[/dim] [cyan]{task_id}[/cyan]: [red]FAILED[/red]"
+                    )
+                elif new_status == "needs_review":
+                    console.print(
+                        f"[dim]{timestamp}[/dim] "
+                        f"[cyan]{task_id}[/cyan]: "
+                        f"[red]NEEDS_REVIEW[/red]"
+                    )
+                elif new_status == "ready" and old_status == "failed":
+                    console.print(
+                        f"[dim]{timestamp}[/dim] "
+                        f"[cyan]{task_id}[/cyan]: "
+                        f"[yellow]RETRYING[/yellow]"
+                    )
+
+            # Create scheduler
+            scheduler = await create_scheduler_from_config(
+                db=db,
+                tasks=config.tasks,
+                spawners=spawners,  # type: ignore[arg-type]  # variance of invariant dict
+                max_concurrent=config.max_concurrent,
+                workdir=workdir,
+                log_dir=log_dir,
+                notification_manager=notifications,
+                on_status_change=_on_status_change,
+                auto_commit=(config.git.auto_commit if config.git else False),
+                routing=routing,
+                arbiter_mode=arbiter_mode,
+                arbiter_enabled=arbiter_cfg is not None and arbiter_cfg.enabled,
+                execution=config.execution,
+                verifier=config.verifier,
+            )
+            if arbiter_cfg is not None:
+                scheduler._abandon_outcome_after_s = arbiter_cfg.abandon_outcome_after_s
+
+            # Display initial state
+            all_tasks = await db.get_all_tasks()
+            _display_tasks_table(all_tasks, "Starting Tasks")
+
+            console.print(
+                Panel(
+                    f"[green]Scheduler started[/green]\n"
+                    f"Project: {config.project}\n"
+                    f"Max concurrent: {config.max_concurrent}\n"
+                    f"Tasks: {len(config.tasks)}",
+                    title="Maestro",
+                )
+            )
+
+            # Record HEAD before run for commit summary
+            head_before = _get_git_head(workdir)
+
+            # Run scheduler
+            await scheduler.run()
+
+            # Show what agents changed
+            _display_git_summary(workdir)
+            _display_auto_commits(workdir, head_before)
+
+            # Display final state
+            all_tasks = await db.get_all_tasks()
+            console.print()
+            _display_tasks_table(all_tasks, "Final Status")
+            _display_summary(all_tasks)
+
+            # Same rule as mode 2 (`orchestrate`): the run records its own ending
+            # before the failure exit, or it is reported `interrupted` forever
+            # (spec §B.1, §B.3).
+            await _announce_conclusion(db, conclusion_for_tasks(all_tasks))
+
+            # Check for failures
+            failed_tasks = [
+                t
+                for t in all_tasks
+                if t.status in (TaskStatus.FAILED, TaskStatus.NEEDS_REVIEW)
+            ]
+            if failed_tasks:
+                console.print(
+                    f"\n[red]Warning: {len(failed_tasks)} task(s) failed or need review[/red]"
+                )
+                raise typer.Exit(1)
+
+            console.print("\n[green]All tasks completed successfully![/green]")
+
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            await record_cancelled(db, "interrupted by the operator")
+            raise
+        finally:
+            if routing is not None:
+                await routing.aclose()
+            if notifications is not None:
+                # Bounded drain of queued notification deliveries (webhook).
+                await notifications.aclose()
+            await db.close()
     finally:
-        if routing is not None:
-            await routing.aclose()
-        if notifications is not None:
-            # Bounded drain of queued notification deliveries (webhook).
-            await notifications.aclose()
-        await db.close()
-        if lock_fd is not None:
-            _release_pid_lock(lock_fd)
+        _release_pid_lock(lock_fd)
 
 
 #: The commands whose whole act is *look at the evidence*, and which must
