@@ -170,6 +170,11 @@ class TestGateEvents:
         self, repo: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         apply_start_gate(repo, run_branch="pilot/x", base_branch="master")
+        # caplog captures for the WHOLE test once any earlier suite member
+        # raised the root level (setup_logging leaves it at INFO), so the
+        # setup call's `.created` record must be dropped before asserting
+        # the second call emits only `.verified`.
+        caplog.clear()
         with caplog.at_level(logging.INFO, logger="maestro.run_branch_gate"):
             apply_start_gate(repo, run_branch="pilot/x", base_branch="master")
         messages = self._messages(caplog)
