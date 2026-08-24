@@ -783,6 +783,14 @@ class GitConfig(BaseModel):
             "branch per task (issue #216)"
         ),
     )
+    run_branch: str | None = Field(
+        default=None,
+        description=(
+            "Mode-1 run-level branch isolation (issue #216 part 2): the one "
+            "branch this DAG's runs execute on. Verified or created by the "
+            "runtime before the run is published; never equal to base_branch."
+        ),
+    )
 
     @model_validator(mode="after")
     def reject_branch_prefix(self) -> Self:
@@ -795,6 +803,17 @@ class GitConfig(BaseModel):
                 "is checked out. Remove the key. Run-level branch isolation "
                 "is a planned separate contract: issue #216, "
                 "todo://maestro/mode1-branch-isolation."
+            )
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def reject_run_branch_equal_to_base(self) -> Self:
+        """`run_branch == base_branch` defeats the isolation it configures."""
+        if self.run_branch is not None and self.run_branch == self.base_branch:
+            msg = (
+                f"git.run_branch ({self.run_branch!r}) must differ from "
+                f"git.base_branch: the whole point is not running on the base"
             )
             raise ValueError(msg)
         return self

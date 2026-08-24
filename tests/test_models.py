@@ -3,6 +3,7 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import ValidationError
 
 from maestro.dag import DAG, CycleError
 from maestro.models import (
@@ -824,6 +825,25 @@ class TestGitConfig:
         """
         with pytest.raises(ValueError, match="branch_prefix"):
             GitConfig(branch_prefix="pilot/")
+
+
+class TestGitConfigRunBranch:
+    """Tests for GitConfig.run_branch field."""
+
+    def test_run_branch_absent_defaults_to_none(self) -> None:
+        """Test that run_branch defaults to None when not specified."""
+        config = GitConfig()
+        assert config.run_branch is None
+
+    def test_run_branch_accepted(self) -> None:
+        """Test that run_branch is accepted when set."""
+        config = GitConfig(base_branch="master", run_branch="pilot/x")
+        assert config.run_branch == "pilot/x"
+
+    def test_run_branch_equal_to_base_rejected(self) -> None:
+        """Test that run_branch cannot equal base_branch."""
+        with pytest.raises(ValidationError, match="run_branch"):
+            GitConfig(base_branch="master", run_branch="master")
 
 
 class TestNotificationConfig:
