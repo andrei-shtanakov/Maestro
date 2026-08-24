@@ -29,6 +29,9 @@ async def create_run(
     repo_key_text: str,
     started_at: str,
     home: Path | None = None,
+    run_branch: str | None = None,
+    run_branch_declared: int | None = None,
+    run_branch_head: str | None = None,
 ) -> Path:
     """Create `runs/<run_id>/` and return its `state.db`.
 
@@ -61,7 +64,12 @@ async def create_run(
         db_path = staging / "state.db"
         db = await create_database(db_path)
         await db.create_run_row(
-            run_id=run_id, repo_key=repo_key_text, started_at=started_at
+            run_id=run_id,
+            repo_key=repo_key_text,
+            started_at=started_at,
+            run_branch=run_branch,
+            run_branch_declared=run_branch_declared,
+            run_branch_head=run_branch_head,
         )
         await db.close()  # WAL/shm checkpointed and released
         db_path.chmod(FILE_MODE)
