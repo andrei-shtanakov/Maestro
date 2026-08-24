@@ -11,6 +11,7 @@ This module provides a command-line interface using Typer for:
 import asyncio
 import contextlib
 import fcntl
+import logging
 import os
 import shutil
 import signal
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import typer
+import ulid
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
@@ -96,6 +98,12 @@ from maestro.review_workspace import (
     recover_push,
 )
 from maestro.run_bootstrap import RunIsLive, bootstrap_run
+from maestro.run_branch_gate import (
+    RunBranchGateError,
+    RunBranchRecord,
+    apply_start_gate,
+    verify_continuation,
+)
 from maestro.run_lifecycle import (
     OPERATOR_ENDINGS,
     RunConclusion,
@@ -190,6 +198,8 @@ _CONFIG_OPTION_HELP = (
 # Rich console for pretty output
 console = Console()
 err_console = Console(stderr=True)
+
+logger = logging.getLogger(__name__)
 
 # Typer app
 service_app = typer.Typer(
@@ -553,6 +563,116 @@ def _print_validation_report(report: ValidationReport) -> None:
     console.print(f"[{style}]{summary}[/{style}]")
 
 
+def _warn_dirty_continuation(dirty: list[str]) -> None:
+    """Name the uncommitted paths a continuation will carry (spec §6).
+
+    §6's priced hole: continuation never refuses over a dirty tree — a
+    crashed run legitimately leaves uncommitted task work — so what the gate
+    owes the operator here is visibility, not a block.
+    """
+    if not dirty:
+        return
+    shown = ", ".join(escape(path) for path in dirty[:10])
+    err_console.print(
+        "[yellow]run-branch gate: uncommitted paths will ride into task "
+        f"commits: {shown}[/yellow]",
+        soft_wrap=True,
+    )
+
+
+async def _verify_run_branch_continuation(
+    db: Database,
+    *,
+    workdir: Path,
+    configured: str | None,
+    accept_branch_tip: bool,
+) -> dict[str, object] | None:
+    """§6's three-state record check, run before recovery. Returns the run row.
+
+    The branch is read from the run row and verified against the checkout —
+    never re-derived from the config, which may have been edited since (#198's
+    territory). A missing run row refuses for **every** continuation-selected
+    invocation with a configured branch, not only for `--resume`/`--run`: a
+    plain `--db` naming an existing database is a continuation too, so the
+    start gate does not run for it, and keying the refusal off the flags would
+    leave that invocation gated by neither seam.
+    """
+    row = await db.get_run_row()
+    if row is None:
+        if configured is not None:
+            raise RunBranchGateError(
+                "record_missing",
+                "this database has no run row, so its branch binding is "
+                "unknown; resume through the resolver path, or drop "
+                "git.run_branch to run it ungated",
+            )
+        return None
+
+    declared = row.get("run_branch_declared")
+    if declared == 1:
+        head = row.get("run_branch_head")
+        record = RunBranchRecord(
+            branch=str(row["run_branch"]),
+            head=str(head) if head else None,
+        )
+        tip, dirty = verify_continuation(workdir, record, accept_tip=accept_branch_tip)
+        if accept_branch_tip and record.head != tip:
+            # The operator's explicit statement that the delta is this run's
+            # own work — audited, never automatic (spec §6).
+            await db.update_run_branch_head(tip)
+            logger.warning(
+                "run_branch_gate.tip_accepted branch=%s recorded=%s observed=%s",
+                record.branch,
+                record.head,
+                tip,
+            )
+            err_console.print(
+                f"[yellow]run-branch gate: re-recorded {escape(record.branch)} "
+                f"tip as {tip[:12]} (--accept-branch-tip)[/yellow]",
+                soft_wrap=True,
+            )
+        _warn_dirty_continuation(dirty)
+    elif declared is None:
+        # A true pre-migration row: the record is absent, so the only intent
+        # available is the config's — and adoption verifies against it first,
+        # so an accidental resume can never durably bind the run to whatever
+        # branch happened to be checked out (spec §6, round-5 major 3).
+        if configured is None:
+            await db.set_run_branch_declared(0)
+        else:
+            tip, dirty = verify_continuation(
+                workdir,
+                RunBranchRecord(branch=configured, head=None),
+                accept_tip=False,
+            )
+            await db.set_run_branch_binding(branch=configured, declared=1, head=tip)
+            # The caller reads the returned row to decide whether this session
+            # maintains `run_branch_head` (its `on_auto_commit` hook), so the
+            # row must describe the state AFTER adoption. Returning the
+            # pre-adoption snapshot left the adopted session unbound: the tip
+            # went unrecorded for its whole length, and the NEXT continuation
+            # then refused `resume_stale_checkout` over this run's own
+            # commits — the exact hole adoption exists to close. Patched
+            # rather than re-read: these three keys are precisely what the
+            # UPDATE above sets, and saying so is clearer than a second query.
+            row |= {
+                "run_branch": configured,
+                "run_branch_declared": 1,
+                "run_branch_head": tip,
+            }
+            err_console.print(
+                "[yellow]run-branch gate: legacy run adopted binding to "
+                f"{escape(configured)} (verified against the config; record "
+                "was pre-migration)[/yellow]",
+                soft_wrap=True,
+            )
+            _warn_dirty_continuation(dirty)
+    # declared == 0: the run opted out at creation — genuinely silent, no
+    # warning and no adoption (spec §6). Adding `run_branch` to the config
+    # later takes effect on the next *fresh* run, never mid-run.
+    return row
+
+
 async def _run_scheduler(
     config_path: Path,
     db_path: Path | None,
@@ -560,6 +680,7 @@ async def _run_scheduler(
     log_dir: Path | None,
     clean: bool = False,
     run: str | None = None,
+    accept_branch_tip: bool = False,
 ) -> None:
     """Run the scheduler with the given configuration."""
     # Load configuration
@@ -579,267 +700,476 @@ async def _run_scheduler(
         err_console.print(f"[red]DAG error:[/red] {e}")
         raise typer.Exit(1) from e
 
-    # Identity, the run, and `ORCHESTRA_PIPELINE_ID` are resolved before
-    # logging initializes — obs.py mints a fresh ULID otherwise (spec §A.3).
-    # Mode 1's identity comes from the `repo:` checkout's `origin` (spec §3.3),
-    # which `bootstrap_run` reaches through the same `identity_from_config`
-    # rule Mode 2 uses. `--db` is an explicit override that skips the resolver.
-    resolved_db_path = db_path
-    if resolved_db_path is None:
-        try:
-            bootstrap = await bootstrap_run(config, resume=resume, run_id_override=run)
-        except IdentityError as e:
-            err_console.print(f"[red]Cannot resolve repository identity:[/red] {e}")
-            raise typer.Exit(1) from e
-        except RunIsLive as e:
-            err_console.print(f"[red]Refusing to start a second run:[/red] {e}")
-            raise typer.Exit(1) from e
-        except NoResumableRun as e:
-            # `--run <id>` puts an operator-controlled string in this message
-            # (see `run_bootstrap._run_by_id`), and a value like `[bold]` would
-            # otherwise be parsed as Rich markup instead of printed.
-            err_console.print(
-                f"[red]No resumable run:[/red] {escape(str(e))}", soft_wrap=True
-            )
-            raise typer.Exit(1) from e
-        except AmbiguousRun as e:
-            err_console.print(f"[red]Several runs could be resumed:[/red] {e}")
-            raise typer.Exit(1) from e
-        resolved_db_path = bootstrap.db_path
-        console.print(
-            f"[dim]acting on {escape('/'.join(bootstrap.key.as_path_parts()))}, "
-            f"run {escape(bootstrap.run_id)}[/dim]",
-            soft_wrap=True,
-        )
+    # Needed by the run-branch gate below (and, unchanged, by the scheduler
+    # further down) — moved up from its old post-bootstrap site.
+    workdir = Path(config.repo).expanduser()  # noqa: ASYNC240
 
-    # Ensure DB directory exists
-    resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Clean existing state if requested
-    if clean:
-        if db_path is None:
-            # A resolved fresh run is empty by construction and a resumed one
-            # must never be cleared — unlinking it would delete the `run` row
-            # that is the run's identity, which is exactly the evidence spec
-            # §E exists to preserve. `--clean` therefore only means anything
-            # against an explicitly named `--db`.
-            console.print(
-                "[yellow]--clean has no effect without --db: a fresh run gets "
-                "its own empty database, and a resumed one must not be "
-                "cleared.[/yellow]"
-            )
-        elif resolved_db_path.exists():
-            resolved_db_path.unlink()
-            console.print("[yellow]Cleaned database for fresh start[/yellow]")
-
-    # Create or connect to database
-    db = await create_database(resolved_db_path)
-    lock_fd: int | None = None
-    notifications: NotificationManager | None = None
-
-    # R-03: pick routing strategy. StaticRouting if cfg.arbiter is None or
-    # disabled; ArbiterRouting (with its subprocess) when enabled.
-    # Build inside try/finally so db.close() and lock release always run even
-    # if arbiter startup raises (e.g. ArbiterStartupError with optional=false).
-    arbiter_cfg = config.arbiter
-    arbiter_mode = arbiter_cfg.mode if arbiter_cfg is not None else ArbiterMode.ADVISORY
-    routing: RoutingStrategy | None = None
-
+    # The run-branch start gate (design doc §5) may switch/create a branch in
+    # `workdir`, so the checkout must only ever be mutated under the Mode-1
+    # singleton fence: acquire lock -> identity + RunIsLive -> gate ->
+    # publish. PID-lock acquisition therefore moves ahead of both the gate
+    # and the bootstrap resolver (it used to sit deep inside the try block
+    # below, after scheduler construction) — a losing second invocation now
+    # dies on the lock before it can touch the checkout at all. Its scope is
+    # unchanged; only the acquisition point moves earlier.
+    lock_fd = _acquire_pid_lock()
     try:
-        routing = await make_routing_strategy(arbiter_cfg)
+        git_cfg = config.git
+        gate_on = git_cfg is not None and git_cfg.run_branch is not None
+        # The branch `_record_head` (below) keeps `run_branch_head` current
+        # against — set wherever a run row actually carries the binding
+        # (spec §6): the bootstrap fresh-start path, a continuation whose row
+        # has `run_branch_declared == 1`, and — since ruling R12 gave that
+        # path a row of its own — the explicit `--db` fresh-gated start.
+        bound_branch: str | None = None
+        # What the `--db` fresh gate bound, when it ran at all: the branch and
+        # the tip it observed. Both stay None on an ungated `--db` start, which
+        # still publishes a row — one that records the opt-out (see below).
+        db_fresh_binding_branch: str | None = None
+        db_fresh_binding_head: str | None = None
 
-        # Determine the log directory and activate the structured event log
-        # BEFORE any resume/recovery work: StateRecovery.recover() emits events
-        # via get_event_logger() (e.g. RECOVERY_ARBITER_DECISIONS_CLOSED), so
-        # activating the logger later would drop recovery events on --resume.
-        workdir = Path(config.repo).expanduser()  # noqa: ASYNC240
-        if log_dir is None:
-            # Beside the state database — `runs/<id>/logs/` on the bootstrap
-            # path — never the target repo's working tree: with
-            # `auto_commit: true` an auto-commit would sweep the logs into
-            # task commits (inbox #217).
-            log_dir = resolved_db_path.parent / "logs"
-        create_event_logger(log_dir)
-
-        # Check if resuming
-        if resume:
-            existing_tasks = await db.get_all_tasks()
-            if existing_tasks:
-                console.print(
-                    f"[cyan]Resuming with {len(existing_tasks)} existing tasks[/cyan]"
-                )
-
-                # Perform state recovery for orphaned tasks
-                recovery = StateRecovery(
-                    db, execution=config.execution, verifier=config.verifier
-                )
-                if await recovery.needs_recovery():
-                    console.print(
-                        "[yellow]Detected orphaned tasks, performing recovery...[/yellow]"
-                    )
-                    stats = await recovery.recover(routing=routing)
-                    console.print(
-                        Panel(
-                            f"[green]Recovery complete[/green]\n"
-                            f"RUNNING → READY: {stats.running_recovered}\n"
-                            f"VALIDATING → READY: {stats.validating_recovered}\n"
-                            f"VERIFYING → NEEDS_REVIEW: "
-                            f"{stats.verifying_recovered}\n"
-                            f"Total recovered: {stats.total_recovered}\n"
-                            f"Already done: {stats.tasks_done}",
-                            title="State Recovery",
-                        )
-                    )
-            else:
-                console.print(
-                    "[yellow]No existing tasks found, starting fresh[/yellow]"
-                )
-
-        # Setup spawners — all five built-ins so YAML configs with
-        # agent_type: codex_cli / aider / announce / opencode work out of
-        # the box, matching what examples/hello.yaml, examples/tasks.yaml,
-        # and the arbiter policy tree's agent set expect.
-        spawners: dict[str, AgentSpawner] = {
-            "claude_code": ClaudeCodeSpawner(),
-            "codex_cli": CodexSpawner(),
-            "aider": AiderSpawner(),
-            "announce": AnnounceSpawner(),
-            "opencode": OpencodeSpawner(),
-        }
-
-        # Setup notifications
-        notifications = create_notification_manager(config.notifications)
-
-        # Setup streaming progress callback
-        _task_start_times: dict[str, datetime] = {}
-
-        def _on_status_change(
-            task_id: str,
-            old_status: str,
-            new_status: str,
-        ) -> None:
-            now = datetime.now(UTC)
-            timestamp = now.strftime("%H:%M:%S")
-            if new_status == "running":
-                _task_start_times[task_id] = now
-                console.print(
-                    f"[dim]{timestamp}[/dim] "
-                    f"[cyan]{task_id}[/cyan]: "
-                    f"[yellow]RUNNING[/yellow]"
-                )
-            elif new_status == "done":
-                elapsed = ""
-                if task_id in _task_start_times:
-                    delta = now - _task_start_times[task_id]
-                    minutes = int(delta.total_seconds() // 60)
-                    seconds = int(delta.total_seconds() % 60)
-                    elapsed = f" [dim]({minutes}m{seconds:02d}s)[/dim]"
-                console.print(
-                    f"[dim]{timestamp}[/dim] "
-                    f"[cyan]{task_id}[/cyan]: "
-                    f"[green]DONE[/green]{elapsed}"
-                )
-            elif new_status == "failed":
-                console.print(
-                    f"[dim]{timestamp}[/dim] [cyan]{task_id}[/cyan]: [red]FAILED[/red]"
-                )
-            elif new_status == "needs_review":
-                console.print(
-                    f"[dim]{timestamp}[/dim] "
-                    f"[cyan]{task_id}[/cyan]: "
-                    f"[red]NEEDS_REVIEW[/red]"
-                )
-            elif new_status == "ready" and old_status == "failed":
-                console.print(
-                    f"[dim]{timestamp}[/dim] "
-                    f"[cyan]{task_id}[/cyan]: "
-                    f"[yellow]RETRYING[/yellow]"
-                )
-
-        # Create scheduler
-        scheduler = await create_scheduler_from_config(
-            db=db,
-            tasks=config.tasks,
-            spawners=spawners,  # type: ignore[arg-type]  # variance of invariant dict
-            max_concurrent=config.max_concurrent,
-            workdir=workdir,
-            log_dir=log_dir,
-            notification_manager=notifications,
-            on_status_change=_on_status_change,
-            auto_commit=(config.git.auto_commit if config.git else False),
-            routing=routing,
-            arbiter_mode=arbiter_mode,
-            arbiter_enabled=arbiter_cfg is not None and arbiter_cfg.enabled,
-            execution=config.execution,
-            verifier=config.verifier,
-        )
-        if arbiter_cfg is not None:
-            scheduler._abandon_outcome_after_s = arbiter_cfg.abandon_outcome_after_s
-
-        # Display initial state
-        all_tasks = await db.get_all_tasks()
-        _display_tasks_table(all_tasks, "Starting Tasks")
-
-        # Acquire PID lock
-        lock_fd = _acquire_pid_lock()
-
-        console.print(
-            Panel(
-                f"[green]Scheduler started[/green]\n"
-                f"Project: {config.project}\n"
-                f"Max concurrent: {config.max_concurrent}\n"
-                f"Tasks: {len(config.tasks)}",
-                title="Maestro",
+        async def _branch_pre_publish(_run_id: str) -> dict[str, object]:
+            assert git_cfg is not None and git_cfg.run_branch is not None
+            head = apply_start_gate(
+                workdir,
+                run_branch=git_cfg.run_branch,
+                base_branch=git_cfg.base_branch,
             )
+            return {
+                "run_branch": git_cfg.run_branch,
+                "run_branch_declared": 1,
+                "run_branch_head": head,
+            }
+
+        # Identity, the run, and `ORCHESTRA_PIPELINE_ID` are resolved before
+        # logging initializes — obs.py mints a fresh ULID otherwise (spec §A.3).
+        # Mode 1's identity comes from the `repo:` checkout's `origin` (spec §3.3),
+        # which `bootstrap_run` reaches through the same `identity_from_config`
+        # rule Mode 2 uses. `--db` is an explicit override that skips the resolver.
+        resolved_db_path = db_path
+        # Continuation = an existing run was selected, however it was selected
+        # (spec §2) — `--resume`, `--run <id>`, or a plain `--db` naming a
+        # database that already exists, which continues its task state today
+        # whether or not `--resume` was typed. `--clean` discards the state
+        # there would be to continue, so that invocation is a fresh start and
+        # takes the §4 start gate instead (spec §6); it only means anything
+        # against an explicitly named `--db`, which is why it cancels
+        # continuation only there.
+        clean_effective = clean and db_path is not None
+        # Non-empty, not merely present: `create_database` initializes any
+        # path it is given, so a zero-byte file (a `touch`, an interrupted
+        # create) carries no state to continue — treating it as a
+        # continuation would refuse `record_missing` on what is plainly a
+        # fresh start.
+        db_has_state = (
+            db_path is not None
+            and db_path.exists()  # noqa: ASYNC240
+            and db_path.stat().st_size > 0  # noqa: ASYNC240
         )
-
-        # Record HEAD before run for commit summary
-        head_before = _get_git_head(workdir)
-
-        # Run scheduler
-        await scheduler.run()
-
-        # Show what agents changed
-        _display_git_summary(workdir)
-        _display_auto_commits(workdir, head_before)
-
-        # Display final state
-        all_tasks = await db.get_all_tasks()
-        console.print()
-        _display_tasks_table(all_tasks, "Final Status")
-        _display_summary(all_tasks)
-
-        # Same rule as mode 2 (`orchestrate`): the run records its own ending
-        # before the failure exit, or it is reported `interrupted` forever
-        # (spec §B.1, §B.3).
-        await _announce_conclusion(db, conclusion_for_tasks(all_tasks))
-
-        # Check for failures
-        failed_tasks = [
-            t
-            for t in all_tasks
-            if t.status in (TaskStatus.FAILED, TaskStatus.NEEDS_REVIEW)
-        ]
-        if failed_tasks:
+        continuation_selected = (
+            resume or run is not None or db_has_state
+        ) and not clean_effective
+        fresh_start = not continuation_selected
+        if resolved_db_path is None:
+            try:
+                bootstrap = await bootstrap_run(
+                    config,
+                    resume=resume,
+                    run_id_override=run,
+                    pre_publish=_branch_pre_publish
+                    if (gate_on and fresh_start)
+                    else None,
+                )
+            except IdentityError as e:
+                err_console.print(f"[red]Cannot resolve repository identity:[/red] {e}")
+                raise typer.Exit(1) from e
+            except RunIsLive as e:
+                err_console.print(f"[red]Refusing to start a second run:[/red] {e}")
+                raise typer.Exit(1) from e
+            except NoResumableRun as e:
+                # `--run <id>` puts an operator-controlled string in this message
+                # (see `run_bootstrap._run_by_id`), and a value like `[bold]` would
+                # otherwise be parsed as Rich markup instead of printed.
+                err_console.print(
+                    f"[red]No resumable run:[/red] {escape(str(e))}", soft_wrap=True
+                )
+                raise typer.Exit(1) from e
+            except AmbiguousRun as e:
+                err_console.print(f"[red]Several runs could be resumed:[/red] {e}")
+                raise typer.Exit(1) from e
+            except RunBranchGateError as e:
+                # Escaped like `NoResumableRun` above, and for the same reason:
+                # every gate refusal quotes the operator's own branch names, and
+                # a `pilot/[x]` would be parsed as Rich markup and vanish.
+                err_console.print(
+                    f"[red]run-branch gate:[/red] {escape(str(e))}", soft_wrap=True
+                )
+                raise typer.Exit(1) from e
+            resolved_db_path = bootstrap.db_path
+            if gate_on and fresh_start:
+                assert git_cfg is not None and git_cfg.run_branch is not None
+                bound_branch = git_cfg.run_branch
             console.print(
-                f"\n[red]Warning: {len(failed_tasks)} task(s) failed or need review[/red]"
+                f"[dim]acting on {escape('/'.join(bootstrap.key.as_path_parts()))}, "
+                f"run {escape(bootstrap.run_id)}[/dim]",
+                soft_wrap=True,
             )
-            raise typer.Exit(1)
+        elif gate_on and fresh_start:
+            # Explicit `--db`: `bootstrap_run` (and its `pre_publish` seam)
+            # is skipped entirely, so the gate runs at the equivalent point
+            # here instead — before the database is opened, and equally
+            # after the PID lock (spec §5). The tip it returns is carried to
+            # the row this path writes once the database is open (below).
+            try:
+                assert git_cfg is not None and git_cfg.run_branch is not None
+                db_fresh_binding_head = apply_start_gate(
+                    workdir,
+                    run_branch=git_cfg.run_branch,
+                    base_branch=git_cfg.base_branch,
+                )
+                db_fresh_binding_branch = git_cfg.run_branch
+            except RunBranchGateError as e:
+                err_console.print(
+                    f"[red]run-branch gate:[/red] {escape(str(e))}", soft_wrap=True
+                )
+                raise typer.Exit(1) from e
 
-        console.print("\n[green]All tasks completed successfully![/green]")
+        # Ensure DB directory exists
+        resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        await record_cancelled(db, "interrupted by the operator")
-        raise
+        # Clean existing state if requested
+        if clean:
+            if db_path is None:
+                # A resolved fresh run is empty by construction and a resumed one
+                # must never be cleared — unlinking it would delete the `run` row
+                # that is the run's identity, which is exactly the evidence spec
+                # §E exists to preserve. `--clean` therefore only means anything
+                # against an explicitly named `--db`.
+                console.print(
+                    "[yellow]--clean has no effect without --db: a fresh run gets "
+                    "its own empty database, and a resumed one must not be "
+                    "cleared.[/yellow]"
+                )
+            elif resolved_db_path.exists():
+                resolved_db_path.unlink()
+                console.print("[yellow]Cleaned database for fresh start[/yellow]")
+
+        # Create or connect to database
+        db = await create_database(resolved_db_path)
+
+        if db_path is not None and fresh_start:
+            # EVERY fresh `--db` run publishes a run row — gated or not
+            # (rulings R12, R15). The row is what makes the next `--db`
+            # invocation, which is a continuation, legible:
+            #
+            #   - gated: without the binding it would refuse `record_missing`,
+            #     so opting into `run_branch` would make the documented `--db`
+            #     workflow single-shot;
+            #   - ungated: `declared=0` says "this run opted out at creation",
+            #     which is `run_publish`'s own R7 contract. Writing nothing
+            #     leaves the same anonymous state a legacy row has, so
+            #     enabling `git.run_branch` later would brick that database on
+            #     `record_missing` instead of continuing it silently, which is
+            #     what §6 says an opted-out run deserves.
+            #
+            # `repo_key` is a deliberate sentinel: this path skips the
+            # resolver, nothing reads the key here, and the row exists solely
+            # to carry (or to deny) the binding. Reached only on a fresh
+            # start, where the file did not exist, was empty, or `--clean`
+            # just removed it — so there is no row to collide with.
+            db_run_id = str(ulid.new())
+            await db.create_run_row(
+                run_id=db_run_id,
+                repo_key=f"_db_explicit/{config.project}",
+                started_at=datetime.now(UTC).isoformat(),
+                run_branch=db_fresh_binding_branch,
+                run_branch_declared=1 if db_fresh_binding_branch is not None else 0,
+                run_branch_head=db_fresh_binding_head,
+            )
+            # Said out loud for the same reason the bootstrap path says
+            # "acting on …, run …": the id is minted here and reaches the
+            # operator nowhere else, and `maestro run-end <id> --db <path>`
+            # needs it. Unprinted, it is knowable only by opening the file.
+            console.print(
+                f"[dim]run {escape(db_run_id)} recorded in "
+                f"{escape(str(resolved_db_path))}[/dim]",
+                soft_wrap=True,
+            )
+            if db_fresh_binding_branch is not None:
+                # A bound row must be maintained by the run that wrote it:
+                # left unbound, the tip would stay at the start sha while
+                # auto-commits advance the branch, and the next continuation
+                # would refuse `resume_stale_checkout` over this run's own
+                # work — the same trap one step later.
+                bound_branch = db_fresh_binding_branch
+
+        # Verification precedes recovery, deliberately (spec §6): Mode-1
+        # recovery is not checkout-neutral — finalizing open handles collects
+        # task results into the working tree, and collecting onto the wrong
+        # branch is exactly "acting in the wrong place". On a refusal nothing
+        # runs, recovery included, and all state is left untouched.
+        run_row: dict[str, object] | None = None
+        try:
+            if continuation_selected:
+                run_row = await _verify_run_branch_continuation(
+                    db,
+                    workdir=workdir,
+                    configured=git_cfg.run_branch if git_cfg is not None else None,
+                    accept_branch_tip=accept_branch_tip,
+                )
+        except BaseException as e:
+            # The database is opened before this check and its `finally` close
+            # only starts below: an unclosed aiosqlite connection would leak a
+            # thread and a ResourceWarning on every refusal.
+            await db.close()
+            if isinstance(e, RunBranchGateError):
+                err_console.print(
+                    f"[red]run-branch gate:[/red] {escape(str(e))}", soft_wrap=True
+                )
+                raise typer.Exit(1) from e
+            raise
+
+        if run_row is not None and run_row.get("run_branch_declared") == 1:
+            bound_branch = str(run_row["run_branch"])
+
+        async def _record_head(sha: str) -> None:
+            """Record the sha of a commit THIS run just made (ruling R14).
+
+            Attribution, not observation: the scheduler hands over the sha it
+            committed, so `run_branch_head` advances only over the run's own
+            work. Best-effort bookkeeping — a failure here must never fail the
+            task it rides in on, so every error is swallowed after a warning.
+            A no-op when the gate isn't bound to a branch.
+            """
+            if bound_branch is None:
+                return
+            try:
+                await db.update_run_branch_head(sha)
+            except Exception:
+                logger.warning("run_branch.head_record_failed", exc_info=True)
+
+        notifications: NotificationManager | None = None
+
+        # R-03: pick routing strategy. StaticRouting if cfg.arbiter is None or
+        # disabled; ArbiterRouting (with its subprocess) when enabled.
+        # Build inside try/finally so db.close() always runs even if arbiter
+        # startup raises (e.g. ArbiterStartupError with optional=false).
+        arbiter_cfg = config.arbiter
+        arbiter_mode = (
+            arbiter_cfg.mode if arbiter_cfg is not None else ArbiterMode.ADVISORY
+        )
+        routing: RoutingStrategy | None = None
+
+        try:
+            routing = await make_routing_strategy(arbiter_cfg)
+
+            # Determine the log directory and activate the structured event log
+            # BEFORE any resume/recovery work: StateRecovery.recover() emits events
+            # via get_event_logger() (e.g. RECOVERY_ARBITER_DECISIONS_CLOSED), so
+            # activating the logger later would drop recovery events on --resume.
+            if log_dir is None:
+                # Beside the state database — `runs/<id>/logs/` on the bootstrap
+                # path — never the target repo's working tree: with
+                # `auto_commit: true` an auto-commit would sweep the logs into
+                # task commits (inbox #217).
+                log_dir = resolved_db_path.parent / "logs"
+            create_event_logger(log_dir)
+
+            # Check if continuing an existing run. Keyed off selection, not
+            # off `--resume` (spec §6, round-5 major 1): a `--run <id>` or
+            # plain `--db` continuation that skipped recovery would open the
+            # database and then stall — crash-stranded RUNNING/VALIDATING rows
+            # never reconciled, never re-spawned, never complete. A `--db`
+            # database with no run row keeps the old behaviour: its provenance
+            # is unknown, so only an explicit `--resume` reconciles it.
+            if continuation_selected and (run_row is not None or resume):
+                existing_tasks = await db.get_all_tasks()
+                if existing_tasks:
+                    console.print(
+                        f"[cyan]Resuming with {len(existing_tasks)} existing tasks[/cyan]"
+                    )
+
+                    # Perform state recovery for orphaned tasks
+                    recovery = StateRecovery(
+                        db, execution=config.execution, verifier=config.verifier
+                    )
+                    if await recovery.needs_recovery():
+                        console.print(
+                            "[yellow]Detected orphaned tasks, performing recovery...[/yellow]"
+                        )
+                        stats = await recovery.recover(routing=routing)
+                        console.print(
+                            Panel(
+                                f"[green]Recovery complete[/green]\n"
+                                f"RUNNING → READY: {stats.running_recovered}\n"
+                                f"VALIDATING → READY: {stats.validating_recovered}\n"
+                                f"VERIFYING → NEEDS_REVIEW: "
+                                f"{stats.verifying_recovered}\n"
+                                f"Total recovered: {stats.total_recovered}\n"
+                                f"Already done: {stats.tasks_done}",
+                                title="State Recovery",
+                            )
+                        )
+                else:
+                    console.print(
+                        "[yellow]No existing tasks found, starting fresh[/yellow]"
+                    )
+
+            # Setup spawners — all five built-ins so YAML configs with
+            # agent_type: codex_cli / aider / announce / opencode work out of
+            # the box, matching what examples/hello.yaml, examples/tasks.yaml,
+            # and the arbiter policy tree's agent set expect.
+            spawners: dict[str, AgentSpawner] = {
+                "claude_code": ClaudeCodeSpawner(),
+                "codex_cli": CodexSpawner(),
+                "aider": AiderSpawner(),
+                "announce": AnnounceSpawner(),
+                "opencode": OpencodeSpawner(),
+            }
+
+            # Setup notifications
+            notifications = create_notification_manager(config.notifications)
+
+            # Setup streaming progress callback
+            _task_start_times: dict[str, datetime] = {}
+
+            def _on_status_change(
+                task_id: str,
+                old_status: str,
+                new_status: str,
+            ) -> None:
+                now = datetime.now(UTC)
+                timestamp = now.strftime("%H:%M:%S")
+                if new_status == "running":
+                    _task_start_times[task_id] = now
+                    console.print(
+                        f"[dim]{timestamp}[/dim] "
+                        f"[cyan]{task_id}[/cyan]: "
+                        f"[yellow]RUNNING[/yellow]"
+                    )
+                elif new_status == "done":
+                    elapsed = ""
+                    if task_id in _task_start_times:
+                        delta = now - _task_start_times[task_id]
+                        minutes = int(delta.total_seconds() // 60)
+                        seconds = int(delta.total_seconds() % 60)
+                        elapsed = f" [dim]({minutes}m{seconds:02d}s)[/dim]"
+                    console.print(
+                        f"[dim]{timestamp}[/dim] "
+                        f"[cyan]{task_id}[/cyan]: "
+                        f"[green]DONE[/green]{elapsed}"
+                    )
+                elif new_status == "failed":
+                    console.print(
+                        f"[dim]{timestamp}[/dim] [cyan]{task_id}[/cyan]: [red]FAILED[/red]"
+                    )
+                elif new_status == "needs_review":
+                    console.print(
+                        f"[dim]{timestamp}[/dim] "
+                        f"[cyan]{task_id}[/cyan]: "
+                        f"[red]NEEDS_REVIEW[/red]"
+                    )
+                elif new_status == "ready" and old_status == "failed":
+                    console.print(
+                        f"[dim]{timestamp}[/dim] "
+                        f"[cyan]{task_id}[/cyan]: "
+                        f"[yellow]RETRYING[/yellow]"
+                    )
+
+            # Create scheduler
+            scheduler = await create_scheduler_from_config(
+                db=db,
+                tasks=config.tasks,
+                spawners=spawners,  # type: ignore[arg-type]  # variance of invariant dict
+                max_concurrent=config.max_concurrent,
+                workdir=workdir,
+                log_dir=log_dir,
+                notification_manager=notifications,
+                on_status_change=_on_status_change,
+                auto_commit=(config.git.auto_commit if config.git else False),
+                # The ONLY writer of `run_branch_head` after publication, and
+                # a deliberate deviation from spec §6's "refreshed on graceful
+                # suspension/stop" (ruling R14): an observational refresh reads
+                # whatever the branch points at, so a foreign commit landing
+                # during the run would be normalized into this run's record and
+                # the next continuation would pass green over it — the exact
+                # hole the stale check exists to catch. The head therefore moves
+                # only with commits this run made. The cost is priced and points
+                # the safe way: a run whose agent commits by itself (auto_commit
+                # off) leaves the record behind the branch and stale-refuses on
+                # the next continuation, where `--accept-branch-tip` is the
+                # audited way through.
+                on_auto_commit=_record_head if bound_branch is not None else None,
+                routing=routing,
+                arbiter_mode=arbiter_mode,
+                arbiter_enabled=arbiter_cfg is not None and arbiter_cfg.enabled,
+                execution=config.execution,
+                verifier=config.verifier,
+            )
+            if arbiter_cfg is not None:
+                scheduler._abandon_outcome_after_s = arbiter_cfg.abandon_outcome_after_s
+
+            # Display initial state
+            all_tasks = await db.get_all_tasks()
+            _display_tasks_table(all_tasks, "Starting Tasks")
+
+            console.print(
+                Panel(
+                    f"[green]Scheduler started[/green]\n"
+                    f"Project: {config.project}\n"
+                    f"Max concurrent: {config.max_concurrent}\n"
+                    f"Tasks: {len(config.tasks)}",
+                    title="Maestro",
+                )
+            )
+
+            # Record HEAD before run for commit summary
+            head_before = _get_git_head(workdir)
+
+            # Run scheduler
+            await scheduler.run()
+
+            # Show what agents changed
+            _display_git_summary(workdir)
+            _display_auto_commits(workdir, head_before)
+
+            # Display final state
+            all_tasks = await db.get_all_tasks()
+            console.print()
+            _display_tasks_table(all_tasks, "Final Status")
+            _display_summary(all_tasks)
+
+            # Same rule as mode 2 (`orchestrate`): the run records its own ending
+            # before the failure exit, or it is reported `interrupted` forever
+            # (spec §B.1, §B.3).
+            await _announce_conclusion(db, conclusion_for_tasks(all_tasks))
+
+            # Check for failures
+            failed_tasks = [
+                t
+                for t in all_tasks
+                if t.status in (TaskStatus.FAILED, TaskStatus.NEEDS_REVIEW)
+            ]
+            if failed_tasks:
+                console.print(
+                    f"\n[red]Warning: {len(failed_tasks)} task(s) failed or need review[/red]"
+                )
+                raise typer.Exit(1)
+
+            console.print("\n[green]All tasks completed successfully![/green]")
+
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            await record_cancelled(db, "interrupted by the operator")
+            raise
+        finally:
+            if routing is not None:
+                await routing.aclose()
+            if notifications is not None:
+                # Bounded drain of queued notification deliveries (webhook).
+                await notifications.aclose()
+            await db.close()
     finally:
-        if routing is not None:
-            await routing.aclose()
-        if notifications is not None:
-            # Bounded drain of queued notification deliveries (webhook).
-            await notifications.aclose()
-        await db.close()
-        if lock_fd is not None:
-            _release_pid_lock(lock_fd)
+        _release_pid_lock(lock_fd)
 
 
 #: The commands whose whole act is *look at the evidence*, and which must
@@ -1098,6 +1428,16 @@ def run_command(
         str | None,
         typer.Option("--run", help=_RUN_OPTION_HELP),
     ] = None,
+    accept_branch_tip: Annotated[
+        bool,
+        typer.Option(
+            "--accept-branch-tip",
+            help=(
+                "Re-record the run branch tip after inspecting an unexpected "
+                "advance (audited)"
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Run tasks from a YAML configuration file.
 
@@ -1115,7 +1455,9 @@ def run_command(
     setup_logging("maestro")
 
     try:
-        asyncio.run(_run_scheduler(config, db, resume, log_dir, clean, run))
+        asyncio.run(
+            _run_scheduler(config, db, resume, log_dir, clean, run, accept_branch_tip)
+        )
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user[/yellow]")
         raise typer.Exit(130) from None
@@ -1992,6 +2334,17 @@ def run_end_command(
         Path | None,
         typer.Option("--config", help=_CONFIG_OPTION_HELP),
     ] = None,
+    db: Annotated[
+        Path | None,
+        typer.Option(
+            "--db",
+            "-d",
+            help="Path to SQLite database file",
+            file_okay=True,
+            dir_okay=False,
+            resolve_path=True,
+        ),
+    ] = None,
 ) -> None:
     """Record an operator's decision that a run is over (spec §B.1).
 
@@ -2009,6 +2362,7 @@ def run_end_command(
     Examples:
         maestro run-end 01J8Z... --outcome superseded
         maestro run-end 01J8Z... --outcome cancelled --reason "wrong branch"
+        maestro run-end 01J8Z... --outcome cancelled --db state.db
     """
     if outcome not in OPERATOR_ENDINGS:
         err_console.print(
@@ -2017,22 +2371,43 @@ def run_end_command(
             "'completed' and 'failed' are recorded by the run itself."
         )
         raise typer.Exit(1)
-    db_path = _resolved_db_path(None, run_id, config_flag=config)
+    # `--db` names a database directly (spec §E), so the resolver — which is
+    # what the run-id argument steers everywhere else — is not consulted, and
+    # the id becomes a check against the row instead (ruling R16). A `--db`
+    # run needs this door: its database lives wherever the operator put it, so
+    # the resolver can never reach it to end the run. `_resolved_db_path`
+    # keeps ownership of the `--db` + `--config` refusal.
+    db_path = _resolved_db_path(db, run_id if db is None else None, config_flag=config)
 
     async def _end() -> None:
-        db = Database(db_path)
-        await db.connect()
+        conn = Database(db_path)
+        await conn.connect()
         try:
+            if db is not None:
+                row = await conn.get_run_row()
+                recorded = row.get("run_id") if row is not None else None
+                if recorded is not None and str(recorded) != run_id:
+                    # The resolver would have selected by id; here nothing
+                    # does, so ending the wrong run's record is a real
+                    # possibility that only this check removes.
+                    err_console.print(
+                        f"[red]Run id mismatch:[/red] {escape(str(db))} records "
+                        f"run {escape(str(recorded))}, not {escape(run_id)}. "
+                        "Name the run this database holds, or point --db at "
+                        "the database that holds the run you named.",
+                        soft_wrap=True,
+                    )
+                    raise typer.Exit(1)
             detail = reason or f"ended by the operator as {outcome}"
             # Two named writers rather than one parameterised by a string:
             # `RunEnding` is a Literal, and widening it to `str` here to save
             # a branch would take a `cast` to put back.
             if outcome == "cancelled":
-                written = await record_cancelled(db, detail)
+                written = await record_cancelled(conn, detail)
             else:
-                written = await record_superseded(db, detail)
+                written = await record_superseded(conn, detail)
         finally:
-            await db.close()
+            await conn.close()
         if not written:
             err_console.print(
                 f"[red]Run {escape(run_id)} was not ended:[/red] it has no run "

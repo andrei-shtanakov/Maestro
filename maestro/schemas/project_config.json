@@ -425,6 +425,19 @@
           "description": "Rejected if set: Mode 1 runs on one shared checkout and cannot branch per task (issue #216)",
           "title": "Branch Prefix",
           "type": "string"
+        },
+        "run_branch": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Mode-1 run-level branch isolation (issue #216 part 2): the one branch this DAG's runs execute on. Verified or created by the runtime before the run is published; never equal to base_branch.",
+          "title": "Run Branch"
         }
       },
       "title": "GitConfig",

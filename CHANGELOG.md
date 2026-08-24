@@ -16,6 +16,20 @@
   only when the operator runs Maestro from inside it.
 
 ### Added
+- **Mode-1 run-level branch isolation — `git.run_branch` (phase A)** (#216
+  part 2). One opt-in key gives a Mode-1 run one checkout on one branch:
+  the runtime verifies or creates the branch (from `base_branch`, clean
+  tree only, never a stash) under the PID lock BEFORE the run is
+  published, records the binding (`run_branch`/`run_branch_declared`/
+  `run_branch_head`, migration 29) atomically with publication, and
+  re-verifies on every continuation — any selector of an existing run —
+  BEFORE recovery, by record and by branch-tip state, with
+  `--accept-branch-tip` as the audited escape for a tip the operator has
+  inspected. Absent key = unchanged behavior; the PID lock is now
+  acquired at startup rather than after scheduler construction (same
+  lock, earlier refusal). Design: docs/superpowers/specs/
+  2026-08-24-mode1-run-branch-isolation-design.md (phase B — live
+  tripwires — ships separately).
 - **A deliberate `TASK_BLOCKED` refusal no longer earns an automatic retry**
   (#209). Under `execution_mode: tdd` a task can be blocked *correctly* — the
   frozen RED test asserts the wrong thing, and the agent rightly refuses to

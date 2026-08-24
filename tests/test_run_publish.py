@@ -111,3 +111,45 @@ async def test_runs_dir_is_empty_during_the_build_window(tmp_path, monkeypatch):
     await create_run(KEY, "RUN-A", repo_key_text="k", started_at=STARTED, home=tmp_path)
 
     assert observed == [[]]
+
+
+async def test_create_run_persists_branch_binding(tmp_path):
+    """create_run forwards run-branch binding kwargs to create_run_row."""
+    path = await create_run(
+        KEY,
+        "RUN-A",
+        repo_key_text="github.com/acme/app",
+        started_at=STARTED,
+        home=tmp_path,
+        run_branch="pilot/x",
+        run_branch_declared=1,
+        run_branch_head="a" * 40,
+    )
+    db = await create_database(path)
+    try:
+        row = await db.get_run_row()
+        assert row is not None and row["run_branch"] == "pilot/x"
+        assert row["run_branch_declared"] == 1
+        assert row["run_branch_head"] == "a" * 40
+    finally:
+        await db.close()
+
+
+async def test_create_run_records_opt_out_as_declared_zero(tmp_path):
+    """A run published with no `git.run_branch` opted OUT — `declared=0`, not
+    NULL (spec §6). NULL is reserved for a pre-migration row, which the
+    continuation gate reads as "no record, adopt the config's intent"; leaving
+    new opt-out runs at NULL would let a `run_branch` added to the config
+    between two runs bind the run mid-flight."""
+    path = await create_run(
+        KEY, "RUN-A", repo_key_text="k", started_at=STARTED, home=tmp_path
+    )
+    db = await create_database(path)
+    try:
+        row = await db.get_run_row()
+        assert row is not None
+        assert row["run_branch_declared"] == 0
+        assert row["run_branch"] is None
+        assert row["run_branch_head"] is None
+    finally:
+        await db.close()

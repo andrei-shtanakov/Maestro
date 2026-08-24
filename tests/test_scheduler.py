@@ -73,6 +73,32 @@ def _fake_backend(scheduler: Scheduler) -> FakeExecutionBackend:
     return cast("FakeExecutionBackend", scheduler._backends.resolve(None))
 
 
+def _git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+    )
+    return result.stdout.strip()
+
+
+def _init_git_repo_with_pending_change(base_dir: Path) -> Path:
+    """A real repo with one commit plus an uncommitted file.
+
+    Auto-commit attribution can only be observed against real git: a plain
+    temp directory makes every `git` call fail, and a commit that never
+    happened has no sha to report.
+    """
+    repo = base_dir / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    _git(repo, "init", "-b", "master")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("a")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "init")
+    (repo / "b.txt").write_text("work an agent left behind")
+    return repo
+
+
 # =============================================================================
 # Test Fixtures
 # =============================================================================
@@ -1798,6 +1824,207 @@ class TestAutoCommit:
         """Test SchedulerConfig defaults auto_commit to False."""
         config = SchedulerConfig()
         assert config.auto_commit is False
+
+    def test_scheduler_config_default_no_on_auto_commit(self) -> None:
+        """SchedulerConfig defaults on_auto_commit to None."""
+        config = SchedulerConfig()
+        assert config.on_auto_commit is None
+
+    @pytest.mark.anyio
+    async def test_on_auto_commit_callback_receives_the_committed_sha(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """The hook is handed the sha of the commit the scheduler just made
+        (ruling R14) — attribution, so a foreign advance can never be
+        normalized into the run's record by an observation of HEAD."""
+        repo = _init_git_repo_with_pending_change(temp_dir)
+        shas: list[str] = []
+
+        async def on_commit(sha: str) -> None:
+            shas.append(sha)
+
+        task_config = TaskConfig(id="t", title="T", prompt="do it")
+
+        db = await create_database(temp_db_path)
+        try:
+            task = Task.from_config(task_config, str(repo))
+            await db.create_task(task)
+
+            mock_spawner = MockSpawner()
+            dag = DAG([task_config])
+            scheduler_config = SchedulerConfig(
+                max_concurrent=1,
+                poll_interval=0.05,
+                workdir=repo,
+                log_dir=repo / "logs",
+                auto_commit=True,
+                on_auto_commit=on_commit,
+            )
+            scheduler = Scheduler(
+                db=db,
+                dag=dag,
+                spawners={"claude_code": mock_spawner},
+                config=scheduler_config,
+            )
+
+            async def run_with_timeout() -> None:
+                try:
+                    await asyncio.wait_for(scheduler.run(), timeout=5.0)
+                except TimeoutError:
+                    await scheduler.shutdown()
+
+            await run_with_timeout()
+
+            assert shas == [_git(repo, "rev-parse", "HEAD")]
+            all_tasks = await db.get_all_tasks()
+            assert all_tasks[0].status == TaskStatus.DONE
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_on_auto_commit_callback_silent_when_nothing_committed(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """Auto-commit on, but the tree is clean: no commit was made, so
+        there is no sha to report and the hook must not fire — reporting the
+        unchanged HEAD is exactly the observation R14 removed."""
+        repo = _init_git_repo_with_pending_change(temp_dir)
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", "pre-committed by someone else")
+        head_before = _git(repo, "rev-parse", "HEAD")
+        shas: list[str] = []
+
+        async def on_commit(sha: str) -> None:
+            shas.append(sha)
+
+        task_config = TaskConfig(id="t", title="T", prompt="do it")
+
+        db = await create_database(temp_db_path)
+        try:
+            task = Task.from_config(task_config, str(repo))
+            await db.create_task(task)
+
+            scheduler = Scheduler(
+                db=db,
+                dag=DAG([task_config]),
+                spawners={"claude_code": MockSpawner()},
+                config=SchedulerConfig(
+                    max_concurrent=1,
+                    poll_interval=0.05,
+                    workdir=repo,
+                    log_dir=repo / "logs",
+                    auto_commit=True,
+                    on_auto_commit=on_commit,
+                ),
+            )
+
+            try:
+                await asyncio.wait_for(scheduler.run(), timeout=5.0)
+            except TimeoutError:
+                await scheduler.shutdown()
+
+            assert shas == []
+            assert _git(repo, "rev-parse", "HEAD") == head_before
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_on_auto_commit_callback_error_does_not_fail_task(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """`on_auto_commit` is best-effort bookkeeping: a raising callback
+        must not fail the task it rides in on, nor escape the scheduler
+        run loop (only cancellation may propagate)."""
+
+        async def on_commit(_sha: str) -> None:
+            raise RuntimeError("boom")
+
+        task_config = TaskConfig(id="t", title="T", prompt="do it")
+        temp_dir = _init_git_repo_with_pending_change(temp_dir)
+
+        db = await create_database(temp_db_path)
+        try:
+            task = Task.from_config(task_config, str(temp_dir))
+            await db.create_task(task)
+
+            mock_spawner = MockSpawner()
+            dag = DAG([task_config])
+            scheduler_config = SchedulerConfig(
+                max_concurrent=1,
+                poll_interval=0.05,
+                workdir=temp_dir,
+                log_dir=temp_dir / "logs",
+                auto_commit=True,
+                on_auto_commit=on_commit,
+            )
+            scheduler = Scheduler(
+                db=db,
+                dag=dag,
+                spawners={"claude_code": mock_spawner},
+                config=scheduler_config,
+            )
+
+            async def run_with_timeout() -> None:
+                try:
+                    await asyncio.wait_for(scheduler.run(), timeout=5.0)
+                except TimeoutError:
+                    await scheduler.shutdown()
+
+            await run_with_timeout()
+
+            all_tasks = await db.get_all_tasks()
+            assert all_tasks[0].status == TaskStatus.DONE
+        finally:
+            await db.close()
+
+    @pytest.mark.anyio
+    async def test_on_auto_commit_absent_does_not_crash(
+        self,
+        temp_db_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """No `on_auto_commit` configured -> auto-commit still completes."""
+        task_config = TaskConfig(id="t", title="T", prompt="do it")
+
+        db = await create_database(temp_db_path)
+        try:
+            task = Task.from_config(task_config, str(temp_dir))
+            await db.create_task(task)
+
+            mock_spawner = MockSpawner()
+            dag = DAG([task_config])
+            scheduler_config = SchedulerConfig(
+                max_concurrent=1,
+                poll_interval=0.05,
+                workdir=temp_dir,
+                log_dir=temp_dir / "logs",
+                auto_commit=True,
+            )
+            scheduler = Scheduler(
+                db=db,
+                dag=dag,
+                spawners={"claude_code": mock_spawner},
+                config=scheduler_config,
+            )
+
+            async def run_with_timeout() -> None:
+                try:
+                    await asyncio.wait_for(scheduler.run(), timeout=5.0)
+                except TimeoutError:
+                    await scheduler.shutdown()
+
+            await run_with_timeout()
+
+            all_tasks = await db.get_all_tasks()
+            assert all_tasks[0].status == TaskStatus.DONE
+        finally:
+            await db.close()
 
 
 class TestSchedulerRoutingInjection:

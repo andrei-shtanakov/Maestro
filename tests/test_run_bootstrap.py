@@ -2,6 +2,7 @@ import os
 
 import pytest
 
+from maestro.database import create_database
 from maestro.repo_identity import RepoKey
 from maestro.run_bootstrap import bootstrap_run
 from maestro.run_publish import create_run
@@ -150,3 +151,85 @@ async def test_a_resume_creates_no_second_run_directory(tmp_path):
     )
     after = sorted(p.name for p in runs_dir(KEY, home=tmp_path).iterdir())
     assert before == after == ["RUN-A"]
+
+
+async def test_pre_publish_runs_before_create_run_and_feeds_row(tmp_path, monkeypatch):
+    """Task 6 seam: `pre_publish`'s return dict is splatted into `create_run`,
+    so the published row carries the run-branch binding it computed."""
+    monkeypatch.delenv("ORCHESTRA_PIPELINE_ID", raising=False)
+
+    async def _pre_publish(run_id: str) -> dict[str, object]:
+        assert run_id  # the minted id, already available before create_run
+        return {
+            "run_branch": "pilot/x",
+            "run_branch_declared": 1,
+            "run_branch_head": "a" * 40,
+        }
+
+    result = await bootstrap_run(
+        _Config("https://github.com/acme/app"),
+        resume=False,
+        run_id_override=None,
+        home=tmp_path,
+        pre_publish=_pre_publish,
+    )
+
+    db = await create_database(result.db_path)
+    try:
+        row = await db.get_run_row()
+    finally:
+        await db.close()
+    assert row is not None
+    assert row["run_branch"] == "pilot/x"
+    assert row["run_branch_declared"] == 1
+    assert row["run_branch_head"] == "a" * 40
+
+
+async def test_pre_publish_exception_publishes_nothing(tmp_path, monkeypatch):
+    """A `pre_publish` failure aborts publication: nothing is staged, so a
+    later resolve sees no run at all (spec: the gate runs before the run
+    becomes discoverable)."""
+    monkeypatch.delenv("ORCHESTRA_PIPELINE_ID", raising=False)
+
+    async def _pre_publish(run_id: str) -> dict[str, object]:
+        raise RuntimeError("gate refused")
+
+    with pytest.raises(RuntimeError, match="gate refused"):
+        await bootstrap_run(
+            _Config("https://github.com/acme/app"),
+            resume=False,
+            run_id_override=None,
+            home=tmp_path,
+            pre_publish=_pre_publish,
+        )
+
+    from maestro.run_registry import resolve_runs
+
+    runs = await resolve_runs(KEY, home=tmp_path, lock_root=tmp_path)
+    assert runs == []
+
+
+async def test_pre_publish_not_called_on_resume(tmp_path, monkeypatch):
+    """The seam is fresh-path only: a resume must never invoke it."""
+    from unittest.mock import AsyncMock
+
+    monkeypatch.delenv("ORCHESTRA_PIPELINE_ID", raising=False)
+    await create_run(
+        KEY,
+        "RUN-A",
+        repo_key_text="github.com/acme/app",
+        started_at="2026-08-15T09:00:00+00:00",
+        home=tmp_path,
+    )
+
+    pre_publish = AsyncMock()
+    result = await bootstrap_run(
+        _Config("https://github.com/acme/app"),
+        resume=True,
+        run_id_override=None,
+        home=tmp_path,
+        pre_publish=pre_publish,
+    )
+
+    assert result.run_id == "RUN-A"
+    pre_publish.assert_not_called()
