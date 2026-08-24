@@ -331,6 +331,68 @@ def test_run_end_refuses_a_run_that_already_ended(
     assert _statuses(home)[run_id] == "completed"
 
 
+async def _seed_db_explicit_run(db_path: Path, run_id: str) -> None:
+    """The row a gated fresh `--db` run publishes (rulings R12/R15)."""
+    db = await create_database(db_path)
+    try:
+        await db.create_run_row(
+            run_id=run_id,
+            repo_key="_db_explicit/scheduler-test",
+            started_at="2026-08-24T09:00:00+00:00",
+            run_branch="pilot/x",
+            run_branch_declared=1,
+            run_branch_head="a" * 40,
+        )
+    finally:
+        await db.close()
+
+
+async def _read_outcome(db_path: Path) -> object:
+    db = await create_database(db_path)
+    try:
+        row = await db.get_run_row()
+    finally:
+        await db.close()
+    assert row is not None
+    return row["outcome"]
+
+
+def test_run_end_db_ends_a_run_the_resolver_cannot_reach(tmp_path: Path) -> None:
+    """A `--db` run's database lives wherever the operator put it, so the
+    resolver can never find it and its residue would be unresolvable without
+    this door (ruling R16)."""
+    db_path = tmp_path / "state.db"
+    asyncio.run(_seed_db_explicit_run(db_path, "RUN-DB"))
+
+    result = runner.invoke(
+        app,
+        ["run-end", "RUN-DB", "--outcome", "superseded", "--db", str(db_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert asyncio.run(_read_outcome(db_path)) == "superseded"
+
+
+def test_run_end_db_refuses_a_run_id_the_database_does_not_hold(
+    tmp_path: Path,
+) -> None:
+    """`--db` skips the resolver, so nothing else checks that the id names
+    the run in this file — and ending the wrong run's record is precisely
+    what naming both is for."""
+    db_path = tmp_path / "state.db"
+    asyncio.run(_seed_db_explicit_run(db_path, "RUN-DB"))
+
+    result = runner.invoke(
+        app,
+        ["run-end", "RUN-ELSEWHERE", "--outcome", "cancelled", "--db", str(db_path)],
+    )
+
+    assert result.exit_code == 1
+    assert "Run id mismatch" in result.stderr
+    assert "RUN-DB" in result.stderr
+    assert asyncio.run(_read_outcome(db_path)) is None
+
+
 # =============================================================================
 # The three levels of §B.1.1, driven through the real command.
 # =============================================================================

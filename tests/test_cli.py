@@ -1254,20 +1254,58 @@ class TestRunBranchGateContinuation:
         assert mock_create.call_args.kwargs["on_auto_commit"] is not None
         assert (await _read_run_row(db_path))["run_branch"] == "pilot/x"
 
-    async def test_ungated_fresh_db_run_writes_no_row(self, temp_dir: Path) -> None:
-        """No `run_branch` configured: byte-identical to before the gate —
-        the row exists only to carry a binding, so with none there is none."""
+    async def test_ungated_fresh_db_run_records_the_opt_out(
+        self, temp_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """No `run_branch` configured, and the row still gets written —
+        recording the opt-out (ruling R15). Silence would leave exactly the
+        anonymous state a pre-migration row has, and the two must stay
+        distinguishable (`run_publish`'s R7 contract, at the other door)."""
         config_path = _write_scheduler_config(temp_dir)
         _init_git_repo(temp_dir / "sched-repo")
         db_path = temp_dir / "test.db"
 
         await self._run(config_path, db_path=db_path)
 
-        db = await create_database(db_path)
-        try:
-            assert await db.get_run_row() is None
-        finally:
-            await db.close()
+        captured = capsys.readouterr()
+        row = await _read_run_row(db_path)
+        assert (
+            row["run_branch"],
+            row["run_branch_declared"],
+            row["run_branch_head"],
+        ) == (None, 0, None)
+        # The id is minted here and reaches the operator nowhere else, yet
+        # `maestro run-end <id> --db <path>` needs it.
+        assert str(row["run_id"]) in captured.out
+
+    async def test_ungated_db_run_is_not_bricked_by_enabling_the_gate(
+        self, temp_dir: Path
+    ) -> None:
+        """The regression R15 closes: an ungated `--db` run, continued after
+        `git.run_branch` was added to the config, continues **silently** —
+        the run opted out at creation and does not change its own rules
+        mid-flight (spec §6). Without the recorded opt-out that continuation
+        would refuse `record_missing` and the database would be a brick."""
+        repo_dir = temp_dir / "sched-repo"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        _init_git_repo(repo_dir)
+        db_path = temp_dir / "test.db"
+
+        await self._run(_write_scheduler_config(temp_dir), db_path=db_path)
+
+        gated = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        await self._run(gated, db_path=db_path, resume=True)
+
+        row = await _read_run_row(db_path)
+        assert (
+            row["run_branch"],
+            row["run_branch_declared"],
+            row["run_branch_head"],
+        ) == (None, 0, None)
+        # No adoption means no switch: the checkout is where it started.
+        assert _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD") == "master"
 
     async def test_foreign_commit_during_the_run_is_not_blessed(
         self, temp_dir: Path, capsys: pytest.CaptureFixture[str]

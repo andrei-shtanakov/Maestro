@@ -722,8 +722,10 @@ async def _run_scheduler(
         # has `run_branch_declared == 1`, and — since ruling R12 gave that
         # path a row of its own — the explicit `--db` fresh-gated start.
         bound_branch: str | None = None
-        # The tip the `--db` fresh gate observed; also the signal that this
-        # invocation must publish its own run row (see below).
+        # What the `--db` fresh gate bound, when it ran at all: the branch and
+        # the tip it observed. Both stay None on an ungated `--db` start, which
+        # still publishes a row — one that records the opt-out (see below).
+        db_fresh_binding_branch: str | None = None
         db_fresh_binding_head: str | None = None
 
         async def _branch_pre_publish(_run_id: str) -> dict[str, object]:
@@ -825,6 +827,7 @@ async def _run_scheduler(
                     run_branch=git_cfg.run_branch,
                     base_branch=git_cfg.base_branch,
                 )
+                db_fresh_binding_branch = git_cfg.run_branch
             except RunBranchGateError as e:
                 err_console.print(
                     f"[red]run-branch gate:[/red] {escape(str(e))}", soft_wrap=True
@@ -854,31 +857,51 @@ async def _run_scheduler(
         # Create or connect to database
         db = await create_database(resolved_db_path)
 
-        if db_fresh_binding_head is not None:
-            assert git_cfg is not None and git_cfg.run_branch is not None
-            # A gated `--db` run publishes its own run row, or it could never
-            # be resumed: the next `--db` invocation is a continuation, finds
-            # no row and refuses `record_missing` — so opting into
-            # `run_branch` would trap the documented `--db` workflow (ruling
-            # R12). `repo_key` is a deliberate sentinel: this path skips the
+        if db_path is not None and fresh_start:
+            # EVERY fresh `--db` run publishes a run row — gated or not
+            # (rulings R12, R15). The row is what makes the next `--db`
+            # invocation, which is a continuation, legible:
+            #
+            #   - gated: without the binding it would refuse `record_missing`,
+            #     so opting into `run_branch` would make the documented `--db`
+            #     workflow single-shot;
+            #   - ungated: `declared=0` says "this run opted out at creation",
+            #     which is `run_publish`'s own R7 contract. Writing nothing
+            #     leaves the same anonymous state a legacy row has, so
+            #     enabling `git.run_branch` later would brick that database on
+            #     `record_missing` instead of continuing it silently, which is
+            #     what §6 says an opted-out run deserves.
+            #
+            # `repo_key` is a deliberate sentinel: this path skips the
             # resolver, nothing reads the key here, and the row exists solely
-            # to carry the binding. Reached only on a fresh start, where the
-            # file either did not exist or `--clean` just removed it, so
-            # there is no row to collide with.
+            # to carry (or to deny) the binding. Reached only on a fresh
+            # start, where the file did not exist, was empty, or `--clean`
+            # just removed it — so there is no row to collide with.
+            db_run_id = str(ulid.new())
             await db.create_run_row(
-                run_id=str(ulid.new()),
+                run_id=db_run_id,
                 repo_key=f"_db_explicit/{config.project}",
                 started_at=datetime.now(UTC).isoformat(),
-                run_branch=git_cfg.run_branch,
-                run_branch_declared=1,
+                run_branch=db_fresh_binding_branch,
+                run_branch_declared=1 if db_fresh_binding_branch is not None else 0,
                 run_branch_head=db_fresh_binding_head,
             )
-            # And the row must be maintained by the run that wrote it: left
-            # unbound, the tip would stay at the start sha while auto-commits
-            # advance the branch, and the next continuation would refuse
-            # `resume_stale_checkout` over this run's own work — the same trap
-            # one step later.
-            bound_branch = git_cfg.run_branch
+            # Said out loud for the same reason the bootstrap path says
+            # "acting on …, run …": the id is minted here and reaches the
+            # operator nowhere else, and `maestro run-end <id> --db <path>`
+            # needs it. Unprinted, it is knowable only by opening the file.
+            console.print(
+                f"[dim]run {escape(db_run_id)} recorded in "
+                f"{escape(str(resolved_db_path))}[/dim]",
+                soft_wrap=True,
+            )
+            if db_fresh_binding_branch is not None:
+                # A bound row must be maintained by the run that wrote it:
+                # left unbound, the tip would stay at the start sha while
+                # auto-commits advance the branch, and the next continuation
+                # would refuse `resume_stale_checkout` over this run's own
+                # work — the same trap one step later.
+                bound_branch = db_fresh_binding_branch
 
         # Verification precedes recovery, deliberately (spec §6): Mode-1
         # recovery is not checkout-neutral — finalizing open handles collects
@@ -2311,6 +2334,17 @@ def run_end_command(
         Path | None,
         typer.Option("--config", help=_CONFIG_OPTION_HELP),
     ] = None,
+    db: Annotated[
+        Path | None,
+        typer.Option(
+            "--db",
+            "-d",
+            help="Path to SQLite database file",
+            file_okay=True,
+            dir_okay=False,
+            resolve_path=True,
+        ),
+    ] = None,
 ) -> None:
     """Record an operator's decision that a run is over (spec §B.1).
 
@@ -2328,6 +2362,7 @@ def run_end_command(
     Examples:
         maestro run-end 01J8Z... --outcome superseded
         maestro run-end 01J8Z... --outcome cancelled --reason "wrong branch"
+        maestro run-end 01J8Z... --outcome cancelled --db state.db
     """
     if outcome not in OPERATOR_ENDINGS:
         err_console.print(
@@ -2336,22 +2371,43 @@ def run_end_command(
             "'completed' and 'failed' are recorded by the run itself."
         )
         raise typer.Exit(1)
-    db_path = _resolved_db_path(None, run_id, config_flag=config)
+    # `--db` names a database directly (spec §E), so the resolver — which is
+    # what the run-id argument steers everywhere else — is not consulted, and
+    # the id becomes a check against the row instead (ruling R16). A `--db`
+    # run needs this door: its database lives wherever the operator put it, so
+    # the resolver can never reach it to end the run. `_resolved_db_path`
+    # keeps ownership of the `--db` + `--config` refusal.
+    db_path = _resolved_db_path(db, run_id if db is None else None, config_flag=config)
 
     async def _end() -> None:
-        db = Database(db_path)
-        await db.connect()
+        conn = Database(db_path)
+        await conn.connect()
         try:
+            if db is not None:
+                row = await conn.get_run_row()
+                recorded = row.get("run_id") if row is not None else None
+                if recorded is not None and str(recorded) != run_id:
+                    # The resolver would have selected by id; here nothing
+                    # does, so ending the wrong run's record is a real
+                    # possibility that only this check removes.
+                    err_console.print(
+                        f"[red]Run id mismatch:[/red] {escape(str(db))} records "
+                        f"run {escape(str(recorded))}, not {escape(run_id)}. "
+                        "Name the run this database holds, or point --db at "
+                        "the database that holds the run you named.",
+                        soft_wrap=True,
+                    )
+                    raise typer.Exit(1)
             detail = reason or f"ended by the operator as {outcome}"
             # Two named writers rather than one parameterised by a string:
             # `RunEnding` is a Literal, and widening it to `str` here to save
             # a branch would take a `cast` to put back.
             if outcome == "cancelled":
-                written = await record_cancelled(db, detail)
+                written = await record_cancelled(conn, detail)
             else:
-                written = await record_superseded(db, detail)
+                written = await record_superseded(conn, detail)
         finally:
-            await db.close()
+            await conn.close()
         if not written:
             err_console.print(
                 f"[red]Run {escape(run_id)} was not ended:[/red] it has no run "
