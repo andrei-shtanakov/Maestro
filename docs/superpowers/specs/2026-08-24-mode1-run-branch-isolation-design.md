@@ -1,8 +1,20 @@
 # Mode-1 run-level branch isolation (`git.run_branch`) — design
 
-**Status:** revision 4 — codex-review round 2 incorporated; awaiting
+**Status:** revision 5 — codex-review round 3 incorporated; awaiting
 owner approval
 **Date:** 2026-08-24
+**Revision 5 (codex-review round 3, three majors, each confirmed):**
+(1) §7 — the completion-path tripwire fires before any terminal
+transition, and the success tail reorders to tripwire → auto-commit →
+`DONE` on gated runs: `DONE` is terminal, so a gate between `DONE` and
+the commit would strand a terminal-yet-uncommitted task that resume
+never revisits; the residual one-git-invocation window is stated, not
+hidden. (2) §7 — verifier preflight added to the tripwire inventory
+(`_run_verifier` reads the worktree), and the inventory itself becomes
+test-asserted: a new checkout-using seam must claim a tripwire.
+(3) §2/§6 — the gate covers *continuation of an existing run* as
+`bootstrap_run` defines it (any `run_id_override`), so `--run <id>`
+without `--resume` cannot slip past §6.
 **Revision 4 (codex-review round 2 on PR #221, three majors, each
 confirmed against the code):** (1) §6 — a superseded run refuses to
 resume (`resume_superseded`): name equality is not state identity, so
@@ -72,9 +84,17 @@ after the checkout was already accepted.
 ## 2. Scope and non-goals
 
 **In scope:** one opt-in config key, `git.run_branch`, enforced by the
-Maestro runtime on exactly two seams — run start (before the run is
-published) and resume (before recovery). Plus a durable record of the
-branch in the run row and a per-dispatch tripwire (phase B).
+Maestro runtime on exactly two seams — fresh run start (before the run
+is published) and **continuation of an existing run**, whatever flags
+select it (before recovery). "Continuation" is defined by
+`bootstrap_run`'s own behavior, not by the `--resume` flag: the
+existing-run path is taken whenever `run_id_override` is set,
+`--resume` or not, so `--run <id>` without `--resume` walks the same
+§6 verification (codex-review round 3, major 3 — the earlier "fresh
+start and resume" wording left that invocation outside the gate, able
+to continue a run bound to `feature/x` while standing on `main`). Plus
+a durable record of the branch in the run row and a per-dispatch
+tripwire (phase B).
 
 **Non-goals:**
 
@@ -224,7 +244,9 @@ happened to resume from. A schema migration adds both columns to
 existing databases; the number is claimed at implementation time
 (parallel actors also claim migrations).
 
-On `--resume` (consumer point 4):
+On continuation of an existing run — `--resume`, `--run <id>`, or both
+(§2; the flagless definition is deliberate so no selector of an
+existing run bypasses this section) — (consumer point 4):
 
 - The branch is **read from the run row and verified against the
   checkout** — never re-derived from the config. The config may have
@@ -310,19 +332,36 @@ already trusts (#166: the late check is the guarantee):
 
 - The tripwire fires at **every point where the scheduler is about to
   use the checkout**, not only before spawns (codex-review round 2,
-  major 2): immediately before each task spawn, before launching a
-  task's validation, and before `_auto_commit_task` stages anything.
-  The completion path matters as much as the dispatch path — a task
-  that exits cleanly is followed by validation and auto-commit in the
-  *current* worktree, and today `_auto_commit_task` runs `git add`/`git
-  commit` on whatever branch is checked out; a branch flip in the
-  window between task exit and finalization would land the commit on
-  the wrong branch, which is the exact write this gate exists to
-  prevent. Each check is one `git rev-parse --abbrev-ref HEAD` —
-  negligible cost.
+  major 2). The current inventory of those seams, each guarded:
+  immediately before each task spawn; before launching a task's
+  validation; before verifier preflight (round 3, major 2 —
+  `_run_verifier` builds the scope patch and reads `HEAD` from the
+  worktree, so a flip between validation and the judge would have the
+  judge inspect, and rule on, unrelated tree state); and before the
+  auto-commit-plus-DONE finalization block. The inventory is a claim
+  about the scheduler, so the implementation derives it from "every
+  checkout read/write on the run path" and a test asserts the list —
+  a new checkout-using seam must claim a tripwire, the way a new
+  status must claim a transitions-table entry. Each check is one `git
+  rev-parse --abbrev-ref HEAD` — negligible cost.
+- **The completion-path check runs before any terminal transition**
+  (round 3, major 1). Today the scheduler marks a task `DONE` and only
+  then calls `_auto_commit_task`; `DONE` is terminal, so a gate firing
+  between the two would strand a task that is terminal yet
+  uncommitted — "preserved for resume" would be a lie, because resume
+  never revisits `DONE`. Phase B therefore reorders the success tail
+  on gated runs: tripwire → auto-commit → `DONE`. A mismatch suspends
+  with the task still in its pre-terminal status, which resume
+  re-enters. The residual window between a passed check and the git
+  operation it guards cannot be closed without git-level locking and
+  is stated, not hidden — the tripwire narrows every window to the
+  width of one git invocation; the start-gate and continuation checks
+  remain the outer barriers (the same honesty as the approver spec's
+  "H-6's SHA check is the final barrier").
 - Mismatch at any tripwire point → the pending mutation does not
-  happen (no spawn / no validation launch / no commit), the completed
-  task's recorded state is preserved for resume, and the run
+  happen (no spawn / no validation launch / no verifier / no commit,
+  no terminal transition), the task's pre-terminal state is preserved
+  for resume, and the run
   **suspends** (`suspended_at` +
   `suspend_reason`, spec §B.1.1 — resumable, not an outcome), and the
   refusal text goes to stderr. Tasks already running are not killed —
@@ -376,9 +415,17 @@ first instant.
   **without touching the checkout** — current branch asserted
   unchanged.
 - Phase B: mid-run branch flip → no further spawns, run suspended,
-  running task untouched; and the completion path — branch flipped
-  between task exit and finalization → no validation launch, no
-  auto-commit, task state preserved, run suspended (round 2, major 2).
+  running task untouched; the completion path — branch flipped between
+  task exit and finalization → no validation launch, no auto-commit,
+  **no terminal transition** (task asserted pre-terminal and re-entered
+  on resume — round 3, major 1); a verifier-enabled task with a flip
+  between validation and verifier preflight → judge never invoked, run
+  suspended (round 3, major 2); and the seam-inventory test — every
+  checkout-using point on the run path claims a tripwire.
+- Continuation-selector test (round 3, major 3): `--run <id>` without
+  `--resume` on a branch-bound run passes through the same §6
+  verification — wrong checkout branch refuses identically to the
+  `--resume` form.
 - The opt-out path (no `run_branch`) byte-identical: existing suite
   green without modification is the evidence, as with every recent gate.
 
