@@ -417,6 +417,18 @@ uv run ruff check .
 uv run pyrefly check
 ```
 
+## Codex review kit (vendored)
+
+`scripts/review/` + `.github/codex/review-schema.json` — вендор-копия
+codex-review-кита из steward (независимое ревью дифа другой моделью), пин —
+`scripts/review/PIN`. Copy-integrity проверяет джоба `review-kit-integrity`
+в CI (чекер исполняется извлечённым из base), дрейф от продюсера ловит
+вахта `review-kit-drift.yml`. `review-prompt.md` — данные этого репо (вне
+integrity), generated-файлы объявляются в `.gitattributes`
+(`linguist-generated`). Локальный прогон: `sh scripts/review/local.sh`.
+Ре-вендор — рецепт в комментарии PIN; смена состава кита — двухшаговая
+дисциплина из шапки `checksum.sh`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
