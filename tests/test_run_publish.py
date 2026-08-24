@@ -133,3 +133,23 @@ async def test_create_run_persists_branch_binding(tmp_path):
         assert row["run_branch_head"] == "a" * 40
     finally:
         await db.close()
+
+
+async def test_create_run_records_opt_out_as_declared_zero(tmp_path):
+    """A run published with no `git.run_branch` opted OUT — `declared=0`, not
+    NULL (spec §6). NULL is reserved for a pre-migration row, which the
+    continuation gate reads as "no record, adopt the config's intent"; leaving
+    new opt-out runs at NULL would let a `run_branch` added to the config
+    between two runs bind the run mid-flight."""
+    path = await create_run(
+        KEY, "RUN-A", repo_key_text="k", started_at=STARTED, home=tmp_path
+    )
+    db = await create_database(path)
+    try:
+        row = await db.get_run_row()
+        assert row is not None
+        assert row["run_branch_declared"] == 0
+        assert row["run_branch"] is None
+        assert row["run_branch_head"] is None
+    finally:
+        await db.close()

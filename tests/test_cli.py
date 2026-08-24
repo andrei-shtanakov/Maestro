@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import logging
 import os
 import subprocess
 import tempfile
@@ -147,6 +148,23 @@ async def _seed_run_row(
                     status=task_status,
                 )
             )
+    finally:
+        await db.close()
+
+
+async def _seed_running_task(db_path: Path) -> None:
+    """Strand a RUNNING task in `db_path` — what recovery exists to reconcile."""
+    db = await create_database(db_path)
+    try:
+        await db.create_task(
+            Task(
+                id="t1",
+                title="T1",
+                prompt="do work",
+                workdir=str(db_path.parent),
+                status=TaskStatus.RUNNING,
+            )
+        )
     finally:
         await db.close()
 
@@ -871,7 +889,9 @@ class TestRunBranchGateContinuation:
         recovery_cls.assert_not_called()
         assert _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD") == "master"
 
-    async def test_moved_tip_refuses_and_flag_re_records(self, temp_dir: Path) -> None:
+    async def test_moved_tip_refuses_and_flag_re_records(
+        self, temp_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
         config_path = _write_scheduler_config(
             temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
         )
@@ -893,11 +913,17 @@ class TestRunBranchGateContinuation:
         assert excinfo.value.exit_code == 1
         assert (await _read_run_row(db_path))["run_branch_head"] == recorded
 
-        await self._run(
-            config_path, db_path=db_path, resume=True, accept_branch_tip=True
-        )
+        with caplog.at_level(logging.WARNING, logger="maestro.cli"):
+            await self._run(
+                config_path, db_path=db_path, resume=True, accept_branch_tip=True
+            )
 
         assert (await _read_run_row(db_path))["run_branch_head"] == moved
+        # Re-recording is an audited operator statement, never a silent adoption.
+        assert any(
+            "run_branch_gate.tip_accepted" in record.getMessage()
+            for record in caplog.records
+        )
 
     async def test_declared_zero_resume_is_silent(
         self, temp_dir: Path, capsys: pytest.CaptureFixture[str]
@@ -999,7 +1025,7 @@ class TestRunBranchGateContinuation:
         _git(repo_dir, "branch", "pilot/x")
         tip = _git(repo_dir, "rev-parse", "refs/heads/pilot/x")
         key = identity_from_checkout(repo_dir)
-        await create_run(
+        db_path = await create_run(
             key,
             "01TESTRUN",
             repo_key_text="/".join(key.as_path_parts()),
@@ -1009,6 +1035,9 @@ class TestRunBranchGateContinuation:
             run_branch_declared=1,
             run_branch_head=tip,
         )
+        # A stranded RUNNING task is what makes `assert_not_called` mean
+        # something: without one, recovery would be skipped anyway.
+        await _seed_running_task(db_path)
         recovery_cls = self._recovery_class_mock()
 
         with pytest.raises(typer.Exit) as excinfo:
@@ -1068,6 +1097,64 @@ class TestRunBranchGateContinuation:
 
         assert excinfo.value.exit_code == 1
         assert _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD") == "master"
+
+    async def test_db_without_row_refuses_without_any_flag(
+        self, temp_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`record_missing` is keyed off continuation, not off the flags. A
+        plain `--db` at an existing row-less database takes neither the start
+        gate (it is a continuation) nor a record check keyed off
+        `--resume`/`--run` — so keying it off the flags would leave this
+        invocation gated by nothing at all."""
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        # ON the configured branch: a refusal here cannot be a branch mismatch.
+        _git(repo_dir, "switch", "-c", "pilot/x")
+        db_path = temp_dir / "test.db"
+        db = await create_database(db_path)
+        await db.close()
+
+        with pytest.raises(typer.Exit) as excinfo:
+            await self._run(config_path, db_path=db_path)
+
+        assert excinfo.value.exit_code == 1
+        assert "no run row" in capsys.readouterr().err
+
+    async def test_opted_out_run_is_not_adopted_when_config_gains_a_branch(
+        self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A run published without `git.run_branch` records `declared=0`, so
+        adding the key to the config afterwards must NOT bind that run on its
+        next continuation: a run does not change its own rules mid-flight
+        (spec §6). The binding takes effect on the next *fresh* run."""
+        home = temp_dir / "home"
+        monkeypatch.setenv("MAESTRO_HOME", str(home))
+        monkeypatch.setenv("ORCHESTRA_PIPELINE_ID", "01TESTRUN")  # restored on teardown
+        repo_dir = temp_dir / "sched-repo"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        _init_git_repo(repo_dir)
+
+        # Run 1: no `git:` block at all — the run opts out at creation.
+        await self._run(_write_scheduler_config(temp_dir))
+
+        key = identity_from_checkout(repo_dir)
+        runs_root = home / "projects" / Path(*key.as_path_parts()) / "runs"
+        run_dir = next(runs_root.iterdir())
+        db_path = run_dir / "state.db"
+        assert (await _read_run_row(db_path))["run_branch_declared"] == 0
+
+        # Run 2: the operator adds `run_branch` and continues the same run
+        # (`--run <id>`, since the mocked run 1 recorded itself as completed).
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        await self._run(config_path, run=run_dir.name)
+
+        row = await _read_run_row(db_path)
+        assert (row["run_branch"], row["run_branch_declared"]) == (None, 0)
 
     async def test_clean_takes_start_gate_not_continuation(
         self, temp_dir: Path
@@ -1132,21 +1219,8 @@ class TestRunBranchGateContinuation:
             repo_key_text="/".join(key.as_path_parts()),
             started_at="2026-08-24T09:00:00+00:00",
             home=home,
-            run_branch_declared=0,
         )
-        db = await create_database(db_path)
-        try:
-            await db.create_task(
-                Task(
-                    id="t1",
-                    title="T1",
-                    prompt="do work",
-                    workdir=str(repo_dir),
-                    status=TaskStatus.RUNNING,
-                )
-            )
-        finally:
-            await db.close()
+        await _seed_running_task(db_path)
         recovery_cls = self._recovery_class_mock()
 
         await self._run(config_path, run="01TESTRUN", recovery_cls=recovery_cls)

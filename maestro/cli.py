@@ -584,20 +584,21 @@ async def _verify_run_branch_continuation(
     *,
     workdir: Path,
     configured: str | None,
-    selected_by_flag: bool,
     accept_branch_tip: bool,
 ) -> dict[str, object] | None:
     """§6's three-state record check, run before recovery. Returns the run row.
 
     The branch is read from the run row and verified against the checkout —
     never re-derived from the config, which may have been edited since (#198's
-    territory). `selected_by_flag` is "`--resume` or `--run <id>` was typed",
-    the invocations for which a missing run row is a refusal rather than an
-    ordinary ungated `--db`.
+    territory). A missing run row refuses for **every** continuation-selected
+    invocation with a configured branch, not only for `--resume`/`--run`: a
+    plain `--db` naming an existing database is a continuation too, so the
+    start gate does not run for it, and keying the refusal off the flags would
+    leave that invocation gated by neither seam.
     """
     row = await db.get_run_row()
     if row is None:
-        if configured is not None and selected_by_flag:
+        if configured is not None:
             raise RunBranchGateError(
                 "record_missing",
                 "this database has no run row, so its branch binding is "
@@ -619,7 +620,7 @@ async def _verify_run_branch_continuation(
             # own work — audited, never automatic (spec §6).
             await db.update_run_branch_head(tip)
             logger.warning(
-                "run_branch.tip_accepted branch=%s recorded=%s observed=%s",
+                "run_branch_gate.tip_accepted branch=%s recorded=%s observed=%s",
                 record.branch,
                 record.head,
                 tip,
@@ -762,7 +763,12 @@ async def _run_scheduler(
                 err_console.print(f"[red]Several runs could be resumed:[/red] {e}")
                 raise typer.Exit(1) from e
             except RunBranchGateError as e:
-                err_console.print(f"[red]run-branch gate:[/red] {e}")
+                # Escaped like `NoResumableRun` above, and for the same reason:
+                # every gate refusal quotes the operator's own branch names, and
+                # a `pilot/[x]` would be parsed as Rich markup and vanish.
+                err_console.print(
+                    f"[red]run-branch gate:[/red] {escape(str(e))}", soft_wrap=True
+                )
                 raise typer.Exit(1) from e
             resolved_db_path = bootstrap.db_path
             console.print(
@@ -784,7 +790,9 @@ async def _run_scheduler(
                     base_branch=git_cfg.base_branch,
                 )
             except RunBranchGateError as e:
-                err_console.print(f"[red]run-branch gate:[/red] {e}")
+                err_console.print(
+                    f"[red]run-branch gate:[/red] {escape(str(e))}", soft_wrap=True
+                )
                 raise typer.Exit(1) from e
 
         # Ensure DB directory exists
@@ -822,7 +830,6 @@ async def _run_scheduler(
                     db,
                     workdir=workdir,
                     configured=git_cfg.run_branch if git_cfg is not None else None,
-                    selected_by_flag=resume or run is not None,
                     accept_branch_tip=accept_branch_tip,
                 )
         except BaseException as e:
@@ -831,7 +838,9 @@ async def _run_scheduler(
             # thread and a ResourceWarning on every refusal.
             await db.close()
             if isinstance(e, RunBranchGateError):
-                err_console.print(f"[red]run-branch gate:[/red] {e}")
+                err_console.print(
+                    f"[red]run-branch gate:[/red] {escape(str(e))}", soft_wrap=True
+                )
                 raise typer.Exit(1) from e
             raise
 

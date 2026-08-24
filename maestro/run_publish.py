@@ -30,10 +30,21 @@ async def create_run(
     started_at: str,
     home: Path | None = None,
     run_branch: str | None = None,
-    run_branch_declared: int | None = None,
+    run_branch_declared: int = 0,
     run_branch_head: str | None = None,
 ) -> Path:
     """Create `runs/<run_id>/` and return its `state.db`.
+
+    **`run_branch_declared` defaults to 0, not NULL** (spec §6): a run
+    published *after* this feature with `git.run_branch` omitted has opted
+    out, and that is a decision, not the absence of one. NULL is reserved for
+    a genuine pre-migration row, which the continuation gate treats as
+    "no record exists, so adopt the config's intent" — leaving new opt-out
+    runs at NULL would send every one of them down that path and let a
+    `run_branch` added to the config between two runs bind the run mid-flight,
+    which §6 forbids (a run must not change its own rules mid-flight). The
+    DB-layer `create_run_row` keeps its `None` default: only publication knows
+    that the omission was contemporary.
 
     The directory is built under a temporary name *outside* `runs/` — under
     `<project>/.staging/<run_id>` — and renamed into `runs/` only after the
