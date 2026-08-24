@@ -1,8 +1,17 @@
 # Mode-1 run-level branch isolation (`git.run_branch`) — design
 
-**Status:** revision 3 — codex-review findings incorporated; awaiting
+**Status:** revision 4 — codex-review round 2 incorporated; awaiting
 owner approval
 **Date:** 2026-08-24
+**Revision 4 (codex-review round 2 on PR #221, three majors, each
+confirmed against the code):** (1) §6 — a superseded run refuses to
+resume (`resume_superseded`): name equality is not state identity, so
+resume checks the registry for a newer run bound to the same branch;
+(2) §7 — the phase-B tripwire fires before *every* checkout use, the
+completion path included (validation launch, `_auto_commit_task`), not
+only before spawns; (3) §6 — `--db` with `run_branch` configured and no
+run row now refuses (`record_missing`) instead of proceeding off the
+config-derived name: unknown provenance is not green.
 **Revision 3 (codex-review on PR #221, two majors, both confirmed
 against the code):** (1) §5 — the checkout is mutated only under the
 Mode-1 singleton fence: `RunIsLive` sees only the Mode-2 stage locks
@@ -229,6 +238,20 @@ On `--resume` (consumer point 4):
   remove. Acting nowhere beats acting in the wrong place.
 - No cleanliness check on resume: a crashed run legitimately leaves
   uncommitted task work in the tree.
+- **A superseded run refuses to resume** (codex-review round 2,
+  major 1). The branch is per-DAG, so a *newer* run of the same DAG
+  legitimately advances the same branch (that is the consumer's
+  iteration pattern — fresh attempts, old runs abandoned). What must
+  not happen is the older run then resuming on top of the newer run's
+  state while the name-only check smiles: name equality is not state
+  identity. On resume, the runs registry (already enumerated by
+  `resolve_runs`) is checked for any **newer** run whose record binds
+  the same branch; if one exists, resume refuses
+  (`resume_superseded`), naming the newer run id. Runs without a
+  branch record (`declared=0`/pre-migration) do not participate. No
+  override flag in this slice — the operator's remedy is resuming the
+  newest run, which is the one whose state the checkout actually
+  carries.
 - The record is read as a three-state matrix on the two columns:
   - `declared=1` → `run_branch` is set; verify as above.
   - `declared=0` → the run opted out at creation; the gate does
@@ -255,9 +278,18 @@ On `--resume` (consumer point 4):
   stand; anyone later "harmonizing" them into one rule would be turning
   one of them into a bug.
 - With `--db` there may be no run row at all (legacy/manual databases).
-  Then resume verification falls back to the config-derived name with an
-  explicit warning that the record is absent. Documented limitation of
-  the `--db` escape hatch.
+  **When `run_branch` is configured, that resume refuses**
+  (`record_missing`) — revised from warn-and-fall-back-to-config in
+  round 2 (codex-review major 3): a database with no run row has
+  unknown provenance, and passing the gate because the checkout happens
+  to match a *config-derived* name is "unknown as green" at the exact
+  seam the gate protects — the same anonymous-state hazard the frozen
+  legacy default was split away to remove. The refusal names the two
+  exits: resume through the resolver path (whose databases carry run
+  rows), or drop `run_branch` from the config, which makes the run an
+  ordinary ungated `--db` run — an explicit operator choice, not a
+  silent fallback. A `--db` pointing at a resolver-created database
+  *has* a run row and verifies normally.
 
 **Ordering: verification precedes recovery.** This deliberately diverges
 from #198, which halts *after* the liveness/reconciliation pass. #198's
@@ -276,10 +308,22 @@ lock holds off a second *controller* run, not a human at the terminal),
 and that human can switch branches mid-run. Phase B closes that window at the same point the codebase
 already trusts (#166: the late check is the guarantee):
 
-- Immediately before each task spawn, the scheduler compares the current
-  branch against the recorded `run_branch` (one `git rev-parse
-  --abbrev-ref HEAD`, negligible cost).
-- Mismatch → no spawn; the run **suspends** (`suspended_at` +
+- The tripwire fires at **every point where the scheduler is about to
+  use the checkout**, not only before spawns (codex-review round 2,
+  major 2): immediately before each task spawn, before launching a
+  task's validation, and before `_auto_commit_task` stages anything.
+  The completion path matters as much as the dispatch path — a task
+  that exits cleanly is followed by validation and auto-commit in the
+  *current* worktree, and today `_auto_commit_task` runs `git add`/`git
+  commit` on whatever branch is checked out; a branch flip in the
+  window between task exit and finalization would land the commit on
+  the wrong branch, which is the exact write this gate exists to
+  prevent. Each check is one `git rev-parse --abbrev-ref HEAD` —
+  negligible cost.
+- Mismatch at any tripwire point → the pending mutation does not
+  happen (no spawn / no validation launch / no commit), the completed
+  task's recorded state is preserved for resume, and the run
+  **suspends** (`suspended_at` +
   `suspend_reason`, spec §B.1.1 — resumable, not an outcome), and the
   refusal text goes to stderr. Tasks already running are not killed —
   the same drain philosophy as #166's first-signal behavior. Confirmed
@@ -298,8 +342,9 @@ first instant.
 
 - One typed error family (`RunBranchGateError` with a machine-readable
   `reason`: `branch_equals_base`, `dirty_tree`, `wrong_start_point`,
-  `resume_branch_mismatch`). The two fail-open cases (§6: NULL record,
-  `--db` without a run row) are warnings, not members of this family.
+  `resume_branch_mismatch`, `resume_superseded`, `record_missing`).
+  The one fail-open case (§6: a true pre-migration record) is a
+  warning, not a member of this family.
 - Rendered as plain text on **stderr** (`err_console`, matching every
   existing refusal in `cli.py`), exit code 1 (consumer point 5: stderr
   is the only channel dispatcher relays to the operator). Each message
@@ -319,12 +364,21 @@ first instant.
   asserts zero calls); `declared=0` resume is silent — no warning, no
   adoption, no gate; `declared=NULL` + config-declared warns, adopts
   the observed branch, and a second resume then verifies against the
-  adopted record; `--db` fallback warns.
-- Lock-ordering test (major 1): with the PID lock already held, a
-  second `maestro run` with `run_branch` configured refuses **without
-  touching the checkout** — current branch asserted unchanged.
+  adopted record; `--db` + configured `run_branch` + no run row
+  refuses (`record_missing`), never proceeds off the config-derived
+  name.
+- Superseded-resume test (round 2, major 1): run A suspended on `B`,
+  fresh run B' records the same branch → `--resume --run <A>` refuses
+  (`resume_superseded`) even though the branch name matches; resuming
+  B' succeeds.
+- Lock-ordering test (round 1, major 1): with the PID lock already
+  held, a second `maestro run` with `run_branch` configured refuses
+  **without touching the checkout** — current branch asserted
+  unchanged.
 - Phase B: mid-run branch flip → no further spawns, run suspended,
-  running task untouched.
+  running task untouched; and the completion path — branch flipped
+  between task exit and finalization → no validation launch, no
+  auto-commit, task state preserved, run suspended (round 2, major 2).
 - The opt-out path (no `run_branch`) byte-identical: existing suite
   green without modification is the evidence, as with every recent gate.
 
