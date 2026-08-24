@@ -25,7 +25,6 @@ defaults:
 git:
   base_branch: main
   auto_push: true
-  branch_prefix: "agent/"
 
 # Execution backends (Phase 1: local isolator process + optional local Docker
 # isolation). Absent entirely -> every task runs local+bare (see tasks.yaml).

@@ -46,6 +46,22 @@
   re-vendor bytes nobody looked at.
 
 ### Changed
+- **BREAKING (config): a Mode-1 config with `git.branch_prefix` set is now
+  rejected at load, not silently ignored** (#216). The key's only consumer,
+  `GitManager`, is constructed exclusively on the Mode-2 path, so in
+  `maestro run` it never did anything — while its presence read as
+  "isolation is configured". A pilot found out the hard way: with
+  `auto_commit: true` the run committed straight to the checked-out branch
+  (`master`) of the target repo, whose own rules forbid exactly that.
+  Per-task branches are semantically impossible in Mode 1 (one shared
+  checkout, concurrent tasks), so the honest answers are only "refuse" or
+  "implement something else"; a warning about a safety property nobody reads
+  is how the pilot got there. Deliberately no deprecation window: the Mode-1
+  config population is small and the fix is deleting one line. The refusal
+  message points at the replacement — run-level branch isolation, tracked as
+  issue #216 part 2 (`todo://maestro/mode1-branch-isolation`). The check
+  lives on the `load_config` path (a Pydantic validator on `GitConfig`), not
+  in Mode-2-only `maestro validate`, so it actually reaches Mode 1.
 - **BREAKING (wire): `report_benchmark` now sends `score` as a FRACTION in
   [0,1], not a percent.** ATP reports the benchmark-plane score as a percent
   (`unit: percent`, `range {0,100}`); arbiter's canonical wire unit is a

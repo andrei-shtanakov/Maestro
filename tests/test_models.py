@@ -812,16 +812,18 @@ class TestGitConfig:
         config = GitConfig(
             base_branch="develop",
             auto_push=False,
-            branch_prefix="feature/",
         )
         assert config.base_branch == "develop"
         assert config.auto_push is False
-        assert config.branch_prefix == "feature/"
 
-    def test_invalid_branch_prefix(self) -> None:
-        """Test invalid branch prefix is rejected."""
-        with pytest.raises(ValueError, match="Branch prefix"):
-            GitConfig(branch_prefix="invalid@prefix")
+    def test_explicit_branch_prefix_is_rejected(self) -> None:
+        """Setting branch_prefix is rejected: Mode 1 has no per-task branches.
+
+        Issue #216: the key's only consumer is the Mode-2 path, so a Mode-1
+        config accepting it promises isolation the run cannot provide.
+        """
+        with pytest.raises(ValueError, match="branch_prefix"):
+            GitConfig(branch_prefix="pilot/")
 
 
 class TestNotificationConfig:

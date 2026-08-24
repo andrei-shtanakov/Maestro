@@ -756,7 +756,16 @@ class Task(BaseModel):
 
 
 class GitConfig(BaseModel):
-    """Git configuration for project."""
+    """Git configuration for a Mode-1 (`maestro run`) project.
+
+    `branch_prefix` is rejected when explicitly set: per-task branches are
+    semantically impossible in Mode 1 (one shared checkout, concurrent
+    tasks), and silently accepting the key made a run with
+    `auto_commit: true` write to whatever branch was checked out while the
+    author believed isolation was configured (issue #216). The field is kept
+    (rather than dropped) so the key cannot regress to being silently
+    ignored as an unknown extra.
+    """
 
     base_branch: str = Field(default="main", description="Base branch name")
     auto_push: bool = Field(default=True, description="Automatically push after task")
@@ -764,16 +773,31 @@ class GitConfig(BaseModel):
         default=False,
         description="Auto-commit changes after each task completes",
     )
-    branch_prefix: str = Field(default="agent/", description="Prefix for task branches")
+    branch_prefix: str = Field(
+        default="agent/",
+        # exclude: the field is a tripwire for input, not data — dumping it
+        # would make a model_dump()/re-parse roundtrip reject itself.
+        exclude=True,
+        description=(
+            "Rejected if set: Mode 1 runs on one shared checkout and cannot "
+            "branch per task (issue #216)"
+        ),
+    )
 
-    @field_validator("branch_prefix")
-    @classmethod
-    def validate_branch_prefix(cls, v: str) -> str:
-        """Validate branch prefix format."""
-        if not re.match(r"^[a-zA-Z0-9_/-]*$", v):
-            msg = "Branch prefix must contain only alphanumeric characters, hyphens, underscores, and slashes"
+    @model_validator(mode="after")
+    def reject_branch_prefix(self) -> Self:
+        """Refuse an explicitly-set branch_prefix instead of ignoring it."""
+        if "branch_prefix" in self.model_fields_set:
+            msg = (
+                "git.branch_prefix is not applicable to Mode 1 (maestro run): "
+                "all tasks share one checkout, so per-task branches cannot "
+                "exist — with auto_commit the run writes to whatever branch "
+                "is checked out. Remove the key. Run-level branch isolation "
+                "is a planned separate contract: issue #216, "
+                "todo://maestro/mode1-branch-isolation."
+            )
             raise ValueError(msg)
-        return v
+        return self
 
 
 class NotificationConfig(BaseModel):
