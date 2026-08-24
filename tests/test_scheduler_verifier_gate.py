@@ -263,11 +263,15 @@ def _scheduler(
     verifier: VerifierConfig | None,
     task_id: str = "t1",
     scope: list[str] | None = None,
-    on_auto_commit: Callable[[], Awaitable[None]] | None = None,
+    on_auto_commit: Callable[[str], Awaitable[None]] | None = None,
+    auto_commit: bool = False,
 ) -> Scheduler:
     dag = DAG([_task_config(task_id, scope=scope)])
     config = SchedulerConfig(
-        workdir=repo, log_dir=repo / "logs", on_auto_commit=on_auto_commit
+        workdir=repo,
+        log_dir=repo / "logs",
+        on_auto_commit=on_auto_commit,
+        auto_commit=auto_commit,
     )
     return Scheduler(db, dag, spawners={}, config=config, verifier=verifier)
 
@@ -334,29 +338,32 @@ class TestVerifierGatePass:
         one auto-commit call site the no-verifier scheduler tests don't
         reach. `_auto_commit_task` itself runs for real here (not
         monkeypatched away) so the callback is exercised at its actual
-        call site, not a stand-in for it.
+        call site, not a stand-in for it — and since ruling R14 it must
+        receive the sha of the commit that site just made, which requires
+        auto-commit to be genuinely on.
         """
         _modify_scope_file(repo)
         task = await _make_running_task(db, repo)
         _install_fake_model_resolution(monkeypatch)
         _install_fake_judge(monkeypatch, _pass_result(task.id))
 
-        calls: list[int] = []
+        shas: list[str] = []
 
-        async def on_commit() -> None:
-            calls.append(1)
+        async def on_commit(sha: str) -> None:
+            shas.append(sha)
 
         scheduler = _scheduler(
             db,
             repo,
             verifier=VerifierConfig(model="m", timeout_seconds=5),
             on_auto_commit=on_commit,
+            auto_commit=True,
         )
 
         final = await _complete(scheduler, db, task.id)
 
         assert final.status is TaskStatus.DONE
-        assert calls == [1]
+        assert shas == [_head(repo)]
 
 
 class TestVerifierGateFail:

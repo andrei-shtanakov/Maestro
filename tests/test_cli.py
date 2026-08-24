@@ -1269,6 +1269,85 @@ class TestRunBranchGateContinuation:
         finally:
             await db.close()
 
+    async def test_foreign_commit_during_the_run_is_not_blessed(
+        self, temp_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Ruling R14, the codex regression: `run_branch_head` advances only
+        with commits THIS run made. While the run is live a foreign commit
+        lands on the branch; the run makes none of its own (the scheduler is
+        mocked, as an announce-style task that changes no files would be), so
+        the record stays at the publication sha and the next continuation
+        refuses. An observational refresh at the end of the run would have
+        recorded the foreign tip instead and waved the next resume through.
+        """
+        config_path = _write_scheduler_config(
+            temp_dir,
+            git_block={
+                "run_branch": "pilot/x",
+                "base_branch": "master",
+                "auto_commit": True,
+            },
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        db_path = temp_dir / "test.db"
+
+        async def _foreign_commit_lands() -> None:
+            (repo_dir / "foreign.txt").write_text("somebody else's work")
+            _git(repo_dir, "add", "foreign.txt")
+            _git(repo_dir, "commit", "-m", "foreign, mid-run")
+
+        scheduler_instance = MagicMock()
+        scheduler_instance.run = AsyncMock(side_effect=_foreign_commit_lands)
+
+        with (
+            patch("maestro.cli.create_event_logger"),
+            patch("maestro.cli.make_routing_strategy", new_callable=AsyncMock),
+            patch(
+                "maestro.cli.create_scheduler_from_config",
+                new_callable=AsyncMock,
+                return_value=scheduler_instance,
+            ),
+            patch("maestro.cli._acquire_pid_lock", return_value=99),
+            patch("maestro.cli._release_pid_lock"),
+        ):
+            await _run_scheduler(
+                config_path=config_path,
+                db_path=db_path,
+                resume=False,
+                log_dir=None,
+                clean=False,
+            )
+
+        published = await _read_run_row(db_path)
+        assert published["run_branch_head"] != _git(
+            repo_dir, "rev-parse", "refs/heads/pilot/x"
+        )
+
+        capsys.readouterr()
+        with pytest.raises(typer.Exit) as excinfo:
+            await self._run(config_path, db_path=db_path, resume=True)
+
+        assert excinfo.value.exit_code == 1
+        assert "tip moved" in capsys.readouterr().err
+
+    async def test_empty_db_file_is_a_fresh_start(self, temp_dir: Path) -> None:
+        """A zero-byte `--db` file carries no state: `create_database` would
+        initialize it either way, so treating its mere existence as a
+        continuation refused `record_missing` on a plainly fresh start."""
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        db_path = temp_dir / "test.db"
+        db_path.touch()
+
+        await self._run(config_path, db_path=db_path)
+
+        assert _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD") == "pilot/x"
+        assert (await _read_run_row(db_path))["run_branch"] == "pilot/x"
+
     async def test_plain_db_on_existing_state_is_a_continuation(
         self, temp_dir: Path
     ) -> None:

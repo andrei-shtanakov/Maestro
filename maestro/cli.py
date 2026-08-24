@@ -102,7 +102,6 @@ from maestro.run_branch_gate import (
     RunBranchGateError,
     RunBranchRecord,
     apply_start_gate,
-    branch_tip,
     verify_continuation,
 )
 from maestro.run_lifecycle import (
@@ -755,7 +754,16 @@ async def _run_scheduler(
         # against an explicitly named `--db`, which is why it cancels
         # continuation only there.
         clean_effective = clean and db_path is not None
-        db_has_state = db_path is not None and db_path.exists()  # noqa: ASYNC240
+        # Non-empty, not merely present: `create_database` initializes any
+        # path it is given, so a zero-byte file (a `touch`, an interrupted
+        # create) carries no state to continue — treating it as a
+        # continuation would refuse `record_missing` on what is plainly a
+        # fresh start.
+        db_has_state = (
+            db_path is not None
+            and db_path.exists()  # noqa: ASYNC240
+            and db_path.stat().st_size > 0  # noqa: ASYNC240
+        )
         continuation_selected = (
             resume or run is not None or db_has_state
         ) and not clean_effective
@@ -901,17 +909,19 @@ async def _run_scheduler(
         if run_row is not None and run_row.get("run_branch_declared") == 1:
             bound_branch = str(run_row["run_branch"])
 
-        async def _record_head() -> None:
-            """Refresh `run_branch_head` to the checkout's current tip.
+        async def _record_head(sha: str) -> None:
+            """Record the sha of a commit THIS run just made (ruling R14).
 
-            Best-effort bookkeeping (spec §6): a failure here must never
-            fail the task it rides in on, so every error is swallowed after
-            a warning. A no-op when the gate isn't bound to a branch.
+            Attribution, not observation: the scheduler hands over the sha it
+            committed, so `run_branch_head` advances only over the run's own
+            work. Best-effort bookkeeping — a failure here must never fail the
+            task it rides in on, so every error is swallowed after a warning.
+            A no-op when the gate isn't bound to a branch.
             """
             if bound_branch is None:
                 return
             try:
-                await db.update_run_branch_head(branch_tip(workdir, bound_branch))
+                await db.update_run_branch_head(sha)
             except Exception:
                 logger.warning("run_branch.head_record_failed", exc_info=True)
 
@@ -1054,6 +1064,18 @@ async def _run_scheduler(
                 notification_manager=notifications,
                 on_status_change=_on_status_change,
                 auto_commit=(config.git.auto_commit if config.git else False),
+                # The ONLY writer of `run_branch_head` after publication, and
+                # a deliberate deviation from spec §6's "refreshed on graceful
+                # suspension/stop" (ruling R14): an observational refresh reads
+                # whatever the branch points at, so a foreign commit landing
+                # during the run would be normalized into this run's record and
+                # the next continuation would pass green over it — the exact
+                # hole the stale check exists to catch. The head therefore moves
+                # only with commits this run made. The cost is priced and points
+                # the safe way: a run whose agent commits by itself (auto_commit
+                # off) leaves the record behind the branch and stale-refuses on
+                # the next continuation, where `--accept-branch-tip` is the
+                # audited way through.
                 on_auto_commit=_record_head if bound_branch is not None else None,
                 routing=routing,
                 arbiter_mode=arbiter_mode,
@@ -1083,7 +1105,6 @@ async def _run_scheduler(
 
             # Run scheduler
             await scheduler.run()
-            await _record_head()
 
             # Show what agents changed
             _display_git_summary(workdir)
@@ -1116,7 +1137,6 @@ async def _run_scheduler(
 
         except (KeyboardInterrupt, asyncio.CancelledError):
             await record_cancelled(db, "interrupted by the operator")
-            await _record_head()
             raise
         finally:
             if routing is not None:

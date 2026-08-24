@@ -232,11 +232,13 @@ class SchedulerConfig:
         poll_interval: Seconds between scheduler loop iterations.
         workdir: Base working directory for tasks.
         log_dir: Directory for task log files.
-        on_auto_commit: Optional callback awaited right after a successful
-            `_auto_commit_task` call. The scheduler itself stays
-            git/DB-agnostic about run bookkeeping — the callback owner (the
-            run-branch gate, when active) reads the checkout's current tip
-            and persists it. Best-effort by contract: invoked through
+        on_auto_commit: Optional callback awaited with the sha of a commit
+            this scheduler just made, and **only** when it actually made one
+            (ruling R14). The scheduler stays DB-agnostic about run
+            bookkeeping; it owes the callback attribution — *this* commit is
+            ours — rather than an observation of wherever the branch happens
+            to point, which would silently normalize a foreign advance into
+            the run's record. Best-effort by contract: invoked through
             `Scheduler._invoke_on_auto_commit`, which logs and swallows any
             `Exception` the hook raises, so a hook failure never fails the
             task it rides in on (cancellation still propagates).
@@ -248,7 +250,7 @@ class SchedulerConfig:
     log_dir: Path = field(default_factory=lambda: Path.cwd() / "logs")
     shutdown_grace_seconds: float = 5.0
     auto_commit: bool = False
-    on_auto_commit: Callable[[], Awaitable[None]] | None = None
+    on_auto_commit: Callable[[str], Awaitable[None]] | None = None
 
 
 class SchedulerError(Exception):
@@ -770,10 +772,16 @@ class Scheduler:
                         )
                 delivered_count += 1
 
-    def _auto_commit_task(self, task: Task) -> None:
-        """Auto-commit changes for a completed task."""
+    def _auto_commit_task(self, task: Task) -> str | None:
+        """Auto-commit changes for a completed task.
+
+        Returns the sha of the commit it made, or `None` when it made none —
+        auto-commit off, nothing staged, or the commit itself failed. That
+        return is what lets `on_auto_commit` attribute a sha to this run
+        instead of observing wherever the branch points (ruling R14).
+        """
         if not self._config.auto_commit:
-            return
+            return None
         try:
             workdir = self._config.workdir
             # Stage files matching task scope
@@ -803,7 +811,7 @@ class Scheduler:
                 check=False,
             )
             if result.returncode != 0:  # There are staged changes
-                subprocess.run(
+                commit = subprocess.run(
                     [
                         "git",
                         "commit",
@@ -815,26 +823,47 @@ class Scheduler:
                     timeout=30,
                     check=False,
                 )
+                if commit.returncode != 0:
+                    return None
+                # A second invocation, so a commit landing between these two
+                # would be attributed here. The window is one git call wide
+                # and bounded by the same single-run working agreement as the
+                # spec §7 tripwire — stated rather than hidden, because the
+                # alternative (parsing the commit's own output) reads a sha
+                # prefix in a locale-dependent format.
+                head = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=workdir,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                if head.returncode == 0:
+                    return head.stdout.strip()
         except (subprocess.TimeoutExpired, FileNotFoundError) as e:
             logger.debug(
                 "Auto-commit failed for task %s: %s",
                 task.id,
                 e,
             )
+        return None
 
-    async def _invoke_on_auto_commit(self) -> None:
+    async def _invoke_on_auto_commit(self, sha: str | None) -> None:
         """Best-effort call to the configured `on_auto_commit` hook.
 
-        Contract (`SchedulerConfig.on_auto_commit`): pure bookkeeping — a
-        hook failure must never fail the task it rides in on, so any
-        exception is logged and swallowed here, at the scheduler seam,
-        rather than left to each of the three completion call sites.
-        `Exception` only: cancellation must still propagate.
+        A `None` sha means no commit was made, and the hook is for reporting
+        commits — so nothing is called. Contract
+        (`SchedulerConfig.on_auto_commit`): pure bookkeeping — a hook failure
+        must never fail the task it rides in on, so any exception is logged
+        and swallowed here, at the scheduler seam, rather than left to each of
+        the three completion call sites. `Exception` only: cancellation must
+        still propagate.
         """
-        if self._config.on_auto_commit is None:
+        if self._config.on_auto_commit is None or sha is None:
             return
         try:
-            await self._config.on_auto_commit()
+            await self._config.on_auto_commit(sha)
         except Exception:
             logger.warning("on_auto_commit hook failed", exc_info=True)
 
@@ -1926,8 +1955,7 @@ class Scheduler:
                             expected_status=TaskStatus.VALIDATING,
                             result_summary="Task completed successfully",
                         )
-                        self._auto_commit_task(task)
-                        await self._invoke_on_auto_commit()
+                        await self._invoke_on_auto_commit(self._auto_commit_task(task))
                         outcome = await self._build_outcome(done_task, exit_code=0)
                         await self._try_report_outcome(done_task, outcome)
                         _obs_log.info(
@@ -1951,8 +1979,7 @@ class Scheduler:
                     expected_status=TaskStatus.RUNNING,
                     result_summary="Task completed successfully",
                 )
-                self._auto_commit_task(task)
-                await self._invoke_on_auto_commit()
+                await self._invoke_on_auto_commit(self._auto_commit_task(task))
                 outcome = await self._build_outcome(done_task, exit_code=0)
                 await self._try_report_outcome(done_task, outcome)
                 _obs_log.info(
@@ -2309,8 +2336,7 @@ class Scheduler:
                 expected_status=TaskStatus.VERIFYING,
                 result_summary="Task completed successfully (verifier PASS)",
             )
-            self._auto_commit_task(task)
-            await self._invoke_on_auto_commit()
+            await self._invoke_on_auto_commit(self._auto_commit_task(task))
             outcome = await self._build_outcome(done_task, exit_code=0, attempt=attempt)
             await self._try_report_outcome(done_task, outcome)
             self._emit_event(
@@ -2748,7 +2774,7 @@ async def create_scheduler_from_config(
     notification_manager: NotificationManager | None = None,
     on_status_change: StatusChangeCallback | None = None,
     auto_commit: bool = False,
-    on_auto_commit: Callable[[], Awaitable[None]] | None = None,
+    on_auto_commit: Callable[[str], Awaitable[None]] | None = None,
     routing: RoutingStrategy | None = None,
     arbiter_mode: ArbiterMode = ArbiterMode.ADVISORY,
     arbiter_enabled: bool = False,
@@ -2772,8 +2798,9 @@ async def create_scheduler_from_config(
         notification_manager: Optional notification manager.
         on_status_change: Optional callback for task status changes.
         auto_commit: Whether to auto-commit after task completion.
-        on_auto_commit: Optional callback awaited right after a successful
-            auto-commit; forwarded to `SchedulerConfig`.
+        on_auto_commit: Optional callback awaited with the sha of a commit
+            the scheduler made, and only when it made one; forwarded to
+            `SchedulerConfig`.
         routing: Routing strategy (defaults to StaticRouting).
         arbiter_mode: Arbiter authority mode (ADVISORY by default).
         arbiter_enabled: Whether arbiter integration is enabled.
