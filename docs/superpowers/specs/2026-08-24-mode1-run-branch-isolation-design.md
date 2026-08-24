@@ -1,8 +1,20 @@
 # Mode-1 run-level branch isolation (`git.run_branch`) — design
 
-**Status:** revision 2 — consumer review incorporated (dispatcher,
-2026-08-24, issue #216); awaiting owner approval
+**Status:** revision 3 — codex-review findings incorporated; awaiting
+owner approval
 **Date:** 2026-08-24
+**Revision 3 (codex-review on PR #221, two majors, both confirmed
+against the code):** (1) §5 — the checkout is mutated only under the
+Mode-1 singleton fence: `RunIsLive` sees only the Mode-2 stage locks
+(`orchestrate`/`review`), so the global PID lock — the real Mode-1
+serializer, today acquired late — moves ahead of the gate; without
+this a losing second invocation could flip the shared checkout under
+the live scheduler and only then die on the lock. (2) §6 — `NULL`
+cannot mean both "pre-migration row" and "opted out", so the run row
+carries `run_branch_declared` alongside `run_branch` (#198's
+`workstreams_declared` lesson at the same table); opt-out runs resume
+genuinely byte-identically, and warn-plus-adopt applies only to true
+pre-migration rows.
 **Revision 2 (consumer review):** §4 asymmetry made explicit (switching
 to an existing run branch is deliberate iteration, not state capture);
 §6 records why this fail-open deliberately diverges from dispatcher's
@@ -154,6 +166,22 @@ directory. Consequences, in the shape the consumer cares about
 - The `RunIsLive` check stays first: while another run is live, Maestro
   must not touch the checkout at all — not even to switch to a branch
   the live run may itself be standing on.
+- **The checkout is mutated only under the Mode-1 singleton fence**
+  (codex-review major 1, revision 3). `RunIsLive` alone is NOT that
+  fence: `resolve_runs` derives liveness from the scoped stage locks,
+  whose stages are only `orchestrate` and `review` — a live Mode-1
+  scheduler is invisible to it. The lock that actually serializes
+  `maestro run` is the global PID lock, today acquired late in
+  `_run_scheduler` (after bootstrap, DB open and scheduler
+  construction). Left there, a losing second invocation would pass the
+  gate, `git switch` the shared checkout under the live scheduler, and
+  only then die on the lock — moving the branch the live run's
+  `auto_commit` writes to. Phase A therefore moves PID-lock acquisition
+  **ahead of the gate**: acquire lock → identity + `RunIsLive` → gate →
+  publish; any refusal on that path releases the lock and leaves no
+  run. The lock's scope is unchanged (one Mode-1 scheduler per Maestro
+  home, exactly what it enforces today) — only the acquisition point
+  moves earlier, which narrows nobody.
 - The gate is also what may *create and switch* the branch, and that
   side effect lands only on the success path toward publication. A
   crash between the switch and the rename leaves the checkout on `B`
@@ -163,17 +191,29 @@ directory. Consequences, in the shape the consumer cares about
 Mechanically: `bootstrap_run` gains a seam between liveness resolution
 and `create_run` (an optional pre-publish hook or an explicit split into
 resolve + publish — implementation's choice; the contract is only the
-ordering above). `--db <path>` skips `bootstrap_run` entirely; there the
-gate runs at the equivalent point in `_run_scheduler` — before the
-database is opened.
+ordering above, PID lock included). `--db <path>` skips `bootstrap_run`
+entirely; there the gate runs at the equivalent point in
+`_run_scheduler` — before the database is opened, and equally after the
+PID lock.
 
 ## 6. Durable record and `--resume`
 
-`create_run_row` gains a `run_branch` column, written in the same
-transaction as the rest of the row — inside staging, so the record is
-atomic with publication (no published run without its branch record).
-A schema migration adds the column to existing databases; the number is
-claimed at implementation time (parallel actors also claim migrations).
+`create_run_row` gains **two** columns, written in the same transaction
+as the rest of the row — inside staging, so the record is atomic with
+publication (no published run without its record): `run_branch` (TEXT,
+the bound branch or NULL) and `run_branch_declared` (0/1). The second
+column exists because `NULL` alone cannot carry two meanings
+(codex-review major 2, revision 3) — this is #198's
+`workstreams_declared` lesson applied at the same table: a run created
+*after* this feature with `run_branch` **omitted** writes
+`(NULL, declared=0)`, and a pre-migration row reads
+`(NULL, declared=NULL)`. Without the bit, every new opt-out run would
+hit the legacy warn-and-adopt path on its first resume — a warning plus
+a persisted branch binding on a run that opted out, breaking the §3
+byte-identical promise, and adopting whatever branch the operator
+happened to resume from. A schema migration adds both columns to
+existing databases; the number is claimed at implementation time
+(parallel actors also claim migrations).
 
 On `--resume` (consumer point 4):
 
@@ -189,15 +229,24 @@ On `--resume` (consumer point 4):
   remove. Acting nowhere beats acting in the wrong place.
 - No cleanliness check on resume: a crashed run legitimately leaves
   uncommitted task work in the tree.
-- `run_branch` recorded as NULL (a run started before this feature)
-  **fails open** with a structured warning, following #198's
-  `workstreams_declared` precedent — and then **adopts the observed
-  branch into the record** (consumer proposal, one UPDATE): the first
-  resume writes the current branch into the run row, so every later
-  resume of that run is protected. The hole closes on first use, not by
-  legacy runs dying out. The adoption is announced (structured event +
-  the same warning), because it records observed state, not verified
-  intent.
+- The record is read as a three-state matrix on the two columns:
+  - `declared=1` → `run_branch` is set; verify as above.
+  - `declared=0` → the run opted out at creation; the gate does
+    nothing on resume — genuinely byte-identical, no warning, no
+    adoption. Adding `run_branch` to the config later takes effect on
+    the next *fresh* run, never mid-run (a run must not change its own
+    rules mid-flight — #198's own principle).
+  - `declared=NULL` → a true pre-migration row. **Fails open** with a
+    structured warning, following #198's `workstreams_declared`
+    precedent — and, when the config declares `run_branch`, **adopts
+    the observed branch into the record** (consumer proposal, one
+    UPDATE setting both columns): the first resume writes the current
+    branch, so every later resume of that run is protected. The hole
+    closes on first use, not by legacy runs dying out. The adoption is
+    announced (structured event + the same warning), because it
+    records observed state, not verified intent. A pre-migration row
+    whose config does *not* declare `run_branch` is recorded as
+    `declared=0` and stays silent.
   **This deliberately diverges from dispatcher's fail-closed at their
   analogous seam** ("predates checkout binding, re-submit"), and the
   divergence is priced, not accidental: a dispatcher request is cheap to
@@ -265,10 +314,15 @@ first instant.
   (the existing `test_git*` fixtures pattern).
 - Publication-ordering test: a refusing gate leaves `runs/` empty and
   `resolve_runs` blind (no staging residue).
-- Resume tests: record honored over config; mismatch refuses before
-  recovery (recovery mock asserts zero calls); NULL record warns,
-  adopts the observed branch, and proceeds — and a second resume then
-  verifies against the adopted record; `--db` fallback warns.
+- Resume tests over the three-state record matrix: `declared=1` record
+  honored over config, mismatch refuses before recovery (recovery mock
+  asserts zero calls); `declared=0` resume is silent — no warning, no
+  adoption, no gate; `declared=NULL` + config-declared warns, adopts
+  the observed branch, and a second resume then verifies against the
+  adopted record; `--db` fallback warns.
+- Lock-ordering test (major 1): with the PID lock already held, a
+  second `maestro run` with `run_branch` configured refuses **without
+  touching the checkout** — current branch asserted unchanged.
 - Phase B: mid-run branch flip → no further spawns, run suspended,
   running task untouched.
 - The opt-out path (no `run_branch`) byte-identical: existing suite
