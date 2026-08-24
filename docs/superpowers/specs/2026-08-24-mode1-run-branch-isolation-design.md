@@ -1,7 +1,18 @@
 # Mode-1 run-level branch isolation (`git.run_branch`) — design
 
-**Status:** draft for review (owner + dispatcher as consumer)
+**Status:** revision 2 — consumer review incorporated (dispatcher,
+2026-08-24, issue #216); awaiting owner approval
 **Date:** 2026-08-24
+**Revision 2 (consumer review):** §4 asymmetry made explicit (switching
+to an existing run branch is deliberate iteration, not state capture);
+§6 records why this fail-open deliberately diverges from dispatcher's
+fail-closed at the analogous seam, and adopts the consumer's
+close-the-hole-earlier proposal (NULL record → adopt the current branch
+on first resume); §3 states per-DAG-not-per-run explicitly; new §10
+rollout note (pilot's temporary precondition task is *replaced*, not
+kept); the three open questions are resolved (clean tree stays strict —
+consumer's own #217 burn as evidence; phase B suspends, never kills;
+`{run_id}` templating rejected, not deferred).
 **Issue:** #216 part 2 (`slug: mode1-branch-isolation`), TODO wave 9
 **Consumer input incorporated:** dispatcher's five points (2026-08-24,
 relayed by the owner): (1) verification alone is not enough — Maestro
@@ -70,15 +81,25 @@ git:
 
 - `run_branch: <literal branch name>`, optional. Absent → today's
   behavior, byte-identical (opt-in, like every recent gate).
+- **The branch is per-DAG, not per-run.** The key lives in the DAG's
+  config, so two runs of one DAG share the branch. What is isolated is
+  the run *from `base`*, never runs *from each other* — re-running a
+  DAG continues on its own branch (see §4). The feature name says
+  "run-level" because the *enforcement unit* is the run (one gate per
+  run start, one record per run row), not because each run gets a fresh
+  branch.
 - **One key, not two.** A separate `require_non_base_branch: true`
   (check-only) is not offered: a check-only mode cannot make pass 1
   UI-driven (consumer point 1), and the check is implied — `run_branch`
   equal to `base_branch` is rejected at config validation, in the same
   validator style as part 1's `branch_prefix` rejection.
-- **Literal name only in this slice.** `{run_id}`-style templating is
-  recorded as a possible extension, not designed: the pilot's usage is
-  an operator-named per-DAG branch, and templating would reopen every
-  "branch already exists" question for no present consumer.
+- **Literal name only — `{run_id}` templating rejected, not deferred**
+  (consumer answer 3): the point of the pilot branch is that a human can
+  find it and open a PR from it. A branch per run means a branch per
+  attempt — the pilot had three in one day, two of them dead — which is
+  branch-list noise plus a standing "which one do I PR from?" question.
+  A future consumer would have to overturn this with a use case, not
+  merely claim it.
 
 ## 4. Start gate (fresh run)
 
@@ -101,11 +122,22 @@ Decisions behind the table:
   the run branch from the declared base". Anything cleverer (create from
   an explicit ref, fast-forward first) is deferred until a consumer
   needs it.
+- **The switch/create asymmetry is deliberate, not an oversight.**
+  Switching to an *existing* `B` accepts whatever state `B` carries —
+  including commits from a previous run — while creating `B` from a
+  non-`base` branch refuses as `wrong_start_point`. The difference is
+  ownership: `B` is *the run branch this config declares*, so continuing
+  on it is normal iteration over the DAG's own prior work (the pilot ran
+  three attempts exactly this way); an arbitrary `cur` is somebody
+  else's state, and cutting `B` from it would capture that state
+  silently.
 - **Clean tree required on every fresh-start path, including "already on
-  `B`".** A dirty tree plus `auto_commit: true` means pre-existing
-  operator changes get swept into task commits — the same artifact-sweep
-  hazard as #217, and the pilot's own temporary precondition already
-  required a clean tree. Refusal names the dirty paths (bounded list).
+  `B`" — strict, confirmed by the consumer** (answer 1). A dirty tree
+  plus `auto_commit: true` means pre-existing content gets swept into an
+  agent's commit. Not hypothetical: #217's run logs sat un-gitignored in
+  deployer's tree and would have ridden into the pilot's commit exactly
+  this way. The pilot's own temporary precondition already required a
+  clean tree. Refusal names the dirty paths (bounded list).
 - **Detached HEAD refuses** (`wrong_start_point`): there is no `cur` to
   reason about.
 
@@ -159,8 +191,20 @@ On `--resume` (consumer point 4):
   uncommitted task work in the tree.
 - `run_branch` recorded as NULL (a run started before this feature)
   **fails open** with a structured warning, following #198's
-  `workstreams_declared` precedent: refusing every legacy resume would
-  be worse than the hole, and the hole closes itself as old runs drain.
+  `workstreams_declared` precedent — and then **adopts the observed
+  branch into the record** (consumer proposal, one UPDATE): the first
+  resume writes the current branch into the run row, so every later
+  resume of that run is protected. The hole closes on first use, not by
+  legacy runs dying out. The adoption is announced (structured event +
+  the same warning), because it records observed state, not verified
+  intent.
+  **This deliberately diverges from dispatcher's fail-closed at their
+  analogous seam** ("predates checkout binding, re-submit"), and the
+  divergence is priced, not accidental: a dispatcher request is cheap to
+  recreate, while a Maestro run *exists* — it has state, and a refused
+  resume would strand it forever. Both decisions are correct where they
+  stand; anyone later "harmonizing" them into one rule would be turning
+  one of them into a bug.
 - With `--db` there may be no run row at all (legacy/manual databases).
   Then resume verification falls back to the config-derived name with an
   explicit warning that the record is absent. Documented limitation of
@@ -189,7 +233,11 @@ already trusts (#166: the late check is the guarantee):
 - Mismatch → no spawn; the run **suspends** (`suspended_at` +
   `suspend_reason`, spec §B.1.1 — resumable, not an outcome), and the
   refusal text goes to stderr. Tasks already running are not killed —
-  the same drain philosophy as #166's first-signal behavior.
+  the same drain philosophy as #166's first-signal behavior. Confirmed
+  by the consumer (answer 2): a kill loses the task's result and leaves
+  partial edits in the tree — the very mess the gate protects against —
+  and their console renders `suspended` as resumable, where a killed run
+  would read as breakage.
 - Resume then passes through §6's verification as usual.
 
 Phase B ships as a separate PR on the same spec. Phase A alone closes
@@ -218,21 +266,30 @@ first instant.
 - Publication-ordering test: a refusing gate leaves `runs/` empty and
   `resolve_runs` blind (no staging residue).
 - Resume tests: record honored over config; mismatch refuses before
-  recovery (recovery mock asserts zero calls); NULL record warns and
-  proceeds; `--db` fallback warns.
+  recovery (recovery mock asserts zero calls); NULL record warns,
+  adopts the observed branch, and proceeds — and a second resume then
+  verifies against the adopted record; `--db` fallback warns.
 - Phase B: mid-run branch flip → no further spawns, run suspended,
   running task untouched.
 - The opt-out path (no `run_branch`) byte-identical: existing suite
   green without modification is the evidence, as with every recent gate.
 
-## 10. Open questions for review
+## 10. Rollout and review resolutions
 
-1. **Fresh-start cleanliness on "already on `B`"** (§4): strict refusal
-   is specified; if the pilot needs "dirty but already on the run
-   branch" to pass, that row can be relaxed to a warning without
-   touching the rest.
-2. **Phase B suspension vs. hard stop:** suspension keeps running tasks
-   alive (drain); if the consumer would rather kill on tripwire, say so
-   — the mechanism is the same, the policy differs.
-3. **`{run_id}` templating:** deferred here; a consumer with a
-   one-branch-per-run need should claim it with a use case.
+**Rollout (coordination with the pilot, consumer remark 4):** when
+phase A lands, the pilot's temporary scheme is **replaced, not kept**.
+deployer#35 put a first DAG task that asserts "on `pilot/<slug>`, tree
+clean"; once the runtime gate fires earlier, that task checks the
+already-guaranteed and becomes a relic that drifts from reality — the
+next DAG reader cannot tell which of the two checks is the real one.
+Removing it is a dispatcher/deployer-side step and belongs in their
+adoption of phase A; recorded here so neither side treats coexistence
+as the plan.
+
+**Review resolutions (revision 2 — dispatcher, issue #216):** the three
+questions §10 used to hold are closed, with the reasoning folded into
+their sections:
+
+1. Fresh-start cleanliness stays **strict** on every path (§4).
+2. Phase B **suspends**, never kills (§7).
+3. `{run_id}` templating **rejected** (§3).
