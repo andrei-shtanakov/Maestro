@@ -768,7 +768,7 @@ class TestRunBranchGateStart:
         # checkout is still on the branch `_init_git_repo` left it on.
         assert _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD") == "master"
 
-    async def test_fresh_run_creates_branch_and_records_binding(
+    async def test_db_fresh_run_creates_and_switches_branch(
         self, temp_dir: Path
     ) -> None:
         config_path = _write_scheduler_config(
@@ -954,8 +954,12 @@ class TestRunBranchGateContinuation:
         run: str | None = None,
         accept_branch_tip: bool = False,
         recovery_cls: MagicMock | None = None,
-    ) -> MagicMock:
-        """Drive `_run_scheduler` with everything past the gate mocked out."""
+    ) -> AsyncMock:
+        """Drive `_run_scheduler` with everything past the gate mocked out.
+
+        Returns the `create_scheduler_from_config` mock, so a caller can read
+        back what the run wired into the scheduler.
+        """
         scheduler_instance = MagicMock()
         scheduler_instance.run = AsyncMock(return_value=None)
         recovery = recovery_cls if recovery_cls is not None else MagicMock()
@@ -967,7 +971,7 @@ class TestRunBranchGateContinuation:
                 "maestro.cli.create_scheduler_from_config",
                 new_callable=AsyncMock,
                 return_value=scheduler_instance,
-            ),
+            ) as mock_create,
             patch("maestro.cli.StateRecovery", recovery),
             patch("maestro.cli._acquire_pid_lock", return_value=99),
             patch("maestro.cli._release_pid_lock"),
@@ -981,7 +985,7 @@ class TestRunBranchGateContinuation:
                 run=run,
                 accept_branch_tip=accept_branch_tip,
             )
-        return recovery
+        return mock_create
 
     async def test_wrong_branch_refuses_before_recovery(self, temp_dir: Path) -> None:
         config_path = _write_scheduler_config(
@@ -1097,7 +1101,7 @@ class TestRunBranchGateContinuation:
         _git(repo_dir, "switch", "pilot/x")
         tip = _git(repo_dir, "rev-parse", "refs/heads/pilot/x")
 
-        await self._run(config_path, db_path=db_path, resume=True)
+        mock_create = await self._run(config_path, db_path=db_path, resume=True)
 
         row = await _read_run_row(db_path)
         assert (
@@ -1109,6 +1113,18 @@ class TestRunBranchGateContinuation:
             1,
             tip,
         )
+        # The adopting session must itself maintain `run_branch_head`: if it
+        # runs unbound, the tip goes unrecorded for its whole length and the
+        # next continuation refuses `resume_stale_checkout` over this run's
+        # own commits.
+        assert mock_create.call_args.kwargs["on_auto_commit"] is not None
+
+        # And the adopted record is what the NEXT continuation verifies
+        # against — the binding closed the hole for good, not for one run
+        # (spec §9).
+        await self._run(config_path, db_path=db_path, resume=True)
+
+        assert (await _read_run_row(db_path))["run_branch_head"] == tip
 
     async def test_legacy_null_without_config_backfills_declared_zero(
         self, temp_dir: Path, capsys: pytest.CaptureFixture[str]
@@ -1325,6 +1341,33 @@ class TestRunBranchGateContinuation:
         captured = capsys.readouterr()
         # Named by the gate itself, not merely by the closing git summary.
         assert "uncommitted paths will ride into task commits: a.txt" in captured.err
+
+    async def test_plain_db_continuation_runs_recovery(self, temp_dir: Path) -> None:
+        """The `--db` half of the recovery re-key: a branch-bound database
+        selected without `--resume`/`--run` still reconciles what a crash
+        stranded, or the gate would bless an invocation that then stalls
+        forever (spec §6, round-5 major 1)."""
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        _git(repo_dir, "switch", "-c", "pilot/x")
+        tip = _git(repo_dir, "rev-parse", "refs/heads/pilot/x")
+        db_path = temp_dir / "test.db"
+        await _seed_run_row(
+            db_path,
+            branch="pilot/x",
+            declared=1,
+            head=tip,
+            task_status=TaskStatus.RUNNING,
+        )
+        recovery_cls = self._recovery_class_mock()
+
+        await self._run(config_path, db_path=db_path, recovery_cls=recovery_cls)
+
+        recovery_cls.assert_called_once()
+        recovery_cls.return_value.recover.assert_awaited_once()
 
     async def test_continuation_selector_runs_recovery(
         self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch

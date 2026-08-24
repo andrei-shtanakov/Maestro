@@ -646,6 +646,20 @@ async def _verify_run_branch_continuation(
                 accept_tip=False,
             )
             await db.set_run_branch_binding(branch=configured, declared=1, head=tip)
+            # The caller reads the returned row to decide whether this session
+            # maintains `run_branch_head` (its `on_auto_commit` hook), so the
+            # row must describe the state AFTER adoption. Returning the
+            # pre-adoption snapshot left the adopted session unbound: the tip
+            # went unrecorded for its whole length, and the NEXT continuation
+            # then refused `resume_stale_checkout` over this run's own
+            # commits — the exact hole adoption exists to close. Patched
+            # rather than re-read: these three keys are precisely what the
+            # UPDATE above sets, and saying so is clearer than a second query.
+            row |= {
+                "run_branch": configured,
+                "run_branch_declared": 1,
+                "run_branch_head": tip,
+            }
             err_console.print(
                 "[yellow]run-branch gate: legacy run adopted binding to "
                 f"{escape(configured)} (verified against the config; record "
