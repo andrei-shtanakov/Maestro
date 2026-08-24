@@ -899,7 +899,12 @@
       то, как dispatcher сюда попал; популяция Mode-1 DAG маленькая и своя,
       правка в каждом — одна строка. В сообщении об отказе указать замену:
       run-level изоляция (`@id:mode1-branch-isolation`, issue #216 часть 2).
-- [ ] **mode1-branch-isolation**: run-level контракт изоляции ветки для Mode 1 @owner:github:andrei-shtanakov @id:mode1-branch-isolation
+- [x] **mode1-branch-isolation**: run-level контракт изоляции ветки для Mode 1 @owner:github:andrei-shtanakov @id:mode1-branch-isolation
+      (closed 2026-08-24: спека PR #221, фаза A PR #222 `8bac90c`; перегон
+      пилота dispatcher'ом подтвердил изоляцию — прогон
+      01M0T5HA1PW0J0GWTCGMZVFWW0, ветка создана гейтом без ручных
+      git-действий, master не сдвинут, durable-биндинг в run row; блокер
+      dispatcher'а разрешён работающей изоляцией, как и требовал пункт)
       Новый контракт, сначала дизайн-спека: имя (`run_branch` /
       `require_non_base_branch`), семантика (один чекаут, одна ветка на весь
       прогон), кто проверяет и кто создаёт, что делать с грязным деревом, как
@@ -917,9 +922,24 @@
       фаза B — per-dispatch tripwire; вобраны пять пунктов dispatcher'а как
       потребителя). Ревью: владелец + dispatcher; реализация только после
       одобрения спеки.
-      Фаза A реализована (PR #222): гейт+запись+continuation-верификация;
-      фаза B (tripwire) — отдельный PR. Пункт держит блокер dispatcher'а до
-      перегона пилота.
+      Фаза A реализована (PR #222): гейт+запись+continuation-верификация.
+      Хвост приёмки: события §8 run_branch_gate.{created,verified,refused}
+      дореализованы (feat/run-branch-gate-events) — третий след изоляции,
+      на котором dispatcher строил приёмочную проверку.
+- [ ] **mode1-run-branch-tripwire**: фаза B run-branch гейта — state-tripwire на каждом checkout-шве @owner:github:andrei-shtanakov @id:mode1-run-branch-tripwire
+      Спека §7 (та же
+      `docs/superpowers/specs/2026-08-24-mode1-run-branch-isolation-design.md`):
+      проверка «имя ветки И tip == записи» перед КАЖДЫМ использованием
+      чекаута — спавн, запуск validation, verifier preflight,
+      auto-commit+DONE (порядок success-хвоста: tripwire → auto-commit →
+      DONE, задача остаётся pre-terminal при suspend); mismatch → suspend с
+      drain'ом (kill отвергнут потребителем). Инвентарь швов test-asserted.
+      Сюда же — спек-ревизия §6/§8 под фактическое состояние: R14
+      (атрибуция вместо graceful-stop refresh; цена — agent-committing
+      прогоны через --accept-branch-tip, повторно найдено codex-раундом 4
+      PR #222) и событийная поверхность §8 (реализована logger-based).
+      Закрывает известные mid-run окна фазы A: чужое движение ветки/грязь
+      посреди живого прогона (codex-находки, отложенные в фазу B по спеке).
 
 ---
 

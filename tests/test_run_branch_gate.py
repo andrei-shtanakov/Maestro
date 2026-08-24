@@ -1,5 +1,6 @@
 """Tests for maestro/run_branch_gate.py — spec §4 start matrix."""
 
+import logging
 import subprocess
 from pathlib import Path
 
@@ -146,4 +147,72 @@ class TestVerifyContinuation:
         apply_start_gate(repo, run_branch="pilot/x", base_branch="master")
         verify_continuation(
             repo, RunBranchRecord(branch="pilot/x", head=None), accept_tip=False
+        )
+
+
+class TestGateEvents:
+    """Spec §8: run_branch_gate.{created,verified,refused} through the obs
+    pipeline (module logger -> logging_bridge). Best-effort telemetry; the
+    stderr text remains the contract — but the pilot's acceptance built on
+    these traces (issue #216), so they are asserted, not assumed."""
+
+    def _messages(self, caplog: pytest.LogCaptureFixture) -> list[str]:
+        return [r.getMessage() for r in caplog.records]
+
+    def test_create_emits_created(
+        self, repo: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.INFO, logger="maestro.run_branch_gate"):
+            apply_start_gate(repo, run_branch="pilot/x", base_branch="master")
+        assert any("run_branch_gate.created" in m for m in self._messages(caplog))
+
+    def test_proceed_emits_verified(
+        self, repo: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        apply_start_gate(repo, run_branch="pilot/x", base_branch="master")
+        with caplog.at_level(logging.INFO, logger="maestro.run_branch_gate"):
+            apply_start_gate(repo, run_branch="pilot/x", base_branch="master")
+        messages = self._messages(caplog)
+        assert any("run_branch_gate.verified" in m for m in messages)
+        assert not any("run_branch_gate.created" in m for m in messages)
+
+    def test_start_refusal_emits_refused_with_reason(
+        self, repo: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        (repo / "a.txt").write_text("edited")
+        with (
+            caplog.at_level(logging.INFO, logger="maestro.run_branch_gate"),
+            pytest.raises(RunBranchGateError),
+        ):
+            apply_start_gate(repo, run_branch="pilot/x", base_branch="master")
+        assert any(
+            "run_branch_gate.refused" in m and "dirty_tree" in m
+            for m in self._messages(caplog)
+        )
+
+    def test_continuation_success_emits_verified(
+        self, repo: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        tip = apply_start_gate(repo, run_branch="pilot/x", base_branch="master")
+        with caplog.at_level(logging.INFO, logger="maestro.run_branch_gate"):
+            verify_continuation(
+                repo, RunBranchRecord(branch="pilot/x", head=tip), accept_tip=False
+            )
+        assert any("run_branch_gate.verified" in m for m in self._messages(caplog))
+
+    def test_continuation_refusal_emits_refused(
+        self, repo: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        tip = apply_start_gate(repo, run_branch="pilot/x", base_branch="master")
+        _git(repo, "switch", "master")
+        with (
+            caplog.at_level(logging.INFO, logger="maestro.run_branch_gate"),
+            pytest.raises(RunBranchGateError),
+        ):
+            verify_continuation(
+                repo, RunBranchRecord(branch="pilot/x", head=tip), accept_tip=False
+            )
+        assert any(
+            "run_branch_gate.refused" in m and "resume_branch_mismatch" in m
+            for m in self._messages(caplog)
         )

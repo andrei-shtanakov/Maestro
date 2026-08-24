@@ -7,6 +7,7 @@ Design doc: docs/superpowers/specs/2026-08-24-mode1-run-branch-isolation-design.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from dataclasses import dataclass
 from enum import Enum
@@ -15,6 +16,14 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+# Spec §8 events (run_branch_gate.created/.verified/.refused) flow through
+# the stdlib logger into the obs JSONL pipeline via logging_bridge. INFO on
+# purpose, refusals included: WARNING+ is mirrored to stderr by the bridge,
+# and the refusal already reaches the operator once via err_console — the
+# events are telemetry, the stderr text is the contract.
+_log = logging.getLogger(__name__)
 
 
 class RunBranchGateError(Exception):
@@ -120,20 +129,31 @@ def branch_tip(workdir: Path, branch: str) -> str:
 
 def apply_start_gate(workdir: Path, *, run_branch: str, base_branch: str) -> str:
     """Decide per §4 and execute the one allowed action. Returns the tip sha."""
-    snap = read_snapshot(workdir, run_branch)
-    action = decide_start(snap, run_branch=run_branch, base_branch=base_branch)
-    if action is StartAction.SWITCH:
-        result = _run_git(workdir, "switch", run_branch)
-    elif action is StartAction.CREATE:
-        result = _run_git(workdir, "switch", "-c", run_branch)
-    else:
-        result = None
-    if result is not None and result.returncode != 0:
-        raise RunBranchGateError(
-            "wrong_start_point",
-            f"git switch failed: {result.stderr.strip()}",
-        )
-    return branch_tip(workdir, run_branch)
+    try:
+        snap = read_snapshot(workdir, run_branch)
+        action = decide_start(snap, run_branch=run_branch, base_branch=base_branch)
+        if action is StartAction.SWITCH:
+            result = _run_git(workdir, "switch", run_branch)
+        elif action is StartAction.CREATE:
+            result = _run_git(workdir, "switch", "-c", run_branch)
+        else:
+            result = None
+        if result is not None and result.returncode != 0:
+            raise RunBranchGateError(
+                "wrong_start_point",
+                f"git switch failed: {result.stderr.strip()}",
+            )
+        tip = branch_tip(workdir, run_branch)
+    except RunBranchGateError as e:
+        _log.info("run_branch_gate.refused reason=%s branch=%s", e.reason, run_branch)
+        raise
+    event = (
+        "run_branch_gate.created"
+        if action is StartAction.CREATE
+        else "run_branch_gate.verified"
+    )
+    _log.info("%s branch=%s action=%s tip=%s", event, run_branch, action.value, tip)
+    return tip
 
 
 @dataclass(frozen=True)
@@ -153,20 +173,32 @@ def verify_continuation(
     caller's warning). Dirtiness NEVER refuses here — spec §6's priced
     hole: a crashed run legitimately leaves uncommitted work.
     """
-    snap = read_snapshot(workdir, record.branch)
-    if snap.current_branch != record.branch:
-        raise RunBranchGateError(
-            "resume_branch_mismatch",
-            f"run is bound to {record.branch!r} but the checkout is on "
-            f"{snap.current_branch!r}; run: git switch {record.branch}",
+    try:
+        snap = read_snapshot(workdir, record.branch)
+        if snap.current_branch != record.branch:
+            raise RunBranchGateError(
+                "resume_branch_mismatch",
+                f"run is bound to {record.branch!r} but the checkout is on "
+                f"{snap.current_branch!r}; run: git switch {record.branch}",
+            )
+        tip = branch_tip(workdir, record.branch)
+        if record.head is not None and tip != record.head and not accept_tip:
+            raise RunBranchGateError(
+                "resume_stale_checkout",
+                f"branch {record.branch!r} tip moved: recorded "
+                f"{record.head[:12]}, observed {tip[:12]} — the state advanced "
+                "under this run. Resume the newest run, or re-run with "
+                "--accept-branch-tip after inspecting the delta",
+            )
+    except RunBranchGateError as e:
+        _log.info(
+            "run_branch_gate.refused reason=%s branch=%s", e.reason, record.branch
         )
-    tip = branch_tip(workdir, record.branch)
-    if record.head is not None and tip != record.head and not accept_tip:
-        raise RunBranchGateError(
-            "resume_stale_checkout",
-            f"branch {record.branch!r} tip moved: recorded {record.head[:12]}, "
-            f"observed {tip[:12]} — the state advanced under this run. Resume "
-            "the newest run, or re-run with --accept-branch-tip after "
-            "inspecting the delta",
-        )
+        raise
+    _log.info(
+        "run_branch_gate.verified branch=%s tip=%s dirty=%d",
+        record.branch,
+        tip,
+        len(snap.dirty_paths),
+    )
     return tip, snap.dirty_paths
