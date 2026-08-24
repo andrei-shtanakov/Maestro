@@ -897,10 +897,13 @@
 
 ## codex-review: потребитель кита steward (принят 2026-08-24)
 
-- [ ] PR-B: caller-workflow гейта codex-review (по образцу пилота spec-runner:
+- [x] PR-B: caller-workflow гейта codex-review (по образцу пилота spec-runner:
       механика из base, потолки, generated-декларация, экономный триггер по
       драфту/лейблу) + лейбл `codex-review` + секрет `CODEX_REVIEW_API_KEY`
-      (кладёт владелец в настройки репо) — после мержа PR-A
+      (кладёт владелец в настройки репо) — после мержа PR-A — влит #214
+      (`a2438c4`, 2026-08-24); приёмка одним платным прогоном; major про
+      metadata-события отклонён с доводом (влит поверх красного), довод
+      дописан у продюсера (steward#112) и приехал сюда синком caller'а
       @owner:github:andrei-shtanakov @id:codex-review-caller
 
   PR-A (этот): кит завендорен — `scripts/review/` (5 скриптов) +
