@@ -7,23 +7,30 @@ Design doc: docs/superpowers/specs/2026-08-24-mode1-run-branch-isolation-design.
 
 from __future__ import annotations
 
-import logging
 import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
+
+from maestro._vendor import obs
 
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 
-# Spec §8 events (run_branch_gate.created/.verified/.refused) flow through
-# the stdlib logger into the obs JSONL pipeline via logging_bridge. INFO on
-# purpose, refusals included: WARNING+ is mirrored to stderr by the bridge,
-# and the refusal already reaches the operator once via err_console — the
-# events are telemetry, the stderr text is the contract.
-_log = logging.getLogger(__name__)
+def _emit(event: str, **attrs: object) -> None:
+    """Spec §8 events (run_branch_gate.created/.verified/.refused) as
+    STRUCTURED obs records: the event name lands in `Attributes.event` and
+    the kwargs become attributes, so post-mortems can filter by name instead
+    of grepping body text (codex on PR #223). The logger is fetched per call
+    — a module-level lazy proxy would cache whatever structlog configuration
+    is active at first emission (`cache_logger_on_first_use=True` under
+    `obs.init_logging`) and blind later `capture_logs()` consumers; the
+    bridge takes the same per-record approach. Telemetry only — the stderr
+    text remains the operator contract.
+    """
+    obs.get_logger("maestro.run_branch_gate").info(event, **attrs)
 
 
 class RunBranchGateError(Exception):
@@ -145,14 +152,14 @@ def apply_start_gate(workdir: Path, *, run_branch: str, base_branch: str) -> str
             )
         tip = branch_tip(workdir, run_branch)
     except RunBranchGateError as e:
-        _log.info("run_branch_gate.refused reason=%s branch=%s", e.reason, run_branch)
+        _emit("run_branch_gate.refused", reason=e.reason, branch=run_branch)
         raise
     event = (
         "run_branch_gate.created"
         if action is StartAction.CREATE
         else "run_branch_gate.verified"
     )
-    _log.info("%s branch=%s action=%s tip=%s", event, run_branch, action.value, tip)
+    _emit(event, branch=run_branch, action=action.value, tip=tip)
     return tip
 
 
@@ -191,14 +198,12 @@ def verify_continuation(
                 "--accept-branch-tip after inspecting the delta",
             )
     except RunBranchGateError as e:
-        _log.info(
-            "run_branch_gate.refused reason=%s branch=%s", e.reason, record.branch
-        )
+        _emit("run_branch_gate.refused", reason=e.reason, branch=record.branch)
         raise
-    _log.info(
-        "run_branch_gate.verified branch=%s tip=%s dirty=%d",
-        record.branch,
-        tip,
-        len(snap.dirty_paths),
+    _emit(
+        "run_branch_gate.verified",
+        branch=record.branch,
+        tip=tip,
+        dirty=len(snap.dirty_paths),
     )
     return tip, snap.dirty_paths
