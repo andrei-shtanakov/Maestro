@@ -11,6 +11,7 @@ This module provides a command-line interface using Typer for:
 import asyncio
 import contextlib
 import fcntl
+import logging
 import os
 import shutil
 import signal
@@ -96,7 +97,12 @@ from maestro.review_workspace import (
     recover_push,
 )
 from maestro.run_bootstrap import RunIsLive, bootstrap_run
-from maestro.run_branch_gate import RunBranchGateError, apply_start_gate
+from maestro.run_branch_gate import (
+    RunBranchGateError,
+    RunBranchRecord,
+    apply_start_gate,
+    verify_continuation,
+)
 from maestro.run_lifecycle import (
     OPERATOR_ENDINGS,
     RunConclusion,
@@ -191,6 +197,8 @@ _CONFIG_OPTION_HELP = (
 # Rich console for pretty output
 console = Console()
 err_console = Console(stderr=True)
+
+logger = logging.getLogger(__name__)
 
 # Typer app
 service_app = typer.Typer(
@@ -554,6 +562,101 @@ def _print_validation_report(report: ValidationReport) -> None:
     console.print(f"[{style}]{summary}[/{style}]")
 
 
+def _warn_dirty_continuation(dirty: list[str]) -> None:
+    """Name the uncommitted paths a continuation will carry (spec §6).
+
+    §6's priced hole: continuation never refuses over a dirty tree — a
+    crashed run legitimately leaves uncommitted task work — so what the gate
+    owes the operator here is visibility, not a block.
+    """
+    if not dirty:
+        return
+    shown = ", ".join(escape(path) for path in dirty[:10])
+    err_console.print(
+        "[yellow]run-branch gate: uncommitted paths will ride into task "
+        f"commits: {shown}[/yellow]",
+        soft_wrap=True,
+    )
+
+
+async def _verify_run_branch_continuation(
+    db: Database,
+    *,
+    workdir: Path,
+    configured: str | None,
+    selected_by_flag: bool,
+    accept_branch_tip: bool,
+) -> dict[str, object] | None:
+    """§6's three-state record check, run before recovery. Returns the run row.
+
+    The branch is read from the run row and verified against the checkout —
+    never re-derived from the config, which may have been edited since (#198's
+    territory). `selected_by_flag` is "`--resume` or `--run <id>` was typed",
+    the invocations for which a missing run row is a refusal rather than an
+    ordinary ungated `--db`.
+    """
+    row = await db.get_run_row()
+    if row is None:
+        if configured is not None and selected_by_flag:
+            raise RunBranchGateError(
+                "record_missing",
+                "this database has no run row, so its branch binding is "
+                "unknown; resume through the resolver path, or drop "
+                "git.run_branch to run it ungated",
+            )
+        return None
+
+    declared = row.get("run_branch_declared")
+    if declared == 1:
+        head = row.get("run_branch_head")
+        record = RunBranchRecord(
+            branch=str(row["run_branch"]),
+            head=str(head) if head else None,
+        )
+        tip, dirty = verify_continuation(workdir, record, accept_tip=accept_branch_tip)
+        if accept_branch_tip and record.head != tip:
+            # The operator's explicit statement that the delta is this run's
+            # own work — audited, never automatic (spec §6).
+            await db.update_run_branch_head(tip)
+            logger.warning(
+                "run_branch.tip_accepted branch=%s recorded=%s observed=%s",
+                record.branch,
+                record.head,
+                tip,
+            )
+            err_console.print(
+                f"[yellow]run-branch gate: re-recorded {escape(record.branch)} "
+                f"tip as {tip[:12]} (--accept-branch-tip)[/yellow]",
+                soft_wrap=True,
+            )
+        _warn_dirty_continuation(dirty)
+    elif declared is None:
+        # A true pre-migration row: the record is absent, so the only intent
+        # available is the config's — and adoption verifies against it first,
+        # so an accidental resume can never durably bind the run to whatever
+        # branch happened to be checked out (spec §6, round-5 major 3).
+        if configured is None:
+            await db.set_run_branch_declared(0)
+        else:
+            tip, dirty = verify_continuation(
+                workdir,
+                RunBranchRecord(branch=configured, head=None),
+                accept_tip=False,
+            )
+            await db.set_run_branch_binding(branch=configured, declared=1, head=tip)
+            err_console.print(
+                "[yellow]run-branch gate: legacy run adopted binding to "
+                f"{escape(configured)} (verified against the config; record "
+                "was pre-migration)[/yellow]",
+                soft_wrap=True,
+            )
+            _warn_dirty_continuation(dirty)
+    # declared == 0: the run opted out at creation — genuinely silent, no
+    # warning and no adoption (spec §6). Adding `run_branch` to the config
+    # later takes effect on the next *fresh* run, never mid-run.
+    return row
+
+
 async def _run_scheduler(
     config_path: Path,
     db_path: Path | None,
@@ -561,6 +664,7 @@ async def _run_scheduler(
     log_dir: Path | None,
     clean: bool = False,
     run: str | None = None,
+    accept_branch_tip: bool = False,
 ) -> None:
     """Run the scheduler with the given configuration."""
     # Load configuration
@@ -616,7 +720,20 @@ async def _run_scheduler(
         # which `bootstrap_run` reaches through the same `identity_from_config`
         # rule Mode 2 uses. `--db` is an explicit override that skips the resolver.
         resolved_db_path = db_path
-        fresh_start = not resume and run is None
+        # Continuation = an existing run was selected, however it was selected
+        # (spec §2) — `--resume`, `--run <id>`, or a plain `--db` naming a
+        # database that already exists, which continues its task state today
+        # whether or not `--resume` was typed. `--clean` discards the state
+        # there would be to continue, so that invocation is a fresh start and
+        # takes the §4 start gate instead (spec §6); it only means anything
+        # against an explicitly named `--db`, which is why it cancels
+        # continuation only there.
+        clean_effective = clean and db_path is not None
+        db_has_state = db_path is not None and db_path.exists()  # noqa: ASYNC240
+        continuation_selected = (
+            resume or run is not None or db_has_state
+        ) and not clean_effective
+        fresh_start = not continuation_selected
         if resolved_db_path is None:
             try:
                 bootstrap = await bootstrap_run(
@@ -692,6 +809,32 @@ async def _run_scheduler(
 
         # Create or connect to database
         db = await create_database(resolved_db_path)
+
+        # Verification precedes recovery, deliberately (spec §6): Mode-1
+        # recovery is not checkout-neutral — finalizing open handles collects
+        # task results into the working tree, and collecting onto the wrong
+        # branch is exactly "acting in the wrong place". On a refusal nothing
+        # runs, recovery included, and all state is left untouched.
+        run_row: dict[str, object] | None = None
+        try:
+            if continuation_selected:
+                run_row = await _verify_run_branch_continuation(
+                    db,
+                    workdir=workdir,
+                    configured=git_cfg.run_branch if git_cfg is not None else None,
+                    selected_by_flag=resume or run is not None,
+                    accept_branch_tip=accept_branch_tip,
+                )
+        except BaseException as e:
+            # The database is opened before this check and its `finally` close
+            # only starts below: an unclosed aiosqlite connection would leak a
+            # thread and a ResourceWarning on every refusal.
+            await db.close()
+            if isinstance(e, RunBranchGateError):
+                err_console.print(f"[red]run-branch gate:[/red] {e}")
+                raise typer.Exit(1) from e
+            raise
+
         notifications: NotificationManager | None = None
 
         # R-03: pick routing strategy. StaticRouting if cfg.arbiter is None or
@@ -719,8 +862,14 @@ async def _run_scheduler(
                 log_dir = resolved_db_path.parent / "logs"
             create_event_logger(log_dir)
 
-            # Check if resuming
-            if resume:
+            # Check if continuing an existing run. Keyed off selection, not
+            # off `--resume` (spec §6, round-5 major 1): a `--run <id>` or
+            # plain `--db` continuation that skipped recovery would open the
+            # database and then stall — crash-stranded RUNNING/VALIDATING rows
+            # never reconciled, never re-spawned, never complete. A `--db`
+            # database with no run row keeps the old behaviour: its provenance
+            # is unknown, so only an explicit `--resume` reconciles it.
+            if continuation_selected and (run_row is not None or resume):
                 existing_tasks = await db.get_all_tasks()
                 if existing_tasks:
                     console.print(
@@ -1153,6 +1302,16 @@ def run_command(
         str | None,
         typer.Option("--run", help=_RUN_OPTION_HELP),
     ] = None,
+    accept_branch_tip: Annotated[
+        bool,
+        typer.Option(
+            "--accept-branch-tip",
+            help=(
+                "Re-record the run branch tip after inspecting an unexpected "
+                "advance (audited)"
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Run tasks from a YAML configuration file.
 
@@ -1170,7 +1329,9 @@ def run_command(
     setup_logging("maestro")
 
     try:
-        asyncio.run(_run_scheduler(config, db, resume, log_dir, clean, run))
+        asyncio.run(
+            _run_scheduler(config, db, resume, log_dir, clean, run, accept_branch_tip)
+        )
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user[/yellow]")
         raise typer.Exit(130) from None

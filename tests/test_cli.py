@@ -33,6 +33,8 @@ from maestro.cli import (
 )
 from maestro.database import create_database
 from maestro.models import AgentType, Task, TaskStatus, Workstream, WorkstreamConfig
+from maestro.repo_identity import identity_from_checkout
+from maestro.run_publish import create_run
 from maestro.state_paths import maestro_home
 
 
@@ -114,6 +116,50 @@ def _init_git_repo(repo_dir: Path) -> None:
     (repo_dir / "a.txt").write_text("a")
     _git(repo_dir, "add", "a.txt")
     _git(repo_dir, "commit", "-m", "init")
+
+
+async def _seed_run_row(
+    db_path: Path,
+    *,
+    branch: str | None,
+    declared: int | None,
+    head: str | None,
+    task_status: TaskStatus | None = None,
+) -> None:
+    """Create a database carrying exactly one run row with `branch`'s binding."""
+    db = await create_database(db_path)
+    try:
+        await db.create_run_row(
+            run_id="01SEEDRUN",
+            repo_key="_local/seed",
+            started_at="2026-08-24T09:00:00+00:00",
+            run_branch=branch,
+            run_branch_declared=declared,
+            run_branch_head=head,
+        )
+        if task_status is not None:
+            await db.create_task(
+                Task(
+                    id="t1",
+                    title="T1",
+                    prompt="do work",
+                    workdir=str(db_path.parent),
+                    status=task_status,
+                )
+            )
+    finally:
+        await db.close()
+
+
+async def _read_run_row(db_path: Path) -> dict[str, object]:
+    """Read the run row back, closing the connection before asserting on it."""
+    db = await create_database(db_path)
+    try:
+        row = await db.get_run_row()
+    finally:
+        await db.close()
+    assert row is not None
+    return row
 
 
 async def _seed_workstream(db_path: Path, workstream_id: str) -> None:
@@ -732,6 +778,381 @@ class TestRunBranchGateStart:
 
         assert excinfo.value.exit_code == 1
         assert not db_path.exists()
+
+
+class TestRunBranchGateContinuation:
+    """Task 7: continuation of an existing run verifies the recorded binding
+    against the checkout BEFORE recovery (spec §6). "Continuation" is defined
+    by selection — `--resume`, `--run <id>`, or a plain `--db` naming a
+    database that already exists — never by the `--resume` flag alone, and
+    `--clean` takes the fresh-start gate instead because it discards the very
+    state there would be to continue."""
+
+    def _recovery_class_mock(self) -> MagicMock:
+        """A stand-in for `maestro.cli.StateRecovery` that records use."""
+        instance = MagicMock()
+        instance.needs_recovery = AsyncMock(return_value=True)
+        instance.recover = AsyncMock(
+            return_value=SimpleNamespace(
+                running_recovered=1,
+                validating_recovered=0,
+                verifying_recovered=0,
+                total_recovered=1,
+                tasks_done=0,
+            )
+        )
+        return MagicMock(return_value=instance)
+
+    async def _run(
+        self,
+        config_path: Path,
+        *,
+        db_path: Path | None = None,
+        resume: bool = False,
+        clean: bool = False,
+        run: str | None = None,
+        accept_branch_tip: bool = False,
+        recovery_cls: MagicMock | None = None,
+    ) -> MagicMock:
+        """Drive `_run_scheduler` with everything past the gate mocked out."""
+        scheduler_instance = MagicMock()
+        scheduler_instance.run = AsyncMock(return_value=None)
+        recovery = recovery_cls if recovery_cls is not None else MagicMock()
+
+        with (
+            patch("maestro.cli.create_event_logger"),
+            patch("maestro.cli.make_routing_strategy", new_callable=AsyncMock),
+            patch(
+                "maestro.cli.create_scheduler_from_config",
+                new_callable=AsyncMock,
+                return_value=scheduler_instance,
+            ),
+            patch("maestro.cli.StateRecovery", recovery),
+            patch("maestro.cli._acquire_pid_lock", return_value=99),
+            patch("maestro.cli._release_pid_lock"),
+        ):
+            await _run_scheduler(
+                config_path=config_path,
+                db_path=db_path,
+                resume=resume,
+                log_dir=None,
+                clean=clean,
+                run=run,
+                accept_branch_tip=accept_branch_tip,
+            )
+        return recovery
+
+    async def test_wrong_branch_refuses_before_recovery(self, temp_dir: Path) -> None:
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        _git(repo_dir, "branch", "pilot/x")
+        tip = _git(repo_dir, "rev-parse", "refs/heads/pilot/x")
+        db_path = temp_dir / "test.db"
+        # A RUNNING task is what recovery exists for: absent the refusal this
+        # invocation would construct `StateRecovery`.
+        await _seed_run_row(
+            db_path,
+            branch="pilot/x",
+            declared=1,
+            head=tip,
+            task_status=TaskStatus.RUNNING,
+        )
+        recovery_cls = self._recovery_class_mock()
+
+        with pytest.raises(typer.Exit) as excinfo:
+            await self._run(
+                config_path, db_path=db_path, resume=True, recovery_cls=recovery_cls
+            )
+
+        assert excinfo.value.exit_code == 1
+        recovery_cls.assert_not_called()
+        assert _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD") == "master"
+
+    async def test_moved_tip_refuses_and_flag_re_records(self, temp_dir: Path) -> None:
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        _git(repo_dir, "switch", "-c", "pilot/x")
+        recorded = _git(repo_dir, "rev-parse", "refs/heads/pilot/x")
+        (repo_dir / "b.txt").write_text("b")
+        _git(repo_dir, "add", "b.txt")
+        _git(repo_dir, "commit", "-m", "foreign")
+        moved = _git(repo_dir, "rev-parse", "refs/heads/pilot/x")
+        assert moved != recorded
+        db_path = temp_dir / "test.db"
+        await _seed_run_row(db_path, branch="pilot/x", declared=1, head=recorded)
+
+        with pytest.raises(typer.Exit) as excinfo:
+            await self._run(config_path, db_path=db_path, resume=True)
+
+        assert excinfo.value.exit_code == 1
+        assert (await _read_run_row(db_path))["run_branch_head"] == recorded
+
+        await self._run(
+            config_path, db_path=db_path, resume=True, accept_branch_tip=True
+        )
+
+        assert (await _read_run_row(db_path))["run_branch_head"] == moved
+
+    async def test_declared_zero_resume_is_silent(
+        self, temp_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        db_path = temp_dir / "test.db"
+        await _seed_run_row(db_path, branch=None, declared=0, head=None)
+
+        await self._run(config_path, db_path=db_path, resume=True)
+
+        captured = capsys.readouterr()
+        assert "run-branch" not in captured.out + captured.err
+        row = await _read_run_row(db_path)
+        assert (
+            row["run_branch"],
+            row["run_branch_declared"],
+            row["run_branch_head"],
+        ) == (
+            None,
+            0,
+            None,
+        )
+
+    async def test_legacy_null_adopts_only_matching_config(
+        self, temp_dir: Path
+    ) -> None:
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        _git(repo_dir, "branch", "pilot/x")
+        db_path = temp_dir / "test.db"
+        await _seed_run_row(db_path, branch=None, declared=None, head=None)
+
+        with pytest.raises(typer.Exit) as excinfo:
+            await self._run(config_path, db_path=db_path, resume=True)
+
+        assert excinfo.value.exit_code == 1
+        row = await _read_run_row(db_path)
+        assert row["run_branch"] is None
+        assert row["run_branch_declared"] is None
+
+        _git(repo_dir, "switch", "pilot/x")
+        tip = _git(repo_dir, "rev-parse", "refs/heads/pilot/x")
+
+        await self._run(config_path, db_path=db_path, resume=True)
+
+        row = await _read_run_row(db_path)
+        assert (
+            row["run_branch"],
+            row["run_branch_declared"],
+            row["run_branch_head"],
+        ) == (
+            "pilot/x",
+            1,
+            tip,
+        )
+
+    async def test_legacy_null_without_config_backfills_declared_zero(
+        self, temp_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        config_path = _write_scheduler_config(temp_dir)
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        db_path = temp_dir / "test.db"
+        await _seed_run_row(db_path, branch=None, declared=None, head=None)
+
+        await self._run(config_path, db_path=db_path, resume=True)
+
+        captured = capsys.readouterr()
+        assert "run-branch" not in captured.out + captured.err
+        row = await _read_run_row(db_path)
+        assert (
+            row["run_branch"],
+            row["run_branch_declared"],
+            row["run_branch_head"],
+        ) == (
+            None,
+            0,
+            None,
+        )
+
+    async def test_run_selector_without_resume_verifies(
+        self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = temp_dir / "home"
+        monkeypatch.setenv("MAESTRO_HOME", str(home))
+        monkeypatch.setenv("ORCHESTRA_PIPELINE_ID", "01TESTRUN")  # restored on teardown
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        _git(repo_dir, "branch", "pilot/x")
+        tip = _git(repo_dir, "rev-parse", "refs/heads/pilot/x")
+        key = identity_from_checkout(repo_dir)
+        await create_run(
+            key,
+            "01TESTRUN",
+            repo_key_text="/".join(key.as_path_parts()),
+            started_at="2026-08-24T09:00:00+00:00",
+            home=home,
+            run_branch="pilot/x",
+            run_branch_declared=1,
+            run_branch_head=tip,
+        )
+        recovery_cls = self._recovery_class_mock()
+
+        with pytest.raises(typer.Exit) as excinfo:
+            await self._run(config_path, run="01TESTRUN", recovery_cls=recovery_cls)
+
+        assert excinfo.value.exit_code == 1
+        recovery_cls.assert_not_called()
+
+    async def test_db_without_row_and_configured_branch_refuses(
+        self, temp_dir: Path
+    ) -> None:
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        _git(repo_dir, "switch", "-c", "pilot/x")
+        db_path = temp_dir / "test.db"
+        db = await create_database(db_path)
+        try:
+            await db.create_task(
+                Task(
+                    id="t1",
+                    title="T1",
+                    prompt="do work",
+                    workdir=str(temp_dir),
+                    status=TaskStatus.PENDING,
+                )
+            )
+        finally:
+            await db.close()
+
+        with pytest.raises(typer.Exit) as excinfo:
+            await self._run(config_path, db_path=db_path, resume=True)
+
+        assert excinfo.value.exit_code == 1
+
+    async def test_plain_db_on_existing_state_is_a_continuation(
+        self, temp_dir: Path
+    ) -> None:
+        """A `--db` naming an existing database continues its task state today
+        whether or not `--resume` was typed (spec §6), so it must verify the
+        binding — never take the start gate, which would silently `git switch`
+        the checkout onto the recorded branch."""
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        _git(repo_dir, "branch", "pilot/x")
+        tip = _git(repo_dir, "rev-parse", "refs/heads/pilot/x")
+        db_path = temp_dir / "test.db"
+        await _seed_run_row(db_path, branch="pilot/x", declared=1, head=tip)
+
+        with pytest.raises(typer.Exit) as excinfo:
+            await self._run(config_path, db_path=db_path)
+
+        assert excinfo.value.exit_code == 1
+        assert _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD") == "master"
+
+    async def test_clean_takes_start_gate_not_continuation(
+        self, temp_dir: Path
+    ) -> None:
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        _git(repo_dir, "switch", "-c", "pilot/x")
+        recorded = _git(repo_dir, "rev-parse", "refs/heads/pilot/x")
+        (repo_dir / "b.txt").write_text("b")
+        _git(repo_dir, "add", "b.txt")
+        _git(repo_dir, "commit", "-m", "foreign")
+        db_path = temp_dir / "test.db"
+        await _seed_run_row(db_path, branch="pilot/x", declared=1, head=recorded)
+
+        await self._run(config_path, db_path=db_path, clean=True)
+
+        # The named database was discarded, so the binding it carried — and
+        # the stale tip that would have refused a continuation — is gone.
+        db = await create_database(db_path)
+        try:
+            assert await db.get_run_row() is None
+        finally:
+            await db.close()
+        assert _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD") == "pilot/x"
+
+    async def test_dirty_continuation_warns_and_proceeds(
+        self, temp_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        _git(repo_dir, "switch", "-c", "pilot/x")
+        tip = _git(repo_dir, "rev-parse", "refs/heads/pilot/x")
+        (repo_dir / "a.txt").write_text("edited, uncommitted")
+        db_path = temp_dir / "test.db"
+        await _seed_run_row(db_path, branch="pilot/x", declared=1, head=tip)
+
+        await self._run(config_path, db_path=db_path, resume=True)
+
+        captured = capsys.readouterr()
+        # Named by the gate itself, not merely by the closing git summary.
+        assert "uncommitted paths will ride into task commits: a.txt" in captured.err
+
+    async def test_continuation_selector_runs_recovery(
+        self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = temp_dir / "home"
+        monkeypatch.setenv("MAESTRO_HOME", str(home))
+        monkeypatch.setenv("ORCHESTRA_PIPELINE_ID", "01TESTRUN")  # restored on teardown
+        config_path = _write_scheduler_config(temp_dir)
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        key = identity_from_checkout(repo_dir)
+        db_path = await create_run(
+            key,
+            "01TESTRUN",
+            repo_key_text="/".join(key.as_path_parts()),
+            started_at="2026-08-24T09:00:00+00:00",
+            home=home,
+            run_branch_declared=0,
+        )
+        db = await create_database(db_path)
+        try:
+            await db.create_task(
+                Task(
+                    id="t1",
+                    title="T1",
+                    prompt="do work",
+                    workdir=str(repo_dir),
+                    status=TaskStatus.RUNNING,
+                )
+            )
+        finally:
+            await db.close()
+        recovery_cls = self._recovery_class_mock()
+
+        await self._run(config_path, run="01TESTRUN", recovery_cls=recovery_cls)
+
+        recovery_cls.assert_called_once()
+        recovery_cls.return_value.recover.assert_awaited_once()
 
 
 # =============================================================================
