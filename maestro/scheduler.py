@@ -236,7 +236,10 @@ class SchedulerConfig:
             `_auto_commit_task` call. The scheduler itself stays
             git/DB-agnostic about run bookkeeping — the callback owner (the
             run-branch gate, when active) reads the checkout's current tip
-            and persists it.
+            and persists it. Best-effort by contract: invoked through
+            `Scheduler._invoke_on_auto_commit`, which logs and swallows any
+            `Exception` the hook raises, so a hook failure never fails the
+            task it rides in on (cancellation still propagates).
     """
 
     max_concurrent: int = 3
@@ -818,6 +821,22 @@ class Scheduler:
                 task.id,
                 e,
             )
+
+    async def _invoke_on_auto_commit(self) -> None:
+        """Best-effort call to the configured `on_auto_commit` hook.
+
+        Contract (`SchedulerConfig.on_auto_commit`): pure bookkeeping — a
+        hook failure must never fail the task it rides in on, so any
+        exception is logged and swallowed here, at the scheduler seam,
+        rather than left to each of the three completion call sites.
+        `Exception` only: cancellation must still propagate.
+        """
+        if self._config.on_auto_commit is None:
+            return
+        try:
+            await self._config.on_auto_commit()
+        except Exception:
+            logger.warning("on_auto_commit hook failed", exc_info=True)
 
     async def run(self) -> None:
         """Run the scheduler main loop.
@@ -1908,8 +1927,7 @@ class Scheduler:
                             result_summary="Task completed successfully",
                         )
                         self._auto_commit_task(task)
-                        if self._config.on_auto_commit is not None:
-                            await self._config.on_auto_commit()
+                        await self._invoke_on_auto_commit()
                         outcome = await self._build_outcome(done_task, exit_code=0)
                         await self._try_report_outcome(done_task, outcome)
                         _obs_log.info(
@@ -1934,8 +1952,7 @@ class Scheduler:
                     result_summary="Task completed successfully",
                 )
                 self._auto_commit_task(task)
-                if self._config.on_auto_commit is not None:
-                    await self._config.on_auto_commit()
+                await self._invoke_on_auto_commit()
                 outcome = await self._build_outcome(done_task, exit_code=0)
                 await self._try_report_outcome(done_task, outcome)
                 _obs_log.info(
@@ -2293,8 +2310,7 @@ class Scheduler:
                 result_summary="Task completed successfully (verifier PASS)",
             )
             self._auto_commit_task(task)
-            if self._config.on_auto_commit is not None:
-                await self._config.on_auto_commit()
+            await self._invoke_on_auto_commit()
             outcome = await self._build_outcome(done_task, exit_code=0, attempt=attempt)
             await self._try_report_outcome(done_task, outcome)
             self._emit_event(
