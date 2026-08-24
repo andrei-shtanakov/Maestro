@@ -654,7 +654,11 @@ async def _run_scheduler(
         # activating the logger later would drop recovery events on --resume.
         workdir = Path(config.repo).expanduser()  # noqa: ASYNC240
         if log_dir is None:
-            log_dir = workdir / "logs"
+            # Beside the state database — `runs/<id>/logs/` on the bootstrap
+            # path — never the target repo's working tree: with
+            # `auto_commit: true` an auto-commit would sweep the logs into
+            # task commits (inbox #217).
+            log_dir = resolved_db_path.parent / "logs"
         create_event_logger(log_dir)
 
         # Check if resuming
@@ -1074,7 +1078,10 @@ def run_command(
         typer.Option(
             "--log-dir",
             "-l",
-            help="Directory for task log files",
+            help=(
+                "Directory for per-task logs and the structured event log "
+                "(default: logs/ beside the state database)"
+            ),
             file_okay=False,
             dir_okay=True,
             resolve_path=True,

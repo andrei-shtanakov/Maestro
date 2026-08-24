@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Changed
+- **Mode-1 default log location moved out of the target repo's working tree**
+  (#217). `maestro run` used to default its structured event log and per-task
+  logs to `<repo>/logs/` — inside the very checkout the tasks edit, so with
+  `auto_commit: true` an auto-commit swept Maestro's own artifacts into task
+  commits, and the run directory's `logs/` stayed empty. The default is now
+  beside the state database — `~/.maestro/projects/<...>/runs/<run-id>/logs/`
+  on the normal path, next to the named file under an explicit `--db`. An
+  explicit `--log-dir` is honored unchanged. Not everything has moved: the obs
+  OTel JSONL stream still lands under `logs/<run-id>/` relative to the
+  *current* directory (or `$ORCHESTRA_LOG_DIR`), which touches the target tree
+  only when the operator runs Maestro from inside it.
+
 ### Added
 - **A deliberate `TASK_BLOCKED` refusal no longer earns an automatic retry**
   (#209). Under `execution_mode: tdd` a task can be blocked *correctly* — the
