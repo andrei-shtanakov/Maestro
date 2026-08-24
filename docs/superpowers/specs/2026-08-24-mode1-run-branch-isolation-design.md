@@ -1,8 +1,19 @@
 # Mode-1 run-level branch isolation (`git.run_branch`) — design
 
-**Status:** revision 6 — codex-review round 4 incorporated; awaiting
+**Status:** revision 7 — codex-review round 5 incorporated; awaiting
 owner approval
 **Date:** 2026-08-24
+**Revision 7 (codex-review round 5, three majors, each confirmed):**
+(1) §6 — continuation selectors also take the recovery path: phase A
+re-keys the Mode-1 recovery guard from the `--resume` flag to "an
+existing run was selected", because a gated continuation that skips
+recovery stalls on crash-stranded tasks — a gate that blesses a
+stalling invocation is worse than none. (2) §7 — the live tripwire
+compares branch name AND tip against `run_branch_head`: a foreign
+commit on the same branch moves the state as surely as a flip.
+(3) §6 — legacy adoption verifies against the config-declared name
+before adopting; a checkout that disagrees with declared intent
+refuses instead of durably binding the run to an accident.
 **Revision 6 (codex-review round 4: one major, one medium):** (1) §6 —
 the supersession check is re-founded on *state* instead of proxies:
 the run row records `run_branch_head` (tip sha, kept current by the
@@ -264,7 +275,19 @@ and the scheduler preserves its existing tasks), so it walks the same
 verification whether or not `--resume` was typed (codex-review round 4,
 medium — the selector list alone left it undefined). The flagless
 definition is deliberate so no selector of an existing run bypasses
-this section (consumer point 4):
+this section (consumer point 4).
+
+**Continuation selectors also take the recovery path** (round 5,
+major 1): today Mode-1 recovery is guarded by `if resume:` alone, so a
+`--run <id>` or plain-`--db` continuation would pass the branch gate,
+open the database — and then stall: crash-stranded `RUNNING`/
+`VALIDATING` rows are never reconciled, never re-spawned, and never
+complete. A gate that blesses a stalling invocation is worse than
+none. Phase A re-keys the recovery guard to the same definition this
+section uses — "an existing run was selected" — so every continuation
+reconciles before scheduling, `--resume` flag or not.
+
+The verification rules:
 
 - The branch is **read from the run row and verified against the
   checkout** — never re-derived from the config. The config may have
@@ -317,17 +340,23 @@ this section (consumer point 4):
     adoption. Adding `run_branch` to the config later takes effect on
     the next *fresh* run, never mid-run (a run must not change its own
     rules mid-flight — #198's own principle).
-  - `declared=NULL` → a true pre-migration row. **Fails open** with a
-    structured warning, following #198's `workstreams_declared`
-    precedent — and, when the config declares `run_branch`, **adopts
-    the observed branch into the record** (consumer proposal, one
-    UPDATE setting both columns): the first resume writes the current
-    branch, so every later resume of that run is protected. The hole
-    closes on first use, not by legacy runs dying out. The adoption is
-    announced (structured event + the same warning), because it
-    records observed state, not verified intent. A pre-migration row
-    whose config does *not* declare `run_branch` is recorded as
-    `declared=0` and stays silent.
+  - `declared=NULL` → a true pre-migration row. A row whose config
+    does *not* declare `run_branch` is recorded as `declared=0` and
+    stays silent. When the config *does* declare one, the record is
+    absent so the config-declared name is the only intent available —
+    and **adoption verifies against it first** (round 5, major 3):
+    observed branch == configured `run_branch` → warn (legacy binding,
+    #198's fail-open precedent) and adopt, one UPDATE setting both
+    columns, announced by a structured event — the hole closes on
+    first use, not by legacy runs dying out. Observed branch !=
+    configured → **refuse** (`resume_branch_mismatch`, verified
+    against the config-declared name since no record exists). The
+    earlier rule adopted whatever branch happened to be checked out,
+    which would let one accidental `--resume` on `main` durably bind
+    the run to `main` and send recovery — which mutates the working
+    tree — straight into it, making the mistake permanent. Adoption
+    records observed state only when that state matches declared
+    intent; it never manufactures intent from an accident.
   **This deliberately diverges from dispatcher's fail-closed at their
   analogous seam** ("predates checkout binding, re-submit"), and the
   divergence is priced, not accidental: a dispatcher request is cheap to
@@ -378,8 +407,15 @@ already trusts (#166: the late check is the guarantee):
   about the scheduler, so the implementation derives it from "every
   checkout read/write on the run path" and a test asserts the list —
   a new checkout-using seam must claim a tripwire, the way a new
-  status must claim a transitions-table entry. Each check is one `git
-  rev-parse --abbrev-ref HEAD` — negligible cost.
+  status must claim a transitions-table entry. **Each check compares
+  both the branch name and the branch tip** against the run's recorded
+  `run_branch_head` (round 5, major 2): §6's invariant is state
+  immobility, not name stability, and a foreign commit landed on the
+  *same* branch mid-run moves the state just as surely as a branch
+  flip — the name-only check would smile through it and auto-commit on
+  top of moved state. The run's own commits update the recorded head
+  (§6), so only foreign movement trips. Two `git rev-parse`
+  invocations per seam — still negligible.
 - **The completion-path check runs before any terminal transition**
   (round 3, major 1). Today the scheduler marks a task `DONE` and only
   then calls `_auto_commit_task`; `DONE` is terminal, so a gate firing
@@ -454,6 +490,16 @@ first instant.
 - Plain `--db` continuation test (round 4, medium): `--db` naming a
   database whose run row is branch-bound, no `--resume`, wrong
   checkout branch → same refusal as the `--resume` form.
+- Continuation-recovery test (round 5, major 1): `--run <id>` and
+  plain `--db` continuations with a crash-stranded `RUNNING` task →
+  recovery reconciles it exactly as under `--resume`; no stalled run.
+- Legacy-adoption verification test (round 5, major 3):
+  `declared=NULL` + config declares `pilot/x` + checkout on `main` →
+  refuses (`resume_branch_mismatch`), nothing adopted; on `pilot/x` →
+  warns, adopts, proceeds.
+- Live same-branch movement test (round 5, major 2): foreign commit on
+  the run branch while a task runs → next tripwire seam refuses, no
+  auto-commit on top of the moved state, run suspended.
 - Lock-ordering test (round 1, major 1): with the PID lock already
   held, a second `maestro run` with `run_branch` configured refuses
   **without touching the checkout** — current branch asserted
