@@ -244,6 +244,24 @@ class TestBranchTripwire:
         assert row is not None and row["suspended_at"] is not None
         assert "spawn" in str(row["suspend_reason"])
 
+    async def test_foreign_commit_same_branch_trips_stale_checkout(
+        self, tmp_path: Path, db: Database
+    ) -> None:
+        """Regression for F2: a foreign commit landing on the run branch
+        itself (no flip — the run row's recorded head just falls behind)
+        must trip through `_branch_tripwire`, not only the unit-level
+        `check_live`. Guards the `run_branch_head` threading from the run
+        row into `check_live`."""
+        repo = _make_repo_on_branch(tmp_path)
+        await _bound_db(db, repo)
+        (repo / "foreign.txt").write_text("x")
+        _git(repo, "add", "foreign.txt")
+        _git(repo, "commit", "-m", "foreign")
+        s = _make_scheduler(db, repo, run_branch="pilot/x")
+        assert await s._branch_tripwire("spawn") is False
+        assert isinstance(s.branch_trip, RunBranchGateError)
+        assert s.branch_trip.reason == "live_stale_checkout"
+
     async def test_trip_is_sticky_even_after_branch_restored(
         self, tmp_path: Path, db: Database
     ) -> None:
@@ -265,6 +283,7 @@ class TestBranchTripwire:
         s = _make_scheduler(db, repo, run_branch="pilot/x")
         assert await s._branch_tripwire("spawn") is False
         assert s.branch_trip is not None
+        assert s.branch_trip.reason == "record_missing"
 
     async def test_unknown_seam_is_a_programming_error(
         self, tmp_path: Path, db: Database
@@ -425,6 +444,44 @@ class TestSpawnSeamAndDrain:
         assert s.branch_trip is not None
         handle_b.terminate.assert_not_called()
         assert (await db.get_task("b")).status == TaskStatus.RUNNING
+
+    async def test_flip_discovered_at_own_timeout_terminates_but_no_finalize(
+        self, tmp_path: Path, db: Database
+    ) -> None:
+        """Regression for F1: a task's OWN timeout (elapsed > timeout,
+        first tripwire discovery at this seam) still terminates the
+        process — that's the task's timeout policy, predates the gate —
+        but must NOT finalize/collect/transition into a checkout that
+        just proved moved. The DB row stays RUNNING (never touches
+        `_handle_task_timeout`, so retry_count is untouched too), and
+        the task stays in tracking for the next drain pass to reap once
+        the (already-terminated) process actually exits."""
+        repo = _make_repo_on_branch(tmp_path)
+        await _bound_db(db, repo)
+        task = _make_task("t1", workdir=str(repo), status=TaskStatus.RUNNING)
+        await db.create_task(task)
+        _git(repo, "switch", "master")
+        s = _make_scheduler_with_mock_spawner(db, repo, run_branch="pilot/x")
+        # First poll (this pass, still alive) -> None; second poll (next
+        # pass, now exited since terminate already fired) -> exit code.
+        handle = _scripted_handle(poll_results=[None, 0])
+        started_at = datetime.now(UTC) - timedelta(minutes=task.timeout_minutes + 1)
+        s._running_tasks["t1"] = _running_task(task, handle, started_at=started_at)
+
+        await s._monitor_running_tasks()
+
+        handle.terminate.assert_called_once_with(grace_seconds=10.0)
+        assert s.branch_trip is not None
+        assert "t1" in s._running_tasks  # not reaped this pass
+        row = await db.get_task("t1")
+        assert row.status == TaskStatus.RUNNING
+        assert row.retry_count == task.retry_count
+
+        # Next pass: poll() now reports the (already-terminated) process
+        # exited -> plain drain reaps it, still without finalizing.
+        await s._monitor_running_tasks()
+        assert "t1" not in s._running_tasks
+        assert (await db.get_task("t1")).status == TaskStatus.RUNNING
 
 
 class TestCompletionSeams:

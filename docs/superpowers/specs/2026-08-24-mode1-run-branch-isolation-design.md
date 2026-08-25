@@ -514,9 +514,10 @@ already trusts (#166: the late check is the guarantee):
   verifier's fail-closed crash recovery (NEEDS_REVIEW, never
   auto-re-run) — preserved, not softened. The suspend marker is not
   cleared on resume: `classify_run` ranks observed liveness above it,
-  a completed resume's outcome wins over it, and `maestro service`
-  reading "suspended = human required" is the safe direction for a
-  checkout only a human can fix.
+  and a completed resume's outcome wins over the stale marker rather
+  than the marker overriding it. Nothing auto-resumes a suspended
+  Mode-1 run — that fail-safe direction is what protects a checkout
+  only a human can fix.
 
 Phase B ships as a separate PR on the same spec. Phase A alone closes
 the consumer's blocker (UI-driven pass 1); Phase B is the hardening that

@@ -907,7 +907,7 @@ class Scheduler:
             row = await self._db.get_run_row()
             if row is None:
                 raise RunBranchGateError(
-                    "live_stale_checkout",
+                    "record_missing",
                     "run row unreadable mid-run; refusing to touch the "
                     "checkout on missing evidence",
                 )
@@ -1949,7 +1949,19 @@ class Scheduler:
                 timeout_seconds = running_task.task.timeout_minutes * 60
 
                 if elapsed.total_seconds() > timeout_seconds:
+                    # Terminate is the task's own timeout policy (predates
+                    # this gate, mirrors `_drain_running_tasks`) and fires
+                    # regardless. The collect/finalize that follows is a
+                    # separate, gated decision: a moved checkout must not
+                    # receive this task's partial results.
                     await running_task.handle.terminate(grace_seconds=10.0)
+                    if not await self._branch_tripwire("collect"):
+                        # First trip discovered here: leave the timed-out
+                        # task un-finalized (no collect onto a moved
+                        # checkout, no transition); the process is already
+                        # terminated, so the next drain pass reaps it via
+                        # `poll()` returning non-None.
+                        continue
                     timeout_fin = await self._finalize_running(running_task)
                     timeout_exec_id = running_task.execution_id
                     if timeout_exec_id is not None and timeout_fin.cleaned:
