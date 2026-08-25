@@ -30,6 +30,10 @@
   lock, earlier refusal). Design: docs/superpowers/specs/
   2026-08-24-mode1-run-branch-isolation-design.md (phase B — live
   tripwires — ships separately).
+- **Mode-1 `git.run_branch` phase B: per-seam checkout tripwires**
+  (spawn/collect/validation/verifier/finalize); a mid-run branch flip or
+  foreign commit suspends the run with a drain — nothing killed, tasks
+  preserved pre-terminal, resume re-verifies.
 - **A deliberate `TASK_BLOCKED` refusal no longer earns an automatic retry**
   (#209). Under `execution_mode: tdd` a task can be blocked *correctly* — the
   frozen RED test asserts the wrong thing, and the agent rightly refuses to

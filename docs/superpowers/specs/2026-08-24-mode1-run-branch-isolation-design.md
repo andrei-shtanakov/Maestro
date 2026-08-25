@@ -1,10 +1,24 @@
 # Mode-1 run-level branch isolation (`git.run_branch`) — design
 
-**Status:** revision 8 — codex-review round 6 incorporated under an
-owner-set cap: one more paid round; an empty verdict merges, a further
-"hole in the remedy" finding merges over red with recorded reasoning
-(precedents #313, #214) — no round 8 of revisions
+**Status:** revision 9 — phase B shipped; §6/§8 revised to the
+as-implemented state (ruling R14; logger-based events)
 **Date:** 2026-08-24
+**Revision 9 (phase B implementation, 2026-08-25):** (1) §6 — the head
+record is maintained by ATTRIBUTION, not observation (ruling R14, PR
+#222): `on_auto_commit` hands over the sha of a commit the run itself
+made; the earlier "refreshed on graceful suspension/stop" is dropped —
+an observational refresh would normalize a foreign commit into the
+run's record and pass the next continuation green over it, the exact
+hole the stale check exists to catch. Priced cost, found twice (codex
+round 4, PR #222): a run whose agent commits by itself (auto_commit
+off) leaves the record behind the branch and stale-refuses on the next
+continuation, where `--accept-branch-tip` is the audited way through.
+(2) §7 — as-built decisions recorded in place: a fifth seam (`collect`),
+sticky suspension, drain semantics, VERIFYING preservation, and the
+undisturbed suspend marker. (3) §8 — the event surface is implemented
+as structured obs records (`Attributes.event` + kwargs) through a
+per-call logger, not as `EventType` members; reasons gain
+`live_branch_mismatch` / `live_stale_checkout`.
 **Revision 8 (codex-review round 6: two high, one medium; owner
 decision on the process):** (1) §6 — continuation deliberately does
 not require a clean tree: both alternatives (fail-closed; acceptance
@@ -350,8 +364,10 @@ The verification rules:
   resume through on top of foreign commits. The invariant was never
   "no newer run exists"; it is "the state did not move"). So the run
   row records **`run_branch_head`** — the branch tip sha — written at
-  publication, updated after each auto-commit the run itself makes,
-  and refreshed on graceful suspension/stop. On continuation: tip of
+  publication, and updated by attribution only — after each commit the
+  run itself makes (ruling R14; revision 9 dropped the graceful-stop
+  observational refresh, which would normalize foreign commits into
+  the record). On continuation: tip of
   the recorded branch equals the recorded head → proceed; anything
   else → refuse (`resume_stale_checkout`), naming both shas — this
   catches a newer run of the same DAG, a run of a different DAG, and a
@@ -482,6 +498,25 @@ already trusts (#166: the late check is the guarantee):
   and their console renders `suspended` as resumable, where a killed run
   would read as breakage.
 - Resume then passes through §6's verification as usual.
+- **As implemented (revision 9):** the inventory gained a fifth seam,
+  `collect` — finalizing a remote handle applies results into the
+  working tree, which §6 itself names as checkout-mutating; the
+  inventory test (`tests/test_run_branch_tripwire.py`) asserts all
+  five. The trip is **sticky**: once the run is suspending, every later
+  seam refuses without re-reading git — a branch restored mid-drain
+  must not let half the completions finalize under a run already
+  recorded suspended. The drain never finalizes: exited processes are
+  dropped from tracking with their RUNNING rows and open execution
+  handles intact — the crash shape resume recovery already reconciles
+  after §6 re-verification (the task's own timeout keeps its
+  pre-existing terminate; it is the task's policy, not the gate's). A
+  task tripped in VERIFYING stays VERIFYING and resolves through the
+  verifier's fail-closed crash recovery (NEEDS_REVIEW, never
+  auto-re-run) — preserved, not softened. The suspend marker is not
+  cleared on resume: `classify_run` ranks observed liveness above it,
+  a completed resume's outcome wins over it, and `maestro service`
+  reading "suspended = human required" is the safe direction for a
+  checkout only a human can fix.
 
 Phase B ships as a separate PR on the same spec. Phase A alone closes
 the consumer's blocker (UI-driven pass 1); Phase B is the hardening that
@@ -492,7 +527,8 @@ first instant.
 
 - One typed error family (`RunBranchGateError` with a machine-readable
   `reason`: `branch_equals_base`, `dirty_tree`, `wrong_start_point`,
-  `resume_branch_mismatch`, `resume_stale_checkout`, `record_missing`).
+  `resume_branch_mismatch`, `resume_stale_checkout`, `record_missing`,
+  `live_branch_mismatch`, `live_stale_checkout`).
   The one fail-open case (§6: a true pre-migration record) is a
   warning, not a member of this family.
 - Rendered as plain text on **stderr** (`err_console`, matching every
@@ -501,7 +537,11 @@ first instant.
   carries the observed state and the one command that fixes it.
 - Structured event (`run_branch_gate.refused` / `.created` /
   `.verified`) through the obs pipeline for post-mortem debugging —
-  best-effort, the stderr text is the contract.
+  best-effort, the stderr text is the contract. As implemented, the
+  structured events are obs records emitted through a per-call logger
+  (`run_branch_gate.py::_emit`) — the event name lands in
+  `Attributes.event` — rather than `EventType` members; telemetry
+  only, the stderr text remains the contract.
 
 ## 9. Testing sketch
 
