@@ -101,7 +101,7 @@
 
 Дальнейший трек ведётся в Linear (Maestro / Arbiter проекты, team Labs). Ниже — snapshot на 2026-04-17.
 
-- [ ] **R-03b** (LABS-TBD): Mode 2 (`maestro orchestrate`) workstream-level routing. Gate: ≥1 неделя стабильного Mode-1 dogfood после v0.2.0 @owner:github:andrei-shtanakov @trigger:"≥1 неделя стабильного Mode-1 dogfood после v0.2.0" @id:r-03b
+- [ ] **R-03b** (LABS-TBD): Mode 2 (`maestro orchestrate`) workstream-level routing. Gate: ≥1 неделя стабильного Mode-1 dogfood после v0.2.0 @owner:github:andrei-shtanakov @trigger:"≥1 неделя стабильного Mode-1 dogfood после v0.2.0" @id:r-03b @epic:eco.distributed-execution
 - [x] **R-05 contract-level** (commit `f1f7d26`, 2026-04-25): 4 e2e теста против реального `arbiter-mcp` бинарника в `tests/test_arbiter_real_subprocess.py`. Auto-skip без бинарника; `MAESTRO_ARBITER_BIN` override. Покрывает: decision_id i64, int→str coercion, route→report_outcome round-trip, distinct rowids.
 - [x] **R-05 CI job** (2026-05-07): новый `arbiter-e2e` job в `.github/workflows/ci.yml` — sibling-checkout Maestro + arbiter (`andrei-shtanakov/arbiter`), `cargo build --release --bin arbiter-mcp` под Swatinem cache, прогон `tests/test_arbiter_real_subprocess.py` с `MAESTRO_ARBITER_BIN`. Ref-strategy: PR/push на pinned `ARBITER_PINNED_SHA=d1a8ecd` (arbiter#9 fix), weekly schedule (Mon 06:00 UTC) на `master` для drift-check. Локальный smoke: 4/4 теста зелёные.
 - [x] **R-05 scheduler-driven e2e** (2026-05-07): `tests/test_scheduler_arbiter_real_subprocess.py` — 2 теста скрещивают real arbiter-mcp + Scheduler full cycle + MagicMock spawner. (1) ASSIGN happy-path: real arbiter routes → mock exit 0 → outcome reported back to real arbiter → DONE; проверяет int→str round-trip decision_id через TEXT-колонку. (2) Retry-gating с real rowids: exit 1 → ADVISORY reset → второй route real arbiter mint'ит fresh i64 ≠ первого. HOLD/REJECT покрыты в `test_scheduler_arbiter_integration.py` через FakeArbiter — дублирование через real subprocess не оправдано (требует seed'инга cost/failure history)
@@ -127,12 +127,12 @@
 ### Follow-ups from R-06b M4
 
 - [x] **M3-obs / arbiter trace** (2026-07-19): W3C `traceparent` инжектится в `params._meta` каждого `tools/call` (`arbiter_client._call_tool_once`); пропуск при нулевом trace-id; e2e-тест подтверждает, что пинованный arbiter игнорирует `_meta`. Arbiter-side чтение `_meta.traceparent` — handoff в `prograph-vault/authored/notes/2026-07-19-arbiter-meta-traceparent-handoff.md`.
-- [ ] **R-06b M4b**: revisit `max_per_task=200` sampling for swe-bench-full (>1000 tasks). Trigger: first PROD swe-bench-full run. @owner:github:andrei-shtanakov @trigger:"первый PROD-прогон swe-bench-full" @id:r-06b-m4b
-- [ ] **R-07 prereq (GIN index)**: GIN index on `benchmark_runs.per_task` jsonb. Trigger: when R-07 starts writing SQL filters on per_task. @owner:repo:arbiter @trigger:"R-07 начинает писать SQL-фильтры по per_task" @id:r-07-prereq-gin-index
-- [ ] **R-07 prereq (normalize)**: normalize `benchmark_task_results` table (migration from jsonb blob). Trigger: same as GIN — formal query demand. @owner:repo:arbiter @trigger:"тот же формальный запрос, что у GIN" @id:r-07-prereq-normalize
-- [ ] **R-07 prereq (retention)**: TTL / archive policy for `benchmark_runs`. Trigger: table > 10k rows OR > 1 GB total JSON blobs. @owner:repo:arbiter @trigger:"benchmark_runs > 10k строк ИЛИ > 1 GB JSON" @id:r-07-prereq-retention
-- [ ] **R-14**: vendored `arbiter_client.py` → standalone PyPI `arbiter-py` package. M4 enlarged vendor surface. @owner:repo:arbiter @trigger:"arbiter публикует standalone arbiter-py package" @id:r-14
-- [ ] **Unscheduled — outbox**: persistent outbox + background retry for benchmark report. Trigger: if fire-and-forget shows real CI churn. @owner:github:andrei-shtanakov @trigger:"fire-and-forget даёт реальный CI-churn" @id:outbox-persistent-retry
+- [ ] **R-06b M4b**: revisit `max_per_task=200` sampling for swe-bench-full (>1000 tasks). Trigger: first PROD swe-bench-full run. @owner:github:andrei-shtanakov @trigger:"первый PROD-прогон swe-bench-full" @id:r-06b-m4b @epic:eco.routing
+- [ ] **R-07 prereq (GIN index)**: GIN index on `benchmark_runs.per_task` jsonb. Trigger: when R-07 starts writing SQL filters on per_task. @owner:repo:arbiter @trigger:"R-07 начинает писать SQL-фильтры по per_task" @id:r-07-prereq-gin-index @epic:eco.routing
+- [ ] **R-07 prereq (normalize)**: normalize `benchmark_task_results` table (migration from jsonb blob). Trigger: same as GIN — formal query demand. @owner:repo:arbiter @trigger:"тот же формальный запрос, что у GIN" @id:r-07-prereq-normalize @epic:eco.routing
+- [ ] **R-07 prereq (retention)**: TTL / archive policy for `benchmark_runs`. Trigger: table > 10k rows OR > 1 GB total JSON blobs. @owner:repo:arbiter @trigger:"benchmark_runs > 10k строк ИЛИ > 1 GB JSON" @id:r-07-prereq-retention @epic:eco.routing
+- [ ] **R-14**: vendored `arbiter_client.py` → standalone PyPI `arbiter-py` package. M4 enlarged vendor surface. @owner:repo:arbiter @trigger:"arbiter публикует standalone arbiter-py package" @id:r-14 @epic:eco.routing
+- [ ] **Unscheduled — outbox**: persistent outbox + background retry for benchmark report. Trigger: if fire-and-forget shows real CI churn. @owner:github:andrei-shtanakov @trigger:"fire-and-forget даёт реальный CI-churn" @id:outbox-persistent-retry @epic:eco.routing
 
 ### Score contract v1 (ATP → maestro), закрыт 2026-08-22
 
@@ -145,7 +145,7 @@
     прогон не отправляется (`report_status: "withheld"`).
   - Фикстуры и `score_contract.py` завендорены с пином по фактическим байтам
     (`tests/fixtures/atp-score-contract/v1/`, atp-platform `05bd939`).
-- [ ] **atp-score-contract-upstream-drift**: перевендорить, когда ATP тронет контракт @owner:github:andrei-shtanakov @trigger:"atp-platform меняет packages/atp-dashboard/atp/dashboard/benchmark/score_contract.py или tests/fixtures/benchmark_score_contract/ выше 05bd939" @id:atp-score-contract-upstream-drift
+- [ ] **atp-score-contract-upstream-drift**: перевендорить, когда ATP тронет контракт @owner:github:andrei-shtanakov @trigger:"atp-platform меняет packages/atp-dashboard/atp/dashboard/benchmark/score_contract.py или tests/fixtures/benchmark_score_contract/ выше 05bd939" @id:atp-score-contract-upstream-drift @epic:eco.atp-platform
   - Copy-integrity держится тестом; это вторая гарантия — «апстрим уехал».
     **Больше не держится на одном этом пункте:** `atp-score-contract-digest-sidecar`
     закрыт — еженедельный workflow сверяет опубликованные ATP дайджесты с нашим `PIN`,
@@ -180,7 +180,7 @@
     нашем `PIN` — фикстура, опубликованная уже после вендоринга.
   - **Порядок мержа:** сначала atp-platform#301, потом наш PR. Сайдкар тянется из их
     `main`, и до мержа #301 первый прогон честно упадёт с кодом 2.
-- [ ] **atp-score-contract-provenance-test-misnamed**: `test_upstream_has_not_drifted_past_the_pin` проверяет провенанс, а не дрейф @owner:github:andrei-shtanakov @id:atp-score-contract-provenance-test-misnamed
+- [ ] **atp-score-contract-provenance-test-misnamed**: `test_upstream_has_not_drifted_past_the_pin` проверяет провенанс, а не дрейф @owner:github:andrei-shtanakov @id:atp-score-contract-provenance-test-misnamed @epic:eco.atp-platform
   - Тест сверяет наши байты с `git show 05bd939:<path>` — это «мы скопировали то, что
     действительно лежало в пиненом коммите, а не из чужого дерева». Гарантия настоящая
     (copy-integrity сверяет байты с хешами, посчитанными с нашего же диска, и ложный пин
@@ -209,20 +209,20 @@
     его и видит человек в CLI. Одна конвертация в одном месте, с тестом.
   - Схема получила `minimum: 0` / `maximum: 1`; выход за диапазон теперь `-32602` на ингесте,
     что у нас уже классифицируется как contract_break, а не транзиент для ретрая.
-- [ ] **report-benchmark-schema-ownership**: SSOT схемы у нас, но правку внесли у потребителя @owner:github:andrei-shtanakov @trigger:"следующая правка report_benchmark-v1 с любой стороны" @id:report-benchmark-schema-ownership
+- [ ] **report-benchmark-schema-ownership**: SSOT схемы у нас, но правку внесли у потребителя @owner:github:andrei-shtanakov @trigger:"следующая правка report_benchmark-v1 с любой стороны" @id:report-benchmark-schema-ownership @epic:eco.atp-platform
   - `contracts/benchmark/report_benchmark-v1.schema.json` объявлен единственным источником
     истины (так написано в `tests/test_benchmark_contract.py`), но `minimum/maximum` и
     `score_semantics` появились сначала в копии arbiter, и копии молча разъехались на 1224 байта.
     Тест `test_schema_copy_matches_the_arbiter_side` теперь ловит расхождение при наличии
     соседнего чекаута — но вопрос «кто редактирует SSOT» остаётся открытым и решается не тестом.
-- [ ] **Unscheduled — arbiter-initiated benchmark**: outgoing benchmark trigger from arbiter ("router uncertain → run benchmark"). From design open question #2. @owner:repo:arbiter @id:arbiter-initiated-benchmark
-- [ ] **M5 / multi-tenant auth**: service-account ATP token for CI; multi-tenant arbiter auth as separate ticket if arbiter ever leaves subprocess trust model. @owner:repo:atp-platform @trigger:"arbiter выходит за subprocess-trust-модель" @id:m5-multi-tenant-auth
+- [ ] **Unscheduled — arbiter-initiated benchmark**: outgoing benchmark trigger from arbiter ("router uncertain → run benchmark"). From design open question #2. @owner:repo:arbiter @id:arbiter-initiated-benchmark @epic:eco.routing
+- [ ] **M5 / multi-tenant auth**: service-account ATP token for CI; multi-tenant arbiter auth as separate ticket if arbiter ever leaves subprocess trust model. @owner:repo:atp-platform @trigger:"arbiter выходит за subprocess-trust-модель" @id:m5-multi-tenant-auth @epic:eco.atp-platform
 
 ### Новое из v0.2.0 dogfood (LABS-87..90)
 
 - [x] **LABS-87** (2026-05-07): validation-failure path теперь репортит outcome в arbiter с retry-gating. `_handle_validation_failure` отзеркалил `_handle_task_failure`: build outcome (status FAILURE) → `_try_report_outcome` → ADVISORY/AUTHORITATIVE-aware reset. Both paths (retry-available + exhausted-NEEDS_REVIEW) шлют outcome. +4 теста в `test_scheduler_arbiter_integration.py` (advisory+retry, exhausted, advisory+arbiter-down, authoritative+arbiter-down). Routing API не расширен — `validation_passed` остаётся out-of-scope
 - [x] **LABS-88** (Low): CI guard для unreferenced public modules (commit `c002f46`) — `tests/test_no_unreferenced_modules.py`, grimp import-graph, allowlist `maestro.schemas.generate` (python -m)
-- [ ] **LABS-89** (Medium): release automation (version-vs-tag guard + release-drafter) @owner:github:andrei-shtanakov @id:labs-89
+- [ ] **LABS-89** (Medium): release automation (version-vs-tag guard + release-drafter) @owner:github:andrei-shtanakov @id:labs-89 @epic:eco.ops
 - [x] **LABS-90** (Medium): per-example YAML smoke test в CI (commit `e9cbb1c`) — `tests/test_examples_smoke.py`, parametrized `examples/*.yaml` (Mode-1 `load_config`; Mode-2 `load_orchestrator_config`+`validate_project(check_fs=False)`) + `observed-models.json`; dummy `${VAR}` env; caught+fixed drifted `maestro-builds-maestro.yaml` (`repo: .`)
 
 ### Observability (cross-project) — M1 closed, M2 closed 2026-04-25
@@ -231,9 +231,9 @@
 - [x] **M2** (commit `d474120`, 2026-04-25): scheduler instrumentation. `obs.span("scheduler.session")` + `obs.span("task.spawn")` (subprocess inheritance через TRACEPARENT), 4 структурированных emit'а (`task.completed`/`task.validation_failed`/`task.failed`/`task.timeout`), `spawn_env()` helper в `spawners/base.py` пропагирует трасу в claude_code/codex/aider/validator subprocesses. 3 теста в `test_scheduler_observability.py`
 - [x] **M3 (runtime-decision instrumentation)** (closed by feat/observability-m3): `scheduler.tick` emit-on-change per poll cycle + `task.route` span around the routing decision (covers static + arbiter, records latency/decision_id; failure → `task.route.failed`).
 - [x] **M-obs stdlib bridge** (2026-07-19): все stdlib `logging` вызовы (~93 call-sites в ~16 модулях) маршрутизируются в obs OTel JSONL через `maestro/logging_bridge.py` (`ObsBridgeHandler` + `setup_logging` в cli.py); WARNING+ дублируются в stderr (замена lastResort). Vendored `_vendor/obs.py` не тронут.
-- [ ] **M3 — observability dashboards** (pending): separate project (backend/viz over the OTel JSONL or the existing `maestro/dashboard/` UI). @owner:github:andrei-shtanakov @id:m3-observability-dashboards
+- [ ] **M3 — observability dashboards** (pending): separate project (backend/viz over the OTel JSONL or the existing `maestro/dashboard/` UI). @owner:github:andrei-shtanakov @id:m3-observability-dashboards @epic:eco.observability
 - [x] **M3 — W3C traceparent into the MCP JSON-RPC envelope** (2026-07-19, Maestro-side done): injection in `params._meta` on every `tools/call`; arbiter-side reading is the remaining half (handoff note in prograph-vault).
-- [ ] **Single async pytest plugin** (follow-up к фиксу R-05 2026-07-19): в тестах конкурируют pytest-asyncio (`asyncio_mode=auto`) и anyio-плагин — владелец `@pytest.mark.anyio`-теста зависит от порядка регистрации плагинов (uv 0.11.29 флипнул порядок в CI → cross-loop падения real-subprocess тестов). Точечный фикс: маркеры сняты в 3 real-subprocess файлах. Системно: стандартизироваться на одном плагине (anyio, по конвенции) и убрать pytest-asyncio. Trigger: следующий флип порядка или новые async-фикстуры с loop-bound состоянием. @owner:github:andrei-shtanakov @trigger:"следующий флип порядка плагинов или новые async-фикстуры с loop-bound состоянием" @id:single-async-pytest-plugin
+- [ ] **Single async pytest plugin** (follow-up к фиксу R-05 2026-07-19): в тестах конкурируют pytest-asyncio (`asyncio_mode=auto`) и anyio-плагин — владелец `@pytest.mark.anyio`-теста зависит от порядка регистрации плагинов (uv 0.11.29 флипнул порядок в CI → cross-loop падения real-subprocess тестов). Точечный фикс: маркеры сняты в 3 real-subprocess файлах. Системно: стандартизироваться на одном плагине (anyio, по конвенции) и убрать pytest-asyncio. Trigger: следующий флип порядка или новые async-фикстуры с loop-bound состоянием. @owner:github:andrei-shtanakov @trigger:"следующий флип порядка плагинов или новые async-фикстуры с loop-bound состоянием" @id:single-async-pytest-plugin @epic:eco.observability
 
 ---
 
@@ -280,32 +280,32 @@
 
 ### Открытые follow-ups июльского трека
 
-- [ ] **Verifier: CHECK-констрейнт на `task_costs.execution_phase`** @owner:github:andrei-shtanakov @id:verifier-execution-phase-check-constraint
+- [ ] **Verifier: CHECK-констрейнт на `task_costs.execution_phase`** @owner:github:andrei-shtanakov @id:verifier-execution-phase-check-constraint @epic:eco.distributed-execution
       Схемное ужесточение, требует rebuild таблицы. Отдельным маленьким PR — решение
       2026-07-26: три verifier-follow-up'а не бандлить в один.
-- [ ] **Verifier: envelope без usage не должен схлопываться в $0** @owner:github:andrei-shtanakov @id:verifier-envelope-no-usage-unknown
+- [ ] **Verifier: envelope без usage не должен схлопываться в $0** @owner:github:andrei-shtanakov @id:verifier-envelope-no-usage-unknown @epic:eco.distributed-execution
       В `maestro costs` такая строка обязана оставаться UNKNOWN. Корректность.
-- [ ] **Verifier: кэш `load_catalog`** @owner:github:andrei-shtanakov @trigger:"замер показал реальную стоимость повторных load_catalog" @id:verifier-load-catalog-cache
+- [ ] **Verifier: кэш `load_catalog`** @owner:github:andrei-shtanakov @trigger:"замер показал реальную стоимость повторных load_catalog" @id:verifier-load-catalog-cache @epic:eco.distributed-execution
       Перф; браться только после замера, не раньше.
-- [ ] **Verifier-docker: интеграционные и smoke-тесты не проверены против живого демона** @owner:github:andrei-shtanakov @trigger:"первый прогон с доступным docker-демоном (CI или локально)" @id:verifier-docker-live-daemon-tests
+- [ ] **Verifier-docker: интеграционные и smoke-тесты не проверены против живого демона** @owner:github:andrei-shtanakov @trigger:"первый прогон с доступным docker-демоном (CI или локально)" @id:verifier-docker-live-daemon-tests @epic:eco.distributed-execution
       `tests/integration/test_verifier_docker_*.py` сейчас чисто скипаются без docker,
       то есть контейнерные ассерты не подтверждены ни разу.
-- [ ] **Verifier-docker: мелочи из леджера #110** @owner:github:andrei-shtanakov @id:verifier-docker-ledger-110-nits
+- [ ] **Verifier-docker: мелочи из леджера #110** @owner:github:andrei-shtanakov @id:verifier-docker-ledger-110-nits @epic:eco.distributed-execution
       Коллизия имён `get_open_verification_handle` (ед.ч.) / `...handles` (мн.ч.) —
       сегодня предикаты состояний эквивалентны, новое состояние разойдётся молча;
       collection-time `docker info` probe на 10s в каждом прогоне сьюты; `docker pull`
       без таймаута.
-- [ ] **Distributed Execution Phase 3 — routing/registry/queues** @owner:github:andrei-shtanakov @id:distributed-execution-phase-3
+- [ ] **Distributed Execution Phase 3 — routing/registry/queues** @owner:github:andrei-shtanakov @id:distributed-execution-phase-3 @epic:eco.distributed-execution
       Сознательно отложено через все фазы 0…2c.
-- [ ] **Mode-1 remote: patch-collect** @owner:github:andrei-shtanakov @id:mode-1-remote-patch-collect
+- [ ] **Mode-1 remote: patch-collect** @owner:github:andrei-shtanakov @id:mode-1-remote-patch-collect @epic:eco.distributed-execution
       Сегодня collect умеет только `scope_paths`.
-- [ ] **Полный именованный реестр `backends: {}`** + публикация образа `maestro-runner` @owner:github:andrei-shtanakov @id:named-backends-registry
-- [ ] **Хвост Phase 2b/2c** (детали — в `.superpowers/sdd/progress.md`) @owner:github:andrei-shtanakov @id:phase-2b-2c-tail
+- [ ] **Полный именованный реестр `backends: {}`** + публикация образа `maestro-runner` @owner:github:andrei-shtanakov @id:named-backends-registry @epic:eco.distributed-execution
+- [ ] **Хвост Phase 2b/2c** (детали — в `.superpowers/sdd/progress.md`) @owner:github:andrei-shtanakov @id:phase-2b-2c-tail @epic:eco.distributed-execution
       reap/recovery re-hold reconciliation; local not-started held-not-released;
       `SshBackend` scope ключуется по `include`, а не по `mode`; arbiter-outcome на
       collect-conflict; `mktemp -d` без таймаута в `can_run`; дедуп ветки
       `decode_transport_ref`+isolation между probe и GC.
-- [ ] **Stage B: ssh+docker dual-probe зеркало в `orchestrator.py`** @owner:github:andrei-shtanakov @trigger:"первый нелокальный бэкенд верификатора в Mode 2" @id:stage-b-ssh-docker-dual-probe
+- [ ] **Stage B: ssh+docker dual-probe зеркало в `orchestrator.py`** @owner:github:andrei-shtanakov @trigger:"первый нелокальный бэкенд верификатора в Mode 2" @id:stage-b-ssh-docker-dual-probe @epic:eco.distributed-execution
       TODO стоит в коде; сегодня верификатор Mode-2 пинён на локальный бэкенд.
 
 ---
@@ -555,7 +555,7 @@
 > Требование ко всем четырём: **отдельный regression-тест на сценарий пилота** —
 > не только на юнит-инвариант, но на воспроизведение наблюдения из issue.
 
-- [ ] **#169a spec-runner-exit-contract-bump: `_load_meta` теряет строковые `stop_reason`/`stop_detail`** (P1, первый PR волны) @owner:github:andrei-shtanakov @id:spec-runner-exit-contract-bump
+- [ ] **#169a spec-runner-exit-contract-bump: `_load_meta` теряет строковые `stop_reason`/`stop_detail`** (P1, первый PR волны) @owner:github:andrei-shtanakov @id:spec-runner-exit-contract-bump @epic:eco.spec-toolchain
       `_load_meta` (`maestro/spec_runner.py`) приводит каждое значение
       `executor_meta` через `int(row["value"])` и молча `continue` на
       `TypeError/ValueError` — то есть строковые `last_run_stop_reason` /
@@ -984,15 +984,15 @@
 > Источник: `../prograph-vault/authored/notes/2026-07-22-ideas-from-ai-repos-research.md`
 > Закрыто оттуда: #6 (#107), #7a (#92), #10 (#94), #25 (#97).
 
-- [ ] **Idea #1 — сериализуемый RunState** со schema-version, interruptions, approvals @owner:github:andrei-shtanakov @id:idea-1-serializable-runstate
+- [ ] **Idea #1 — сериализуемый RunState** со schema-version, interruptions, approvals @owner:github:andrei-shtanakov @id:idea-1-serializable-runstate @epic:eco.ops
       Сначала отдельный discovery-проход: состояние Maestro уже живёт в SQLite, надо
       понять, что именно добавляет версионированный снапшот сверху.
-- [ ] **Idea #3 — семафорный dispatch и лимиты конкурентности** подзадач @owner:github:andrei-shtanakov @id:idea-3-semaphore-dispatch
+- [ ] **Idea #3 — семафорный dispatch и лимиты конкурентности** подзадач @owner:github:andrei-shtanakov @id:idea-3-semaphore-dispatch @epic:eco.ops
       Изолированный контекст на файл-бандл (default 8, BatchStrategy по языку/директории).
-- [ ] **Idea #8 — guardrails с tripwire** на input/output/tool-вызовы @owner:github:andrei-shtanakov @id:idea-8-guardrails-tripwire
+- [ ] **Idea #8 — guardrails с tripwire** на input/output/tool-вызовы @owner:github:andrei-shtanakov @id:idea-8-guardrails-tripwire @epic:eco.ops
       Сначала fit-спайк: какие границы Maestro реально наблюдает — иначе это, как и
       отклонённый #17, окажется заботой харнесса, а не оркестратора.
-- [ ] **Idea #21 — handover-блоки с обязательной секцией Test Result** @owner:github:andrei-shtanakov @id:idea-21-handover-blocks
+- [ ] **Idea #21 — handover-блоки с обязательной секцией Test Result** @owner:github:andrei-shtanakov @id:idea-21-handover-blocks @epic:eco.ops
       Оркестратор валидирует структуру и требует переделать. Лёгкая структурная
       верификация свободного текста без JSON-схем.
 - ~~**Idea #17 — architect/editor split**~~ — **отклонено 2026-07-23**: aider уже
@@ -1024,7 +1024,7 @@
 
 ## Кросс-репные watch-items
 
-- [ ] **`executor-config v0-provisional` висит без потребителя** @owner:github:andrei-shtanakov @id:specrunnerconfig-passthrough
+- [ ] **`executor-config v0-provisional` висит без потребителя** @owner:github:andrei-shtanakov @id:specrunnerconfig-passthrough @epic:eco.spec-toolchain
       dispatcher запинил `contracts/executor-config/v0-provisional/schema.json`
       (DESIGN-301), и единственная ссылка на него во всей экосистеме — наш план-док
       `docs/superpowers/plans/2026-07-17-specrunnerconfig-passthrough.md`. Либо довести
@@ -1063,14 +1063,14 @@ ls .github/workflows/
 
 ## Catalog distribution follow-ups (ADR-ECO-003b)
 
-- [ ] XDG default catalog path ($XDG_CONFIG_HOME/<eco>/agents-catalog.toml) once the @owner:github:andrei-shtanakov @trigger:"<eco> namespace ратифицирован" @id:xdg-catalog-path
+- [ ] XDG default catalog path ($XDG_CONFIG_HOME/<eco>/agents-catalog.toml) once the @owner:github:andrei-shtanakov @trigger:"<eco> namespace ратифицирован" @id:xdg-catalog-path @epic:eco.agents-catalog
       <eco> namespace is ratified; extend `resolve_catalog_path`.
 - [x] `maestro models init | list | discover | update` CLI (ADR-003b D3) (closed by feat/models-cli).
-- [ ] Shared `CLAUDE_MODEL` / `CODEX_MODEL` cross-tool override layer. @owner:github:andrei-shtanakov @id:shared-model-override-layer
-- [ ] `default = true` field in the catalog `[[agents]]` schema to disambiguate the @owner:repo:atp-platform @trigger:"atp-platform catalog schema добавляет default=true" @id:agents-catalog-default-flag
+- [ ] Shared `CLAUDE_MODEL` / `CODEX_MODEL` cross-tool override layer. @owner:github:andrei-shtanakov @id:shared-model-override-layer @epic:eco.agents-catalog
+- [ ] `default = true` field in the catalog `[[agents]]` schema to disambiguate the @owner:repo:atp-platform @trigger:"atp-platform catalog schema добавляет default=true" @id:agents-catalog-default-flag @epic:eco.agents-catalog
       A/B window (cross-repo, PM-owned) — removes the `HarnessModelUnresolved`
       ambiguity raise.
-- [ ] `$ATP_CATALOG` указывает на отсутствующий файл → сейчас молчаливый `None` + @owner:github:andrei-shtanakov @id:catalog-missing-file-fail-loud
+- [ ] `$ATP_CATALOG` указывает на отсутствующий файл → сейчас молчаливый `None` + @owner:github:andrei-shtanakov @id:catalog-missing-file-fail-loud @epic:eco.agents-catalog
       info-лог; контракт (ADR-ECO-003b D2, зеркалит arbiter) требует громкой
       ошибки. Ожидание **признано верным, а не оспорено** — Maestro здесь
       единственный расходящийся потребитель ратифицированного контракта.
@@ -1079,7 +1079,7 @@ ls .github/workflows/
       мягкое поведение. Растяжка стоит: `xfail(strict=True)` в
       `tests/test_catalog_conformance.py` — починить молча невозможно.
       Блокера нет намеренно (ждать нечего, работа своя).
-- [ ] `maestro models init`: шаблон не эмитит плоскость `[harnesses.*]`, поэтому @owner:github:andrei-shtanakov @id:models-init-harnesses-plane
+- [ ] `maestro models init`: шаблон не эмитит плоскость `[harnesses.*]`, поэтому @owner:github:andrei-shtanakov @id:models-init-harnesses-plane @epic:eco.agents-catalog
       на каталогах, созданных этой командой, референсные проверки V1/V5
       **не вооружены вовсе** (`check_catalog_references` армирует их только при
       наличии плоскости — как велит фикстура). Отсутствие плоскости — это
@@ -1130,9 +1130,9 @@ ls .github/workflows/
       проверено сборкой wheel), потому что набор лежит под `tests/`, которых в
       wheel нет; байт-идентичность двух копий проверяется тестом, так что пин
       по-прежнему один.
-- [ ] Extract the loader to a shared PyPI lib with a cross-reader behavioral @owner:github:andrei-shtanakov @id:catalog-loader-shared-lib
+- [ ] Extract the loader to a shared PyPI lib with a cross-reader behavioral @owner:github:andrei-shtanakov @id:catalog-loader-shared-lib @epic:eco.agents-catalog
       conformance test (precedence + alias resolution across Maestro / ATP / arbiter).
-- [ ] `maestro models`: detect the same observed model id under TWO vendors in @owner:github:andrei-shtanakov @id:models-duplicate-vendor-detection
+- [ ] `maestro models`: detect the same observed model id under TWO vendors in @owner:github:andrei-shtanakov @id:models-duplicate-vendor-detection @epic:eco.agents-catalog
       one manifest — today it renders an unparseable Plane-1 block (two
       `[models."id"]` tables); update refuses safely via the validation gate
       (cryptic tomllib message), discover --out writes the broken block while
@@ -1166,14 +1166,14 @@ ls .github/workflows/
       (`harness_of_agent_id(task.routed_agent_type)` fallback) at the same
       call site.
       (closed by feat/cost-from-log)
-- [ ] Recovery-path reported cost: `_reconstruct_outcome` (recovery.py) always @owner:github:andrei-shtanakov @id:recovery-reported-cost
+- [ ] Recovery-path reported cost: `_reconstruct_outcome` (recovery.py) always @owner:github:andrei-shtanakov @id:recovery-reported-cost @epic:eco.runtime-cost-control
       reports cost_usd=None even when a persisted TaskCost row with
       reported_cost_usd exists for the crashed attempt — honest-unknown, but
       real dollars the DB already holds are lost on crash-recovery reports.
-- [ ] Responder `cost or None` (spawner_responder.py) collapses a genuine @owner:github:andrei-shtanakov @trigger:"free/local open-модели реально бегут под opencode" @id:responder-cost-none-collapse
+- [ ] Responder `cost or None` (spawner_responder.py) collapses a genuine @owner:github:andrei-shtanakov @trigger:"free/local open-модели реально бегут под opencode" @id:responder-cost-none-collapse @epic:eco.runtime-cost-control
       reported $0.00 into None ("confirmed free" reads as "unknown") — becomes
       real when free/local open models run under opencode.
-- [ ] Codex cost-from-log (research): `codex exec` writes plain text (no @owner:github:andrei-shtanakov @id:codex-cost-from-log
+- [ ] Codex cost-from-log (research): `codex exec` writes plain text (no @owner:github:andrei-shtanakov @id:codex-cost-from-log @epic:eco.runtime-cost-control
       `--output-format json`); `parse_log` routes CODEX through the Claude JSON
       parser, which extracts nothing. Investigate whether codex can emit
       structured usage/cost (tokens + cost) and, if so, add a dedicated codex
@@ -1226,7 +1226,7 @@ ls .github/workflows/
 
 ## mcp SDK v2 migration (deferred, blocked on upstream)
 
-- [ ] mcp SDK v2: blocked on upstream — fastmcp (≤3.4.5) pins mcp<2.0. @trigger:"fastmcp release notes announce mcp>=2 support" @id:mcp-sdk-v2-migration
+- [ ] mcp SDK v2: blocked on upstream — fastmcp (≤3.4.5) pins mcp<2.0. @trigger:"fastmcp release notes announce mcp>=2 support" @id:mcp-sdk-v2-migration @epic:eco.ops
       Then: lift both pins together, re-run test_mcp_server.py, and check the
       fastmcp 3→v2-based changelog for Client/transport API changes.
       Context: prograph-vault/authored/notes/2026-08-04-mcp-v2-migration-plan.md
