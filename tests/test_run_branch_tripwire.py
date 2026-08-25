@@ -402,20 +402,52 @@ class TestSpawnSeamAndDrain:
         self, tmp_path: Path, db: Database
     ) -> None:
         """Drain honors the task's OWN timeout terminate (predates the
-        gate), but never finalizes: terminate happens, tracking drops
-        the task, and the DB row stays RUNNING — no collect, no
-        transition."""
+        gate), but never finalizes: terminate happens, and once `poll()`
+        proves the process is provably dead, tracking drops the task and
+        the DB row stays RUNNING — no collect, no transition."""
         repo = _make_repo_on_branch(tmp_path)
         await _bound_db(db, repo)
         task = _make_task("t1", workdir=str(repo), status=TaskStatus.RUNNING)
         await db.create_task(task)
         s = _make_scheduler_with_mock_spawner(db, repo, run_branch="pilot/x")
-        handle = _scripted_handle(poll_results=[None])  # never exits on its own
+        # alive at the pre-timeout check, exited by the time terminate()
+        # is followed up with a poll() — represents "terminate killed it".
+        handle = _scripted_handle(poll_results=[None, 0])
         started_at = datetime.now(UTC) - timedelta(minutes=task.timeout_minutes + 1)
         s._running_tasks["t1"] = _running_task(task, handle, started_at=started_at)
         s.branch_trip = RunBranchGateError("live_branch_mismatch", "test")
         await s._monitor_running_tasks()
         handle.terminate.assert_called_once_with(grace_seconds=10.0)
+        assert "t1" not in s._running_tasks
+        assert (await db.get_task("t1")).status == TaskStatus.RUNNING
+
+    async def test_drain_keeps_timed_out_task_until_poll_proves_exit(
+        self, tmp_path: Path, db: Database
+    ) -> None:
+        """A non-local handle's `terminate()` may return before the
+        process is provably dead. Drain must not drop the task on
+        terminate() alone — it stays tracked (and terminate() is not
+        re-called if the process is genuinely gone) until a later
+        `poll()` proves the exit, at which point the next drain pass
+        reaps it."""
+        repo = _make_repo_on_branch(tmp_path)
+        await _bound_db(db, repo)
+        task = _make_task("t1", workdir=str(repo), status=TaskStatus.RUNNING)
+        await db.create_task(task)
+        s = _make_scheduler_with_mock_spawner(db, repo, run_branch="pilot/x")
+        # Still alive through the pre-timeout check AND right after
+        # terminate() — stays undrained. Only the third poll() (next
+        # drain pass) proves the exit.
+        handle = _scripted_handle(poll_results=[None, None, 0])
+        started_at = datetime.now(UTC) - timedelta(minutes=task.timeout_minutes + 1)
+        s._running_tasks["t1"] = _running_task(task, handle, started_at=started_at)
+        s.branch_trip = RunBranchGateError("live_branch_mismatch", "test")
+
+        await s._monitor_running_tasks()  # first drain pass
+        handle.terminate.assert_called_once_with(grace_seconds=10.0)
+        assert "t1" in s._running_tasks
+
+        await s._monitor_running_tasks()  # second drain pass: poll() -> 0
         assert "t1" not in s._running_tasks
         assert (await db.get_task("t1")).status == TaskStatus.RUNNING
 

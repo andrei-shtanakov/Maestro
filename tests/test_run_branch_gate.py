@@ -242,3 +242,5 @@ class TestCheckLive:
         with pytest.raises(RunBranchGateError) as exc:
             check_live(repo, RunBranchRecord(branch="pilot/x", head=tip))
         assert exc.value.reason == "live_branch_mismatch"
+        assert "detached HEAD" in str(exc.value)
+        assert "None" not in str(exc.value)

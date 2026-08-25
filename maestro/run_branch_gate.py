@@ -226,11 +226,17 @@ def check_live(workdir: Path, record: RunBranchRecord) -> None:
         head = _run_git(workdir, "symbolic-ref", "--quiet", "--short", "HEAD")
         current = head.stdout.strip() if head.returncode == 0 else None
         if current != record.branch:
-            raise RunBranchGateError(
-                "live_branch_mismatch",
-                f"checkout moved to {current!r} mid-run but the run is "
-                f"bound to {record.branch!r}; run: git switch {record.branch}",
-            )
+            if current is None:
+                detail = (
+                    "checkout is on a detached HEAD mid-run but the run is "
+                    f"bound to {record.branch!r}; run: git switch {record.branch}"
+                )
+            else:
+                detail = (
+                    f"checkout moved to {current!r} mid-run but the run is "
+                    f"bound to {record.branch!r}; run: git switch {record.branch}"
+                )
+            raise RunBranchGateError("live_branch_mismatch", detail)
         tip = branch_tip(workdir, record.branch)
         if record.head is not None and tip != record.head:
             raise RunBranchGateError(

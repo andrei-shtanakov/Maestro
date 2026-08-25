@@ -1856,6 +1856,15 @@ class Scheduler:
         the crash shape resume recovery reconciles after §6
         re-verification. Finalizing here would collect into a checkout
         that just proved wrong.
+
+        A timed-out task is only dropped once `poll()` proves the process
+        has actually exited. For a non-local handle, `terminate()` may
+        return before the process is provably dead, so a task that is
+        still alive right after `terminate()` stays in `_running_tasks`
+        for the next drain pass to reap by `poll()`. Re-terminating on a
+        later pass is idempotent-safe — each handle implementation guards
+        re-entry (local no-ops once `returncode` is set; docker/ssh
+        re-signal a process group that may already be gone).
         """
         drained: list[str] = []
         for task_id, running_task in self._running_tasks.items():
@@ -1865,7 +1874,8 @@ class Scheduler:
             elapsed = datetime.now(UTC) - running_task.started_at
             if elapsed.total_seconds() > running_task.task.timeout_minutes * 60:
                 await running_task.handle.terminate(grace_seconds=10.0)
-                drained.append(task_id)
+                if running_task.handle.poll() is not None:
+                    drained.append(task_id)
         for task_id in drained:
             del self._running_tasks[task_id]
 
