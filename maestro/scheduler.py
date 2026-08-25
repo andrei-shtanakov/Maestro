@@ -1139,6 +1139,20 @@ class Scheduler:
     async def _main_loop(self) -> None:
         """Main scheduler loop."""
         while not self._shutdown_requested:
+            if self.branch_trip is not None:
+                # Suspension drain: no new work, monitor until live
+                # processes exit, then leave. `_cleanup` then has
+                # nothing to terminate or reset.
+                if not self._running_tasks:
+                    break
+                await self._monitor_running_tasks()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._shutdown_event.wait(),
+                        timeout=self._config.poll_interval,
+                    )
+                continue
+
             # Get completed task IDs from database
             completed_ids = await self._get_completed_task_ids()
 
@@ -1253,6 +1267,9 @@ class Scheduler:
         Returns:
             True if the task was started, False if deferred or skipped.
         """
+        if not await self._branch_tripwire("spawn"):
+            return False
+
         # Get task from database
         task = await self._db.get_task(task_id)
 
@@ -1829,8 +1846,35 @@ class Scheduler:
             )
         )
 
+    async def _drain_running_tasks(self) -> None:
+        """Suspension drain (spec §7): never kill, never finalize.
+
+        Waits for each live process to exit on its own — honoring the
+        task's own timeout terminate, which predates this gate — and
+        drops it from tracking WITHOUT collect/cleanup/transition. The
+        DB keeps the RUNNING row and any open execution handle: exactly
+        the crash shape resume recovery reconciles after §6
+        re-verification. Finalizing here would collect into a checkout
+        that just proved wrong.
+        """
+        drained: list[str] = []
+        for task_id, running_task in self._running_tasks.items():
+            if running_task.handle.poll() is not None:
+                drained.append(task_id)
+                continue
+            elapsed = datetime.now(UTC) - running_task.started_at
+            if elapsed.total_seconds() > running_task.task.timeout_minutes * 60:
+                await running_task.handle.terminate(grace_seconds=10.0)
+                drained.append(task_id)
+        for task_id in drained:
+            del self._running_tasks[task_id]
+
     async def _monitor_running_tasks(self) -> None:
         """Monitor all running tasks for completion or timeout."""
+        if self.branch_trip is not None:
+            await self._drain_running_tasks()
+            return
+
         completed: list[str] = []
         to_release: list[str] = []
 
@@ -1839,6 +1883,11 @@ class Scheduler:
             return_code = running_task.handle.poll()
 
             if return_code is not None:
+                if not await self._branch_tripwire("collect"):
+                    # First trip discovered here: leave the exited task
+                    # un-finalized (no collect onto a moved checkout);
+                    # the drain pass reaps it next iteration.
+                    continue
                 # Process finished — finalize (reap/collect/cleanup) exactly
                 # once before dispatching on the outcome.
                 fin = await self._finalize_running(running_task)
