@@ -1998,6 +1998,43 @@ class Scheduler:
             error_message=message,
         )
 
+    async def _finalize_success(
+        self,
+        task_id: str,
+        task: Task,
+        *,
+        expected_status: TaskStatus,
+        result_summary: str,
+    ) -> Task | None:
+        """The success tail. Ungated: DONE -> auto-commit — today's
+        order, byte-identical. Gated (spec §7, round-3 major 1):
+        tripwire -> auto-commit -> DONE, because `DONE` is terminal and
+        a gate between DONE and the commit would strand a
+        terminal-yet-uncommitted task that resume never revisits. On a
+        trip the task stays in `expected_status` (pre-terminal,
+        re-entered by resume) and None is returned. The residual window
+        between the passed check and the git invocation it guards is
+        one git call wide — stated, not hidden (spec §7).
+        """
+        if self._config.run_branch is None:
+            done_task = await self._transition(
+                task_id,
+                TaskStatus.DONE,
+                expected_status=expected_status,
+                result_summary=result_summary,
+            )
+            await self._invoke_on_auto_commit(self._auto_commit_task(task))
+            return done_task
+        if not await self._branch_tripwire("success_finalize"):
+            return None
+        await self._invoke_on_auto_commit(self._auto_commit_task(task))
+        return await self._transition(
+            task_id,
+            TaskStatus.DONE,
+            expected_status=expected_status,
+            result_summary=result_summary,
+        )
+
     async def _handle_task_completion(
         self,
         task_id: str,
@@ -2022,6 +2059,8 @@ class Scheduler:
         if return_code == 0:
             # Success - check if validation is needed
             if task.validation_cmd:
+                if not await self._branch_tripwire("validation"):
+                    return  # task stays RUNNING, preserved for resume
                 # The VALIDATING transition differs by backend: local does a
                 # plain transition then runs; a durable (non-local) backend
                 # folds the RUNNING->VALIDATING transition into its atomic mint
@@ -2073,13 +2112,14 @@ class Scheduler:
                         # VALIDATING -> VERIFYING -> {DONE, retry, NEEDS_REVIEW}.
                         await self._run_verifier(task_id, task, running_task)
                     else:
-                        done_task = await self._transition(
+                        done_task = await self._finalize_success(
                             task_id,
-                            TaskStatus.DONE,
+                            task,
                             expected_status=TaskStatus.VALIDATING,
                             result_summary="Task completed successfully",
                         )
-                        await self._invoke_on_auto_commit(self._auto_commit_task(task))
+                        if done_task is None:
+                            return
                         outcome = await self._build_outcome(done_task, exit_code=0)
                         await self._try_report_outcome(done_task, outcome)
                         _obs_log.info(
@@ -2097,13 +2137,14 @@ class Scheduler:
                     )
             else:
                 # No validation - mark as done
-                done_task = await self._transition(
+                done_task = await self._finalize_success(
                     task_id,
-                    TaskStatus.DONE,
+                    task,
                     expected_status=TaskStatus.RUNNING,
                     result_summary="Task completed successfully",
                 )
-                await self._invoke_on_auto_commit(self._auto_commit_task(task))
+                if done_task is None:
+                    return
                 outcome = await self._build_outcome(done_task, exit_code=0)
                 await self._try_report_outcome(done_task, outcome)
                 _obs_log.info(

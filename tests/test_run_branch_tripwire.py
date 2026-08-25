@@ -10,6 +10,7 @@ from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
+from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -83,6 +84,20 @@ def _make_task(task_id: str = "t1", **overrides: object) -> Task:
         "status": TaskStatus.READY,
     }
     defaults.update(overrides)
+    # A task constructed directly in a post-RUNNING status (as opposed to
+    # reaching it through `_transition`, which stamps `started_at` via
+    # COALESCE) must still satisfy the model's "completed_at requires
+    # started_at" invariant once a completion test drives it to DONE. Both
+    # timestamps are pinned to the same instant so `started_at` never lands
+    # before the `created_at` default that `Task()` would otherwise mint a
+    # moment later.
+    if (
+        defaults["status"] not in (TaskStatus.PENDING, TaskStatus.READY)
+        and "started_at" not in overrides
+    ):
+        now = datetime.now(UTC)
+        defaults.setdefault("created_at", now)
+        defaults["started_at"] = now
     return Task(**defaults)  # type: ignore[arg-type]
 
 
@@ -327,3 +342,110 @@ class TestSpawnSeamAndDrain:
         assert s.branch_trip is not None
         handle_b.terminate.assert_not_called()
         assert (await db.get_task("b")).status == TaskStatus.RUNNING
+
+
+class TestCompletionSeams:
+    async def test_flip_between_exit_and_validation_preserves_running(
+        self, tmp_path: Path, db: Database
+    ) -> None:
+        """Round-2 major 2: no validation launch, no transition."""
+        repo = _make_repo_on_branch(tmp_path)
+        await _bound_db(db, repo)
+        task = _make_task(
+            "t1",
+            workdir=str(repo),
+            status=TaskStatus.RUNNING,
+            validation_cmd="true",
+        )
+        await db.create_task(task)
+        _git(repo, "switch", "master")
+        s = _make_scheduler_with_mock_spawner(db, repo, run_branch="pilot/x")
+        rt = _running_task(task, _scripted_handle(poll_results=[0]))
+        await s._handle_task_completion("t1", rt, 0)
+        assert s.branch_trip is not None
+        assert (await db.get_task("t1")).status == TaskStatus.RUNNING
+
+    async def test_gated_success_tail_commits_before_done(
+        self, tmp_path: Path, db: Database
+    ) -> None:
+        """Round-3 major 1: tripwire -> auto-commit -> DONE. Verified by
+        the commit sha the run records: on the gated path the DONE row
+        exists only after HEAD already moved."""
+        repo = _make_repo_on_branch(tmp_path)
+        await _bound_db(db, repo)
+        (repo / "work.txt").write_text("agent output")
+        task = _make_task("t1", workdir=str(repo), status=TaskStatus.RUNNING)
+        await db.create_task(task)
+        s = _make_scheduler_with_mock_spawner(db, repo, run_branch="pilot/x")
+        rt = _running_task(task, _scripted_handle(poll_results=[0]))
+        await s._handle_task_completion("t1", rt, 0)
+        assert (await db.get_task("t1")).status == TaskStatus.DONE
+        assert s.branch_trip is None
+        # the auto-commit landed and is on the run branch
+        assert "work.txt" in _git(repo, "show", "--name-only", "HEAD")
+
+    async def test_flip_before_success_tail_no_commit_no_done(
+        self, tmp_path: Path, db: Database
+    ) -> None:
+        repo = _make_repo_on_branch(tmp_path)
+        await _bound_db(db, repo)
+        head_before = _git(repo, "rev-parse", "HEAD")
+        (repo / "work.txt").write_text("agent output")
+        task = _make_task("t1", workdir=str(repo), status=TaskStatus.RUNNING)
+        await db.create_task(task)
+        s = _make_scheduler_with_mock_spawner(db, repo, run_branch="pilot/x")
+        # trip is discovered at the collect seam in monitor normally; here
+        # drive the completion handler directly after a flip
+        _git(repo, "switch", "master")
+        rt = _running_task(task, _scripted_handle(poll_results=[0]))
+        await s._handle_task_completion("t1", rt, 0)
+        assert (await db.get_task("t1")).status == TaskStatus.RUNNING
+        assert _git(repo, "rev-parse", "refs/heads/pilot/x") == head_before
+
+    @pytest.mark.parametrize(
+        ("run_branch", "expected_order"),
+        [
+            (None, ["transition", "commit"]),  # ungated: today's order
+            ("pilot/x", ["commit", "transition"]),  # gated: spec §7 reorder
+        ],
+    )
+    async def test_success_tail_order(
+        self,
+        tmp_path: Path,
+        db: Database,
+        run_branch: str | None,
+        expected_order: list[str],
+    ) -> None:
+        """Ungated stays DONE -> auto-commit byte-identically; gated
+        reorders to auto-commit -> DONE. Asserted by recording the CALL
+        ORDER of the two steps."""
+        repo = _make_repo_on_branch(tmp_path)
+        if run_branch is not None:
+            await _bound_db(db, repo, run_branch)
+        task = _make_task("t1", workdir=str(repo), status=TaskStatus.RUNNING)
+        await db.create_task(task)
+        s = _make_scheduler_with_mock_spawner(db, repo, run_branch=run_branch)
+        order: list[str] = []
+        real_transition = s._transition
+        real_commit = s._auto_commit_task
+
+        async def spy_transition(*args: object, **kwargs: object) -> Task:
+            order.append("transition")
+            return await real_transition(*args, **kwargs)  # type: ignore[arg-type]
+
+        def spy_commit(t: Task) -> str | None:
+            order.append("commit")
+            return real_commit(t)
+
+        with (
+            mock.patch.object(s, "_transition", spy_transition),
+            mock.patch.object(s, "_auto_commit_task", spy_commit),
+        ):
+            done_task = await s._finalize_success(
+                "t1",
+                task,
+                expected_status=TaskStatus.RUNNING,
+                result_summary="Task completed successfully",
+            )
+        assert done_task is not None
+        assert order == expected_order
