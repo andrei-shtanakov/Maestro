@@ -2391,6 +2391,8 @@ class Scheduler:
         if cfg is None:
             # Invariant: callers only reach here via `_verifier_enabled`.
             return
+        if not await self._branch_tripwire("verifier_preflight"):
+            return  # task stays VALIDATING, preserved for resume
         worktree = Path(task.workdir)
 
         try:
@@ -2495,13 +2497,18 @@ class Scheduler:
         await self._record_verifier_cost(task_id, attempt, verifier_model, result)
 
         if result.outcome is VerdictValue.PASS:
-            done_task = await self._transition(
+            done_task = await self._finalize_success(
                 task_id,
-                TaskStatus.DONE,
+                task,
                 expected_status=TaskStatus.VERIFYING,
                 result_summary="Task completed successfully (verifier PASS)",
             )
-            await self._invoke_on_auto_commit(self._auto_commit_task(task))
+            if done_task is None:
+                # Tripped between the judge and finalization: the task
+                # stays VERIFYING; crash-recovery for VERIFYING routes
+                # fail-closed to NEEDS_REVIEW (never auto-re-run), which
+                # is this gate's own philosophy — preserved, not softened.
+                return
             outcome = await self._build_outcome(done_task, exit_code=0, attempt=attempt)
             await self._try_report_outcome(done_task, outcome)
             self._emit_event(

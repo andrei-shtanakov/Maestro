@@ -17,7 +17,13 @@ import pytest
 
 from maestro.dag import DAG
 from maestro.database import Database, create_database
-from maestro.models import AgentType, Task, TaskStatus
+from maestro.domain.verdict import (
+    TaskHandshakeResult,
+    TaskVerdictDocument,
+    TaskVerdictIdentity,
+    VerdictValue,
+)
+from maestro.models import AgentType, Task, TaskStatus, VerifierConfig
 from maestro.run_branch_gate import RunBranchGateError
 from maestro.scheduler import (
     CHECKOUT_SEAMS,
@@ -130,6 +136,51 @@ def _make_scheduler_with_mock_spawner(
     dag = DAG([])
     spawner = MagicMock()
     return Scheduler(db, dag, {AgentType.CLAUDE_CODE.value: spawner}, config)
+
+
+def _make_verifier_scheduler(
+    db: Database, repo: Path, *, run_branch: str | None
+) -> Scheduler:
+    """Same shape as `_make_scheduler_with_mock_spawner`, plus a minimal
+    `VerifierConfig` (following `tests/test_scheduler_verifier_gate.py`'s
+    fixture pattern) so `_run_verifier` is reachable.
+    """
+    config = SchedulerConfig(
+        max_concurrent=2,
+        workdir=repo,
+        log_dir=repo.parent / "logs",
+        auto_commit=True,
+        run_branch=run_branch,
+    )
+    dag = DAG([])
+    return Scheduler(
+        db,
+        dag,
+        {},
+        config,
+        verifier=VerifierConfig(model="fake-verifier-model", runner="claude"),
+    )
+
+
+def _verifier_pass_result(task_id: str) -> TaskHandshakeResult:
+    identity = TaskVerdictIdentity(
+        task_id=task_id,
+        verification_run_id=f"verify-{task_id}-1",
+        verification_attempt=1,
+        artifact=f"task-diff:{task_id}",
+        artifact_sha256="a" * 64,
+        criteria_sha256="b" * 64,
+        profile_sha256="c" * 64,
+        verified_source_commit="deadbeef",
+        verified_scope_sha256="d" * 64,
+    )
+    document = TaskVerdictDocument(
+        schema_version=2,
+        identity=identity,
+        verdict=VerdictValue.PASS,
+        findings=[],
+    )
+    return TaskHandshakeResult(outcome=VerdictValue.PASS, document=document)
 
 
 def _scripted_handle(poll_results: list[int | None]) -> MagicMock:
@@ -449,3 +500,91 @@ class TestCompletionSeams:
             )
         assert done_task is not None
         assert order == expected_order
+
+
+class TestVerifierSeams:
+    async def test_flip_before_verifier_preflight_judge_never_invoked(
+        self, tmp_path: Path, db: Database, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Round-3 major 2: a flip between validation and the judge
+        would have the judge rule on unrelated tree state. Task stays
+        VALIDATING (pre-terminal; recovery routes VALIDATING -> READY)."""
+        repo = _make_repo_on_branch(tmp_path)
+        await _bound_db(db, repo)
+        task = _make_task(
+            "t1",
+            workdir=str(repo),
+            status=TaskStatus.VALIDATING,
+            validation_cmd="true",
+            scope=["*.txt"],
+            verifier_baseline_sha=_git(repo, "rev-parse", "HEAD"),
+        )
+        await db.create_task(task)
+        _git(repo, "switch", "master")
+        s = _make_verifier_scheduler(db, repo, run_branch="pilot/x")
+        judge_invoked = []
+        monkeypatch.setattr(
+            "maestro.scheduler.ClaudeDiffJudge",
+            lambda **kw: judge_invoked.append(kw),  # would explode if called
+        )
+        rt = _running_task(task, _scripted_handle(poll_results=[0]))
+        await s._run_verifier("t1", task, rt)
+        assert judge_invoked == []
+        assert s.branch_trip is not None
+        assert (await db.get_task("t1")).status == TaskStatus.VALIDATING
+
+    async def test_pass_tail_commits_before_done(
+        self, tmp_path: Path, db: Database, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Round-3 major 1, verifier flavor: on a gated run the PASS tail
+        auto-commits BEFORE the DONE transition, via `_finalize_success`
+        (same call-order technique as `test_success_tail_order`)."""
+        repo = _make_repo_on_branch(tmp_path)
+        await _bound_db(db, repo)
+        baseline_sha = _git(repo, "rev-parse", "HEAD")
+        (repo / "a.txt").write_text("changed")
+        task = _make_task(
+            "t1",
+            workdir=str(repo),
+            status=TaskStatus.VALIDATING,
+            validation_cmd="true",
+            scope=["*.txt"],
+            verifier_baseline_sha=baseline_sha,
+        )
+        await db.create_task(task)
+        s = _make_verifier_scheduler(db, repo, run_branch="pilot/x")
+        monkeypatch.setattr(
+            "maestro.scheduler.resolve_verifier_model",
+            lambda cfg, catalog: "fake-verifier-model",  # noqa: ARG005
+        )
+
+        class _FakeJudge:
+            def __init__(self, **_kw: object) -> None:
+                pass
+
+            async def verify(self, _ctx: object) -> TaskHandshakeResult:
+                return _verifier_pass_result("t1")
+
+        monkeypatch.setattr("maestro.scheduler.ClaudeDiffJudge", _FakeJudge)
+
+        order: list[str] = []
+        real_transition = s._transition
+        real_commit = s._auto_commit_task
+
+        async def spy_transition(*args: object, **kwargs: object) -> Task:
+            order.append("transition")
+            return await real_transition(*args, **kwargs)  # type: ignore[arg-type]
+
+        def spy_commit(t: Task) -> str | None:
+            order.append("commit")
+            return real_commit(t)
+
+        rt = _running_task(task, _scripted_handle(poll_results=[0]))
+        with (
+            mock.patch.object(s, "_transition", spy_transition),
+            mock.patch.object(s, "_auto_commit_task", spy_commit),
+        ):
+            await s._run_verifier("t1", task, rt)
+
+        assert order == ["commit", "transition"]
+        assert (await db.get_task("t1")).status == TaskStatus.DONE
