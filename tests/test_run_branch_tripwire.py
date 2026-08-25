@@ -7,7 +7,7 @@ run row, a MagicMock spawner — mirrors tests/test_scheduler.py's fixtures.
 import asyncio
 import subprocess
 from collections.abc import AsyncGenerator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
@@ -134,11 +134,13 @@ def _scripted_handle(poll_results: list[int | None]) -> MagicMock:
     return handle
 
 
-def _running_task(task: Task, handle: MagicMock) -> RunningTask:
+def _running_task(
+    task: Task, handle: MagicMock, *, started_at: datetime | None = None
+) -> RunningTask:
     return RunningTask(
         task=task,
         handle=handle,
-        started_at=datetime.now(UTC),
+        started_at=started_at if started_at is not None else datetime.now(UTC),
         log_file=Path("/tmp/t1.log"),
         execution_id=None,
         backend_id="local",
@@ -278,3 +280,50 @@ class TestSpawnSeamAndDrain:
         s = _make_scheduler_with_mock_spawner(db, repo, run_branch="pilot/x")
         s.branch_trip = RunBranchGateError("live_branch_mismatch", "test")
         await asyncio.wait_for(s._main_loop(), timeout=5)  # no running tasks -> returns
+
+    async def test_drain_terminates_timed_out_task_without_finalize(
+        self, tmp_path: Path, db: Database
+    ) -> None:
+        """Drain honors the task's OWN timeout terminate (predates the
+        gate), but never finalizes: terminate happens, tracking drops
+        the task, and the DB row stays RUNNING — no collect, no
+        transition."""
+        repo = _make_repo_on_branch(tmp_path)
+        await _bound_db(db, repo)
+        task = _make_task("t1", workdir=str(repo), status=TaskStatus.RUNNING)
+        await db.create_task(task)
+        s = _make_scheduler_with_mock_spawner(db, repo, run_branch="pilot/x")
+        handle = _scripted_handle(poll_results=[None])  # never exits on its own
+        started_at = datetime.now(UTC) - timedelta(minutes=task.timeout_minutes + 1)
+        s._running_tasks["t1"] = _running_task(task, handle, started_at=started_at)
+        s.branch_trip = RunBranchGateError("live_branch_mismatch", "test")
+        await s._monitor_running_tasks()
+        handle.terminate.assert_called_once_with(grace_seconds=10.0)
+        assert "t1" not in s._running_tasks
+        assert (await db.get_task("t1")).status == TaskStatus.RUNNING
+
+    async def test_same_pass_trip_leaves_other_timed_out_task_undrained(
+        self, tmp_path: Path, db: Database
+    ) -> None:
+        """Regression for the same-pass ordering bug: task A exits and
+        trips the collect seam mid-iteration; task B (a DIFFERENT task,
+        already past its own timeout) must NOT be terminated or
+        finalized in that same pass — it is left for the next drain
+        pass, exactly like A."""
+        repo = _make_repo_on_branch(tmp_path)
+        await _bound_db(db, repo)
+        task_a = _make_task("a", workdir=str(repo), status=TaskStatus.RUNNING)
+        task_b = _make_task("b", workdir=str(repo), status=TaskStatus.RUNNING)
+        await db.create_task(task_a)
+        await db.create_task(task_b)
+        _git(repo, "switch", "master")
+        s = _make_scheduler_with_mock_spawner(db, repo, run_branch="pilot/x")
+        handle_a = _scripted_handle(poll_results=[0, 0])  # exited
+        handle_b = _scripted_handle(poll_results=[None])  # still alive
+        started_at_b = datetime.now(UTC) - timedelta(minutes=task_b.timeout_minutes + 1)
+        s._running_tasks["a"] = _running_task(task_a, handle_a)
+        s._running_tasks["b"] = _running_task(task_b, handle_b, started_at=started_at_b)
+        await s._monitor_running_tasks()
+        assert s.branch_trip is not None
+        handle_b.terminate.assert_not_called()
+        assert (await db.get_task("b")).status == TaskStatus.RUNNING

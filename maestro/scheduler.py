@@ -1879,6 +1879,14 @@ class Scheduler:
         to_release: list[str] = []
 
         for task_id, running_task in self._running_tasks.items():
+            if self.branch_trip is not None:
+                # A prior task in THIS pass tripped the gate — never
+                # finalize/collect/transition anything after that,
+                # including an unrelated task's timeout. The next
+                # drain pass reaps it (drain already terminates a
+                # timed-out task without finalizing).
+                continue
+
             # Check if process has finished
             return_code = running_task.handle.poll()
 
