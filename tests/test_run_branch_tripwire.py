@@ -5,6 +5,8 @@ run row, a MagicMock spawner — mirrors tests/test_scheduler.py's fixtures.
 """
 
 import asyncio
+import inspect
+import re
 import subprocess
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
@@ -15,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import maestro.scheduler
 from maestro.dag import DAG
 from maestro.database import Database, create_database
 from maestro.domain.verdict import (
@@ -271,6 +274,14 @@ class TestBranchTripwire:
         with pytest.raises(AssertionError):
             await s._branch_tripwire("not-a-seam")
 
+
+class TestSeamInventory:
+    """Spec §7: the tripwire inventory is a claim about the scheduler,
+    asserted here. Extending the scheduler with a new checkout-using
+    seam must (a) add the seam to CHECKOUT_SEAMS and (b) call
+    _branch_tripwire at that seam — either half alone fails this class.
+    """
+
     def test_seam_inventory_is_exactly_the_spec_set(self) -> None:
         assert {
             "spawn",
@@ -279,6 +290,27 @@ class TestBranchTripwire:
             "verifier_preflight",
             "success_finalize",
         } == CHECKOUT_SEAMS
+
+    def test_every_registered_seam_is_claimed_in_source(self) -> None:
+        source = inspect.getsource(maestro.scheduler)
+        claimed = set(re.findall(r'_branch_tripwire\("([a-z_]+)"\)', source))
+        assert claimed == CHECKOUT_SEAMS
+
+    @pytest.mark.parametrize(
+        ("method", "seam"),
+        [
+            ("_spawn_task", "spawn"),
+            ("_monitor_running_tasks", "collect"),
+            ("_handle_task_completion", "validation"),
+            ("_run_verifier", "verifier_preflight"),
+            ("_finalize_success", "success_finalize"),
+        ],
+    )
+    def test_seam_guard_lives_at_its_checkout_site(
+        self, method: str, seam: str
+    ) -> None:
+        source = inspect.getsource(getattr(Scheduler, method))
+        assert f'_branch_tripwire("{seam}")' in source
 
 
 class TestSpawnSeamAndDrain:
