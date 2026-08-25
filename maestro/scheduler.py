@@ -85,6 +85,7 @@ from maestro.notifications.base import Notification, NotificationEvent
 from maestro.notifications.manager import NotificationManager
 from maestro.preflight import ValidationBackendError, check_validation_backends
 from maestro.retry import RetryManager
+from maestro.run_branch_gate import RunBranchGateError, RunBranchRecord, check_live
 from maestro.transitions import TransitionDispatcher
 from maestro.validator import (
     ValidationResult,
@@ -107,6 +108,18 @@ logger = logging.getLogger(__name__)
 _obs_log = obs.get_logger("maestro.scheduler")
 
 MAX_REATTEMPTS_PER_TICK = 5
+
+#: Every checkout-using seam on the Mode-1 run path (spec §7). A new seam
+#: must be added here AND claim a `_branch_tripwire(...)` call — the
+#: inventory test (tests/test_run_branch_tripwire.py) asserts both, the
+#: way transitions.py's totality test forces a table entry for a new
+#: status. `collect` is here although spec §7 lists four: finalizing a
+#: remote handle applies results into the working tree (§6 names collect
+#: as checkout-mutating), and §7's rule is "every point about to use the
+#: checkout".
+CHECKOUT_SEAMS: frozenset[str] = frozenset(
+    {"spawn", "collect", "validation", "verifier_preflight", "success_finalize"}
+)
 
 StatusChangeCallback = Callable[[str, str, str], None]
 
@@ -251,6 +264,9 @@ class SchedulerConfig:
     shutdown_grace_seconds: float = 5.0
     auto_commit: bool = False
     on_auto_commit: Callable[[str], Awaitable[None]] | None = None
+    #: The run's bound branch (spec §7 phase B). None = ungated: every
+    #: tripwire is a no-op and the success tail keeps today's order.
+    run_branch: str | None = None
 
 
 class SchedulerError(Exception):
@@ -359,6 +375,10 @@ class Scheduler:
         self._shutdown_requested = False
         self._shutdown_event = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
+        #: Spec §7 sticky tripwire state: the refusal that suspended this
+        #: run, or None while ungated / not yet tripped. Public — the CLI
+        #: reads it after `run()` returns to render the stderr refusal.
+        self.branch_trip: RunBranchGateError | None = None
 
     @property
     def is_running(self) -> bool:
@@ -866,6 +886,53 @@ class Scheduler:
             await self._config.on_auto_commit(sha)
         except Exception:
             logger.warning("on_auto_commit hook failed", exc_info=True)
+
+    async def _branch_tripwire(self, seam: str) -> bool:
+        """Spec §7 live check before a checkout-using seam. True = proceed.
+
+        No-op (True) on ungated runs. Sticky after the first trip: the
+        run is suspending, and a branch restored mid-drain must not let
+        later completions finalize under a run already recorded
+        suspended. A gated run whose run row cannot be read fails
+        closed — missing evidence is never green. The suspension write
+        is durable (`set_run_suspended`, §B.1.1: resumable, not an
+        outcome); the CLI renders the stderr refusal after the drain.
+        """
+        assert seam in CHECKOUT_SEAMS, f"unregistered checkout seam: {seam}"
+        if self._config.run_branch is None:
+            return True
+        if self.branch_trip is not None:
+            return False
+        try:
+            row = await self._db.get_run_row()
+            if row is None:
+                raise RunBranchGateError(
+                    "live_stale_checkout",
+                    "run row unreadable mid-run; refusing to touch the "
+                    "checkout on missing evidence",
+                )
+            head = row.get("run_branch_head")
+            check_live(
+                self._config.workdir,
+                RunBranchRecord(
+                    branch=self._config.run_branch,
+                    head=str(head) if head is not None else None,
+                ),
+            )
+        except RunBranchGateError as e:
+            self.branch_trip = e
+            logger.error("run-branch tripwire at %s: %s", seam, e)
+            try:
+                await self._db.set_run_suspended(
+                    suspended_at=datetime.now(UTC).isoformat(),
+                    suspend_reason=f"run-branch tripwire at {seam}: {e}",
+                )
+            except Exception:
+                # The in-memory trip still drains and the CLI still
+                # refuses; only the durable marker is missing.
+                logger.warning("suspend record failed", exc_info=True)
+            return False
+        return True
 
     async def run(self) -> None:
         """Run the scheduler main loop.
