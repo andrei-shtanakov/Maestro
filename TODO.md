@@ -926,7 +926,7 @@
       Хвост приёмки: события §8 run_branch_gate.{created,verified,refused}
       дореализованы (feat/run-branch-gate-events) — третий след изоляции,
       на котором dispatcher строил приёмочную проверку.
-- [ ] **mode1-run-branch-tripwire**: фаза B run-branch гейта — state-tripwire на каждом checkout-шве @owner:github:andrei-shtanakov @id:mode1-run-branch-tripwire
+- [x] **mode1-run-branch-tripwire**: фаза B run-branch гейта — state-tripwire на каждом checkout-шве @owner:github:andrei-shtanakov @id:mode1-run-branch-tripwire (closed by feat/mode1-run-branch-tripwire)
       Спека §7 (та же
       `docs/superpowers/specs/2026-08-24-mode1-run-branch-isolation-design.md`):
       проверка «имя ветки И tip == записи» перед КАЖДЫМ использованием

@@ -1,6 +1,6 @@
 """Mode-1 run-level branch gate (issue #216 part 2, spec revision 8).
 
-Pure decision core: every §4/§6 rule is computed from a snapshot dataclass
+Pure decision core: every §4/§6/§7 rule is computed from a snapshot dataclass
 so the git- and DB-facing plumbing stays thin and separately testable.
 Design doc: docs/superpowers/specs/2026-08-24-mode1-run-branch-isolation-design.md
 """
@@ -207,3 +207,44 @@ def verify_continuation(
         dirty=len(snap.dirty_paths),
     )
     return tip, snap.dirty_paths
+
+
+def check_live(workdir: Path, record: RunBranchRecord) -> None:
+    """Spec §7 per-seam tripwire: branch name AND tip must equal the record.
+
+    §6's invariant is state immobility, not name stability — a foreign
+    commit landed on the *same* branch mid-run moves the state as surely
+    as a flip (round-5 major 2). The run's own commits keep the recorded
+    head current (`on_auto_commit`), so only foreign movement trips.
+    Raises on mismatch (emitting the refusal event, like
+    `verify_continuation`); a pass emits nothing — this runs at every
+    seam and a per-seam `.verified` would be noise. A `None` head
+    degrades to name-only: phase A always records a head for a bound
+    run, so this is tolerance for a hand-edited row, not a mode.
+    """
+    try:
+        head = _run_git(workdir, "symbolic-ref", "--quiet", "--short", "HEAD")
+        current = head.stdout.strip() if head.returncode == 0 else None
+        if current != record.branch:
+            if current is None:
+                detail = (
+                    "checkout is on a detached HEAD mid-run but the run is "
+                    f"bound to {record.branch!r}; run: git switch {record.branch}"
+                )
+            else:
+                detail = (
+                    f"checkout moved to {current!r} mid-run but the run is "
+                    f"bound to {record.branch!r}; run: git switch {record.branch}"
+                )
+            raise RunBranchGateError("live_branch_mismatch", detail)
+        tip = branch_tip(workdir, record.branch)
+        if record.head is not None and tip != record.head:
+            raise RunBranchGateError(
+                "live_stale_checkout",
+                f"branch {record.branch!r} tip moved mid-run: recorded "
+                f"{record.head[:12]}, observed {tip[:12]} — foreign "
+                "movement on the run branch",
+            )
+    except RunBranchGateError as e:
+        _emit("run_branch_gate.refused", reason=e.reason, branch=record.branch)
+        raise

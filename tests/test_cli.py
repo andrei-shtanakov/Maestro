@@ -35,6 +35,7 @@ from maestro.cli import (
 from maestro.database import create_database
 from maestro.models import AgentType, Task, TaskStatus, Workstream, WorkstreamConfig
 from maestro.repo_identity import identity_from_checkout
+from maestro.run_branch_gate import RunBranchGateError
 from maestro.run_publish import create_run
 from maestro.state_paths import maestro_home
 
@@ -565,6 +566,7 @@ class TestOrchestratorResumeFlag:
         recovery_instance.recover = _recover
 
         scheduler_instance = MagicMock()
+        scheduler_instance.branch_trip = None
         scheduler_instance.run = AsyncMock(return_value=None)
 
         with (
@@ -611,6 +613,7 @@ class TestMode1DefaultLogDir:
         """Drive `_run_scheduler` to completion, returning the
         `create_event_logger` mock to inspect the resolved log dir."""
         scheduler_instance = MagicMock()
+        scheduler_instance.branch_trip = None
         scheduler_instance.run = AsyncMock(return_value=None)
 
         with (
@@ -681,6 +684,7 @@ class TestMode1DefaultLogDir:
         )
 
         scheduler_instance = MagicMock()
+        scheduler_instance.branch_trip = None
         scheduler_instance.run = AsyncMock(return_value=None)
 
         with (
@@ -722,6 +726,7 @@ class TestRunBranchGateStart:
     ) -> None:
         """Copied verbatim from `TestMode1DefaultLogDir`'s helper."""
         scheduler_instance = MagicMock()
+        scheduler_instance.branch_trip = None
         scheduler_instance.run = AsyncMock(return_value=None)
 
         with (
@@ -820,6 +825,7 @@ class TestOnAutoCommitWiring:
         )
 
         scheduler_instance = MagicMock()
+        scheduler_instance.branch_trip = None
         scheduler_instance.run = AsyncMock(return_value=None)
 
         with (
@@ -853,6 +859,7 @@ class TestOnAutoCommitWiring:
         db_path = temp_dir / "test.db"
 
         scheduler_instance = MagicMock()
+        scheduler_instance.branch_trip = None
         scheduler_instance.run = AsyncMock(return_value=None)
 
         with (
@@ -897,6 +904,7 @@ class TestOnAutoCommitWiring:
         await _seed_run_row(db_path, branch="pilot/x", declared=1, head=tip)
 
         scheduler_instance = MagicMock()
+        scheduler_instance.branch_trip = None
         scheduler_instance.run = AsyncMock(return_value=None)
 
         with (
@@ -919,6 +927,124 @@ class TestOnAutoCommitWiring:
             )
 
         assert mock_create.call_args.kwargs["on_auto_commit"] is not None
+
+    async def test_gated_fresh_run_passes_run_branch(self, temp_dir: Path) -> None:
+        """Task 7: the bound branch itself (not just a non-None callback)
+        reaches `create_scheduler_from_config`, which is what arms the
+        scheduler's §7 tripwires."""
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        db_path = temp_dir / "test.db"
+
+        scheduler_instance = MagicMock()
+        scheduler_instance.branch_trip = None
+        scheduler_instance.run = AsyncMock(return_value=None)
+
+        with (
+            patch("maestro.cli.create_event_logger"),
+            patch("maestro.cli.make_routing_strategy", new_callable=AsyncMock),
+            patch(
+                "maestro.cli.create_scheduler_from_config",
+                new_callable=AsyncMock,
+                return_value=scheduler_instance,
+            ) as mock_create,
+            patch("maestro.cli._acquire_pid_lock", return_value=99),
+            patch("maestro.cli._release_pid_lock"),
+        ):
+            await _run_scheduler(
+                config_path=config_path,
+                db_path=db_path,
+                resume=False,
+                log_dir=None,
+                clean=False,
+            )
+
+        assert mock_create.call_args.kwargs["run_branch"] == "pilot/x"
+
+    async def test_ungated_run_passes_none_run_branch(self, temp_dir: Path) -> None:
+        config_path = _write_scheduler_config(temp_dir)  # no git block
+        db_path = temp_dir / "test.db"
+
+        scheduler_instance = MagicMock()
+        scheduler_instance.branch_trip = None
+        scheduler_instance.run = AsyncMock(return_value=None)
+
+        with (
+            patch("maestro.cli.create_event_logger"),
+            patch("maestro.cli.make_routing_strategy", new_callable=AsyncMock),
+            patch(
+                "maestro.cli.create_scheduler_from_config",
+                new_callable=AsyncMock,
+                return_value=scheduler_instance,
+            ) as mock_create,
+            patch("maestro.cli._acquire_pid_lock", return_value=99),
+            patch("maestro.cli._release_pid_lock"),
+        ):
+            await _run_scheduler(
+                config_path=config_path,
+                db_path=db_path,
+                resume=False,
+                log_dir=None,
+                clean=False,
+            )
+
+        assert mock_create.call_args.kwargs["run_branch"] is None
+
+
+class TestBranchTripSuspensionRender:
+    """Task 7: a scheduler that trips a §7 tripwire mid-run must exit 1 with
+    the refusal on stderr, never fall through to `_announce_conclusion` as
+    if the run had a normal ending — the durable suspension is already
+    written by the scheduler itself; the CLI only has to say why it stopped
+    and exit non-zero."""
+
+    async def test_tripped_run_exits_1_with_stderr_refusal(
+        self, temp_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        config_path = _write_scheduler_config(
+            temp_dir, git_block={"run_branch": "pilot/x", "base_branch": "master"}
+        )
+        repo_dir = temp_dir / "sched-repo"
+        _init_git_repo(repo_dir)
+        db_path = temp_dir / "test.db"
+
+        scheduler_instance = MagicMock()
+        scheduler_instance.branch_trip = None
+
+        async def _run() -> None:
+            scheduler_instance.branch_trip = RunBranchGateError(
+                "live_branch_mismatch", "moved to 'master'"
+            )
+
+        scheduler_instance.run = AsyncMock(side_effect=_run)
+
+        with (
+            patch("maestro.cli.create_event_logger"),
+            patch("maestro.cli.make_routing_strategy", new_callable=AsyncMock),
+            patch(
+                "maestro.cli.create_scheduler_from_config",
+                new_callable=AsyncMock,
+                return_value=scheduler_instance,
+            ),
+            patch("maestro.cli._acquire_pid_lock", return_value=99),
+            patch("maestro.cli._release_pid_lock"),
+            pytest.raises(typer.Exit) as excinfo,
+        ):
+            await _run_scheduler(
+                config_path=config_path,
+                db_path=db_path,
+                resume=False,
+                log_dir=None,
+                clean=False,
+            )
+
+        assert excinfo.value.exit_code == 1
+        captured = capsys.readouterr()
+        assert "run-branch tripwire" in captured.err
+        assert "moved to 'master'" in captured.err
 
 
 class TestRunBranchGateContinuation:
@@ -961,6 +1087,7 @@ class TestRunBranchGateContinuation:
         back what the run wired into the scheduler.
         """
         scheduler_instance = MagicMock()
+        scheduler_instance.branch_trip = None
         scheduler_instance.run = AsyncMock(return_value=None)
         recovery = recovery_cls if recovery_cls is not None else MagicMock()
 
@@ -1336,6 +1463,7 @@ class TestRunBranchGateContinuation:
             _git(repo_dir, "commit", "-m", "foreign, mid-run")
 
         scheduler_instance = MagicMock()
+        scheduler_instance.branch_trip = None
         scheduler_instance.run = AsyncMock(side_effect=_foreign_commit_lands)
 
         with (

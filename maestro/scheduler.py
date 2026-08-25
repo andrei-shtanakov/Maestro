@@ -85,6 +85,7 @@ from maestro.notifications.base import Notification, NotificationEvent
 from maestro.notifications.manager import NotificationManager
 from maestro.preflight import ValidationBackendError, check_validation_backends
 from maestro.retry import RetryManager
+from maestro.run_branch_gate import RunBranchGateError, RunBranchRecord, check_live
 from maestro.transitions import TransitionDispatcher
 from maestro.validator import (
     ValidationResult,
@@ -107,6 +108,18 @@ logger = logging.getLogger(__name__)
 _obs_log = obs.get_logger("maestro.scheduler")
 
 MAX_REATTEMPTS_PER_TICK = 5
+
+#: Every checkout-using seam on the Mode-1 run path (spec §7). A new seam
+#: must be added here AND claim a `_branch_tripwire(...)` call — the
+#: inventory test (tests/test_run_branch_tripwire.py) asserts both, the
+#: way transitions.py's totality test forces a table entry for a new
+#: status. `collect` is here although spec §7 lists four: finalizing a
+#: remote handle applies results into the working tree (§6 names collect
+#: as checkout-mutating), and §7's rule is "every point about to use the
+#: checkout".
+CHECKOUT_SEAMS: frozenset[str] = frozenset(
+    {"spawn", "collect", "validation", "verifier_preflight", "success_finalize"}
+)
 
 StatusChangeCallback = Callable[[str, str, str], None]
 
@@ -251,6 +264,9 @@ class SchedulerConfig:
     shutdown_grace_seconds: float = 5.0
     auto_commit: bool = False
     on_auto_commit: Callable[[str], Awaitable[None]] | None = None
+    #: The run's bound branch (spec §7 phase B). None = ungated: every
+    #: tripwire is a no-op and the success tail keeps today's order.
+    run_branch: str | None = None
 
 
 class SchedulerError(Exception):
@@ -359,6 +375,10 @@ class Scheduler:
         self._shutdown_requested = False
         self._shutdown_event = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
+        #: Spec §7 sticky tripwire state: the refusal that suspended this
+        #: run, or None while ungated / not yet tripped. Public — the CLI
+        #: reads it after `run()` returns to render the stderr refusal.
+        self.branch_trip: RunBranchGateError | None = None
 
     @property
     def is_running(self) -> bool:
@@ -867,6 +887,53 @@ class Scheduler:
         except Exception:
             logger.warning("on_auto_commit hook failed", exc_info=True)
 
+    async def _branch_tripwire(self, seam: str) -> bool:
+        """Spec §7 live check before a checkout-using seam. True = proceed.
+
+        No-op (True) on ungated runs. Sticky after the first trip: the
+        run is suspending, and a branch restored mid-drain must not let
+        later completions finalize under a run already recorded
+        suspended. A gated run whose run row cannot be read fails
+        closed — missing evidence is never green. The suspension write
+        is durable (`set_run_suspended`, §B.1.1: resumable, not an
+        outcome); the CLI renders the stderr refusal after the drain.
+        """
+        assert seam in CHECKOUT_SEAMS, f"unregistered checkout seam: {seam}"
+        if self._config.run_branch is None:
+            return True
+        if self.branch_trip is not None:
+            return False
+        try:
+            row = await self._db.get_run_row()
+            if row is None:
+                raise RunBranchGateError(
+                    "record_missing",
+                    "run row unreadable mid-run; refusing to touch the "
+                    "checkout on missing evidence",
+                )
+            head = row.get("run_branch_head")
+            check_live(
+                self._config.workdir,
+                RunBranchRecord(
+                    branch=self._config.run_branch,
+                    head=str(head) if head is not None else None,
+                ),
+            )
+        except RunBranchGateError as e:
+            self.branch_trip = e
+            logger.error("run-branch tripwire at %s: %s", seam, e)
+            try:
+                await self._db.set_run_suspended(
+                    suspended_at=datetime.now(UTC).isoformat(),
+                    suspend_reason=f"run-branch tripwire at {seam}: {e}",
+                )
+            except Exception:
+                # The in-memory trip still drains and the CLI still
+                # refuses; only the durable marker is missing.
+                logger.warning("suspend record failed", exc_info=True)
+            return False
+        return True
+
     async def run(self) -> None:
         """Run the scheduler main loop.
 
@@ -1072,6 +1139,20 @@ class Scheduler:
     async def _main_loop(self) -> None:
         """Main scheduler loop."""
         while not self._shutdown_requested:
+            if self.branch_trip is not None:
+                # Suspension drain: no new work, monitor until live
+                # processes exit, then leave. `_cleanup` then has
+                # nothing to terminate or reset.
+                if not self._running_tasks:
+                    break
+                await self._monitor_running_tasks()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._shutdown_event.wait(),
+                        timeout=self._config.poll_interval,
+                    )
+                continue
+
             # Get completed task IDs from database
             completed_ids = await self._get_completed_task_ids()
 
@@ -1186,6 +1267,9 @@ class Scheduler:
         Returns:
             True if the task was started, False if deferred or skipped.
         """
+        if not await self._branch_tripwire("spawn"):
+            return False
+
         # Get task from database
         task = await self._db.get_task(task_id)
 
@@ -1762,16 +1846,66 @@ class Scheduler:
             )
         )
 
+    async def _drain_running_tasks(self) -> None:
+        """Suspension drain (spec §7): never kill, never finalize.
+
+        Waits for each live process to exit on its own — honoring the
+        task's own timeout terminate, which predates this gate — and
+        drops it from tracking WITHOUT collect/cleanup/transition. The
+        DB keeps the RUNNING row and any open execution handle: exactly
+        the crash shape resume recovery reconciles after §6
+        re-verification. Finalizing here would collect into a checkout
+        that just proved wrong.
+
+        A timed-out task is only dropped once `poll()` proves the process
+        has actually exited. For a non-local handle, `terminate()` may
+        return before the process is provably dead, so a task that is
+        still alive right after `terminate()` stays in `_running_tasks`
+        for the next drain pass to reap by `poll()`. Re-terminating on a
+        later pass is idempotent-safe — each handle implementation guards
+        re-entry (local no-ops once `returncode` is set; docker/ssh
+        re-signal a process group that may already be gone).
+        """
+        drained: list[str] = []
+        for task_id, running_task in self._running_tasks.items():
+            if running_task.handle.poll() is not None:
+                drained.append(task_id)
+                continue
+            elapsed = datetime.now(UTC) - running_task.started_at
+            if elapsed.total_seconds() > running_task.task.timeout_minutes * 60:
+                await running_task.handle.terminate(grace_seconds=10.0)
+                if running_task.handle.poll() is not None:
+                    drained.append(task_id)
+        for task_id in drained:
+            del self._running_tasks[task_id]
+
     async def _monitor_running_tasks(self) -> None:
         """Monitor all running tasks for completion or timeout."""
+        if self.branch_trip is not None:
+            await self._drain_running_tasks()
+            return
+
         completed: list[str] = []
         to_release: list[str] = []
 
         for task_id, running_task in self._running_tasks.items():
+            if self.branch_trip is not None:
+                # A prior task in THIS pass tripped the gate — never
+                # finalize/collect/transition anything after that,
+                # including an unrelated task's timeout. The next
+                # drain pass reaps it (drain already terminates a
+                # timed-out task without finalizing).
+                continue
+
             # Check if process has finished
             return_code = running_task.handle.poll()
 
             if return_code is not None:
+                if not await self._branch_tripwire("collect"):
+                    # First trip discovered here: leave the exited task
+                    # un-finalized (no collect onto a moved checkout);
+                    # the drain pass reaps it next iteration.
+                    continue
                 # Process finished — finalize (reap/collect/cleanup) exactly
                 # once before dispatching on the outcome.
                 fin = await self._finalize_running(running_task)
@@ -1825,7 +1959,19 @@ class Scheduler:
                 timeout_seconds = running_task.task.timeout_minutes * 60
 
                 if elapsed.total_seconds() > timeout_seconds:
+                    # Terminate is the task's own timeout policy (predates
+                    # this gate, mirrors `_drain_running_tasks`) and fires
+                    # regardless. The collect/finalize that follows is a
+                    # separate, gated decision: a moved checkout must not
+                    # receive this task's partial results.
                     await running_task.handle.terminate(grace_seconds=10.0)
+                    if not await self._branch_tripwire("collect"):
+                        # First trip discovered here: leave the timed-out
+                        # task un-finalized (no collect onto a moved
+                        # checkout, no transition); the process is already
+                        # terminated, so the next drain pass reaps it via
+                        # `poll()` returning non-None.
+                        continue
                     timeout_fin = await self._finalize_running(running_task)
                     timeout_exec_id = running_task.execution_id
                     if timeout_exec_id is not None and timeout_fin.cleaned:
@@ -1874,6 +2020,43 @@ class Scheduler:
             error_message=message,
         )
 
+    async def _finalize_success(
+        self,
+        task_id: str,
+        task: Task,
+        *,
+        expected_status: TaskStatus,
+        result_summary: str,
+    ) -> Task | None:
+        """The success tail. Ungated: DONE -> auto-commit — today's
+        order, byte-identical. Gated (spec §7, round-3 major 1):
+        tripwire -> auto-commit -> DONE, because `DONE` is terminal and
+        a gate between DONE and the commit would strand a
+        terminal-yet-uncommitted task that resume never revisits. On a
+        trip the task stays in `expected_status` (pre-terminal,
+        re-entered by resume) and None is returned. The residual window
+        between the passed check and the git invocation it guards is
+        one git call wide — stated, not hidden (spec §7).
+        """
+        if self._config.run_branch is None:
+            done_task = await self._transition(
+                task_id,
+                TaskStatus.DONE,
+                expected_status=expected_status,
+                result_summary=result_summary,
+            )
+            await self._invoke_on_auto_commit(self._auto_commit_task(task))
+            return done_task
+        if not await self._branch_tripwire("success_finalize"):
+            return None
+        await self._invoke_on_auto_commit(self._auto_commit_task(task))
+        return await self._transition(
+            task_id,
+            TaskStatus.DONE,
+            expected_status=expected_status,
+            result_summary=result_summary,
+        )
+
     async def _handle_task_completion(
         self,
         task_id: str,
@@ -1898,6 +2081,8 @@ class Scheduler:
         if return_code == 0:
             # Success - check if validation is needed
             if task.validation_cmd:
+                if not await self._branch_tripwire("validation"):
+                    return  # task stays RUNNING, preserved for resume
                 # The VALIDATING transition differs by backend: local does a
                 # plain transition then runs; a durable (non-local) backend
                 # folds the RUNNING->VALIDATING transition into its atomic mint
@@ -1949,13 +2134,14 @@ class Scheduler:
                         # VALIDATING -> VERIFYING -> {DONE, retry, NEEDS_REVIEW}.
                         await self._run_verifier(task_id, task, running_task)
                     else:
-                        done_task = await self._transition(
+                        done_task = await self._finalize_success(
                             task_id,
-                            TaskStatus.DONE,
+                            task,
                             expected_status=TaskStatus.VALIDATING,
                             result_summary="Task completed successfully",
                         )
-                        await self._invoke_on_auto_commit(self._auto_commit_task(task))
+                        if done_task is None:
+                            return
                         outcome = await self._build_outcome(done_task, exit_code=0)
                         await self._try_report_outcome(done_task, outcome)
                         _obs_log.info(
@@ -1973,13 +2159,14 @@ class Scheduler:
                     )
             else:
                 # No validation - mark as done
-                done_task = await self._transition(
+                done_task = await self._finalize_success(
                     task_id,
-                    TaskStatus.DONE,
+                    task,
                     expected_status=TaskStatus.RUNNING,
                     result_summary="Task completed successfully",
                 )
-                await self._invoke_on_auto_commit(self._auto_commit_task(task))
+                if done_task is None:
+                    return
                 outcome = await self._build_outcome(done_task, exit_code=0)
                 await self._try_report_outcome(done_task, outcome)
                 _obs_log.info(
@@ -2226,6 +2413,8 @@ class Scheduler:
         if cfg is None:
             # Invariant: callers only reach here via `_verifier_enabled`.
             return
+        if not await self._branch_tripwire("verifier_preflight"):
+            return  # task stays VALIDATING, preserved for resume
         worktree = Path(task.workdir)
 
         try:
@@ -2330,13 +2519,18 @@ class Scheduler:
         await self._record_verifier_cost(task_id, attempt, verifier_model, result)
 
         if result.outcome is VerdictValue.PASS:
-            done_task = await self._transition(
+            done_task = await self._finalize_success(
                 task_id,
-                TaskStatus.DONE,
+                task,
                 expected_status=TaskStatus.VERIFYING,
                 result_summary="Task completed successfully (verifier PASS)",
             )
-            await self._invoke_on_auto_commit(self._auto_commit_task(task))
+            if done_task is None:
+                # Tripped between the judge and finalization: the task
+                # stays VERIFYING; crash-recovery for VERIFYING routes
+                # fail-closed to NEEDS_REVIEW (never auto-re-run), which
+                # is this gate's own philosophy — preserved, not softened.
+                return
             outcome = await self._build_outcome(done_task, exit_code=0, attempt=attempt)
             await self._try_report_outcome(done_task, outcome)
             self._emit_event(
@@ -2780,6 +2974,7 @@ async def create_scheduler_from_config(
     arbiter_enabled: bool = False,
     execution: ExecutionConfig | None = None,
     verifier: VerifierConfig | None = None,
+    run_branch: str | None = None,
 ) -> Scheduler:
     """Create a scheduler from task configurations.
 
@@ -2810,6 +3005,7 @@ async def create_scheduler_from_config(
         verifier: Optional adversarial LLM verifier-gate config (the
             project's `verifier:` block); forwarded to `Scheduler`. None
             keeps `VALIDATING -> DONE` with no `VERIFYING` phase.
+        run_branch: the run's bound branch; arms the spec-§7 tripwires.
 
     Returns:
         Configured Scheduler instance.
@@ -2824,6 +3020,7 @@ async def create_scheduler_from_config(
         log_dir=log_dir or Path.cwd() / "logs",
         auto_commit=auto_commit,
         on_auto_commit=on_auto_commit,
+        run_branch=run_branch,
     )
 
     # Create tasks in database if they don't exist
