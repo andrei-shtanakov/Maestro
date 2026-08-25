@@ -8,14 +8,15 @@ import asyncio
 import inspect
 import re
 import subprocess
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import structlog
 
 import maestro.scheduler
 from maestro.dag import DAG
@@ -40,6 +41,38 @@ from tests.fakes.fake_execution_backend import FakeExecutionBackend
 @pytest.fixture(autouse=True)
 def _fake_execution_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("maestro.execution.resolver.LocalBackend", FakeExecutionBackend)
+
+
+@pytest.fixture(autouse=True)
+def _no_structlog_logger_caching() -> Iterator[None]:
+    """Keep these tests from poisoning `structlog`-based tests that follow.
+
+    `obs.init_logging` (reached through `setup_logging`, which earlier CLI
+    tests trigger) configures structlog with `cache_logger_on_first_use=True`.
+    A module-level lazy proxy — `scheduler.py`'s `_obs_log` — then *caches*
+    whatever pipeline is configured on its first emission, for the rest of
+    the process. This file drives completion paths (e.g.
+    `_handle_task_completion` reaching DONE) that emit through that proxy;
+    if this happened to be the first such emission under a real (caching)
+    config, the JSONL pipeline would get baked in and a later
+    `structlog.testing.capture_logs()` elsewhere (e.g.
+    `tests/test_scheduler.py`) would see nothing — the same failure mode
+    `tests/test_run_branch_e2e.py` carries this identical fixture to guard
+    against. Emitting with caching off leaves the proxy re-reading the
+    config every time, which is what `capture_logs` needs.
+    """
+    was_configured = structlog.is_configured()
+    saved: dict[str, Any] = dict(structlog.get_config())
+    uncached: dict[str, Any] = dict(saved)
+    uncached["cache_logger_on_first_use"] = False
+    structlog.configure(**uncached)
+    try:
+        yield
+    finally:
+        if was_configured:
+            structlog.configure(**saved)
+        else:
+            structlog.reset_defaults()
 
 
 def _git(repo: Path, *args: str) -> str:
