@@ -2952,6 +2952,7 @@ async def create_scheduler_from_config(
     arbiter_enabled: bool = False,
     execution: ExecutionConfig | None = None,
     verifier: VerifierConfig | None = None,
+    run_branch: str | None = None,
 ) -> Scheduler:
     """Create a scheduler from task configurations.
 
@@ -2982,6 +2983,7 @@ async def create_scheduler_from_config(
         verifier: Optional adversarial LLM verifier-gate config (the
             project's `verifier:` block); forwarded to `Scheduler`. None
             keeps `VALIDATING -> DONE` with no `VERIFYING` phase.
+        run_branch: the run's bound branch; arms the spec-§7 tripwires.
 
     Returns:
         Configured Scheduler instance.
@@ -2996,6 +2998,7 @@ async def create_scheduler_from_config(
         log_dir=log_dir or Path.cwd() / "logs",
         auto_commit=auto_commit,
         on_auto_commit=on_auto_commit,
+        run_branch=run_branch,
     )
 
     # Create tasks in database if they don't exist

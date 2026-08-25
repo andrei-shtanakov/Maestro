@@ -18,6 +18,8 @@ import structlog
 import yaml
 
 from maestro.cli import _run_scheduler
+from maestro.database import create_database
+from maestro.models import TaskStatus
 
 
 @pytest.fixture(autouse=True)
@@ -70,16 +72,34 @@ def _init_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _write_config(base_dir: Path, repo: Path, *, git_block: dict) -> Path:
+def _write_config(
+    base_dir: Path,
+    repo: Path,
+    *,
+    git_block: dict,
+    validation_cmd: str | None = None,
+) -> Path:
     """Minimal scheduler (mode-1) config with one announce task — the
     consumer's-eye equivalent of `test_cli.py`'s `_write_scheduler_config`
-    extended with a `git:` block, local to this file per the brief."""
+    extended with a `git:` block, local to this file per the brief.
+
+    ``validation_cmd``, when given, is the one way to get a real file
+    change out of the `announce` agent (which only echoes) — it runs as a
+    plain argv in the task's workdir (`maestro/validator.py`), so
+    `"touch new.txt"` gives `auto_commit` something to actually land.
+    """
+    task: dict[str, Any] = {
+        "id": "t1",
+        "title": "T1",
+        "prompt": "hi",
+        "agent_type": "announce",
+    }
+    if validation_cmd is not None:
+        task["validation_cmd"] = validation_cmd
     config = {
         "project": "run-branch-e2e",
         "repo": str(repo),
-        "tasks": [
-            {"id": "t1", "title": "T1", "prompt": "hi", "agent_type": "announce"},
-        ],
+        "tasks": [task],
         "git": git_block,
     }
     config_path = base_dir / "project.yaml"
@@ -145,3 +165,52 @@ async def test_second_fresh_run_iterates_on_same_branch(tmp_path: Path) -> None:
     )
 
     assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "pilot/e2e"
+
+
+async def test_gated_run_completes_green_with_tripwire_armed(tmp_path: Path) -> None:
+    """Task 7: no false trip. The §7 tripwires fire at every seam of a
+    gated run (spawn, validation, success_finalize) — this proves arming
+    them end to end does not perturb an otherwise-clean run. A deterministic
+    mid-run flip is covered at the scheduler level
+    (`tests/test_run_branch_tripwire.py`); an e2e flip would be a race.
+
+    `validation_cmd="touch new.txt"` is the one way to get a real file
+    change out of the `announce` agent (which only echoes its prompt), so
+    `auto_commit` has something to actually land on `pilot/e2e` — proving
+    the whole chain reaches `DONE` with the tripwire armed, not just that
+    it doesn't crash.
+    """
+    repo = _init_repo(tmp_path)
+    config_path = _write_config(
+        tmp_path,
+        repo,
+        git_block={
+            "base_branch": "master",
+            "auto_commit": True,
+            "run_branch": "pilot/e2e",
+        },
+        validation_cmd="touch new.txt",
+    )
+    db_path = tmp_path / "state" / "run.db"
+    db_path.parent.mkdir()
+
+    await _run_scheduler(
+        config_path=config_path, db_path=db_path, resume=False, log_dir=None
+    )
+
+    tip = _git(repo, "rev-parse", "pilot/e2e")
+    # `init` plus exactly one commit the run made — the commit landed.
+    assert _git(repo, "rev-list", "--count", "pilot/e2e") == "2"
+
+    db = await create_database(db_path)
+    try:
+        tasks = await db.get_all_tasks()
+        run_row = await db.get_run_row()
+    finally:
+        await db.close()
+
+    assert len(tasks) == 1
+    assert tasks[0].status == TaskStatus.DONE
+    assert run_row is not None
+    assert run_row["run_branch_head"] == tip
+    assert run_row["suspended_at"] is None

@@ -1100,6 +1100,7 @@ async def _run_scheduler(
                 # the next continuation, where `--accept-branch-tip` is the
                 # audited way through.
                 on_auto_commit=_record_head if bound_branch is not None else None,
+                run_branch=bound_branch,
                 routing=routing,
                 arbiter_mode=arbiter_mode,
                 arbiter_enabled=arbiter_cfg is not None and arbiter_cfg.enabled,
@@ -1138,6 +1139,20 @@ async def _run_scheduler(
             console.print()
             _display_tasks_table(all_tasks, "Final Status")
             _display_summary(all_tasks)
+
+            if scheduler.branch_trip is not None:
+                # The tripwire already wrote the durable suspension
+                # (spec §B.1.1) and the drain preserved every live task
+                # pre-terminal; nothing to conclude — say why we stopped
+                # and exit 1 (spec §7/§8: stderr is the contract).
+                err_console.print(
+                    "[red]run-branch tripwire:[/red] "
+                    f"{escape(str(scheduler.branch_trip))} — run suspended, "
+                    "live work preserved; fix the checkout and re-run to "
+                    "resume (continuation re-verifies the branch)",
+                    soft_wrap=True,
+                )
+                raise typer.Exit(1)
 
             # Same rule as mode 2 (`orchestrate`): the run records its own ending
             # before the failure exit, or it is reported `interrupted` forever
