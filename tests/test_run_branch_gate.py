@@ -12,6 +12,7 @@ from maestro.run_branch_gate import (
     RunBranchRecord,
     StartAction,
     apply_start_gate,
+    check_live,
     decide_start,
     verify_continuation,
 )
@@ -198,3 +199,46 @@ class TestGateEvents:
             )
         refused = [e for e in logs if e["event"] == "run_branch_gate.refused"]
         assert refused and refused[0]["reason"] == "resume_branch_mismatch"
+
+
+class TestCheckLive:
+    """Spec §7: the per-seam live tripwire — name AND tip vs the record."""
+
+    def test_passes_when_name_and_tip_match(self, repo: Path) -> None:
+        _git(repo, "switch", "-c", "pilot/x")
+        tip = _git(repo, "rev-parse", "refs/heads/pilot/x")
+        check_live(repo, RunBranchRecord(branch="pilot/x", head=tip))  # no raise
+
+    def test_branch_flip_trips_with_live_branch_mismatch(self, repo: Path) -> None:
+        _git(repo, "switch", "-c", "pilot/x")
+        tip = _git(repo, "rev-parse", "refs/heads/pilot/x")
+        _git(repo, "switch", "master")
+        with pytest.raises(RunBranchGateError) as exc:
+            check_live(repo, RunBranchRecord(branch="pilot/x", head=tip))
+        assert exc.value.reason == "live_branch_mismatch"
+
+    def test_foreign_commit_same_branch_trips_stale(self, repo: Path) -> None:
+        """Round-5 major 2: a commit on the SAME branch moves the state."""
+        _git(repo, "switch", "-c", "pilot/x")
+        recorded = _git(repo, "rev-parse", "refs/heads/pilot/x")
+        (repo / "foreign.txt").write_text("x")
+        _git(repo, "add", "foreign.txt")
+        _git(repo, "commit", "-m", "foreign")
+        with pytest.raises(RunBranchGateError) as exc:
+            check_live(repo, RunBranchRecord(branch="pilot/x", head=recorded))
+        assert exc.value.reason == "live_stale_checkout"
+
+    def test_none_head_degrades_to_name_only(self, repo: Path) -> None:
+        _git(repo, "switch", "-c", "pilot/x")
+        (repo / "b.txt").write_text("b")
+        _git(repo, "add", "b.txt")
+        _git(repo, "commit", "-m", "moved")
+        check_live(repo, RunBranchRecord(branch="pilot/x", head=None))  # no raise
+
+    def test_detached_head_trips_mismatch(self, repo: Path) -> None:
+        tip = _git(repo, "rev-parse", "HEAD")
+        _git(repo, "switch", "-c", "pilot/x")
+        _git(repo, "checkout", "--detach", tip)
+        with pytest.raises(RunBranchGateError) as exc:
+            check_live(repo, RunBranchRecord(branch="pilot/x", head=tip))
+        assert exc.value.reason == "live_branch_mismatch"
